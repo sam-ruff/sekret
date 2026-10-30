@@ -2,6 +2,11 @@
 
 # sekret
 
+[![Documentation](https://img.shields.io/badge/docs-read%20the%20docs-14a093?logo=readthedocs&logoColor=white)](https://sam-ruff.github.io/sekret/)
+[![CI](https://github.com/sam-ruff/sekret/actions/workflows/ci.yml/badge.svg)](https://github.com/sam-ruff/sekret/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sam-ruff/sekret?color=14a093)](https://github.com/sam-ruff/sekret/releases/latest)
+[![Licence](https://img.shields.io/github/license/sam-ruff/sekret?color=14a093)](LICENSE)
+
 sekret is a self-hosted secrets manager that ships as one static Linux binary. That one file runs the server with its web interface, the command-line client and a Kubernetes operator. It keeps secrets per project, environment and folder, keeps every version, and encrypts each value with XChaCha20-Poly1305 under a root key you hold.
 
 People sign in through your OpenID Connect provider. CI jobs, Kubernetes pods and Ansible runs log in as machine identities with tokens they already have, so there are no shared passwords to hand out. Encryption happens on the server, so whoever runs it can read the secrets; if that rules it out for you, it is better to know now.
