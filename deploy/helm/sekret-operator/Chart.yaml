@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sekret-operator
+description: Syncs secrets from a sekret server into Kubernetes Secrets
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

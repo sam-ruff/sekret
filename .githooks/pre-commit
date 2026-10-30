@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# PRIVATE.md holds local-only notes and must never reach the repository.
+private=$(git ls-files --cached | grep -E '(^|/)PRIVATE\.md$' || true)
+if [ -n "$private" ]; then
+  echo "Refusing to commit private notes:" >&2
+  echo "$private" >&2
+  echo "Unstage with: git rm --cached <file>" >&2
+  exit 1
+fi
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+if echo "$staged" | grep -q '^integrations/ansible/.*\.py$'; then
+  (cd integrations/ansible && uv run ruff check . && uv run ruff format --check .)
+fi
+
+if echo "$staged" | grep -q '\.rs$'; then
+  cargo fmt --all -- --check
+fi

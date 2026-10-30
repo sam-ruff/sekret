@@ -1,0 +1,32 @@
+# Connection details come from SEKRET_URL plus SEKRET_TOKEN or SEKRET_CLIENT_ID/SEKRET_CLIENT_SECRET.
+- name: Render an app config from sekret
+  hosts: localhost
+  gather_facts: false
+  vars:
+    sekret_project: app
+    sekret_environment: prod
+    config_dest: "{{ playbook_dir }}/app.env"
+    log_level: info
+  tasks:
+    - name: Store the log level
+      sekret.secrets.secret:
+        project: "{{ sekret_project }}"
+        environment: "{{ sekret_environment }}"
+        path: /app
+        key: LOG_LEVEL
+        value: "{{ log_level }}"
+        comment: set by ansible
+
+    - name: Write the config file
+      ansible.builtin.template:
+        src: app.env.j2
+        dest: "{{ config_dest }}"
+        mode: "0600"
+      diff: false
+      vars:
+        db_password: >-
+          {{ lookup('sekret.secrets.secret', 'DB_PASSWORD',
+                    project=sekret_project, environment=sekret_environment, path='/db') }}
+        app_settings: >-
+          {{ lookup('sekret.secrets.secret',
+                    project=sekret_project, environment=sekret_environment, path='/app') }}

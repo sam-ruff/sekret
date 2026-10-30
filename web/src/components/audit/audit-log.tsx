@@ -1,0 +1,207 @@
+import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
+import { ScrollText, SearchX, X } from "lucide-react";
+import { useCallback, useMemo } from "react";
+import { useSearchParams } from "react-router";
+import type { AuditQuery } from "@/api/endpoints";
+import type { AuditEntry, AuditPage, Environment } from "@/api/types";
+import { ResponsiveTable } from "@/components/responsive-table";
+import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  auditQuery,
+  auditSearchParams,
+  EMPTY_AUDIT_FILTERS,
+  hasActiveFilters,
+  parseAuditFilters,
+  type AuditFilters,
+} from "@/lib/audit-filters";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { AuditToolbar } from "./audit-toolbar";
+
+const PAGE_SIZE = 50;
+
+interface AuditLogProps {
+  queryKey: readonly unknown[];
+  fetchPage: (query: AuditQuery) => Promise<AuditPage>;
+  scope: "project" | "org";
+  environments?: Environment[];
+}
+
+function target(entry: AuditEntry): string {
+  const where = entry.path && entry.secret_key ? `${entry.path.replace(/\/$/, "")}/${entry.secret_key}` : entry.path;
+  return [entry.environment, where].filter(Boolean).join(" ");
+}
+
+function detailText(detail: unknown): string {
+  if (!detail || typeof detail !== "object") return "";
+  const entries = Object.entries(detail as Record<string, unknown>).filter(
+    ([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0),
+  );
+  const show = (v: unknown) => (Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v));
+  return entries.map(([k, v]) => `${k}: ${show(v)}`).join(" · ");
+}
+
+function FilterChip({ label, value, onClear, testId }: { label: string; value: string; onClear: () => void; testId: string }) {
+  return (
+    <Badge variant="secondary" className="h-6 max-w-full gap-1 pr-0.5" data-testid={testId}>
+      <span className="text-muted-foreground">{label}</span>
+      <span className="truncate font-mono">{value}</span>
+      <Button variant="ghost" size="icon-xs" className="size-5" onClick={onClear} aria-label={`Remove ${label.toLowerCase()} filter`}>
+        <X />
+      </Button>
+    </Badge>
+  );
+}
+
+export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogProps) {
+  const [params, setParams] = useSearchParams();
+  const filters = useMemo(() => parseAuditFilters(params), [params]);
+  const setFilters = useCallback(
+    (next: AuditFilters) => setParams(auditSearchParams(next), { replace: true }),
+    [setParams],
+  );
+  const query = useMemo(() => ({ ...auditQuery(filters), limit: PAGE_SIZE }), [filters]);
+
+  const pages = useInfiniteQuery({
+    queryKey: [...queryKey, query],
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => fetchPage({ ...query, ...(pageParam ? { cursor: pageParam } : {}) }),
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    placeholderData: keepPreviousData,
+  });
+
+  const entries = pages.data?.pages.flatMap((p) => p.entries) ?? [];
+  const total = pages.data?.pages[0]?.total ?? 0;
+  const filtered = hasActiveFilters(filters);
+  const actorName = entries.find((e) => e.actor_id === filters.actorId)?.actor_name ?? filters.actorId;
+  const clear = () => setFilters({ ...EMPTY_AUDIT_FILTERS, order: filters.order });
+
+  return (
+    <div className="space-y-4">
+      <AuditToolbar filters={filters} onChange={setFilters} scope={scope} environments={environments} />
+
+      <div className="flex min-h-7 flex-wrap items-center gap-2 text-sm">
+        <span
+          className="text-muted-foreground tabular-nums"
+          data-testid="audit-total"
+          data-fetching={pages.isFetching}
+          data-filters={auditSearchParams(filters).toString()}
+        >
+          {pages.isSuccess ? `${total} ${total === 1 ? "entry" : "entries"}` : "Loading"}
+        </span>
+        {pages.isFetching && !pages.isFetchingNextPage && pages.isSuccess && <Spinner className="size-3.5" />}
+        {filters.actorId && (
+          <FilterChip label="Actor" value={actorName} onClear={() => setFilters({ ...filters, actorId: "" })} testId="audit-chip-actor" />
+        )}
+        {filters.key && <FilterChip label="Key" value={filters.key} onClear={() => setFilters({ ...filters, key: "" })} testId="audit-chip-key" />}
+        {filters.path && (
+          <FilterChip label="Path" value={filters.path} onClear={() => setFilters({ ...filters, path: "" })} testId="audit-chip-path" />
+        )}
+        {filtered && (
+          <Button variant="ghost" size="sm" className="ml-auto" onClick={clear} data-testid="audit-clear">
+            Clear filters
+          </Button>
+        )}
+      </div>
+
+      {pages.error && <ErrorState error={pages.error} onRetry={() => void pages.refetch()} />}
+      {pages.isPending && <ListSkeleton rows={6} />}
+      {pages.isSuccess && entries.length === 0 && filtered && (
+        <EmptyState
+          icon={<SearchX />}
+          title="No matching activity"
+          description="Nothing in the log matches these filters. Try a wider date range or fewer filters."
+          action={
+            <Button variant="outline" size="sm" onClick={clear}>
+              Clear filters
+            </Button>
+          }
+          testId="audit-empty"
+        />
+      )}
+      {pages.isSuccess && entries.length === 0 && !filtered && (
+        <EmptyState
+          icon={<ScrollText />}
+          title="No activity yet"
+          description="Actions appear here as people and machines use sekret."
+          testId="audit-empty"
+        />
+      )}
+      {entries.length > 0 && (
+        <ResponsiveTable
+          rows={entries}
+          rowKey={(e) => e.id}
+          rowTestId={() => "audit-row"}
+          columns={[
+            {
+              header: "Action",
+              primary: true,
+              cell: (e) => (
+                <Badge variant="secondary" className="max-w-full truncate font-mono" data-testid="audit-action">
+                  {e.action}
+                </Badge>
+              ),
+            },
+            {
+              header: "Actor",
+              cell: (e) => (
+                <button
+                  type="button"
+                  className="max-w-full truncate text-left hover:text-primary hover:underline"
+                  title={`${e.actor_kind} ${e.actor_id} from ${e.ip}. Show only this actor.`}
+                  onClick={() => setFilters({ ...filters, actorId: e.actor_id })}
+                  data-testid="audit-actor"
+                  data-kind={e.actor_kind}
+                >
+                  {e.actor_name}
+                </button>
+              ),
+            },
+            {
+              header: "Target",
+              cell: (e) => (
+                <span className="truncate font-mono text-xs text-muted-foreground" data-testid="audit-target">
+                  {target(e) || "-"}
+                </span>
+              ),
+            },
+            {
+              header: "Detail",
+              className: "md:max-w-72",
+              cell: (e) => <span className="line-clamp-2 text-xs break-all text-muted-foreground">{detailText(e.detail) || "-"}</span>,
+            },
+            {
+              header: "When",
+              className: "md:w-36",
+              cell: (e) => (
+                <span className="text-xs whitespace-nowrap text-muted-foreground" title={formatDateTime(e.created_at)} data-testid="audit-when" data-at={e.created_at}>
+                  {formatRelative(e.created_at)}
+                </span>
+              ),
+            },
+          ]}
+        />
+      )}
+      {entries.length > 0 && (
+        <div className="flex flex-col items-center gap-2">
+          <p className="text-xs text-muted-foreground tabular-nums" data-testid="audit-shown">
+            Showing {entries.length} of {total}
+          </p>
+          {pages.hasNextPage && (
+            <Button
+              variant="outline"
+              onClick={() => void pages.fetchNextPage()}
+              disabled={pages.isFetchingNextPage}
+              data-testid="audit-load-more"
+            >
+              {pages.isFetchingNextPage && <Spinner />}
+              Load more
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

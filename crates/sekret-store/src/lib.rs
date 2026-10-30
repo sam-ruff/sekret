@@ -1,0 +1,142 @@
+//! Persistence for sekret behind the [`Store`] trait, with a sqlx implementation for SQLite and Postgres.
+
+pub mod models;
+mod sql;
+
+use async_trait::async_trait;
+pub use models::*;
+pub use sql::SqlStore;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("record already exists or was changed concurrently")]
+    Conflict,
+    #[error("record not found")]
+    NotFound,
+    #[error("stored data is corrupt: {0}")]
+    Corrupt(String),
+    #[error("database error: {0}")]
+    Database(String),
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
+#[cfg_attr(any(test, feature = "mock"), mockall::automock)]
+#[async_trait]
+pub trait Store: Send + Sync {
+    async fn get_meta(&self, key: &str) -> StoreResult<Option<String>>;
+    async fn set_meta(&self, key: &str, value: &str) -> StoreResult<()>;
+
+    async fn upsert_user(&self, login: UserLogin) -> StoreResult<User>;
+    async fn get_user(&self, id: &str) -> StoreResult<Option<User>>;
+    async fn list_users(&self) -> StoreResult<Vec<User>>;
+    async fn set_user_disabled(&self, id: &str, disabled: bool) -> StoreResult<()>;
+
+    async fn create_identity(&self, identity: Identity) -> StoreResult<()>;
+    async fn get_identity(&self, id: &str) -> StoreResult<Option<Identity>>;
+    async fn list_identities(&self) -> StoreResult<Vec<Identity>>;
+    async fn update_identity(&self, identity: Identity) -> StoreResult<()>;
+    async fn delete_identity(&self, id: &str) -> StoreResult<()>;
+
+    async fn put_auth_method(&self, method: AuthMethod) -> StoreResult<()>;
+    async fn get_auth_method(&self, identity_id: &str, kind: &str) -> StoreResult<Option<AuthMethod>>;
+    async fn list_auth_methods(&self, identity_id: &str) -> StoreResult<Vec<AuthMethod>>;
+    async fn delete_auth_method(&self, identity_id: &str, kind: &str) -> StoreResult<()>;
+
+    async fn create_client_secret(&self, secret: ClientSecret) -> StoreResult<()>;
+    async fn list_client_secrets(&self, identity_id: &str) -> StoreResult<Vec<ClientSecret>>;
+    async fn find_client_secret(&self, secret_hash: &str) -> StoreResult<Option<ClientSecret>>;
+    /// Records a use, decrementing any remaining-use counter. False when no use is left.
+    async fn consume_client_secret(&self, id: &str, now: i64) -> StoreResult<bool>;
+    async fn revoke_client_secret(&self, identity_id: &str, id: &str) -> StoreResult<()>;
+
+    async fn create_token(&self, token: AccessToken) -> StoreResult<()>;
+    async fn find_token(&self, token_hash: &str) -> StoreResult<Option<AccessToken>>;
+    async fn touch_token(&self, id: &str, now: i64) -> StoreResult<()>;
+    async fn extend_token(&self, id: &str, expires_at: i64) -> StoreResult<()>;
+    async fn revoke_token(&self, id: &str) -> StoreResult<()>;
+    async fn revoke_principal_tokens(&self, kind: PrincipalKind, principal_id: &str) -> StoreResult<()>;
+    async fn revoke_tokens_from_source(&self, source: &str) -> StoreResult<()>;
+    async fn list_principal_tokens(&self, kind: PrincipalKind, principal_id: &str) -> StoreResult<Vec<AccessToken>>;
+
+    async fn list_org_bindings(&self) -> StoreResult<Vec<Binding>>;
+    async fn add_org_binding(&self, binding: Binding) -> StoreResult<()>;
+    async fn remove_org_binding(&self, kind: PrincipalKind, principal_id: &str, role_slug: &str) -> StoreResult<()>;
+
+    /// Creates the project with its environments in one transaction.
+    async fn create_project(&self, project: Project, environments: Vec<Environment>) -> StoreResult<()>;
+    async fn get_project(&self, id_or_slug: &str) -> StoreResult<Option<Project>>;
+    async fn list_projects(&self) -> StoreResult<Vec<Project>>;
+    /// Replaces the project's logo, or removes it with `None`.
+    async fn set_project_logo(&self, project_id: &str, logo: Option<ProjectLogo>, now: i64) -> StoreResult<()>;
+    async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>>;
+    async fn set_project_policy(&self, project_id: &str, policy: Option<String>) -> StoreResult<()>;
+    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
+    async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
+    async fn delete_project(&self, id: &str) -> StoreResult<()>;
+    /// Swaps every root-key-dependent value in one transaction: project keys and re-sealed auth method configs.
+    async fn replace_wrapped_keys(
+        &self,
+        keys: Vec<(String, Vec<u8>)>,
+        auth_methods: Vec<AuthMethod>,
+        fingerprint: &str,
+    ) -> StoreResult<()>;
+
+    async fn list_roles(&self, project_id: &str) -> StoreResult<Vec<Role>>;
+    async fn upsert_role(&self, role: Role) -> StoreResult<()>;
+    async fn delete_role(&self, project_id: &str, slug: &str) -> StoreResult<()>;
+
+    async fn list_memberships(&self, project_id: &str) -> StoreResult<Vec<Membership>>;
+    async fn memberships_for(&self, principals: Vec<(PrincipalKind, String)>) -> StoreResult<Vec<Membership>>;
+    async fn add_membership(&self, membership: Membership) -> StoreResult<()>;
+    async fn remove_membership(
+        &self,
+        project_id: &str,
+        kind: PrincipalKind,
+        principal_id: &str,
+        role_slug: &str,
+    ) -> StoreResult<()>;
+
+    async fn list_environments(&self, project_id: &str) -> StoreResult<Vec<Environment>>;
+    async fn create_environment(&self, environment: Environment) -> StoreResult<()>;
+    async fn update_environment(&self, id: &str, name: &str, position: i64) -> StoreResult<()>;
+    async fn delete_environment(&self, id: &str) -> StoreResult<()>;
+
+    async fn list_folders(&self, environment_id: &str) -> StoreResult<Vec<Folder>>;
+    async fn create_folder(&self, folder: Folder) -> StoreResult<()>;
+    async fn delete_folder(&self, environment_id: &str, path: &str) -> StoreResult<()>;
+
+    /// Secrets in `path`, or beneath it when `recursive`, with their current version.
+    async fn list_secrets(
+        &self,
+        environment_id: &str,
+        path: &str,
+        recursive: bool,
+        include_deleted: bool,
+    ) -> StoreResult<Vec<SecretWithVersion>>;
+    async fn get_secret(&self, environment_id: &str, path: &str, key: &str) -> StoreResult<Option<SecretWithVersion>>;
+    async fn get_secret_by_id(&self, id: &str) -> StoreResult<Option<SecretWithVersion>>;
+    async fn list_versions(&self, secret_id: &str) -> StoreResult<Vec<SecretVersion>>;
+    async fn get_version(&self, secret_id: &str, version: i64) -> StoreResult<Option<SecretVersion>>;
+    /// Applies every change and records an environment snapshot atomically.
+    async fn write_secrets(&self, batch: WriteBatch) -> StoreResult<()>;
+
+    async fn list_snapshots(&self, environment_id: &str, limit: i64) -> StoreResult<Vec<Snapshot>>;
+    async fn get_snapshot(&self, id: &str) -> StoreResult<Option<Snapshot>>;
+    async fn prune_snapshots(&self, environment_id: &str, keep: i64) -> StoreResult<()>;
+
+    async fn insert_audit(&self, entry: AuditEntry) -> StoreResult<()>;
+    async fn list_audit(&self, query: AuditQuery) -> StoreResult<Vec<AuditEntry>>;
+    /// Entries matching the query's filters, ignoring `after` and `limit`.
+    async fn count_audit(&self, query: AuditQuery) -> StoreResult<i64>;
+
+    async fn put_login_state(&self, state: LoginState) -> StoreResult<()>;
+    async fn take_login_state(&self, state: &str) -> StoreResult<Option<LoginState>>;
+
+    async fn create_cli_login(&self, login: CliLogin) -> StoreResult<()>;
+    async fn get_cli_login(&self, user_code: &str, now: i64) -> StoreResult<Option<CliLogin>>;
+    async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64) -> StoreResult<bool>;
+    async fn poll_cli_login(&self, device_code_hash: &str, now: i64) -> StoreResult<CliPoll>;
+
+    async fn purge_expired(&self, now: i64) -> StoreResult<()>;
+}

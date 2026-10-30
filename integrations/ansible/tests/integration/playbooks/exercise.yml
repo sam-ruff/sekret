@@ -1,0 +1,106 @@
+- name: Exercise the sekret collection against a live server
+  hosts: localhost
+  gather_facts: false
+  vars:
+    scope:
+      project: "{{ project }}"
+      environment: "{{ sekret_environment }}"
+      path: /it
+  module_defaults:
+    sekret.secrets.secret:
+      project: "{{ project }}"
+      environment: "{{ sekret_environment }}"
+      path: /it
+      key: IT_KEY
+  tasks:
+    - name: Create a secret
+      sekret.secrets.secret:
+        value: "{{ value_one }}"
+        tags: [ansible]
+        comment: created by the integration test
+      register: created
+
+    - name: Set the same value again
+      sekret.secrets.secret:
+        value: "{{ value_one }}"
+        tags: [ansible]
+        comment: a comment alone is not a change
+      register: again
+
+    - name: Change the value in check mode
+      sekret.secrets.secret:
+        value: "{{ value_two }}"
+      check_mode: true
+      register: checked
+
+    - name: Read the secret back
+      ansible.builtin.set_fact:
+        read_back: "{{ lookup('sekret.secrets.secret', 'IT_KEY', **scope) }}"
+        whole: "{{ lookup('sekret.secrets.secret', **scope) }}"
+        fallback: "{{ lookup('sekret.secrets.secret', 'MISSING', default='fallback', **scope) }}"
+      no_log: true
+
+    - name: Check creation, idempotence and check mode
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - created is changed
+          - created.operation == 'created'
+          - again is not changed
+          - checked is changed
+          - checked.operation == 'updated'
+          - read_back == value_one
+          - "whole == {'IT_KEY': value_one}"
+          - fallback == 'fallback'
+
+    - name: Change the value with diff output
+      sekret.secrets.secret:
+        value: "{{ value_two }}"
+      diff: true
+      register: updated
+
+    - name: Read the new value
+      ansible.builtin.set_fact:
+        read_back: "{{ lookup('sekret.secrets.secret', 'IT_KEY', **scope) }}"
+      no_log: true
+
+    - name: Check the update
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - updated is changed
+          - updated.operation == 'updated'
+          - read_back == value_two
+
+    - name: Delete in check mode
+      sekret.secrets.secret:
+        state: absent
+      check_mode: true
+      register: delete_checked
+
+    - name: Delete
+      sekret.secrets.secret:
+        state: absent
+      register: deleted
+
+    - name: Delete again
+      sekret.secrets.secret:
+        state: absent
+      register: deleted_again
+
+    - name: Read the deleted secret
+      ansible.builtin.set_fact:
+        gone: "{{ lookup('sekret.secrets.secret', 'IT_KEY', **scope) }}"
+      register: missing
+      ignore_errors: true
+
+    - name: Check deletion
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - delete_checked is changed
+          - deleted is changed
+          - deleted.operation == 'deleted'
+          - deleted_again is not changed
+          - missing is failed
+          - "'secret IT_KEY not found' in missing.msg"

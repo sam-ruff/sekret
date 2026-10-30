@@ -1,0 +1,23 @@
+[package]
+name = "sekret-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.92"
+mockall = { version = "0.15.0", optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+sekret-api = { version = "0.1.0", path = "../sekret-api" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+url = "2.5.8"
+
+[features]
+mock = ["dep:mockall"]
+
+[dev-dependencies]
+mockall = "0.15.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6.5"

@@ -1,0 +1,38 @@
+import { expect, test } from "@playwright/test";
+import { isMobile } from "./helpers";
+
+test("the sidebar becomes a sheet on narrow screens", async ({ page }) => {
+  test.skip(!isMobile(page), "Mobile layout only");
+  await page.goto("/projects/storefront/secrets/dev");
+
+  await expect(page.getByTestId("nav-identities")).toBeHidden();
+  await page.getByTestId("sidebar-trigger").click();
+  const sheet = page.locator('[data-mobile="true"]');
+  await expect(sheet).toBeVisible();
+  await sheet.getByTestId("nav-overview").click();
+  await expect(page).toHaveURL(/\/overview/);
+  await expect(sheet).toBeHidden();
+
+  await page.getByTestId("sidebar-trigger").click();
+  await page.getByTestId("nav-identities").click();
+  await expect(page).toHaveURL(/\/org\/identities/);
+  await expect(page.getByTestId("page-title")).toHaveText("Machine identities");
+});
+
+test("tables become stacked cards without horizontal scrolling", async ({ page }) => {
+  test.skip(!isMobile(page), "Mobile layout only");
+  await page.goto("/projects/storefront/settings/members");
+  await expect(page.getByTestId("add-member")).toBeVisible();
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+});
+
+test("the sidebar collapses to icons on desktop", async ({ page }) => {
+  test.skip(isMobile(page), "Desktop layout only");
+  await page.goto("/projects");
+  const sidebar = page.locator('[data-slot="sidebar"][data-state]');
+  await expect(sidebar).toHaveAttribute("data-state", "expanded");
+  await page.getByTestId("sidebar-trigger").click();
+  await expect(sidebar).toHaveAttribute("data-state", "collapsed");
+  await expect(page.getByTestId("nav-projects")).toBeVisible();
+});

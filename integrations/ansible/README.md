@@ -1,0 +1,89 @@
+# sekret.secrets
+
+Ansible collection for reading and writing secrets in a sekret server. It has a lookup for pulling values into templates and vars, and a module for setting or removing secrets. Everything uses the Python standard library, so the controller needs nothing beyond Ansible itself.
+
+## Install
+
+From this directory:
+
+```sh
+ansible-galaxy collection build
+ansible-galaxy collection install sekret-secrets-*.tar.gz
+```
+
+Or point Ansible at a checkout by putting it under `ansible_collections/sekret/secrets` somewhere on `ANSIBLE_COLLECTIONS_PATH`.
+
+## Connecting
+
+Set `url` (or `SEKRET_URL`) to the server, plus one way of logging in. Every option can be passed to the lookup or module directly or picked up from the environment.
+
+| Method | Options | Environment |
+| --- | --- | --- |
+| Token | `token` | `SEKRET_TOKEN` |
+| Universal auth | `client_id`, `client_secret` | `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET` |
+| OIDC | `identity_id` with `oidc_token` or `oidc_token_file` | `SEKRET_IDENTITY_ID`, `SEKRET_OIDC_TOKEN`, `SEKRET_OIDC_TOKEN_FILE` |
+| Kubernetes | `identity_id`, `auth_method: kubernetes` | `SEKRET_IDENTITY_ID`, `SEKRET_AUTH_METHOD` |
+
+When `auth_method` is left alone it tries them in that order, skipping Kubernetes, which you have to ask for. Kubernetes reads the pod's service account token from the usual path unless you set `kubernetes_token_file`.
+
+A machine login is cached for the rest of the process, so a template full of lookups only logs in once.
+
+If the server uses a certificate from your own CA, set `ca_path` (or `SEKRET_CA_PATH`) to the CA bundle. `validate_certs: false` turns checking off entirely, which is fine for a quick test and not much else.
+
+`project` and `environment` can also come from `SEKRET_PROJECT` and `SEKRET_ENVIRONMENT`.
+
+## Reading secrets
+
+```yaml
+- name: One value
+  ansible.builtin.debug:
+    msg: "{{ lookup('sekret.secrets.secret', 'DB_PASSWORD', project='app', environment='prod', path='/db') }}"
+
+- name: Everything in a folder, as a dict
+  ansible.builtin.template:
+    src: app.env.j2
+    dest: /etc/app/app.env
+    mode: "0600"
+  vars:
+    settings: "{{ lookup('sekret.secrets.secret', project='app', environment='prod', path='/app') }}"
+```
+
+A key that doesn't exist fails the task. Pass `default=` if you would rather get a fallback value.
+
+## Writing secrets
+
+```yaml
+- name: Store the API key
+  sekret.secrets.secret:
+    project: app
+    environment: prod
+    path: /api
+    key: API_KEY
+    value: "{{ api_key }}"
+    tags: [external]
+  delegate_to: localhost
+
+- name: Drop an old one
+  sekret.secrets.secret:
+    project: app
+    environment: prod
+    key: LEGACY_TOKEN
+    state: absent
+  delegate_to: localhost
+```
+
+The module compares against what is stored before writing, so it only reports a change when there is one, and check mode works. It never returns the value, and `--diff` only tells you whether the value changed. The `comment` is attached to the new version when a write happens and isn't compared.
+
+Like any module it runs on the target host, so `delegate_to: localhost` is usually what you want.
+
+`examples/playbook.yml` shows both together: it stores a setting and renders a config file from a couple of lookups.
+
+## Development
+
+```sh
+uv sync
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
+```
+
+`tests/run_integration.sh` starts a throwaway server from this repository and runs the integration tests against it. To use a server you already have, set `SEKRET_TEST_URL` and an organisation admin token in `SEKRET_TEST_TOKEN` and run `uv run pytest -m integration`.

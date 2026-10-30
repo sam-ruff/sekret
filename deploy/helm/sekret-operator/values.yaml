@@ -1,0 +1,47 @@
+image:
+  # Image containing the sekret binary.
+  repository: sekret
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+sekret:
+  # Base URL of the sekret server, for example https://sekret.example.com
+  serverUrl: ""
+  # Optional ConfigMap holding a PEM CA bundle for the sekret server.
+  caBundle:
+    configMapName: ""
+    key: ca.crt
+  # Optional kubernetes.io/tls Secret (tls.crt, tls.key) presented when the server requires mutual TLS.
+  clientCertificate:
+    secretName: ""
+  requestTimeoutSeconds: 30
+
+# Restrict the operator to one namespace; empty watches every namespace.
+# When set, RBAC is granted with a Role in that namespace instead of a ClusterRole.
+watchNamespace: ""
+
+concurrency: 4
+
+logLevel: info
+
+serviceAccount:
+  create: true
+  # Defaults to the release full name.
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

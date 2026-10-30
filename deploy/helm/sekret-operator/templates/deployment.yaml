@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sekret-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sekret-operator.labels" . | nindent 4 }}
+spec:
+  # The controller has no leader election, so only one replica may run.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sekret-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sekret-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "sekret-operator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["operator"]
+          env:
+            - name: SEKRET_URL
+              value: {{ required "sekret.serverUrl is required" .Values.sekret.serverUrl | quote }}
+            - name: SEKRET_OPERATOR_CONCURRENCY
+              value: {{ .Values.concurrency | quote }}
+            - name: SEKRET_OPERATOR_REQUEST_TIMEOUT
+              value: {{ .Values.sekret.requestTimeoutSeconds | quote }}
+            - name: SEKRET_LOG
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.watchNamespace }}
+            - name: SEKRET_OPERATOR_NAMESPACE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.sekret.caBundle.configMapName }}
+            - name: SEKRET_CA_FILE
+              value: /etc/sekret/ca/{{ .Values.sekret.caBundle.key }}
+            {{- end }}
+            {{- if .Values.sekret.clientCertificate.secretName }}
+            - name: SEKRET_CLIENT_CERT
+              value: /etc/sekret/client/tls.crt
+            - name: SEKRET_CLIENT_KEY
+              value: /etc/sekret/client/tls.key
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.sekret.caBundle.configMapName .Values.sekret.clientCertificate.secretName }}
+          volumeMounts:
+            {{- if .Values.sekret.caBundle.configMapName }}
+            - name: ca
+              mountPath: /etc/sekret/ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.sekret.clientCertificate.secretName }}
+            - name: client-certificate
+              mountPath: /etc/sekret/client
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.sekret.caBundle.configMapName .Values.sekret.clientCertificate.secretName }}
+      volumes:
+        {{- if .Values.sekret.caBundle.configMapName }}
+        - name: ca
+          configMap:
+            name: {{ .Values.sekret.caBundle.configMapName }}
+            items:
+              - key: {{ .Values.sekret.caBundle.key }}
+                path: {{ .Values.sekret.caBundle.key }}
+        {{- end }}
+        {{- if .Values.sekret.clientCertificate.secretName }}
+        - name: client-certificate
+          secret:
+            secretName: {{ .Values.sekret.clientCertificate.secretName }}
+            defaultMode: 0400
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

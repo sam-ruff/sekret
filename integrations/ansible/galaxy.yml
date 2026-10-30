@@ -1,0 +1,23 @@
+namespace: sekret
+name: secrets
+version: 0.1.0
+readme: README.md
+authors:
+  - sekret maintainers
+description: Read and write secrets in a sekret server from Ansible.
+license:
+  - MIT
+tags:
+  - secrets
+  - security
+  - vault
+dependencies: {}
+build_ignore:
+  - .venv
+  - .ruff_cache
+  - .pytest_cache
+  - "*.egg-info"
+  - pyproject.toml
+  - uv.lock
+  - tests
+  - "**/__pycache__"

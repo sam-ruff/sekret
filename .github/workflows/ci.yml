@@ -1,0 +1,144 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sekret-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+# Every job runs on the self-hosted pool. Pull requests from forks are skipped, and the
+# repository requires approval before outside contributors' workflows run at all.
+jobs:
+  rust:
+    uses: sam-ruff/actions/.github/workflows/rust-ci.yml@v1
+    with:
+      runs-on: '["self-hosted", "sophie"]'
+      toolchain: 1.98.0
+      env: |
+        SEKRET_REQUIRE_POSTGRES=1
+      post-command: cargo run --locked -q -p sekret -- openapi | diff -u web/openapi.json -
+
+  web:
+    uses: sam-ruff/actions/.github/workflows/node-ci.yml@v1
+    with:
+      runs-on: '["self-hosted", "sophie"]'
+      working-directory: web
+      check-generated: npm run gen:api
+      e2e-script: e2e
+
+  ansible:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, sophie-small]
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: integrations/ansible
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
+
+  helm:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, sophie-small]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: helm lint deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com
+      - run: helm template sekret deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com > /dev/null
+
+  docs-check:
+    uses: sam-ruff/actions/.github/workflows/docs-pages.yml@v1
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    with:
+      runs-on: '["self-hosted", "sophie-small"]'
+      deploy: false
+
+  system:
+    needs: [rust, web, ansible]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, sophie-large]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.0 --profile minimal --target x86_64-unknown-linux-musl && rustup default 1.98.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.17.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: cd web && npm ci --no-audit --no-fund && npx playwright install chromium
+      - name: Keycloak, Postgres, k3s, CLI, Ansible and live browser suites
+        run: scripts/system-test.sh
+
+  release:
+    needs: [rust, web, ansible, helm, system, docs-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: sam-ruff/actions/.github/workflows/semantic-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      runs-on: '["self-hosted", "sophie-small"]'
+
+  binary:
+    needs: release
+    if: needs.release.outputs.new-release-published == 'true'
+    uses: sam-ruff/actions/.github/workflows/rust-musl-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      runs-on: '["self-hosted", "sophie-large"]'
+      package: sekret
+      tag: ${{ needs.release.outputs.tag }}
+      toolchain: 1.98.0
+      node-version: 24.17.0
+      pre-build-command: cd web && npm ci --no-audit --no-fund && npm run build && test -f dist/index.html
+      verify-command: '"$BINARY" admin web-check'
+      asset-label: sekret (linux amd64, static)
+
+  image:
+    needs: [release, binary]
+    uses: sam-ruff/actions/.github/workflows/container-image.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      runs-on: '["self-hosted", "sophie-small"]'
+      ref: ${{ needs.release.outputs.tag }}
+      version: ${{ needs.release.outputs.version }}
+      binary-artifact: ${{ needs.binary.outputs.artifact-name }}
+      binary-artifact-path: dist
+
+  docs:
+    needs: release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: sam-ruff/actions/.github/workflows/docs-pages.yml@v1
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    with:
+      runs-on: '["self-hosted", "sophie-small"]'

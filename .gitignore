@@ -1,0 +1,17 @@
+/target
+/dist/
+/site/
+node_modules/
+/web/dist/
+/web/test-results/
+/web/playwright-report/
+/integrations/ansible/.venv/
+__pycache__/
+*.pyc
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# Local-only notes for agents; see AGENTS.md. The pre-commit hook refuses to commit it.
+PRIVATE.md
