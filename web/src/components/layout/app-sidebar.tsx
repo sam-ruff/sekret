@@ -1,4 +1,5 @@
 import {
+  BookOpen,
   Bot,
   Camera,
   ChevronsUpDown,
@@ -26,6 +27,7 @@ import {
 import {
   Sidebar,
   SidebarContent,
+  SidebarFooter,
   SidebarGroup,
   SidebarGroupLabel,
   SidebarHeader,
@@ -37,6 +39,7 @@ import {
 } from "@/components/ui/sidebar";
 import { useProjects } from "@/hooks/queries";
 import { useOrgPermissions } from "@/hooks/use-permissions";
+import { DOCS_URL } from "@/lib/links";
 
 interface NavItem {
   to: string;
@@ -170,6 +173,18 @@ export function AppSidebar() {
         {projectItems.length > 0 && <NavGroup label="Project" items={projectItems} />}
         <NavGroup label="Organisation" items={orgItems} />
       </SidebarContent>
+      <SidebarFooter>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild size="sm" tooltip="Documentation" className="text-muted-foreground">
+              <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" data-testid="nav-docs">
+                <BookOpen />
+                <span>Documentation</span>
+              </a>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
       <SidebarRail />
     </Sidebar>
   );

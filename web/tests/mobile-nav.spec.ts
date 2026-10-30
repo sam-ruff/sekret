@@ -27,6 +27,16 @@ test("tables become stacked cards without horizontal scrolling", async ({ page }
   expect(overflow).toBeLessThanOrEqual(0);
 });
 
+test("the sidebar links to the documentation in a new tab", async ({ page }) => {
+  await page.goto("/projects");
+  if (isMobile(page)) await page.getByTestId("sidebar-trigger").click();
+  const docs = page.getByTestId("nav-docs");
+  await expect(docs).toBeVisible();
+  await expect(docs).toHaveAttribute("href", "https://sam-ruff.github.io/sekret/");
+  await expect(docs).toHaveAttribute("target", "_blank");
+  await expect(docs).toHaveAttribute("rel", /noopener/);
+});
+
 test("the sidebar collapses to icons on desktop", async ({ page }) => {
   test.skip(isMobile(page), "Desktop layout only");
   await page.goto("/projects");
