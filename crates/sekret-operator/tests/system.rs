@@ -70,6 +70,8 @@ async fn start_cluster() -> Cluster {
         .expect("kube config");
     let url = format!("https://127.0.0.1:{port}");
     config.cluster_url = url.parse().expect("url");
+    // k3s is on loopback, so a proxy from HTTPS_PROXY could never reach it.
+    config.proxy_url = None;
     let client = Client::try_from(config).expect("kube client");
     Cluster {
         client,
