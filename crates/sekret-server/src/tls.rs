@@ -64,38 +64,41 @@ pub fn server_config(settings: &TlsSettings) -> Result<rustls::ServerConfig, Tls
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
-    fn settings(client_ca: Option<Vec<u8>>, required: bool) -> TlsSettings {
-        let key = rcgen::KeyPair::generate().expect("key");
+    fn settings(client_ca: Option<Vec<u8>>, required: bool) -> anyhow::Result<TlsSettings> {
+        let key = rcgen::KeyPair::generate().context("key")?;
         let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
-            .expect("params")
+            .context("params")?
             .self_signed(&key)
-            .expect("cert");
-        TlsSettings {
+            .context("cert")?;
+        Ok(TlsSettings {
             cert_pem: cert.pem().into_bytes(),
             key_pem: zeroize::Zeroizing::new(key.serialize_pem().into_bytes()),
             client_ca_pem: client_ca,
             client_auth_required: required,
-        }
+        })
     }
 
     #[test]
-    fn builds_with_and_without_client_authentication() {
-        assert!(server_config(&settings(None, false)).is_ok());
-        let ca = settings(None, false).cert_pem;
-        assert!(server_config(&settings(Some(ca.clone()), true)).is_ok());
-        assert!(server_config(&settings(Some(ca), false)).is_ok());
+    fn builds_with_and_without_client_authentication() -> anyhow::Result<()> {
+        assert!(server_config(&settings(None, false)?).is_ok());
+        let ca = settings(None, false)?.cert_pem;
+        assert!(server_config(&settings(Some(ca.clone()), true)?).is_ok());
+        assert!(server_config(&settings(Some(ca), false)?).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn bad_inputs_are_reported() {
-        let mut no_cert = settings(None, false);
+    fn bad_inputs_are_reported() -> anyhow::Result<()> {
+        let mut no_cert = settings(None, false)?;
         no_cert.cert_pem = b"not pem".to_vec();
         assert!(matches!(server_config(&no_cert), Err(TlsError::NoCertificates(_))));
-        let mut no_key = settings(None, false);
+        let mut no_key = settings(None, false)?;
         no_key.key_pem = zeroize::Zeroizing::new(b"nothing".to_vec());
         assert!(matches!(server_config(&no_key), Err(TlsError::Pem(..))));
-        let empty_ca = settings(Some(Vec::new()), true);
+        let empty_ca = settings(Some(Vec::new()), true)?;
         assert!(matches!(server_config(&empty_ca), Err(TlsError::NoCertificates(_))));
+        Ok(())
     }
 }

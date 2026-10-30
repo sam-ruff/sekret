@@ -331,6 +331,7 @@ impl BuiltinRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use proptest::prelude::*;
 
     fn secret<'a>(env: &'a str, path: &'a str, key: &'a str) -> Resource<'a> {
@@ -470,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn rules_round_trip_through_json() {
+    fn rules_round_trip_through_json() -> anyhow::Result<()> {
         let rule = scoped(
             Effect::Deny,
             &[Action::ReadValue],
@@ -479,9 +480,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let json = serde_json::to_string(&rule).expect("serialise");
+        let json = serde_json::to_string(&rule).context("serialise")?;
         assert!(json.contains("\"read-value\""));
-        assert_eq!(serde_json::from_str::<Rule>(&json).expect("parse"), rule);
+        assert_eq!(serde_json::from_str::<Rule>(&json).context("parse")?, rule);
+        Ok(())
     }
 
     #[test]

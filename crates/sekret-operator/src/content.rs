@@ -70,6 +70,7 @@ pub fn content_hash(data: &SecretData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     fn raw(path: &str, key: &str, value: &str) -> RawSecret {
         RawSecret {
@@ -80,29 +81,36 @@ mod tests {
     }
 
     #[test]
-    fn ignores_paths_when_mapping_keys() {
-        let data = build_data(vec![raw("/", "A", "1"), raw("/db", "B", "2")], None).expect("data");
+    fn ignores_paths_when_mapping_keys() -> anyhow::Result<()> {
+        let data = build_data(vec![raw("/", "A", "1"), raw("/db", "B", "2")], None).context("data")?;
         assert_eq!(data.get("A"), Some(&b"1".to_vec()));
         assert_eq!(data.get("B"), Some(&b"2".to_vec()));
+        Ok(())
     }
 
     #[test]
-    fn keys_filter_keeps_only_requested_keys() {
+    fn keys_filter_keeps_only_requested_keys() -> anyhow::Result<()> {
         let keys = vec!["B".to_string()];
-        let data = build_data(vec![raw("/", "A", "1"), raw("/", "B", "2")], Some(&keys)).expect("data");
+        let data = build_data(vec![raw("/", "A", "1"), raw("/", "B", "2")], Some(&keys)).context("data")?;
         assert_eq!(data.keys().collect::<Vec<_>>(), vec!["B"]);
+        Ok(())
     }
 
     #[test]
-    fn keys_filter_reports_missing_keys_by_name() {
+    fn keys_filter_reports_missing_keys_by_name() -> anyhow::Result<()> {
         let keys = vec!["A".to_string(), "MISSING".to_string()];
-        let error = build_data(vec![raw("/", "A", "1")], Some(&keys)).expect_err("missing");
+        let error = build_data(vec![raw("/", "A", "1")], Some(&keys))
+            .err()
+            .context("expected missing keys error")?;
         assert_eq!(error, ContentError::KeysNotFound(vec!["MISSING".into()]));
+        Ok(())
     }
 
     #[test]
-    fn duplicate_keys_across_paths_fail_without_values() {
-        let error = build_data(vec![raw("/a", "DUP", "first"), raw("/b", "DUP", "second")], None).expect_err("dup");
+    fn duplicate_keys_across_paths_fail_without_values() -> anyhow::Result<()> {
+        let error = build_data(vec![raw("/a", "DUP", "first"), raw("/b", "DUP", "second")], None)
+            .err()
+            .context("expected duplicate key error")?;
         assert_eq!(
             error,
             ContentError::DuplicateKey {
@@ -112,6 +120,7 @@ mod tests {
         );
         let message = error.to_string();
         assert!(!message.contains("first") && !message.contains("second"), "{message}");
+        Ok(())
     }
 
     #[test]
@@ -122,17 +131,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_keys_kubernetes_would_refuse() {
-        let error = build_data(vec![raw("/", "BAD KEY", "1")], None).expect_err("invalid");
+    fn rejects_keys_kubernetes_would_refuse() -> anyhow::Result<()> {
+        let error = build_data(vec![raw("/", "BAD KEY", "1")], None)
+            .err()
+            .context("expected invalid key error")?;
         assert_eq!(error, ContentError::InvalidKey("BAD KEY".into()));
+        Ok(())
     }
 
     #[test]
-    fn hash_is_stable_and_sensitive_to_content() {
-        let a = build_data(vec![raw("/", "A", "1"), raw("/", "B", "2")], None).expect("a");
-        let b = build_data(vec![raw("/", "B", "2"), raw("/", "A", "1")], None).expect("b");
+    fn hash_is_stable_and_sensitive_to_content() -> anyhow::Result<()> {
+        let a = build_data(vec![raw("/", "A", "1"), raw("/", "B", "2")], None).context("a")?;
+        let b = build_data(vec![raw("/", "B", "2"), raw("/", "A", "1")], None).context("b")?;
         assert_eq!(content_hash(&a), content_hash(&b));
-        let c = build_data(vec![raw("/", "A", "12"), raw("/", "B", "")], None).expect("c");
+        let c = build_data(vec![raw("/", "A", "12"), raw("/", "B", "")], None).context("c")?;
         assert_ne!(content_hash(&a), content_hash(&c));
+        Ok(())
     }
 }

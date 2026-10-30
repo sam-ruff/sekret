@@ -511,8 +511,8 @@ mod tests {
     }
 
     #[test]
-    fn user_codes_are_readable() {
-        let code = user_code().expect("code");
+    fn user_codes_are_readable() -> anyhow::Result<()> {
+        let code = user_code().map_err(|e| anyhow::anyhow!("code: {e:?}"))?;
         assert_eq!(code.len(), 9);
         assert_eq!(&code[4..5], "-");
         assert!(
@@ -520,5 +520,6 @@ mod tests {
                 .filter(|c| *c != '-')
                 .all(|c| USER_CODE_ALPHABET.contains(&(c as u8)))
         );
+        Ok(())
     }
 }

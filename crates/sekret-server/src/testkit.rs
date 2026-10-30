@@ -59,11 +59,11 @@ impl TestIssuer {
     }
 
     /// Signs `claims`, filling in `iss`, `iat` and `exp` when absent.
-    pub fn sign(&self, claims: Value) -> String {
+    pub fn sign(&self, claims: Value) -> Result<String, jsonwebtoken::errors::Error> {
         self.sign_with_kid(claims, self.kid)
     }
 
-    pub fn sign_with_kid(&self, mut claims: Value, kid: &str) -> String {
+    pub fn sign_with_kid(&self, mut claims: Value, kid: &str) -> Result<String, jsonwebtoken::errors::Error> {
         if let Some(map) = claims.as_object_mut() {
             map.entry("iss").or_insert_with(|| json!(self.url));
             map.entry("iat").or_insert_with(|| json!(self.now));
@@ -71,7 +71,7 @@ impl TestIssuer {
         }
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(kid.to_string());
-        let key = EncodingKey::from_ed_pem(self.pem).expect("fixture key is valid");
-        jsonwebtoken::encode(&header, &claims, &key).expect("signing with fixture key")
+        let key = EncodingKey::from_ed_pem(self.pem)?;
+        jsonwebtoken::encode(&header, &claims, &key)
     }
 }

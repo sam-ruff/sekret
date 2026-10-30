@@ -340,6 +340,8 @@ mod tests {
     use sekret_api::{RawSecret, RawSecrets, TokenResponse};
     use sekret_client::{ClientError, MockSekretApi};
 
+    use anyhow::Context;
+
     use super::*;
     use crate::crd::{AuthSpec, SekretSecretSpec, TargetSpec};
     use crate::kube_api::MockKubeApi;
@@ -448,36 +450,38 @@ mod tests {
         kube
     }
 
-    fn last_status(statuses: &Arc<Mutex<Vec<SekretSecretStatus>>>) -> SekretSecretStatus {
+    fn last_status(statuses: &Arc<Mutex<Vec<SekretSecretStatus>>>) -> anyhow::Result<SekretSecretStatus> {
         statuses
             .lock()
             .ok()
             .and_then(|s| s.last().cloned())
-            .expect("status patched")
+            .context("status patched")
     }
 
-    fn owned_secret(data: &[(&str, &str)]) -> Secret {
+    fn owned_secret(data: &[(&str, &str)]) -> anyhow::Result<Secret> {
         let mut secret = desired_secret(
             &cr(),
             "apps",
-            cr().controller_owner_ref(&()).expect("owner"),
+            cr().controller_owner_ref(&()).context("owner")?,
             data.iter()
                 .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
                 .collect(),
         );
         secret.metadata.resource_version = Some("41".into());
-        secret
+        Ok(secret)
     }
 
-    fn assert_no_leak(statuses: &Arc<Mutex<Vec<SekretSecretStatus>>>, values: &[&str]) {
-        let json = serde_json::to_string(&*statuses.lock().expect("lock")).expect("json");
+    fn assert_no_leak(statuses: &Arc<Mutex<Vec<SekretSecretStatus>>>, values: &[&str]) -> anyhow::Result<()> {
+        let guard = statuses.lock().map_err(|_| anyhow::anyhow!("status lock poisoned"))?;
+        let json = serde_json::to_string(&*guard).context("json")?;
         for value in values.iter().chain([&SA_TOKEN, &ACCESS_TOKEN]) {
             assert!(!json.contains(value), "status leaked {value}: {json}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn creates_the_target_secret_with_owner_and_label() {
+    async fn creates_the_target_secret_with_owner_and_label() -> anyhow::Result<()> {
         let statuses = Arc::default();
         let mut kube = kube(None, Arc::clone(&statuses));
         kube.expect_create_secret()
@@ -505,36 +509,37 @@ mod tests {
             .returning(|_, _| Ok(()));
         let sekret = factory(raw(&[("/", "DB_URL", "postgres://x")]));
 
-        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.expect("sync");
+        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.context("sync")?;
 
         assert_eq!(outcome.write, WriteKind::Created);
-        let status = last_status(&statuses);
-        let ready = status.ready().expect("ready");
+        let status = last_status(&statuses)?;
+        let ready = status.ready().context("ready")?;
         assert_eq!((ready.status.as_str(), ready.reason.as_str()), ("True", "Synced"));
         assert_eq!(status.secret_count, Some(1));
         assert_eq!(status.last_synced_at.as_deref(), Some(NOW));
         assert_eq!(status.observed_generation, Some(3));
-        assert_no_leak(&statuses, &["postgres://x"]);
+        assert_no_leak(&statuses, &["postgres://x"])
     }
 
     #[tokio::test]
-    async fn unchanged_content_skips_the_write() {
+    async fn unchanged_content_skips_the_write() -> anyhow::Result<()> {
         let statuses = Arc::default();
-        let mut kube = kube(Some(owned_secret(&[("A", "1")])), Arc::clone(&statuses));
+        let mut kube = kube(Some(owned_secret(&[("A", "1")])?), Arc::clone(&statuses));
         kube.expect_create_secret().never();
         kube.expect_replace_secret().never();
         let sekret = factory(raw(&[("/", "A", "1")]));
 
-        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.expect("sync");
+        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.context("sync")?;
 
         assert_eq!(outcome.write, WriteKind::Unchanged);
-        assert_eq!(last_status(&statuses).ready().map(|c| c.status.as_str()), Some("True"));
+        assert_eq!(last_status(&statuses)?.ready().map(|c| c.status.as_str()), Some("True"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn changed_content_replaces_with_the_current_resource_version() {
+    async fn changed_content_replaces_with_the_current_resource_version() -> anyhow::Result<()> {
         let statuses = Arc::default();
-        let mut kube = kube(Some(owned_secret(&[("A", "old")])), Arc::clone(&statuses));
+        let mut kube = kube(Some(owned_secret(&[("A", "old")])?), Arc::clone(&statuses));
         kube.expect_replace_secret()
             .withf(|ns, secret| {
                 ns == "apps"
@@ -545,27 +550,29 @@ mod tests {
             .returning(|_, _| Ok(()));
         let sekret = factory(raw(&[("/", "A", "new")]));
 
-        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.expect("sync");
+        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.context("sync")?;
 
         assert_eq!(outcome.write, WriteKind::Replaced);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_desired_label_triggers_a_replace() {
+    async fn missing_desired_label_triggers_a_replace() -> anyhow::Result<()> {
         let statuses = Arc::default();
-        let mut existing = owned_secret(&[("A", "1")]);
+        let mut existing = owned_secret(&[("A", "1")])?;
         existing.metadata.labels = Some(BTreeMap::from([(MANAGED_BY_LABEL.into(), MANAGED_BY_VALUE.into())]));
         let mut kube = kube(Some(existing), Arc::clone(&statuses));
         kube.expect_replace_secret().times(1).returning(|_, _| Ok(()));
         let sekret = factory(raw(&[("/", "A", "1")]));
 
-        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.expect("sync");
+        let outcome = reconcile(&cr(), &kube, &sekret, NOW).await.context("sync")?;
 
         assert_eq!(outcome.write, WriteKind::Replaced);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn refuses_a_secret_owned_by_someone_else() {
+    async fn refuses_a_secret_owned_by_someone_else() -> anyhow::Result<()> {
         for owners in [
             None,
             Some(vec![OwnerReference {
@@ -578,28 +585,32 @@ mod tests {
             }]),
         ] {
             let statuses = Arc::default();
-            let mut foreign = owned_secret(&[("A", "1")]);
+            let mut foreign = owned_secret(&[("A", "1")])?;
             foreign.metadata.owner_references = owners;
             let mut kube = kube(Some(foreign), Arc::clone(&statuses));
             kube.expect_create_secret().never();
             kube.expect_replace_secret().never();
             let sekret = factory(raw(&[("/", "A", "secret-value")]));
 
-            let error = reconcile(&cr(), &kube, &sekret, NOW).await.expect_err("refused");
+            let error = reconcile(&cr(), &kube, &sekret, NOW)
+                .await
+                .err()
+                .context("expected the foreign secret to be refused")?;
 
             assert!(matches!(error, SyncError::TargetNotOwned(_)), "{error:?}");
-            let status = last_status(&statuses);
-            let ready = status.ready().expect("ready");
+            let status = last_status(&statuses)?;
+            let ready = status.ready().context("ready")?;
             assert_eq!(
                 (ready.status.as_str(), ready.reason.as_str()),
                 ("False", "TargetNotOwned")
             );
-            assert_no_leak(&statuses, &["secret-value"]);
+            assert_no_leak(&statuses, &["secret-value"])?;
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn login_failure_sets_ready_false_without_leaking_tokens() {
+    async fn login_failure_sets_ready_false_without_leaking_tokens() -> anyhow::Result<()> {
         let statuses = Arc::default();
         let mut kube = kube(None, Arc::clone(&statuses));
         kube.expect_create_secret().never();
@@ -633,11 +644,12 @@ mod tests {
 
         let error = reconcile(&resource, &kube, &sekret, NOW)
             .await
-            .expect_err("login fails");
+            .err()
+            .context("expected login to fail")?;
 
         assert!(matches!(error, SyncError::Login(_)), "{error:?}");
-        let status = last_status(&statuses);
-        let ready = status.ready().expect("ready");
+        let status = last_status(&statuses)?;
+        let ready = status.ready().context("ready")?;
         assert_eq!((ready.status.as_str(), ready.reason.as_str()), ("False", "LoginFailed"));
         assert!(
             ready.message.contains("kubernetes rejected the token"),
@@ -648,11 +660,11 @@ mod tests {
         assert_eq!(status.conditions.len(), 1);
         assert_eq!(status.secret_count, Some(2), "last good sync is kept");
         assert_eq!(status.last_synced_at.as_deref(), Some("2026-10-29T00:00:00Z"));
-        assert_no_leak(&statuses, &[]);
+        assert_no_leak(&statuses, &[])
     }
 
     #[tokio::test]
-    async fn keys_filter_limits_what_is_written() {
+    async fn keys_filter_limits_what_is_written() -> anyhow::Result<()> {
         let statuses = Arc::default();
         let mut kube = kube(None, Arc::clone(&statuses));
         kube.expect_create_secret()
@@ -665,13 +677,14 @@ mod tests {
         let mut resource = cr();
         resource.spec.keys = Some(vec!["KEEP".into()]);
 
-        let outcome = reconcile(&resource, &kube, &sekret, NOW).await.expect("sync");
+        let outcome = reconcile(&resource, &kube, &sekret, NOW).await.context("sync")?;
 
         assert_eq!(outcome.secret_count, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn duplicate_keys_in_recursive_mode_fail_clearly() {
+    async fn duplicate_keys_in_recursive_mode_fail_clearly() -> anyhow::Result<()> {
         let statuses: Arc<Mutex<Vec<SekretSecretStatus>>> = Arc::default();
         let mut kube = MockKubeApi::new();
         kube.expect_request_token().returning(|_, _, _, _| Ok(SA_TOKEN.into()));
@@ -708,10 +721,13 @@ mod tests {
         let mut resource = cr();
         resource.spec.recursive = true;
 
-        let error = reconcile(&resource, &kube, &sekret, NOW).await.expect_err("duplicate");
+        let error = reconcile(&resource, &kube, &sekret, NOW)
+            .await
+            .err()
+            .context("expected a duplicate key error")?;
 
         assert_eq!(error.reason(), "DuplicateKey");
-        let message = last_status(&statuses)
+        let message = last_status(&statuses)?
             .ready()
             .map(|c| c.message.clone())
             .unwrap_or_default();
@@ -719,11 +735,11 @@ mod tests {
             message.contains("URL") && message.contains("/db") && message.contains("/cache"),
             "{message}"
         );
-        assert_no_leak(&statuses, &["first-value", "second-value"]);
+        assert_no_leak(&statuses, &["first-value", "second-value"])
     }
 
     #[tokio::test]
-    async fn service_account_token_is_requested_in_the_resource_namespace() {
+    async fn service_account_token_is_requested_in_the_resource_namespace() -> anyhow::Result<()> {
         for namespace in ["apps", "team-b"] {
             let mut kube = MockKubeApi::new();
             kube.expect_request_token()
@@ -742,14 +758,18 @@ mod tests {
             let mut resource = cr();
             resource.metadata.namespace = Some(namespace.into());
 
-            let error = reconcile(&resource, &kube, &sekret, NOW).await.expect_err("no token");
+            let error = reconcile(&resource, &kube, &sekret, NOW)
+                .await
+                .err()
+                .context("expected the token request to fail")?;
 
             assert_eq!(error.reason(), "TokenRequestFailed");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn service_account_names_cannot_reference_other_namespaces() {
+    async fn service_account_names_cannot_reference_other_namespaces() -> anyhow::Result<()> {
         for name in [
             "kube-system/admin",
             "system:serviceaccount:kube-system:admin",
@@ -764,14 +784,16 @@ mod tests {
 
             let error = reconcile(&resource, &kube, &MockSekretApiFactory::new(), NOW)
                 .await
-                .expect_err("rejected");
+                .err()
+                .with_context(|| format!("expected {name:?} to be rejected"))?;
 
             assert_eq!(error.reason(), "InvalidSpec", "{name:?}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn secret_types_that_kubernetes_acts_on_are_refused() {
+    async fn secret_types_that_kubernetes_acts_on_are_refused() -> anyhow::Result<()> {
         let mut kube = MockKubeApi::new();
         kube.expect_request_token().never();
         kube.expect_patch_status().returning(|_, _, _| Ok(()));
@@ -780,14 +802,16 @@ mod tests {
 
         let error = reconcile(&resource, &kube, &MockSekretApiFactory::new(), NOW)
             .await
-            .expect_err("refused");
+            .err()
+            .context("expected the secret type to be refused")?;
 
         assert_eq!(error.reason(), "InvalidSpec");
         assert!(error.to_string().contains("service-account-token"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invalid_refresh_interval_is_reported() {
+    async fn invalid_refresh_interval_is_reported() -> anyhow::Result<()> {
         let mut kube = MockKubeApi::new();
         kube.expect_request_token().never();
         let statuses: Arc<Mutex<Vec<SekretSecretStatus>>> = Arc::default();
@@ -801,14 +825,16 @@ mod tests {
 
         let error = reconcile(&resource, &kube, &MockSekretApiFactory::new(), NOW)
             .await
-            .expect_err("invalid");
+            .err()
+            .context("expected the interval to be invalid")?;
 
         assert_eq!(error.reason(), "InvalidSpec");
         assert!(
-            last_status(&statuses)
+            last_status(&statuses)?
                 .ready()
                 .is_some_and(|c| c.message.contains("soon"))
         );
+        Ok(())
     }
 
     #[test]

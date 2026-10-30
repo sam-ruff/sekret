@@ -44,3 +44,6 @@ sekret-store = { path = "../sekret-store" }
 tempfile = "3.27.0"
 testcontainers-modules = { version = "0.15.0", features = ["k3s"] }
 tokio = { version = "1.54.1", features = ["net", "sync"] }
+
+[lints]
+workspace = true

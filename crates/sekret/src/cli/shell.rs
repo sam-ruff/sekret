@@ -169,6 +169,7 @@ pub fn init_script(shell: Shell) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     fn origin(environment: &str) -> Origin {
         Origin {
@@ -183,7 +184,7 @@ mod tests {
     }
 
     /// Runs `script` in a fresh bash and prints the named variables, `-` when unset.
-    fn bash_after(script: &str, names: &[&str]) -> Vec<String> {
+    fn bash_after(script: &str, names: &[&str]) -> anyhow::Result<Vec<String>> {
         let probe: String = names
             .iter()
             .map(|n| format!("printf '%s\\n' \"${{{n}-<unset>}}\"\n"))
@@ -193,15 +194,15 @@ mod tests {
             .arg(format!("{script}\n{probe}"))
             .env_remove(LOADED_KEYS_VAR)
             .output()
-            .expect("bash");
-        String::from_utf8_lossy(&output.stdout)
+            .context("bash")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(String::from)
-            .collect()
+            .collect())
     }
 
     #[test]
-    fn switching_replaces_the_previous_environment() {
+    fn switching_replaces_the_previous_environment() -> anyhow::Result<()> {
         let dev = switch_script(
             Shell::Bash,
             &[],
@@ -217,15 +218,17 @@ mod tests {
         let state = bash_after(
             &format!("{}{}", dev.script, prod.script),
             &["DB_URL", "DEV_ONLY", "SEKRET_ENVIRONMENT", LOADED_KEYS_VAR],
-        );
+        )?;
         assert_eq!(state, ["postgres://prod", "<unset>", "prod", "DB_URL"]);
+        Ok(())
     }
 
     #[test]
-    fn hostile_values_are_not_executed() {
+    fn hostile_values_are_not_executed() -> anyhow::Result<()> {
         let value = "'; touch /tmp/sekret-pwned; echo '$(id) `id` \"\\ \n end";
         let switch = switch_script(Shell::Bash, &[], &vars(&[("NASTY", value)]), &origin("dev"));
-        assert_eq!(bash_after(&switch.script, &["NASTY"]).join("\n"), value);
+        assert_eq!(bash_after(&switch.script, &["NASTY"])?.join("\n"), value);
+        Ok(())
     }
 
     #[test]
@@ -264,14 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn unload_removes_only_what_was_loaded() {
+    fn unload_removes_only_what_was_loaded() -> anyhow::Result<()> {
         let load = switch_script(Shell::Bash, &[], &vars(&[("A", "1")]), &origin("dev"));
         let unload = unload_script(Shell::Bash, &previously_loaded(Some("A")));
         let state = bash_after(
             &format!("KEEP=me\n{}{unload}", load.script),
             &["A", "KEEP", LOADED_KEYS_VAR],
-        );
+        )?;
         assert_eq!(state, ["<unset>", "me", "<unset>"]);
+        Ok(())
     }
 
     #[test]
@@ -289,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_init_defines_a_working_function() {
+    fn bash_init_defines_a_working_function() -> anyhow::Result<()> {
         let script = format!(
             "{}\ntype sekret-env >/dev/null && echo defined",
             init_script(Shell::Bash)
@@ -298,7 +302,8 @@ mod tests {
             .arg("-c")
             .arg(script)
             .output()
-            .expect("bash");
+            .context("bash")?;
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "defined");
+        Ok(())
     }
 }

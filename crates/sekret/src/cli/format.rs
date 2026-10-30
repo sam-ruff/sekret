@@ -199,6 +199,7 @@ pub fn line_diff(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn timestamps_are_utc_dates() {
@@ -225,48 +226,52 @@ mod tests {
     }
 
     #[test]
-    fn dotenv_round_trips() {
-        let text = render(&secrets(), ExportFormat::Dotenv).expect("render");
-        let parsed: BTreeMap<String, String> = parse_dotenv(&text).expect("parse").into_iter().collect();
+    fn dotenv_round_trips() -> anyhow::Result<()> {
+        let text = render(&secrets(), ExportFormat::Dotenv).context("render")?;
+        let parsed: BTreeMap<String, String> = parse_dotenv(&text).context("parse")?.into_iter().collect();
         assert_eq!(parsed, secrets());
+        Ok(())
     }
 
     #[test]
-    fn sourced_dotenv_does_not_expand() {
-        let text = render(&secrets(), ExportFormat::Dotenv).expect("render");
+    fn sourced_dotenv_does_not_expand() -> anyhow::Result<()> {
+        let text = render(&secrets(), ExportFormat::Dotenv).context("render")?;
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{text}\nprintf '%s' \"$B\""))
             .output()
-            .expect("sh");
+            .context("sh")?;
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "it's \"quoted\"\\nline2 $HOME `id` \\n",
             "the shell sees escapes literally but runs nothing"
         );
+        Ok(())
     }
 
     #[test]
-    fn shell_quoting_is_safe() {
-        let text = render(&secrets(), ExportFormat::Shell).expect("render");
+    fn shell_quoting_is_safe() -> anyhow::Result<()> {
+        let text = render(&secrets(), ExportFormat::Shell).context("render")?;
         assert!(text.contains("export A='plain'"));
         assert!(text.contains("'it'\\''s"));
+        Ok(())
     }
 
     #[test]
-    fn json_and_yaml() {
-        let json = render(&secrets(), ExportFormat::Json).expect("json");
-        let back: BTreeMap<String, String> = serde_json::from_str(&json).expect("parse");
+    fn json_and_yaml() -> anyhow::Result<()> {
+        let json = render(&secrets(), ExportFormat::Json).context("json")?;
+        let back: BTreeMap<String, String> = serde_json::from_str(&json).context("parse")?;
         assert_eq!(back, secrets());
-        let yaml = render(&secrets(), ExportFormat::Yaml).expect("yaml");
+        let yaml = render(&secrets(), ExportFormat::Yaml).context("yaml")?;
         assert!(yaml.starts_with("A: \"plain\"\n"));
         assert!(yaml.contains("\\n"));
+        Ok(())
     }
 
     #[test]
-    fn parse_dotenv_variants() {
-        let parsed =
-            parse_dotenv("# comment\nexport A=1\nB = 'two words'\nC=three # trailing\n\nD=\"x=y\"\n").expect("parse");
+    fn parse_dotenv_variants() -> anyhow::Result<()> {
+        let parsed = parse_dotenv("# comment\nexport A=1\nB = 'two words'\nC=three # trailing\n\nD=\"x=y\"\n")
+            .context("parse")?;
         assert_eq!(
             parsed,
             vec![
@@ -277,6 +282,7 @@ mod tests {
             ]
         );
         assert!(parse_dotenv("NOEQUALS").is_err());
+        Ok(())
     }
 
     #[test]

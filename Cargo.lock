@@ -3903,6 +3903,7 @@ dependencies = [
 name = "sekret-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "mockall",
  "reqwest",
@@ -3920,6 +3921,7 @@ dependencies = [
 name = "sekret-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.23.1",
  "chacha20poly1305",
  "getrandom 0.4.3",
@@ -3973,6 +3975,7 @@ dependencies = [
 name = "sekret-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "axum-server",
@@ -4014,6 +4017,7 @@ dependencies = [
 name = "sekret-store"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "mockall",
  "sekret-core",

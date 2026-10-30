@@ -235,46 +235,50 @@ pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
-    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+    fn headers(pairs: &[(&'static str, &str)]) -> anyhow::Result<HeaderMap> {
         let mut map = HeaderMap::new();
         for (k, v) in pairs {
-            map.append(*k, v.parse().expect("header"));
+            map.append(*k, v.parse().context("header")?);
         }
-        map
+        Ok(map)
     }
 
     #[test]
-    fn forwarded_for_is_only_trusted_from_proxies() {
-        let proxy: IpNet = "10.0.0.0/24".parse().expect("net");
-        let h = headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.5")]);
-        let peer: IpAddr = "10.0.0.2".parse().expect("ip");
+    fn forwarded_for_is_only_trusted_from_proxies() -> anyhow::Result<()> {
+        let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
+        let h = headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.5")])?;
+        let peer: IpAddr = "10.0.0.2".parse().context("ip")?;
         assert_eq!(
             client_ip(peer, &h, &[proxy]),
-            "203.0.113.9".parse::<IpAddr>().expect("ip")
+            "203.0.113.9".parse::<IpAddr>().context("ip")?
         );
-        let outsider: IpAddr = "198.51.100.1".parse().expect("ip");
+        let outsider: IpAddr = "198.51.100.1".parse().context("ip")?;
         assert_eq!(client_ip(outsider, &h, &[proxy]), outsider);
         assert_eq!(client_ip(peer, &HeaderMap::new(), &[proxy]), peer);
+        Ok(())
     }
 
     #[test]
-    fn cookie_and_bearer_parsing() {
+    fn cookie_and_bearer_parsing() -> anyhow::Result<()> {
         let h = headers(&[
             ("cookie", "a=1; sekret_session=skt_abc; b=2"),
             ("authorization", "Bearer skt_x"),
-        ]);
+        ])?;
         assert_eq!(cookie_value(&h, SESSION_COOKIE), Some("skt_abc"));
         assert_eq!(bearer(&h), Some("skt_x"));
-        assert_eq!(bearer(&headers(&[("authorization", "Basic abc")])), None);
+        assert_eq!(bearer(&headers(&[("authorization", "Basic abc")])?), None);
+        Ok(())
     }
 
     #[test]
-    fn cidr_allowlist() {
-        let ip: IpAddr = "192.168.1.20".parse().expect("ip");
+    fn cidr_allowlist() -> anyhow::Result<()> {
+        let ip: IpAddr = "192.168.1.20".parse().context("ip")?;
         assert!(ip_allowed(&[], ip));
         assert!(ip_allowed(&["192.168.1.0/24".into()], ip));
         assert!(!ip_allowed(&["10.0.0.0/8".into()], ip));
         assert!(!ip_allowed(&["garbage".into()], ip));
+        Ok(())
     }
 }

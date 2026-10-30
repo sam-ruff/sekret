@@ -418,13 +418,14 @@ impl SekretApi for HttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn client(server: &MockServer, token: Option<&str>) -> HttpClient {
+    fn client(server: &MockServer, token: Option<&str>) -> anyhow::Result<HttpClient> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        HttpClient::new(&server.uri(), token.map(String::from), ClientOptions::default()).expect("client")
+        HttpClient::new(&server.uri(), token.map(String::from), ClientOptions::default()).context("client")
     }
 
     fn at() -> Location {
@@ -436,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_bearer_token_and_query() {
+    async fn sends_bearer_token_and_query() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/secrets/raw"))
@@ -449,12 +450,13 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let raw = client(&server, Some("skt_x")).raw(at(), true).await.expect("raw");
+        let raw = client(&server, Some("skt_x"))?.raw(at(), true).await.context("raw")?;
         assert_eq!(raw.secrets[0].value, "1");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn writes_use_the_location_path() {
+    async fn writes_use_the_location_path() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/projects/app/environments/prod/secrets/batch"))
@@ -474,12 +476,13 @@ mod tests {
             }],
             deletes: vec![],
         };
-        let result = client(&server, None).write(at(), batch).await.expect("write");
+        let result = client(&server, None)?.write(at(), batch).await.context("write")?;
         assert_eq!(result.created, vec!["A".to_string()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn api_errors_carry_status_and_code() {
+    async fn api_errors_carry_status_and_code() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/cli/poll"))
@@ -489,30 +492,38 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let error = client(&server, None).cli_poll("d".into()).await.expect_err("pending");
+        let error = client(&server, None)?
+            .cli_poll("d".into())
+            .await
+            .err()
+            .context("expected a pending error")?;
         assert_eq!(error.code(), Some("authorization_pending"));
         assert_eq!(error.status(), Some(400));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn no_content_and_network_errors() {
+    async fn no_content_and_network_errors() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/token/revoke"))
             .respond_with(ResponseTemplate::new(204))
             .mount(&server)
             .await;
-        assert_eq!(client(&server, Some("t")).revoke().await, Ok(()));
-        let dead = HttpClient::new("http://127.0.0.1:9", None, ClientOptions::default()).expect("client");
+        assert_eq!(client(&server, Some("t"))?.revoke().await, Ok(()));
+        let dead = HttpClient::new("http://127.0.0.1:9", None, ClientOptions::default()).context("client")?;
         assert!(matches!(dead.me().await, Err(ClientError::Network(_))));
+        Ok(())
     }
 
     #[test]
-    fn rejects_bad_urls_and_encodes_segments() {
+    fn rejects_bad_urls_and_encodes_segments() -> anyhow::Result<()> {
         assert!(HttpClient::new("ftp://x", None, ClientOptions::default()).is_err());
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let c = HttpClient::new("https://sekret.example.com/base/", None, ClientOptions::default()).expect("client");
-        let url = c.url(&["api", "a b/c"], &[]).expect("url");
+        let c =
+            HttpClient::new("https://sekret.example.com/base/", None, ClientOptions::default()).context("client")?;
+        let url = c.url(&["api", "a b/c"], &[]).context("url")?;
         assert_eq!(url.as_str(), "https://sekret.example.com/base/api/a%20b%2Fc");
+        Ok(())
     }
 }

@@ -17,7 +17,11 @@ url = "2.5.8"
 mock = ["dep:mockall"]
 
 [dev-dependencies]
+anyhow = "1.0.104"
 mockall = "0.15.0"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6.5"
+
+[lints]
+workspace = true

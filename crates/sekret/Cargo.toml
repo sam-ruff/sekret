@@ -35,3 +35,6 @@ reqwest = { version = "0.13.5", default-features = false, features = ["cookies",
 sekret-client = { path = "../sekret-client", features = ["mock"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full"] }
+
+[lints]
+workspace = true

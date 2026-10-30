@@ -157,64 +157,70 @@ fn render_svg(data: &[u8]) -> Result<DynamicImage, ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
-    fn encode(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+    fn encode(format: ImageFormat, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
         let image = image::RgbaImage::from_pixel(width, height, image::Rgba([30, 44, 67, 255]));
         let mut out = Cursor::new(Vec::new());
         DynamicImage::ImageRgba8(image)
             .write_to(&mut out, format)
-            .expect("encode");
-        out.into_inner()
+            .context("encode")?;
+        Ok(out.into_inner())
     }
 
-    fn decoded(png: &[u8]) -> DynamicImage {
+    fn decoded(png: &[u8]) -> anyhow::Result<DynamicImage> {
         assert!(png.starts_with(b"\x89PNG"), "output is always a PNG");
-        image::load_from_memory_with_format(png, ImageFormat::Png).expect("valid png")
+        image::load_from_memory_with_format(png, ImageFormat::Png).context("valid png")
     }
 
     #[test]
-    fn raster_images_come_back_as_png() {
+    fn raster_images_come_back_as_png() -> anyhow::Result<()> {
         for format in [ImageFormat::Png, ImageFormat::Gif, ImageFormat::WebP, ImageFormat::Jpeg] {
-            let out = normalise_logo(&encode(format, 16, 12)).expect("logo");
-            let image = decoded(&out);
+            let out = normalise_logo(&encode(format, 16, 12)?).context("logo")?;
+            let image = decoded(&out)?;
             assert_eq!((image.width(), image.height()), (16, 12), "{format:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn large_images_are_shrunk_to_fit() {
-        let image = decoded(&normalise_logo(&encode(ImageFormat::Png, 2000, 1000)).expect("logo"));
+    fn large_images_are_shrunk_to_fit() -> anyhow::Result<()> {
+        let image = decoded(&normalise_logo(&encode(ImageFormat::Png, 2000, 1000)?).context("logo")?)?;
         assert_eq!((image.width(), image.height()), (LOGO_SIZE, LOGO_SIZE / 2));
+        Ok(())
     }
 
     #[test]
-    fn appended_data_does_not_survive() {
-        let mut polyglot = encode(ImageFormat::Png, 8, 8);
+    fn appended_data_does_not_survive() -> anyhow::Result<()> {
+        let mut polyglot = encode(ImageFormat::Png, 8, 8)?;
         polyglot.extend_from_slice(b"PK\x03\x04<html><script>alert(1)</script>");
-        let out = normalise_logo(&polyglot).expect("the image part is valid");
+        let out = normalise_logo(&polyglot).context("the image part is valid")?;
         assert!(
             !out.windows(7).any(|w| w == b"<script"),
             "only the re-encoded pixels are kept"
         );
+        Ok(())
     }
 
     #[test]
-    fn magic_bytes_alone_are_not_enough() {
+    fn magic_bytes_alone_are_not_enough() -> anyhow::Result<()> {
         assert!(matches!(
             normalise_logo(b"\x89PNG\r\n\x1a\nthis is not really a png"),
             Err(ImageError::Corrupt(_))
         ));
-        let mut truncated = encode(ImageFormat::Png, 64, 64);
+        let mut truncated = encode(ImageFormat::Png, 64, 64)?;
         truncated.truncate(truncated.len() / 2);
         assert!(matches!(normalise_logo(&truncated), Err(ImageError::Corrupt(_))));
+        Ok(())
     }
 
     #[test]
-    fn oversized_images_are_refused_before_decoding_them() {
+    fn oversized_images_are_refused_before_decoding_them() -> anyhow::Result<()> {
         assert_eq!(
-            normalise_logo(&encode(ImageFormat::Png, MAX_DIMENSION + 1, 1)),
+            normalise_logo(&encode(ImageFormat::Png, MAX_DIMENSION + 1, 1)?),
             Err(ImageError::TooLarge)
         );
+        Ok(())
     }
 
     #[test]
@@ -225,26 +231,28 @@ mod tests {
     }
 
     #[test]
-    fn svgs_are_rendered_to_png() {
+    fn svgs_are_rendered_to_png() -> anyhow::Result<()> {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10">
           <rect width="20" height="10" fill="#1E2C43"/></svg>"##;
-        let image = decoded(&normalise_logo(svg.as_bytes()).expect("logo"));
+        let image = decoded(&normalise_logo(svg.as_bytes()).context("logo")?)?;
         assert_eq!((image.width(), image.height()), (LOGO_SIZE, LOGO_SIZE / 2));
         let pixel = image.to_rgba8().get_pixel(10, 10).0;
         assert_eq!(pixel, [0x1E, 0x2C, 0x43, 255]);
+        Ok(())
     }
 
     #[test]
-    fn scripts_and_external_references_cannot_survive_rendering() {
+    fn scripts_and_external_references_cannot_survive_rendering() -> anyhow::Result<()> {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 10 10">
           <script>alert(1)</script>
           <image href="file:///etc/passwd" width="10" height="10"/>
           <image xlink:href="/etc/hostname" width="10" height="10"/>
           <animate attributeName="href" values="javascript:alert(1)"/>
           <rect width="10" height="10" fill="red"/></svg>"#;
-        let out = normalise_logo(svg.as_bytes()).expect("renders");
+        let out = normalise_logo(svg.as_bytes()).context("renders")?;
         let text = String::from_utf8_lossy(&out);
         assert!(!text.contains("script") && !text.contains("passwd"));
+        Ok(())
     }
 
     #[test]

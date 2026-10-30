@@ -15,6 +15,7 @@ tokio = { version = "1.54.1", features = ["rt", "macros"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]
+anyhow = "1.0.104"
 mockall = "0.15.0"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
@@ -22,3 +23,6 @@ uuid = { version = "1.29.0", features = ["v4"] }
 
 [features]
 mock = ["dep:mockall"]
+
+[lints]
+workspace = true

@@ -148,9 +148,10 @@ pub fn generate(generator: Generator) -> Result<Zeroizing<String>, CryptoError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
-    fn generated_values_use_the_alphabet_and_length() {
+    fn generated_values_use_the_alphabet_and_length() -> anyhow::Result<()> {
         for charset in [
             Charset::Alphanumeric,
             Charset::Symbols,
@@ -158,25 +159,27 @@ mod tests {
             Charset::Base64url,
             Charset::Numeric,
         ] {
-            let value = generate(Generator { length: 200, charset }).expect("generate");
+            let value = generate(Generator { length: 200, charset }).context("generate")?;
             assert_eq!(value.len(), 200);
             assert!(value.bytes().all(|b| charset.alphabet().contains(&b)), "{charset:?}");
         }
-        let a = generate(Generator::default()).expect("a");
-        let b = generate(Generator::default()).expect("b");
+        let a = generate(Generator::default()).context("a")?;
+        let b = generate(Generator::default()).context("b")?;
         assert_ne!(a, b);
+        Ok(())
     }
 
     #[test]
-    fn every_character_turns_up() {
+    fn every_character_turns_up() -> anyhow::Result<()> {
         let value = generate(Generator {
             length: 4000,
             charset: Charset::Hex,
         })
-        .expect("generate");
+        .context("generate")?;
         for c in Charset::Hex.alphabet() {
             assert!(value.as_bytes().contains(c), "{}", *c as char);
         }
+        Ok(())
     }
 
     #[test]
@@ -223,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn overrides_round_trip_as_tagged_json() {
+    fn overrides_round_trip_as_tagged_json() -> anyhow::Result<()> {
         let custom = PolicyOverride::Custom(SecretPolicy {
             generator: Some(Generator {
                 length: 16,
@@ -231,13 +234,14 @@ mod tests {
             }),
             rotation_days: Some(7),
         });
-        let json = serde_json::to_value(custom).expect("json");
+        let json = serde_json::to_value(custom).context("json")?;
         assert_eq!(json["mode"], "custom");
         assert_eq!(json["generator"]["charset"], "numeric");
-        assert_eq!(serde_json::from_value::<PolicyOverride>(json).expect("parse"), custom);
+        assert_eq!(serde_json::from_value::<PolicyOverride>(json).context("parse")?, custom);
         assert_eq!(
-            serde_json::from_value::<PolicyOverride>(serde_json::json!({"mode": "inherit"})).expect("inherit"),
+            serde_json::from_value::<PolicyOverride>(serde_json::json!({"mode": "inherit"})).context("inherit")?,
             PolicyOverride::Inherit
         );
+        Ok(())
     }
 }

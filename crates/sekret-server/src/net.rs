@@ -184,6 +184,7 @@ impl TokenReviewer for ReqwestTokenReviewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn outbound_urls_are_restricted() {
@@ -217,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_authenticates_with_the_reviewer_token_when_set() {
+    async fn review_authenticates_with_the_reviewer_token_when_set() -> anyhow::Result<()> {
         use wiremock::matchers::{body_partial_json, header, method, path};
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(method("POST"))
@@ -235,12 +236,13 @@ mod tests {
         let result = ReqwestTokenReviewer::new(true)
             .review(review_request(&server, Some("reviewer-token")))
             .await
-            .expect("review");
+            .context("review")?;
         assert!(result.authenticated);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn review_falls_back_to_the_presented_token() {
+    async fn review_falls_back_to_the_presented_token() -> anyhow::Result<()> {
         use wiremock::matchers::{header, method};
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(method("POST"))
@@ -252,7 +254,8 @@ mod tests {
         let result = ReqwestTokenReviewer::new(true)
             .review(review_request(&server, None))
             .await
-            .expect("review");
+            .context("review")?;
         assert!(!result.authenticated);
+        Ok(())
     }
 }

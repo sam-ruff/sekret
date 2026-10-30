@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::HashMap;
 
+use anyhow::Context;
 use base64::Engine;
 use common::{Harness, Options, start};
 use reqwest::{Method, StatusCode};
@@ -44,35 +45,35 @@ fn oidc_config(issuer: &TestIssuer) -> HumanOidcConfig {
     }
 }
 
-fn query(location: &str) -> HashMap<String, String> {
-    url::Url::parse(location)
-        .expect("url")
+fn query(location: &str) -> anyhow::Result<HashMap<String, String>> {
+    Ok(url::Url::parse(location)
+        .context("url")?
         .query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect()
+        .collect())
 }
 
-/// Runs the browser sign-in and returns the session cookie value.
+/// Runs the browser sign-in; the inner result is the session cookie value or why the server refused it.
 async fn browser_login(
     h: &Harness,
     server: &MockServer,
     issuer: &TestIssuer,
     roles: &[&str],
     nonce_override: Option<&str>,
-) -> Result<String, String> {
+) -> anyhow::Result<Result<String, String>> {
     let response = h
         .client
         .get(format!("{}/auth/login?return_to=/projects", h.base))
         .send()
         .await
-        .expect("login");
+        .context("login")?;
     assert!(response.status().is_redirection());
-    let location = response.headers()["location"].to_str().expect("location").to_string();
-    let params = query(&location);
+    let location = response.headers()["location"].to_str().context("location")?.to_string();
+    let params = query(&location)?;
     assert_eq!(params["code_challenge_method"], "S256");
     assert_eq!(params["redirect_uri"], format!("{}/auth/callback", h.base));
     let nonce = nonce_override.unwrap_or(&params["nonce"]).to_string();
-    let id_token = issuer.sign(json!({"aud": "sekret", "sub": "alice", "email": "alice@example.com", "name": "Alice", "nonce": nonce, "roles": roles}));
+    let id_token = issuer.sign(json!({"aud": "sekret", "sub": "alice", "email": "alice@example.com", "name": "Alice", "nonce": nonce, "roles": roles}))?;
     server.reset().await;
     mount_keys(server, issuer).await;
     Mock::given(method("POST"))
@@ -90,10 +91,10 @@ async fn browser_login(
         .filter_map(|v| v.to_str().ok())
         .find(|c| c.starts_with("sekret_login="))
         .and_then(|c| c.split(';').next())
-        .expect("login state cookie")
+        .context("login state cookie")?
         .to_string();
     let callback_url = format!("{}/auth/callback?code=the-code&state={}", h.base, params["state"]);
-    let elsewhere = h.client.get(&callback_url).send().await.expect("callback");
+    let elsewhere = h.client.get(&callback_url).send().await.context("callback")?;
     assert!(
         elsewhere.headers()["location"]
             .to_str()
@@ -106,7 +107,7 @@ async fn browser_login(
         .header("cookie", login_cookie)
         .send()
         .await
-        .expect("callback");
+        .context("callback")?;
 
     let requests = server.received_requests().await.unwrap_or_default();
     if let Some(exchange) = requests.iter().find(|r| r.url.path() == "/token") {
@@ -134,7 +135,7 @@ async fn browser_login(
         .find(|c| c.starts_with("sekret_session="))
         .map(String::from)
     else {
-        return Err(format!("{} {target}", callback.status()));
+        return Ok(Err(format!("{} {target}", callback.status())));
     };
     assert_eq!(target, "/projects");
     assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"));
@@ -143,8 +144,8 @@ async fn browser_login(
         .next()
         .and_then(|kv| kv.split_once('='))
         .map(|(_, v)| v.to_string())
-        .expect("cookie");
-    Ok(value)
+        .context("cookie")?;
+    Ok(Ok(value))
 }
 
 async fn with_cookie(
@@ -154,7 +155,7 @@ async fn with_cookie(
     session: &str,
     csrf: bool,
     body: Option<Value>,
-) -> (StatusCode, Value) {
+) -> anyhow::Result<(StatusCode, Value)> {
     let mut request = h
         .client
         .request(method, format!("{}{path}", h.base))
@@ -165,27 +166,28 @@ async fn with_cookie(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request.send().await.expect("request");
+    let response = request.send().await.context("request")?;
     let status = response.status();
-    (status, response.json().await.unwrap_or(Value::Null))
+    Ok((status, response.json().await.unwrap_or(Value::Null)))
 }
 
 #[tokio::test]
-async fn browser_login_sessions_csrf_and_cli_flow() {
+async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
     let (server, issuer) = issuer().await;
     let h = start(Options {
         oidc: Some(oidc_config(&issuer)),
         ..Default::default()
     })
-    .await;
+    .await?;
 
-    let (_, config) = h.call(Method::GET, "/api/v1/auth/config", None, None).await;
+    let (_, config) = h.call(Method::GET, "/api/v1/auth/config", None, None).await?;
     assert_eq!(config["oidc_enabled"], true);
 
     let session = browser_login(&h, &server, &issuer, &["sekret-admin"], None)
-        .await
-        .expect("login");
-    let (status, me) = with_cookie(&h, Method::GET, "/api/v1/me", &session, false, None).await;
+        .await?
+        .map_err(anyhow::Error::msg)
+        .context("login")?;
+    let (status, me) = with_cookie(&h, Method::GET, "/api/v1/me", &session, false, None).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["email"], "alice@example.com");
     assert!(
@@ -204,27 +206,27 @@ async fn browser_login_sessions_csrf_and_cli_flow() {
         false,
         Some(create.clone()),
     )
-    .await;
+    .await?;
     assert_eq!((status, body["error"].as_str()), (StatusCode::FORBIDDEN, Some("csrf")));
-    let (status, _) = with_cookie(&h, Method::POST, "/api/v1/projects", &session, true, Some(create)).await;
+    let (status, _) = with_cookie(&h, Method::POST, "/api/v1/projects", &session, true, Some(create)).await?;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, _) = h.get("/api/v1/me", &session).await;
+    let (status, _) = h.get("/api/v1/me", &session).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "session tokens are not bearer tokens");
 
     // CLI device login.
-    let (status, start_body) = h.call(Method::POST, "/api/v1/auth/cli/start", None, None).await;
+    let (status, start_body) = h.call(Method::POST, "/api/v1/auth/cli/start", None, None).await?;
     assert_eq!(status, StatusCode::OK);
     let poll = json!({"device_code": start_body["device_code"]});
     let (status, pending) = h
         .call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll.clone()))
-        .await;
+        .await?;
     assert_eq!(
         (status, pending["error"].as_str()),
         (StatusCode::BAD_REQUEST, Some("authorization_pending"))
     );
     let approve = json!({"user_code": start_body["user_code"]});
-    let (status, _) = h.post("/api/v1/auth/cli/approve", &h.admin, approve.clone()).await;
+    let (status, _) = h.post("/api/v1/auth/cli/approve", &h.admin, approve.clone()).await?;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -238,31 +240,32 @@ async fn browser_login_sessions_csrf_and_cli_flow() {
         true,
         Some(approve),
     )
-    .await;
+    .await?;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, token) = h
         .call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll.clone()))
-        .await;
+        .await?;
     assert_eq!(status, StatusCode::OK);
-    let cli_token = token["access_token"].as_str().expect("token");
-    let (_, me) = h.get("/api/v1/me", cli_token).await;
+    let cli_token = token["access_token"].as_str().context("token")?;
+    let (_, me) = h.get("/api/v1/me", cli_token).await?;
     assert_eq!(me["email"], "alice@example.com");
-    let (_, gone) = h.call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll)).await;
+    let (_, gone) = h.call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll)).await?;
     assert_eq!(gone["error"], "expired_token");
 
-    let (status, logout) = with_cookie(&h, Method::POST, "/auth/logout", &session, true, None).await;
+    let (status, logout) = with_cookie(&h, Method::POST, "/auth/logout", &session, true, None).await?;
     assert_eq!(status, StatusCode::OK);
     assert!(
         logout["logout_url"]
             .as_str()
             .is_some_and(|u| u.starts_with(&issuer.url))
     );
-    let (status, _) = with_cookie(&h, Method::GET, "/api/v1/me", &session, false, None).await;
+    let (status, _) = with_cookie(&h, Method::GET, "/api/v1/me", &session, false, None).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
 }
 
 #[tokio::test]
-async fn browser_login_rejects_bad_nonce_replay_and_missing_groups() {
+async fn browser_login_rejects_bad_nonce_replay_and_missing_groups() -> anyhow::Result<()> {
     let (server, issuer) = issuer().await;
     let mut config = oidc_config(&issuer);
     config.required_groups = vec!["sekret-users".into()];
@@ -270,15 +273,20 @@ async fn browser_login_rejects_bad_nonce_replay_and_missing_groups() {
         oidc: Some(config),
         ..Default::default()
     })
-    .await;
+    .await?;
 
-    let wrong_nonce = browser_login(&h, &server, &issuer, &["sekret-users"], Some("attacker")).await;
-    assert!(wrong_nonce.unwrap_err().starts_with("401"));
+    let wrong_nonce = browser_login(&h, &server, &issuer, &["sekret-users"], Some("attacker")).await?;
+    assert!(wrong_nonce.err().context("wrong nonce is refused")?.starts_with("401"));
 
-    let not_allowed = browser_login(&h, &server, &issuer, &["guest-x"], None).await;
-    assert!(not_allowed.unwrap_err().contains("/login?error="));
+    let not_allowed = browser_login(&h, &server, &issuer, &["guest-x"], None).await?;
+    assert!(
+        not_allowed
+            .err()
+            .context("missing group is refused")?
+            .contains("/login?error=")
+    );
 
-    let ok = browser_login(&h, &server, &issuer, &["sekret-users"], None).await;
+    let ok = browser_login(&h, &server, &issuer, &["sekret-users"], None).await?;
     assert!(ok.is_ok());
 
     let response = h
@@ -286,11 +294,11 @@ async fn browser_login_rejects_bad_nonce_replay_and_missing_groups() {
         .get(format!("{}/auth/callback?code=x&state=unknown", h.base))
         .send()
         .await
-        .expect("callback");
+        .context("callback")?;
     assert!(
         response.headers()["location"]
             .to_str()
-            .expect("location")
+            .context("location")?
             .starts_with("/login?error=")
     );
     let response = h
@@ -298,17 +306,18 @@ async fn browser_login_rejects_bad_nonce_replay_and_missing_groups() {
         .get(format!("{}/auth/login?return_to=//evil.test", h.base))
         .send()
         .await
-        .expect("login");
+        .context("login")?;
     assert!(response.status().is_redirection());
+    Ok(())
 }
 
-async fn identity_with(h: &Harness, method_kind: &str, config: Value) -> String {
+async fn identity_with(h: &Harness, method_kind: &str, config: Value) -> anyhow::Result<String> {
     let name = format!("{method_kind}-{}", uuid::Uuid::new_v4());
-    let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": name})).await;
-    let id = identity["id"].as_str().expect("id").to_string();
+    let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": name})).await?;
+    let id = identity["id"].as_str().context("id")?.to_string();
     let (status, body) = h
         .put(&format!("/api/v1/identities/{id}/auth/{method_kind}"), &h.admin, config)
-        .await;
+        .await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (status, body) = h
         .post(
@@ -316,12 +325,12 @@ async fn identity_with(h: &Harness, method_kind: &str, config: Value) -> String 
             &h.admin,
             json!({"principal_kind": "identity", "principal_id": id, "role": "viewer"}),
         )
-        .await;
+        .await?;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    id
+    Ok(id)
 }
 
-async fn jwt_login(h: &Harness, kind: &str, id: &str, token: &str) -> (StatusCode, Value) {
+async fn jwt_login(h: &Harness, kind: &str, id: &str, token: &str) -> anyhow::Result<(StatusCode, Value)> {
     h.call(
         Method::POST,
         &format!("/api/v1/auth/{kind}/login"),
@@ -332,54 +341,56 @@ async fn jwt_login(h: &Harness, kind: &str, id: &str, token: &str) -> (StatusCod
 }
 
 #[tokio::test]
-async fn machine_oidc_login_for_ci() {
+async fn machine_oidc_login_for_ci() -> anyhow::Result<()> {
     let (_server, issuer) = issuer().await;
-    let h = start(Options::default()).await;
-    h.create_project("app").await;
-    h.set_secrets("app", "prod", "/", &[("DEPLOY_KEY", "k")]).await;
+    let h = start(Options::default()).await?;
+    h.create_project("app").await?;
+    h.set_secrets("app", "prod", "/", &[("DEPLOY_KEY", "k")]).await?;
     let id = identity_with(&h, "oidc", json!({
         "kind": "oidc",
         "issuer": issuer.url,
         "bindings": {"audiences": ["sekret"], "subjects": ["repo:sam-ruff/*:ref:refs/heads/main"], "claims": {"repository_owner": ["sam-ruff"]}}
     }))
-    .await;
+    .await?;
 
-    let good = issuer
-        .sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"}));
-    let (status, token) = jwt_login(&h, "oidc", &id, &good).await;
+    let good = issuer.sign(
+        json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"}),
+    )?;
+    let (status, token) = jwt_login(&h, "oidc", &id, &good).await?;
     assert_eq!(status, StatusCode::OK, "{token}");
     let (_, raw) = h
         .get(
             "/api/v1/secrets/raw?project=app&environment=prod",
-            token["access_token"].as_str().expect("token"),
+            token["access_token"].as_str().context("token")?,
         )
-        .await;
+        .await?;
     assert_eq!(raw["secrets"][0]["value"], "k");
 
     for bad in [
-        issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/feature", "repository_owner": "sam-ruff"})),
-        issuer.sign(json!({"aud": "other", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"})),
-        issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff", "exp": issuer.now - 600})),
-        TestIssuer::with_key(&issuer.url, 2).sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"})),
+        issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/feature", "repository_owner": "sam-ruff"}))?,
+        issuer.sign(json!({"aud": "other", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"}))?,
+        issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff", "exp": issuer.now - 600}))?,
+        TestIssuer::with_key(&issuer.url, 2).sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main", "repository_owner": "sam-ruff"}))?,
     ] {
-        let (status, body) = jwt_login(&h, "oidc", &id, &bad).await;
+        let (status, body) = jwt_login(&h, "oidc", &id, &bad).await?;
         assert_eq!((status, body["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("login_failed")));
     }
-    let (status, _) = jwt_login(&h, "kubernetes", &id, &good).await;
+    let (status, _) = jwt_login(&h, "kubernetes", &id, &good).await?;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
         "methods that are not configured are refused"
     );
-    let (status, _) = jwt_login(&h, "oidc", "no-such-identity", &good).await;
+    let (status, _) = jwt_login(&h, "oidc", "no-such-identity", &good).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
 }
 
 #[tokio::test]
-async fn kubernetes_login_with_jwks_and_token_review() {
+async fn kubernetes_login_with_jwks_and_token_review() -> anyhow::Result<()> {
     let (server, issuer) = issuer().await;
-    let h = start(Options::default()).await;
-    h.create_project("app").await;
+    let h = start(Options::default()).await?;
+    h.create_project("app").await?;
 
     let jwks_id = identity_with(
         &h,
@@ -389,13 +400,13 @@ async fn kubernetes_login_with_jwks_and_token_review() {
             "namespaces": ["apps"], "service_accounts": ["web"], "audiences": ["sekret"]
         }),
     )
-    .await;
-    let sa_token = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web"}));
-    let (status, body) = jwt_login(&h, "kubernetes", &jwks_id, &sa_token).await;
+    .await?;
+    let sa_token = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web"}))?;
+    let (status, body) = jwt_login(&h, "kubernetes", &jwks_id, &sa_token).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let other_ns = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:kube-system:web"}));
+    let other_ns = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:kube-system:web"}))?;
     assert_eq!(
-        jwt_login(&h, "kubernetes", &jwks_id, &other_ns).await.0,
+        jwt_login(&h, "kubernetes", &jwks_id, &other_ns).await?.0,
         StatusCode::UNAUTHORIZED
     );
 
@@ -414,8 +425,8 @@ async fn kubernetes_login_with_jwks_and_token_review() {
             "namespaces": ["apps"], "service_accounts": ["worker"], "audiences": ["sekret"]
         }),
     )
-    .await;
-    let (status, body) = jwt_login(&h, "kubernetes", &review_id, "opaque-sa-token").await;
+    .await?;
+    let (status, body) = jwt_login(&h, "kubernetes", &review_id, "opaque-sa-token").await?;
     assert_eq!(status, StatusCode::OK, "{body}");
     let review = server
         .received_requests()
@@ -423,25 +434,27 @@ async fn kubernetes_login_with_jwks_and_token_review() {
         .unwrap_or_default()
         .into_iter()
         .find(|r| r.url.path().ends_with("tokenreviews"))
-        .expect("token review sent");
+        .context("token review sent")?;
     assert_eq!(review.headers["authorization"], "Bearer opaque-sa-token");
-    let sent: Value = serde_json::from_slice(&review.body).expect("json");
+    let sent: Value = serde_json::from_slice(&review.body).context("json")?;
     assert_eq!(sent["spec"]["audiences"], json!(["sekret"]));
+    Ok(())
 }
 
 #[tokio::test]
-async fn auth_method_configs_are_validated() {
-    let h = start(Options::default()).await;
-    let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": "x"})).await;
-    let id = identity["id"].as_str().expect("id");
+async fn auth_method_configs_are_validated() -> anyhow::Result<()> {
+    let h = start(Options::default()).await?;
+    let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": "x"})).await?;
+    let id = identity["id"].as_str().context("id")?;
     let unbounded = json!({"kind": "oidc", "issuer": "https://token.actions.githubusercontent.com", "bindings": {"audiences": ["sekret"]}});
     let (status, _) = h
         .put(&format!("/api/v1/identities/{id}/auth/oidc"), &h.admin, unbounded)
-        .await;
+        .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let mismatched = json!({"kind": "universal"});
     let (status, _) = h
         .put(&format!("/api/v1/identities/{id}/auth/oidc"), &h.admin, mismatched)
-        .await;
+        .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
 }

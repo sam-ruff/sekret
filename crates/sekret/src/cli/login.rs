@@ -114,6 +114,7 @@ pub fn open_in_browser(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use sekret_api::CliStartResponse;
     use sekret_client::{ClientError, MockSekretApi};
 
@@ -144,7 +145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_login_polls_until_approved() {
+    async fn device_login_polls_until_approved() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_cli_start().returning(|| Ok(start()));
         let mut seq = mockall::Sequence::new();
@@ -159,14 +160,15 @@ mod tests {
         let mut out = Vec::new();
         let result = device_login(&api, &mut out, &|_| false, Duration::ZERO)
             .await
-            .expect("login");
+            .context("login")?;
         assert_eq!(result.access_token, "skt_t");
-        let printed = String::from_utf8(out).expect("utf8");
+        let printed = String::from_utf8(out).context("utf8")?;
         assert!(printed.contains("ABCD-EFGH") && printed.contains("Open https://sekret.example.com/cli-login"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn device_login_stops_on_expiry_and_errors() {
+    async fn device_login_stops_on_expiry_and_errors() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_cli_start().returning(|| Ok(start()));
         api.expect_cli_poll().returning(|_| {
@@ -176,8 +178,10 @@ mod tests {
                 message: String::new(),
             })
         });
-        let result = device_login(&api, &mut Vec::new(), &|_| true, Duration::ZERO).await;
-        assert!(result.unwrap_err().to_string().contains("expired"));
+        let Err(err) = device_login(&api, &mut Vec::new(), &|_| true, Duration::ZERO).await else {
+            anyhow::bail!("expired device code should fail the login");
+        };
+        assert!(err.to_string().contains("expired"));
 
         let mut api = MockSekretApi::new();
         api.expect_cli_start()
@@ -187,10 +191,11 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn machine_logins_route_to_the_right_endpoint() {
+    async fn machine_logins_route_to_the_right_endpoint() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_oidc_login()
             .withf(|id, t| id == "i" && t == "jwt")
@@ -209,7 +214,7 @@ mod tests {
             },
         )
         .await
-        .expect("oidc");
+        .context("oidc")?;
         machine_login(
             &api,
             MachineCredential::Kubernetes {
@@ -218,7 +223,7 @@ mod tests {
             },
         )
         .await
-        .expect("k8s");
+        .context("k8s")?;
         machine_login(
             &api,
             MachineCredential::Universal {
@@ -227,16 +232,18 @@ mod tests {
             },
         )
         .await
-        .expect("universal");
+        .context("universal")?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn id_token_source_is_injectable() {
+    async fn id_token_source_is_injectable() -> anyhow::Result<()> {
         let mut source = MockIdTokenSource::new();
         source
             .expect_fetch()
             .withf(|aud| aud == "sekret")
             .returning(|_| Ok("jwt".into()));
-        assert_eq!(source.fetch("sekret").await.expect("fetch"), "jwt");
+        assert_eq!(source.fetch("sekret").await.context("fetch")?, "jwt");
+        Ok(())
     }
 }

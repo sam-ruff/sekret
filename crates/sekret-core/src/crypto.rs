@@ -204,6 +204,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     fn ctx<'a>(secret_id: &'a str, version: i64) -> ValueContext<'a> {
         ValueContext {
@@ -214,13 +215,13 @@ mod tests {
     }
 
     #[test]
-    fn credentials_are_bound_to_root_and_context() {
-        let root = RootKey::generate().expect("root");
-        let sealed = seal_credential(&root, "reviewer-jwt", "identity:i1:kubernetes").expect("seal");
+    fn credentials_are_bound_to_root_and_context() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let sealed = seal_credential(&root, "reviewer-jwt", "identity:i1:kubernetes").context("seal")?;
         assert!(!sealed.contains("reviewer-jwt"));
         assert_eq!(
             open_credential(&root, &sealed, "identity:i1:kubernetes")
-                .expect("open")
+                .context("open")?
                 .as_str(),
             "reviewer-jwt"
         );
@@ -228,7 +229,7 @@ mod tests {
             open_credential(&root, &sealed, "identity:i2:kubernetes").err(),
             Some(CryptoError::Decrypt)
         );
-        let other = RootKey::generate().expect("root");
+        let other = RootKey::generate().context("root")?;
         assert_eq!(
             open_credential(&other, &sealed, "identity:i1:kubernetes").err(),
             Some(CryptoError::Decrypt)
@@ -237,22 +238,24 @@ mod tests {
             open_credential(&root, "not base64!", "identity:i1:kubernetes").err(),
             Some(CryptoError::Malformed)
         );
+        Ok(())
     }
 
     #[test]
-    fn value_round_trip() {
-        let key = DataKey::generate().expect("key");
-        let blob = encrypt_value(&key, "hunter2", ctx("s1", 1)).expect("encrypt");
+    fn value_round_trip() -> anyhow::Result<()> {
+        let key = DataKey::generate().context("key")?;
+        let blob = encrypt_value(&key, "hunter2", ctx("s1", 1)).context("encrypt")?;
         assert_eq!(
-            decrypt_value(&key, &blob, ctx("s1", 1)).expect("decrypt").as_str(),
+            decrypt_value(&key, &blob, ctx("s1", 1)).context("decrypt")?.as_str(),
             "hunter2"
         );
+        Ok(())
     }
 
     #[test]
-    fn ciphertext_cannot_move_between_rows_or_versions() {
-        let key = DataKey::generate().expect("key");
-        let blob = encrypt_value(&key, "v", ctx("s1", 1)).expect("encrypt");
+    fn ciphertext_cannot_move_between_rows_or_versions() -> anyhow::Result<()> {
+        let key = DataKey::generate().context("key")?;
+        let blob = encrypt_value(&key, "v", ctx("s1", 1)).context("encrypt")?;
         assert_eq!(
             decrypt_value(&key, &blob, ctx("s2", 1)).err(),
             Some(CryptoError::Decrypt)
@@ -261,12 +264,13 @@ mod tests {
             decrypt_value(&key, &blob, ctx("s1", 2)).err(),
             Some(CryptoError::Decrypt)
         );
+        Ok(())
     }
 
     #[test]
-    fn tampering_is_detected() {
-        let key = DataKey::generate().expect("key");
-        let mut blob = encrypt_value(&key, "value", ctx("s1", 1)).expect("encrypt");
+    fn tampering_is_detected() -> anyhow::Result<()> {
+        let key = DataKey::generate().context("key")?;
+        let mut blob = encrypt_value(&key, "value", ctx("s1", 1)).context("encrypt")?;
         let last = blob.len() - 1;
         blob[last] ^= 1;
         assert_eq!(
@@ -281,47 +285,52 @@ mod tests {
             decrypt_value(&key, &[9, 1, 2], ctx("s1", 1)).err(),
             Some(CryptoError::Malformed)
         );
+        Ok(())
     }
 
     #[test]
-    fn nonces_are_unique() {
-        let key = DataKey::generate().expect("key");
-        let a = encrypt_value(&key, "same", ctx("s1", 1)).expect("encrypt");
-        let b = encrypt_value(&key, "same", ctx("s1", 1)).expect("encrypt");
+    fn nonces_are_unique() -> anyhow::Result<()> {
+        let key = DataKey::generate().context("key")?;
+        let a = encrypt_value(&key, "same", ctx("s1", 1)).context("encrypt")?;
+        let b = encrypt_value(&key, "same", ctx("s1", 1)).context("encrypt")?;
         assert_ne!(a, b);
+        Ok(())
     }
 
     #[test]
-    fn data_key_wrapping_is_bound_to_project() {
-        let root = RootKey::generate().expect("root");
-        let dk = DataKey::generate().expect("dk");
-        let wrapped = wrap_data_key(&root, &dk, "p1").expect("wrap");
+    fn data_key_wrapping_is_bound_to_project() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let dk = DataKey::generate().context("dk")?;
+        let wrapped = wrap_data_key(&root, &dk, "p1").context("wrap")?;
         assert!(unwrap_data_key(&root, &wrapped, "p1").is_ok());
         assert!(unwrap_data_key(&root, &wrapped, "p2").is_err());
-        let other_root = RootKey::generate().expect("root");
+        let other_root = RootKey::generate().context("root")?;
         assert!(unwrap_data_key(&other_root, &wrapped, "p1").is_err());
+        Ok(())
     }
 
     #[test]
-    fn root_key_parses_raw_base64_and_hex() {
+    fn root_key_parses_raw_base64_and_hex() -> anyhow::Result<()> {
         let raw = [7u8; 32];
-        let a = RootKey::parse(&raw).expect("raw");
-        let b = RootKey::parse(format!("{}\n", STANDARD.encode(raw)).as_bytes()).expect("b64");
-        let c = RootKey::parse(hex::encode(raw).as_bytes()).expect("hex");
+        let a = RootKey::parse(&raw).context("raw")?;
+        let b = RootKey::parse(format!("{}\n", STANDARD.encode(raw)).as_bytes()).context("b64")?;
+        let c = RootKey::parse(hex::encode(raw).as_bytes()).context("hex")?;
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), c.fingerprint());
         assert!(RootKey::parse(b"too short").is_err());
+        Ok(())
     }
 
     #[test]
-    fn tokens_are_prefixed_random_and_hash_stably() {
-        let a = generate_token("skt_").expect("token");
-        let b = generate_token("skt_").expect("token");
+    fn tokens_are_prefixed_random_and_hash_stably() -> anyhow::Result<()> {
+        let a = generate_token("skt_").context("token")?;
+        let b = generate_token("skt_").context("token")?;
         assert!(a.starts_with("skt_"));
         assert_ne!(*a, *b);
         assert_eq!(hash_token(&a), hash_token(&a));
         assert_eq!(hash_token(&a).len(), 64);
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
+        Ok(())
     }
 }

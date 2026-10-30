@@ -93,10 +93,11 @@ mod tests {
     }
 
     #[test]
-    fn args_parse_with_defaults() {
-        let cli = Cli::try_parse_from(["sekret", "--server-url", "https://sekret.example.com"]).expect("parse");
+    fn args_parse_with_defaults() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["sekret", "--server-url", "https://sekret.example.com"])?;
         assert_eq!(cli.operator.server_url, "https://sekret.example.com");
         assert_eq!(cli.operator.namespace, None);
         assert_eq!(cli.operator.concurrency, 4);
+        Ok(())
     }
 }

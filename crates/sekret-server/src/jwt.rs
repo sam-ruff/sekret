@@ -218,6 +218,7 @@ mod tests {
     use crate::clock::FixedClock;
     use crate::net::MockOidcHttp;
     use crate::testkit::TestIssuer;
+    use anyhow::Context;
     use mockall::predicate::eq;
     use serde_json::json;
 
@@ -233,7 +234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifies_via_discovery_and_caches_keys() {
+    async fn verifies_via_discovery_and_caches_keys() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://issuer.test");
         let clock = Arc::new(FixedClock::new(issuer.now));
         let mut http = MockOidcHttp::new();
@@ -249,27 +250,28 @@ mod tests {
             audience: None,
         };
         for _ in 0..3 {
-            let token = issuer.sign(json!({"sub": "a", "aud": "sekret"}));
-            let claims = v.verify(&token, &KeySource::Issuer, &expect).await.expect("verify");
+            let token = issuer.sign(json!({"sub": "a", "aud": "sekret"}))?;
+            let claims = v.verify(&token, &KeySource::Issuer, &expect).await.context("verify")?;
             assert_eq!(claims["sub"], "a");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_wrong_issuer_audience_expiry_and_signature() {
+    async fn rejects_wrong_issuer_audience_expiry_and_signature() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://issuer.test");
         let other = TestIssuer::with_key("https://issuer.test", 2);
-        let set = KeySource::Inline(serde_json::from_value(issuer.jwks()).expect("jwks"));
+        let set = KeySource::Inline(serde_json::from_value(issuer.jwks()).context("jwks")?);
         let v = verifier(MockOidcHttp::new(), Arc::new(FixedClock::new(issuer.now)));
         let ok = Expectations {
             issuer: Some("https://issuer.test"),
             audience: Some("client"),
         };
 
-        let good = issuer.sign(json!({"aud": "client"}));
+        let good = issuer.sign(json!({"aud": "client"}))?;
         assert!(v.verify(&good, &set, &ok).await.is_ok());
 
-        let wrong_aud = issuer.sign(json!({"aud": "someone"}));
+        let wrong_aud = issuer.sign(json!({"aud": "someone"}))?;
         assert!(matches!(
             v.verify(&wrong_aud, &set, &ok).await,
             Err(JwtError::Invalid(_))
@@ -284,50 +286,52 @@ mod tests {
             Err(JwtError::Invalid(_))
         ));
 
-        let expired = issuer.sign(json!({"aud": "client", "exp": issuer.now - 3600}));
+        let expired = issuer.sign(json!({"aud": "client", "exp": issuer.now - 3600}))?;
         assert!(matches!(v.verify(&expired, &set, &ok).await, Err(JwtError::Invalid(_))));
 
-        let not_yet = issuer.sign(json!({"aud": "client", "nbf": issuer.now + 3600}));
+        let not_yet = issuer.sign(json!({"aud": "client", "nbf": issuer.now + 3600}))?;
         assert!(matches!(v.verify(&not_yet, &set, &ok).await, Err(JwtError::Invalid(_))));
 
-        let future_iat = issuer.sign(json!({"aud": "client", "iat": issuer.now + 3600, "exp": issuer.now + 7200}));
+        let future_iat = issuer.sign(json!({"aud": "client", "iat": issuer.now + 3600, "exp": issuer.now + 7200}))?;
         assert!(matches!(
             v.verify(&future_iat, &set, &ok).await,
             Err(JwtError::Invalid(_))
         ));
 
-        let no_exp = issuer.sign(json!({"aud": "client", "exp": null}));
+        let no_exp = issuer.sign(json!({"aud": "client", "exp": null}))?;
         assert!(v.verify(&no_exp, &set, &ok).await.is_err());
 
-        let skewed = issuer.sign(json!({"aud": "client", "exp": issuer.now - 10, "iat": issuer.now + 10}));
+        let skewed = issuer.sign(json!({"aud": "client", "exp": issuer.now - 10, "iat": issuer.now + 10}))?;
         assert!(v.verify(&skewed, &set, &ok).await.is_ok(), "within leeway");
 
         // Same key id but signed by a different key.
-        let forged = other.sign_with_kid(json!({"aud": "client"}), "key1");
+        let forged = other.sign_with_kid(json!({"aud": "client"}), "key1")?;
         assert!(matches!(v.verify(&forged, &set, &ok).await, Err(JwtError::Invalid(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn expiry_follows_the_injected_clock() {
+    async fn expiry_follows_the_injected_clock() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://issuer.test");
-        let set = KeySource::Inline(serde_json::from_value(issuer.jwks()).expect("jwks"));
+        let set = KeySource::Inline(serde_json::from_value(issuer.jwks()).context("jwks")?);
         let clock = Arc::new(FixedClock::new(issuer.now));
         let v = verifier(MockOidcHttp::new(), clock.clone());
         let expect = Expectations {
             issuer: None,
             audience: None,
         };
-        let token = issuer.sign(json!({"aud": "client"}));
+        let token = issuer.sign(json!({"aud": "client"}))?;
         assert!(v.verify(&token, &set, &expect).await.is_ok());
         clock.advance(300 + LEEWAY_SECONDS + 1);
         assert!(matches!(
             v.verify(&token, &set, &expect).await,
             Err(JwtError::Invalid(_))
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_hmac_and_none() {
+    async fn rejects_hmac_and_none() -> anyhow::Result<()> {
         let v = verifier(MockOidcHttp::new(), Arc::new(FixedClock::new(0)));
         let expect = Expectations {
             issuer: None,
@@ -338,16 +342,17 @@ mod tests {
             &json!({"exp": 9_999_999_999i64}),
             &jsonwebtoken::EncodingKey::from_secret(b"secret"),
         )
-        .expect("encode");
+        .context("encode")?;
         let empty = KeySource::Inline(JwkSet { keys: vec![] });
         assert_eq!(v.verify(&hmac, &empty, &expect).await, Err(JwtError::Algorithm));
         let none = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.";
         assert!(v.verify(none, &empty, &expect).await.is_err());
         assert_eq!(v.verify("garbage", &empty, &expect).await, Err(JwtError::Malformed));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn refetches_keys_after_rotation() {
+    async fn refetches_keys_after_rotation() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://issuer.test");
         let rotated = TestIssuer::with_key("https://issuer.test", 2);
         let clock = Arc::new(FixedClock::new(issuer.now));
@@ -369,9 +374,10 @@ mod tests {
             issuer: None,
             audience: None,
         };
-        assert!(v.verify(&issuer.sign(json!({})), &source, &expect).await.is_ok());
+        assert!(v.verify(&issuer.sign(json!({}))?, &source, &expect).await.is_ok());
         clock.advance(MIN_REFRESH_SECONDS + 1);
-        assert!(v.verify(&rotated.sign(json!({})), &source, &expect).await.is_ok());
+        assert!(v.verify(&rotated.sign(json!({}))?, &source, &expect).await.is_ok());
+        Ok(())
     }
 
     #[tokio::test]

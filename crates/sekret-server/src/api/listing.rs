@@ -312,10 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn cursors_round_trip_and_reject_junk() {
+    fn cursors_round_trip_and_reject_junk() -> anyhow::Result<()> {
         let cursor = encode_cursor(1700000000, "0192-abc");
-        assert_eq!(decode_cursor(&cursor).expect("cursor"), (1700000000, "0192-abc".into()));
+        let decoded = decode_cursor(&cursor).map_err(|e| anyhow::anyhow!("cursor: {e:?}"))?;
+        assert_eq!(decoded, (1700000000, "0192-abc".into()));
         assert!(decode_cursor("not a cursor!").is_err());
         assert!(decode_cursor(&URL_SAFE_NO_PAD.encode("x:y")).is_err());
+        Ok(())
     }
 }

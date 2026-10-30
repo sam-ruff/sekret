@@ -18,4 +18,8 @@ uuid = { version = "1.29.0", features = ["v4", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
 
 [dev-dependencies]
+anyhow = "1.0.104"
 proptest = "1.12.0"
+
+[lints]
+workspace = true

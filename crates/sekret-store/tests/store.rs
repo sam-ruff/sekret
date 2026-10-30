@@ -1,3 +1,4 @@
+use anyhow::Context;
 use sekret_store::*;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -43,7 +44,7 @@ fn batch(snapshot: &str, changes: Vec<SecretChange>) -> WriteBatch {
     }
 }
 
-async fn seed_project(store: &SqlStore) {
+async fn seed_project(store: &SqlStore) -> anyhow::Result<()> {
     let project = Project {
         id: "p1".into(),
         slug: "app".into(),
@@ -65,11 +66,12 @@ async fn seed_project(store: &SqlStore) {
     store
         .create_project(project, vec![env("e1", "dev", 0), env("e2", "prod", 1)])
         .await
-        .expect("project");
+        .context("project")?;
+    Ok(())
 }
 
-async fn exercise_projects_and_secrets(store: &SqlStore) {
-    seed_project(store).await;
+async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
+    seed_project(store).await?;
     let logo = ProjectLogo {
         content_type: "image/png".into(),
         data: vec![0x89, b'P', b'N', b'G'],
@@ -77,41 +79,41 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
     store
         .set_project_logo("p1", Some(logo.clone()), 42)
         .await
-        .expect("logo");
-    assert_eq!(store.get_project_logo("p1").await.expect("get"), Some(logo));
+        .context("logo")?;
+    assert_eq!(store.get_project_logo("p1").await.context("get")?, Some(logo));
     assert_eq!(
         store
             .get_project("p1")
             .await
-            .expect("get")
+            .context("get")?
             .and_then(|p| p.logo_updated_at),
         Some(42)
     );
-    store.set_project_logo("p1", None, 43).await.expect("clear");
-    assert_eq!(store.get_project_logo("p1").await.expect("get"), None);
+    store.set_project_logo("p1", None, 43).await.context("clear")?;
+    assert_eq!(store.get_project_logo("p1").await.context("get")?, None);
     assert_eq!(
         store
             .get_project("p1")
             .await
-            .expect("get")
+            .context("get")?
             .and_then(|p| p.logo_updated_at),
         None
     );
     assert!(store.set_project_logo("missing", None, 1).await.is_err());
     assert_eq!(
-        store.get_project("app").await.expect("get").map(|p| p.id),
+        store.get_project("app").await.context("get")?.map(|p| p.id),
         Some("p1".into())
     );
     assert_eq!(
-        store.get_project("p1").await.expect("get").map(|p| p.wrapped_key),
+        store.get_project("p1").await.context("get")?.map(|p| p.wrapped_key),
         Some(vec![1, 2, 3])
     );
-    let envs = store.list_environments("p1").await.expect("envs");
+    let envs = store.list_environments("p1").await.context("envs")?;
     assert_eq!(
         envs.iter().map(|e| e.slug.as_str()).collect::<Vec<_>>(),
         ["dev", "prod"]
     );
-    assert_eq!(store.list_folders("e1").await.expect("folders").len(), 1);
+    assert_eq!(store.list_folders("e1").await.context("folders")?.len(), 1);
 
     store
         .write_secrets(batch(
@@ -123,22 +125,29 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
             ],
         ))
         .await
-        .expect("write");
+        .context("write")?;
 
     // `_` must not behave as a LIKE wildcard when listing recursively.
-    let nested = store.list_secrets("e1", "/my_app", true, false).await.expect("list");
+    let nested = store.list_secrets("e1", "/my_app", true, false).await.context("list")?;
     assert_eq!(nested.iter().map(|s| s.secret.key.as_str()).collect::<Vec<_>>(), ["B"]);
-    assert_eq!(store.list_secrets("e1", "/", true, false).await.expect("all").len(), 3);
     assert_eq!(
-        store.list_secrets("e1", "/", false, false).await.expect("root").len(),
+        store.list_secrets("e1", "/", true, false).await.context("all")?.len(),
+        3
+    );
+    assert_eq!(
+        store.list_secrets("e1", "/", false, false).await.context("root")?.len(),
         1
     );
 
     store
         .write_secrets(batch("snap2", vec![change("s1", "/", "A", 1, false)]))
         .await
-        .expect("update");
-    let a = store.get_secret("e1", "/", "A").await.expect("get").expect("exists");
+        .context("update")?;
+    let a = store
+        .get_secret("e1", "/", "A")
+        .await
+        .context("get")?
+        .context("exists")?;
     assert_eq!(a.secret.current_version, 2);
     assert_eq!(a.version.value.as_deref(), Some(&b"A-2"[..]));
     assert_eq!(a.version.tags, vec!["t".to_string()]);
@@ -155,13 +164,13 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
         store
             .get_secret_by_id("s2")
             .await
-            .expect("get")
-            .expect("exists")
+            .context("get")?
+            .context("exists")?
             .secret
             .current_version,
         1
     );
-    assert!(store.get_snapshot("snap3").await.expect("snap").is_none());
+    assert!(store.get_snapshot("snap3").await.context("snap")?.is_none());
 
     // Duplicate keys conflict.
     let duplicate = store
@@ -172,18 +181,21 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
     store
         .write_secrets(batch("snap5", vec![change("s3", "/myXapp", "C", 1, true)]))
         .await
-        .expect("delete");
-    assert_eq!(store.list_secrets("e1", "/", true, false).await.expect("live").len(), 2);
+        .context("delete")?;
+    assert_eq!(
+        store.list_secrets("e1", "/", true, false).await.context("live")?.len(),
+        2
+    );
     assert_eq!(
         store
             .list_secrets("e1", "/", true, true)
             .await
-            .expect("with deleted")
+            .context("with deleted")?
             .len(),
         3
     );
 
-    let versions = store.list_versions("s1").await.expect("versions");
+    let versions = store.list_versions("s1").await.context("versions")?;
     assert_eq!(versions.iter().map(|v| v.version).collect::<Vec<_>>(), [2, 1]);
     assert_eq!(
         versions.iter().map(|v| v.generated).collect::<Vec<_>>(),
@@ -193,32 +205,32 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
     store
         .set_secret_policy("s1", Some(r#"{"mode":"inherit"}"#.into()))
         .await
-        .expect("policy");
+        .context("policy")?;
     store
         .set_project_policy("p1", Some(r#"{"rotation_days":7}"#.into()))
         .await
-        .expect("project policy");
+        .context("project policy")?;
     assert_eq!(
         store
             .get_project("p1")
             .await
-            .expect("get")
+            .context("get")?
             .and_then(|p| p.secret_policy),
         Some(r#"{"rotation_days":7}"#.into())
     );
     assert!(store.set_secret_policy("missing", None).await.is_err());
-    let with_policy = store.list_secrets("e1", "/", true, true).await.expect("list");
+    let with_policy = store.list_secrets("e1", "/", true, true).await.context("list")?;
     assert!(
         with_policy
             .iter()
             .any(|s| s.secret.id == "s1" && s.secret.policy.as_deref() == Some(r#"{"mode":"inherit"}"#))
     );
     assert_eq!(
-        store.get_version("s1", 1).await.expect("v1").map(|v| v.comment),
+        store.get_version("s1", 1).await.context("v1")?.map(|v| v.comment),
         Some("v1".into())
     );
 
-    let snap = store.get_snapshot("snap5").await.expect("snap").expect("exists");
+    let snap = store.get_snapshot("snap5").await.context("snap")?.context("exists")?;
     let mut entries = snap.entries.clone();
     entries.sort_by(|a, b| a.secret_id.cmp(&b.secret_id));
     assert_eq!(
@@ -234,9 +246,9 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
             }
         ]
     );
-    assert_eq!(store.list_snapshots("e1", 10).await.expect("snaps").len(), 3);
-    store.prune_snapshots("e1", 1).await.expect("prune");
-    assert_eq!(store.list_snapshots("e1", 10).await.expect("snaps").len(), 1);
+    assert_eq!(store.list_snapshots("e1", 10).await.context("snaps")?.len(), 3);
+    store.prune_snapshots("e1", 1).await.context("prune")?;
+    assert_eq!(store.list_snapshots("e1", 10).await.context("snaps")?.len(), 1);
 
     store
         .create_folder(Folder {
@@ -245,17 +257,18 @@ async fn exercise_projects_and_secrets(store: &SqlStore) {
             created_at: 1,
         })
         .await
-        .expect("folder");
+        .context("folder")?;
     assert!(matches!(
         store.delete_folder("e1", "/my_app").await,
         Err(StoreError::Conflict)
     ));
 
-    store.delete_project("p1").await.expect("delete project");
-    assert!(store.get_project("p1").await.expect("get").is_none());
+    store.delete_project("p1").await.context("delete project")?;
+    assert!(store.get_project("p1").await.context("get")?.is_none());
+    Ok(())
 }
 
-async fn exercise_identities_and_tokens(store: &SqlStore) {
+async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> {
     let identity = Identity {
         id: "i1".into(),
         name: "ci".into(),
@@ -266,7 +279,7 @@ async fn exercise_identities_and_tokens(store: &SqlStore) {
         disabled: false,
         created_at: 1,
     };
-    store.create_identity(identity.clone()).await.expect("identity");
+    store.create_identity(identity.clone()).await.context("identity")?;
     assert!(matches!(
         store.create_identity(identity).await,
         Err(StoreError::Conflict)
@@ -279,8 +292,8 @@ async fn exercise_identities_and_tokens(store: &SqlStore) {
             created_at: 1,
         })
         .await
-        .expect("method");
-    assert_eq!(store.list_auth_methods("i1").await.expect("methods").len(), 1);
+        .context("method")?;
+    assert_eq!(store.list_auth_methods("i1").await.context("methods")?.len(), 1);
 
     let secret = ClientSecret {
         id: "c1".into(),
@@ -294,9 +307,9 @@ async fn exercise_identities_and_tokens(store: &SqlStore) {
         revoked: false,
         last_used_at: None,
     };
-    store.create_client_secret(secret).await.expect("secret");
-    assert!(store.consume_client_secret("c1", 5).await.expect("consume"));
-    assert!(!store.consume_client_secret("c1", 6).await.expect("exhausted"));
+    store.create_client_secret(secret).await.context("secret")?;
+    assert!(store.consume_client_secret("c1", 5).await.context("consume")?);
+    assert!(!store.consume_client_secret("c1", 6).await.context("exhausted")?);
 
     let token = AccessToken {
         id: "t1".into(),
@@ -319,28 +332,35 @@ async fn exercise_identities_and_tokens(store: &SqlStore) {
             ..token.clone()
         })
         .await
-        .expect("token");
+        .context("token")?;
     store
         .revoke_tokens_from_source("client-secret:c1")
         .await
-        .expect("revoke");
-    assert!(store.find_token("th0").await.expect("find").is_some_and(|t| t.revoked));
-    store.create_token(token).await.expect("token");
+        .context("revoke")?;
+    assert!(
+        store
+            .find_token("th0")
+            .await
+            .context("find")?
+            .is_some_and(|t| t.revoked)
+    );
+    store.create_token(token).await.context("token")?;
     assert_eq!(
-        store.find_token("th").await.expect("find").map(|t| t.principal_kind),
+        store.find_token("th").await.context("find")?.map(|t| t.principal_kind),
         Some(PrincipalKind::Identity)
     );
     store
         .revoke_principal_tokens(PrincipalKind::Identity, "i1")
         .await
-        .expect("revoke");
-    assert!(store.find_token("th").await.expect("find").expect("exists").revoked);
+        .context("revoke")?;
+    assert!(store.find_token("th").await.context("find")?.context("exists")?.revoked);
 
-    store.delete_identity("i1").await.expect("delete");
-    assert!(store.find_token("th").await.expect("find").is_none());
+    store.delete_identity("i1").await.context("delete")?;
+    assert!(store.find_token("th").await.context("find")?.is_none());
+    Ok(())
 }
 
-async fn exercise_logins_and_audit(store: &SqlStore) {
+async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
     let user = store
         .upsert_user(UserLogin {
             subject: "iss|u1".into(),
@@ -350,7 +370,7 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
             now: 1,
         })
         .await
-        .expect("user");
+        .context("user")?;
     let again = store
         .upsert_user(UserLogin {
             subject: "iss|u1".into(),
@@ -360,7 +380,7 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
             now: 2,
         })
         .await
-        .expect("user");
+        .context("user")?;
     assert_eq!(user.id, again.id);
     assert_eq!(again.email, "new@b");
 
@@ -373,9 +393,9 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
             created_at: 1,
         })
         .await
-        .expect("state");
-    assert!(store.take_login_state("st").await.expect("take").is_some());
-    assert!(store.take_login_state("st").await.expect("take twice").is_none());
+        .context("state")?;
+    assert!(store.take_login_state("st").await.context("take")?.is_some());
+    assert!(store.take_login_state("st").await.context("take twice")?.is_none());
 
     store
         .create_cli_login(CliLogin {
@@ -387,25 +407,25 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
             consumed: false,
         })
         .await
-        .expect("cli");
-    assert_eq!(store.poll_cli_login("dc", 2).await.expect("poll"), CliPoll::Pending);
+        .context("cli")?;
+    assert_eq!(store.poll_cli_login("dc", 2).await.context("poll")?, CliPoll::Pending);
     assert!(
         store
             .approve_cli_login("ABCD-EFGH", &user.id, 3)
             .await
-            .expect("approve")
+            .context("approve")?
     );
     assert!(
         !store
             .approve_cli_login("ABCD-EFGH", "someone-else", 3)
             .await
-            .expect("approve twice")
+            .context("approve twice")?
     );
     assert_eq!(
-        store.poll_cli_login("dc", 4).await.expect("poll"),
+        store.poll_cli_login("dc", 4).await.context("poll")?,
         CliPoll::Approved(user.id.clone())
     );
-    assert_eq!(store.poll_cli_login("dc", 5).await.expect("poll"), CliPoll::Gone);
+    assert_eq!(store.poll_cli_login("dc", 5).await.context("poll")?, CliPoll::Gone);
 
     // id, time, actor, action, environment, path, key
     let rows = [
@@ -464,54 +484,52 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
                 ip: "10.0.0.1".into(),
             })
             .await
-            .expect("audit");
+            .context("audit")?;
     }
     let ids = |query: AuditQuery| async move {
-        store
+        let entries = store
             .list_audit(AuditQuery { limit: 50, ..query })
             .await
-            .expect("audit")
-            .into_iter()
-            .map(|a| a.id)
-            .collect::<Vec<_>>()
+            .context("audit")?;
+        anyhow::Ok(entries.into_iter().map(|a| a.id).collect::<Vec<_>>())
     };
-    let count = |query: AuditQuery| async move { store.count_audit(query).await.expect("count") };
+    let count = |query: AuditQuery| async move { store.count_audit(query).await.context("count") };
 
     let action = |a: &str| AuditQuery {
         action: Some(a.into()),
         ..Default::default()
     };
     assert_eq!(
-        ids(action("secret.")).await,
+        ids(action("secret.")).await?,
         ["a4", "a2", "a1", "a0"],
         "action is a prefix"
     );
-    assert_eq!(count(action("secret.read")).await, 2);
+    assert_eq!(count(action("secret.read")).await?, 2);
     let search = |s: &str| AuditQuery {
         search: Some(s.into()),
         ..Default::default()
     };
-    assert_eq!(ids(search("alice")).await, ["a4", "a2", "a0"], "search ignores case");
-    assert_eq!(ids(search("db_")).await, ["a1", "a0"], "underscore is literal");
-    assert_eq!(ids(search("100%")).await, ["a3"], "percent is literal");
-    assert_eq!(ids(search("/app/db")).await, ["a1"]);
+    assert_eq!(ids(search("alice")).await?, ["a4", "a2", "a0"], "search ignores case");
+    assert_eq!(ids(search("db_")).await?, ["a1", "a0"], "underscore is literal");
+    assert_eq!(ids(search("100%")).await?, ["a3"], "percent is literal");
+    assert_eq!(ids(search("/app/db")).await?, ["a1"]);
     let scoped = AuditQuery {
         environment: Some("prod".into()),
         path: Some("/app".into()),
         ..Default::default()
     };
-    assert_eq!(ids(scoped).await, ["a1"], "environment and path prefix combine");
+    assert_eq!(ids(scoped).await?, ["a1"], "environment and path prefix combine");
     let window = AuditQuery {
         since: Some(1),
         until: Some(2),
         ..Default::default()
     };
-    assert_eq!(ids(window).await, ["a2", "a1"]);
+    assert_eq!(ids(window).await?, ["a2", "a1"]);
     let kind = AuditQuery {
         actor_kind: Some("identity".into()),
         ..Default::default()
     };
-    assert_eq!(ids(kind).await, ["a3"]);
+    assert_eq!(ids(kind).await?, ["a3"]);
 
     // Paging in both orders, through entries that share a timestamp.
     for oldest_first in [false, true] {
@@ -527,7 +545,7 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
                     ..Default::default()
                 })
                 .await
-                .expect("page");
+                .context("page")?;
             let Some(last) = page.last() else {
                 break;
             };
@@ -540,44 +558,47 @@ async fn exercise_logins_and_audit(store: &SqlStore) {
         }
         assert_eq!(seen, expected, "oldest_first = {oldest_first}");
     }
+    Ok(())
 }
 
-async fn exercise(store: SqlStore) {
-    exercise_projects_and_secrets(&store).await;
-    exercise_identities_and_tokens(&store).await;
-    exercise_logins_and_audit(&store).await;
-}
-
-#[tokio::test]
-async fn sqlite_store() {
-    exercise(SqlStore::connect("sqlite::memory:").await.expect("connect")).await;
+async fn exercise(store: SqlStore) -> anyhow::Result<()> {
+    exercise_projects_and_secrets(&store).await?;
+    exercise_identities_and_tokens(&store).await?;
+    exercise_logins_and_audit(&store).await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn sqlite_file_store_reopens() {
+async fn sqlite_store() -> anyhow::Result<()> {
+    exercise(SqlStore::connect("sqlite::memory:").await.context("connect")?).await
+}
+
+#[tokio::test]
+async fn sqlite_file_store_reopens() -> anyhow::Result<()> {
     let dir = std::env::temp_dir().join(format!("sekret-store-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::create_dir_all(&dir).context("dir")?;
     let url = format!("sqlite://{}?mode=rwc", dir.join("db.sqlite").display());
-    let store = SqlStore::connect(&url).await.expect("connect");
-    store.set_meta("k", "v").await.expect("meta");
+    let store = SqlStore::connect(&url).await.context("connect")?;
+    store.set_meta("k", "v").await.context("meta")?;
     drop(store);
-    let reopened = SqlStore::connect(&url).await.expect("reconnect");
-    assert_eq!(reopened.get_meta("k").await.expect("meta"), Some("v".into()));
+    let reopened = SqlStore::connect(&url).await.context("reconnect")?;
+    assert_eq!(reopened.get_meta("k").await.context("meta")?, Some("v".into()));
     std::fs::remove_dir_all(dir).ok();
+    Ok(())
 }
 
 /// Needs Docker. Skipped with a message when it is unavailable unless SEKRET_REQUIRE_POSTGRES is set.
 #[tokio::test]
-async fn postgres_store() {
+async fn postgres_store() -> anyhow::Result<()> {
     let container = match Postgres::default().start().await {
         Ok(container) => container,
         Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
             eprintln!("skipping postgres test: {error}");
-            return;
+            return Ok(());
         }
-        Err(error) => panic!("postgres container failed: {error}"),
+        Err(error) => anyhow::bail!("postgres container failed: {error}"),
     };
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    exercise(SqlStore::connect(&url).await.expect("connect")).await;
+    exercise(SqlStore::connect(&url).await.context("connect")?).await
 }

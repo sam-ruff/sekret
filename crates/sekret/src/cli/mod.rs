@@ -803,6 +803,7 @@ pub async fn run_command(api: &dyn SekretApi, at: Location, args: &RunArgs) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use sekret_api::{RawSecret, RawSecrets, Secret, SecretList};
     use sekret_client::MockSekretApi;
 
@@ -843,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn upserts_from_pairs_stdin_and_dotenv() {
+    fn upserts_from_pairs_stdin_and_dotenv() -> anyhow::Result<()> {
         let mut stdin = "from-stdin\n".as_bytes();
         let upserts = collect_upserts(
             &["A=1".into(), "B=-".into(), "C=x=y".into()],
@@ -851,16 +852,17 @@ mod tests {
             "c",
             &mut stdin,
         )
-        .expect("collect");
+        .context("collect")?;
         let pairs: Vec<(&str, &str)> = upserts.iter().map(|u| (u.key.as_str(), u.value.as_str())).collect();
         assert_eq!(pairs, [("D", "4"), ("A", "1"), ("B", "from-stdin"), ("C", "x=y")]);
         assert!(collect_upserts(&["A=-".into(), "B=-".into()], None, "", &mut "x".as_bytes()).is_err());
         assert!(collect_upserts(&["NOEQUALS".into()], None, "", &mut "".as_bytes()).is_err());
         assert!(collect_upserts(&[], None, "", &mut "".as_bytes()).is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn get_prints_value_or_explains_hidden() {
+    async fn get_prints_value_or_explains_hidden() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_get_secret()
             .times(1)
@@ -880,9 +882,9 @@ mod tests {
             &mut "".as_bytes(),
         )
         .await
-        .expect("get");
+        .context("get")?;
         assert_eq!(out, b"v\n");
-        let hidden = secrets(
+        let Err(hidden) = secrets(
             &api,
             at(),
             SecretsCommand::Get {
@@ -892,12 +894,16 @@ mod tests {
             &mut Vec::new(),
             &mut "".as_bytes(),
         )
-        .await;
-        assert!(hidden.unwrap_err().to_string().contains("not allowed"));
+        .await
+        else {
+            anyhow::bail!("getting a hidden value should fail");
+        };
+        assert!(hidden.to_string().contains("not allowed"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_and_delete_send_batches() {
+    async fn set_and_delete_send_batches() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_write()
             .withf(|at, b| {
@@ -917,7 +923,7 @@ mod tests {
         };
         secrets(&api, at(), set, &mut out, &mut "".as_bytes())
             .await
-            .expect("set");
+            .context("set")?;
         secrets(
             &api,
             at(),
@@ -928,16 +934,17 @@ mod tests {
             &mut "".as_bytes(),
         )
         .await
-        .expect("delete");
+        .context("delete")?;
         assert!(
             String::from_utf8(out)
-                .expect("utf8")
+                .context("utf8")?
                 .contains("created: A; unchanged: B")
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_shows_hidden_values_and_folders() {
+    async fn list_shows_hidden_values_and_folders() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_list_secrets().returning(|_, _, _| {
             Ok(SecretList {
@@ -957,13 +964,14 @@ mod tests {
             &mut "".as_bytes(),
         )
         .await
-        .expect("list");
-        let text = String::from_utf8(out).expect("utf8");
+        .context("list")?;
+        let text = String::from_utf8(out).context("utf8")?;
         assert!(text.contains("(hidden)") && text.contains("db/") && text.contains("user:sam"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn export_and_run_use_raw_values() {
+    async fn export_and_run_use_raw_values() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_raw().returning(|_, _| {
             Ok(RawSecrets {
@@ -987,7 +995,7 @@ mod tests {
             &mut out,
         )
         .await
-        .expect("export");
+        .context("export")?;
         assert_eq!(out, b"GREETING=\"hello world\"\n");
 
         let args = RunArgs {
@@ -998,14 +1006,15 @@ mod tests {
                 "test \"$GREETING\" = 'hello world' && exit 7".into(),
             ],
         };
-        assert_eq!(run_command(&api, at(), &args).await.expect("run"), 7);
+        assert_eq!(run_command(&api, at(), &args).await.context("run")?, 7);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn machine_credentials_from_flags() {
-        let dir = tempfile::tempdir().expect("dir");
+    async fn machine_credentials_from_flags() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
         let token_file = dir.path().join("token");
-        std::fs::write(&token_file, "jwt-from-file\n").expect("write");
+        std::fs::write(&token_file, "jwt-from-file\n").context("write")?;
         let base = LoginArgs {
             identity_id: Some("id".into()),
             oidc_token_file: None,
@@ -1020,14 +1029,14 @@ mod tests {
             no_browser: true,
         };
         let no_github = || -> anyhow::Result<Box<dyn IdTokenSource>> { anyhow::bail!("not in GitHub Actions") };
-        assert!(machine_credential(&base, &no_github).await.expect("none").is_none());
+        assert!(machine_credential(&base, &no_github).await.context("none")?.is_none());
 
         let k8s = LoginArgs {
             kubernetes: true,
             ..base.clone()
         };
         assert!(
-            matches!(machine_credential(&k8s, &no_github).await.expect("k8s"), Some(MachineCredential::Kubernetes { token, .. }) if token == "jwt-from-file")
+            matches!(machine_credential(&k8s, &no_github).await.context("k8s")?, Some(MachineCredential::Kubernetes { token, .. }) if token == "jwt-from-file")
         );
 
         let oidc = LoginArgs {
@@ -1035,7 +1044,7 @@ mod tests {
             ..base.clone()
         };
         assert!(matches!(
-            machine_credential(&oidc, &no_github).await.expect("oidc"),
+            machine_credential(&oidc, &no_github).await.context("oidc")?,
             Some(MachineCredential::Oidc { .. })
         ));
 
@@ -1056,13 +1065,14 @@ mod tests {
             Ok(Box::new(source))
         };
         assert!(
-            matches!(machine_credential(&github, &fake_github).await.expect("gh"), Some(MachineCredential::Oidc { token, .. }) if token == "gh-jwt")
+            matches!(machine_credential(&github, &fake_github).await.context("gh")?, Some(MachineCredential::Oidc { token, .. }) if token == "gh-jwt")
         );
         assert!(machine_credential(&github, &no_github).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn env_use_writes_values_to_the_script_and_only_names_to_notes() {
+    async fn env_use_writes_values_to_the_script_and_only_names_to_notes() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_raw()
             .withf(|at, recursive| at.environment == "prod" && !recursive)
@@ -1097,15 +1107,16 @@ mod tests {
             &mut notes,
         )
         .await
-        .expect("env use");
-        let script = String::from_utf8(out).expect("utf8");
-        let notes = String::from_utf8(notes).expect("utf8");
+        .context("env use")?;
+        let script = String::from_utf8(out).context("utf8")?;
+        let notes = String::from_utf8(notes).context("utf8")?;
         assert!(script.starts_with("unset OLD\n"));
         assert!(script.contains("export DB_PASSWORD='hunter2'"));
         assert!(script.contains("export SEKRET_ENVIRONMENT='prod'"));
         assert!(notes.contains("loaded 1 secrets from app/prod"));
         assert!(notes.contains("bad.key"));
         assert!(!notes.contains("hunter2"), "values never reach the notes");
+        Ok(())
     }
 
     #[tokio::test]

@@ -483,6 +483,7 @@ mod tests {
     use crate::clock::FixedClock;
     use crate::net::{MockOidcHttp, MockTokenReviewer, TokenReviewResult};
     use crate::testkit::TestIssuer;
+    use anyhow::{Context, bail};
     use sekret_api::ClaimBindings;
     use std::sync::Arc;
 
@@ -503,6 +504,11 @@ mod tests {
 
     fn verifier(now: i64) -> JwtVerifier {
         JwtVerifier::new(Arc::new(MockOidcHttp::new()), Arc::new(FixedClock::new(now)))
+    }
+
+    /// `ApiError` is not a `std::error::Error`, so `anyhow::Context` cannot wrap it.
+    fn api(context: &'static str) -> impl FnOnce(ApiError) -> anyhow::Error {
+        move |error| anyhow::anyhow!("{context}: {error:?}")
     }
 
     #[test]
@@ -561,21 +567,22 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_tokens_are_sealed_redacted_and_kept() {
-        let root = RootKey::generate().expect("root");
-        let sealed = seal_for_storage(&root, "i1", with_reviewer("reviewer-jwt"), None).expect("seal");
-        let stored = reviewer_of(&sealed).expect("stored");
+    fn reviewer_tokens_are_sealed_redacted_and_kept() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let sealed = seal_for_storage(&root, "i1", with_reviewer("reviewer-jwt"), None).map_err(api("seal"))?;
+        let stored = reviewer_of(&sealed).context("stored")?;
         assert!(!stored.contains("reviewer-jwt"));
         assert_eq!(
             reviewer_of(&redact(sealed.clone())).as_deref(),
             Some(REDACTED_CREDENTIAL)
         );
 
-        let kept = seal_for_storage(&root, "i1", with_reviewer(REDACTED_CREDENTIAL), Some(&sealed)).expect("keep");
+        let kept =
+            seal_for_storage(&root, "i1", with_reviewer(REDACTED_CREDENTIAL), Some(&sealed)).map_err(api("keep"))?;
         assert_eq!(reviewer_of(&kept), Some(stored));
         assert!(seal_for_storage(&root, "i1", with_reviewer(REDACTED_CREDENTIAL), None).is_err());
         let AuthMethodConfig::Kubernetes(mut moved) = with_reviewer(REDACTED_CREDENTIAL) else {
-            panic!("kubernetes config expected");
+            bail!("kubernetes config expected");
         };
         moved.host = Some("https://attacker.example".into());
         assert!(
@@ -583,38 +590,40 @@ mod tests {
             "a stored token is never sent to a new host"
         );
         assert_eq!(
-            reviewer_of(&seal_for_storage(&root, "i1", with_reviewer("  "), Some(&sealed)).expect("clear")),
+            reviewer_of(&seal_for_storage(&root, "i1", with_reviewer("  "), Some(&sealed)).map_err(api("clear"))?),
             None
         );
 
         let AuthMethodConfig::Kubernetes(mut k8s) = kept else {
-            panic!("kubernetes config expected");
+            bail!("kubernetes config expected");
         };
         let mut other_identity = k8s.clone();
-        unseal_reviewer(&root, "i1", &mut k8s).expect("unseal");
+        unseal_reviewer(&root, "i1", &mut k8s).map_err(api("unseal"))?;
         assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-jwt"));
         assert!(unseal_reviewer(&root, "i2", &mut other_identity).is_err());
+        Ok(())
     }
 
     #[test]
-    fn reseal_moves_reviewer_tokens_to_the_new_root() {
-        let old_root = RootKey::generate().expect("root");
-        let new_root = RootKey::generate().expect("root");
-        let sealed = seal_for_storage(&old_root, "i1", with_reviewer("reviewer-jwt"), None).expect("seal");
+    fn reseal_moves_reviewer_tokens_to_the_new_root() -> anyhow::Result<()> {
+        let old_root = RootKey::generate().context("root")?;
+        let new_root = RootKey::generate().context("root")?;
+        let sealed = seal_for_storage(&old_root, "i1", with_reviewer("reviewer-jwt"), None).map_err(api("seal"))?;
         let AuthMethodConfig::Kubernetes(mut k8s) = reseal(&old_root, &new_root, "i1", &sealed)
-            .expect("reseal")
-            .expect("changed")
+            .map_err(api("reseal"))?
+            .context("changed")?
         else {
-            panic!("kubernetes config expected");
+            bail!("kubernetes config expected");
         };
-        unseal_reviewer(&new_root, "i1", &mut k8s).expect("unseal");
+        unseal_reviewer(&new_root, "i1", &mut k8s).map_err(api("unseal"))?;
         assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-jwt"));
         let plain = AuthMethodConfig::Kubernetes(k8s_config(KubernetesMode::Jwks));
-        assert_eq!(reseal(&old_root, &new_root, "i1", &plain).expect("reseal"), None);
+        assert_eq!(reseal(&old_root, &new_root, "i1", &plain).map_err(api("reseal"))?, None);
         assert_eq!(
-            reseal(&old_root, &new_root, "i1", &AuthMethodConfig::Universal).expect("reseal"),
+            reseal(&old_root, &new_root, "i1", &AuthMethodConfig::Universal).map_err(api("reseal"))?,
             None
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -626,30 +635,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jwks_mode_checks_issuer_audience_and_subject() {
+    async fn jwks_mode_checks_issuer_audience_and_subject() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://kubernetes.default.svc.cluster.local");
         let mut config = k8s_config(KubernetesMode::Jwks);
         config.jwks = Some(issuer.jwks());
         let jwt = verifier(issuer.now);
         let reviewer = MockTokenReviewer::new();
-        let good = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web-api"}));
+        let good = issuer.sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web-api"}))?;
         assert!(verify_kubernetes(&jwt, &reviewer, &config, &good).await.is_ok());
         let wrong_aud = issuer
-            .sign(json!({"aud": ["https://kubernetes.default.svc"], "sub": "system:serviceaccount:apps:web-api"}));
+            .sign(json!({"aud": ["https://kubernetes.default.svc"], "sub": "system:serviceaccount:apps:web-api"}))?;
         assert_eq!(
             verify_kubernetes(&jwt, &reviewer, &config, &wrong_aud).await,
             Err(LoginError::Binding("audience".into()))
         );
         let other_issuer = TestIssuer::new("https://evil.test")
-            .sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web-api"}));
+            .sign(json!({"aud": ["sekret"], "sub": "system:serviceaccount:apps:web-api"}))?;
         assert!(matches!(
             verify_kubernetes(&jwt, &reviewer, &config, &other_issuer).await,
             Err(LoginError::Token(_))
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn oidc_login_applies_bindings() {
+    async fn oidc_login_applies_bindings() -> anyhow::Result<()> {
         let issuer = TestIssuer::new("https://token.actions.githubusercontent.com");
         let config = OidcAuthConfig {
             issuer: issuer.url.clone(),
@@ -664,13 +674,14 @@ mod tests {
         let jwks = issuer.jwks();
         http.expect_get_json().returning(move |_| Ok(jwks.clone()));
         let jwt = JwtVerifier::new(Arc::new(http), Arc::new(FixedClock::new(issuer.now)));
-        let good = issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main"}));
+        let good = issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/main"}))?;
         assert!(verify_oidc(&jwt, &config, &good).await.is_ok());
-        let branch = issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/dev"}));
+        let branch = issuer.sign(json!({"aud": "sekret", "sub": "repo:sam-ruff/app:ref:refs/heads/dev"}))?;
         assert!(matches!(
             verify_oidc(&jwt, &config, &branch).await,
             Err(LoginError::Binding(_))
         ));
+        Ok(())
     }
 
     #[test]

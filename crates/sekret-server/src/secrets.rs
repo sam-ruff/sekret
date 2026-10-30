@@ -599,19 +599,25 @@ pub fn to_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use sekret_core::crypto::wrap_data_key;
     use sekret_core::permissions::{BuiltinRole, Conditions, Rule};
     use sekret_store::{MockStore, Secret, SnapshotEntry};
 
-    fn fixture() -> (RootKey, Project, Environment) {
-        let root = RootKey::generate().expect("root");
-        let dk = DataKey::generate().expect("dk");
+    /// `ApiError` is not a `std::error::Error`, so it cannot take `.context` directly.
+    fn api<T>(result: ApiResult<T>, what: &str) -> anyhow::Result<T> {
+        result.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))
+    }
+
+    fn fixture() -> anyhow::Result<(RootKey, Project, Environment)> {
+        let root = RootKey::generate().context("root")?;
+        let dk = DataKey::generate().context("dk")?;
         let project = Project {
             id: "p1".into(),
             slug: "app".into(),
             name: "App".into(),
             description: String::new(),
-            wrapped_key: wrap_data_key(&root, &dk, "p1").expect("wrap"),
+            wrapped_key: wrap_data_key(&root, &dk, "p1").context("wrap")?,
             created_at: 0,
             logo_updated_at: None,
             secret_policy: None,
@@ -624,7 +630,7 @@ mod tests {
             position: 0,
             created_at: 0,
         };
-        (root, project, env)
+        Ok((root, project, env))
     }
 
     fn stored(
@@ -634,22 +640,20 @@ mod tests {
         value: &str,
         version: i64,
         deleted: bool,
-    ) -> SecretWithVersion {
-        let dk = data_key(root, project).expect("dk");
+    ) -> anyhow::Result<SecretWithVersion> {
+        let dk = api(data_key(root, project), "dk")?;
         let id = format!("id-{key}");
-        let blob = (!deleted).then(|| {
-            encrypt_value(
-                &dk,
-                value,
-                ValueContext {
-                    project_id: &project.id,
-                    secret_id: &id,
-                    version,
-                },
-            )
-            .expect("encrypt")
-        });
-        SecretWithVersion {
+        let blob = if deleted {
+            None
+        } else {
+            let context = ValueContext {
+                project_id: &project.id,
+                secret_id: &id,
+                version,
+            };
+            Some(encrypt_value(&dk, value, context).context("encrypt")?)
+        };
+        Ok(SecretWithVersion {
             secret: Secret {
                 id: id.clone(),
                 project_id: project.id.clone(),
@@ -673,7 +677,7 @@ mod tests {
                 created_at: 0,
                 generated: false,
             },
-        }
+        })
     }
 
     fn ctx<'a>(store: &'a MockStore, root: &'a RootKey) -> SecretCtx<'a> {
@@ -697,33 +701,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_values_produce_no_write() {
-        let (root, project, env) = fixture();
-        let existing = stored(&project, &root, "A", "same", 3, false);
+    async fn unchanged_values_produce_no_write() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let existing = stored(&project, &root, "A", "same", 3, false)?;
         let mut store = MockStore::new();
         store
             .expect_get_secret()
             .returning(move |_, _, _| Ok(Some(existing.clone())));
         store.expect_write_secrets().never();
-        let planned = plan_batch(
-            &ctx(&store, &root),
-            &BuiltinRole::Developer.rules(),
-            &project,
-            &env,
-            "/",
-            vec![upsert("A", "same")],
-            vec![],
-        )
-        .await
-        .expect("plan");
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                &BuiltinRole::Developer.rules(),
+                &project,
+                &env,
+                "/",
+                vec![upsert("A", "same")],
+                vec![],
+            )
+            .await,
+            "plan",
+        )?;
         assert!(planned.batch.is_none());
         assert_eq!(planned.result.unchanged, vec!["A".to_string()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn repeating_the_current_comment_is_not_a_change() {
-        let (root, project, env) = fixture();
-        let mut existing = stored(&project, &root, "A", "same", 3, false);
+    async fn repeating_the_current_comment_is_not_a_change() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut existing = stored(&project, &root, "A", "same", 3, false)?;
         existing.version.comment = "rotated".into();
         let mut store = MockStore::new();
         store
@@ -735,56 +742,61 @@ mod tests {
             comment: "rotated".into(),
             ..upsert("A", "same")
         };
-        let planned = plan_batch(&c, &rules, &project, &env, "/", vec![same], vec![])
-            .await
-            .expect("plan");
+        let planned = api(
+            plan_batch(&c, &rules, &project, &env, "/", vec![same], vec![]).await,
+            "plan",
+        )?;
         assert!(planned.batch.is_none());
         let new_comment = SecretUpsert {
             comment: "rotated again".into(),
             ..upsert("A", "same")
         };
-        let planned = plan_batch(&c, &rules, &project, &env, "/", vec![new_comment], vec![])
-            .await
-            .expect("plan");
+        let planned = api(
+            plan_batch(&c, &rules, &project, &env, "/", vec![new_comment], vec![]).await,
+            "plan",
+        )?;
         assert!(planned.batch.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn update_bumps_version_and_encrypts_for_the_new_row() {
-        let (root, project, env) = fixture();
-        let existing = stored(&project, &root, "A", "old", 3, false);
+    async fn update_bumps_version_and_encrypts_for_the_new_row() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let existing = stored(&project, &root, "A", "old", 3, false)?;
         let mut store = MockStore::new();
         store
             .expect_get_secret()
             .returning(move |_, _, _| Ok(Some(existing.clone())));
-        let planned = plan_batch(
-            &ctx(&store, &root),
-            &BuiltinRole::Developer.rules(),
-            &project,
-            &env,
-            "/",
-            vec![upsert("A", "new")],
-            vec![],
-        )
-        .await
-        .expect("plan");
-        let write = planned.batch.expect("batch");
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                &BuiltinRole::Developer.rules(),
+                &project,
+                &env,
+                "/",
+                vec![upsert("A", "new")],
+                vec![],
+            )
+            .await,
+            "plan",
+        )?;
+        let write = planned.batch.context("batch")?;
         let change = &write.changes[0];
         assert_eq!((change.previous_version, change.version.version), (3, 4));
-        let dk = data_key(&root, &project).expect("dk");
+        let dk = api(data_key(&root, &project), "dk")?;
         assert_eq!(
-            decrypt(&dk, "p1", &change.version)
-                .expect("decrypt")
+            api(decrypt(&dk, "p1", &change.version), "decrypt")?
                 .as_deref()
                 .map(String::as_str),
             Some("new")
         );
         assert_eq!(planned.result.updated, vec!["A".to_string()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn viewers_cannot_write_and_nothing_is_stored() {
-        let (root, project, env) = fixture();
+    async fn viewers_cannot_write_and_nothing_is_stored() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
         let mut store = MockStore::new();
         store.expect_get_secret().returning(|_, _, _| Ok(None));
         store.expect_write_secrets().never();
@@ -799,11 +811,12 @@ mod tests {
         )
         .await;
         assert_eq!(denied.err().map(|e| e.status), Some(axum::http::StatusCode::FORBIDDEN));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn conditions_scope_writes_to_paths() {
-        let (root, project, env) = fixture();
+    async fn conditions_scope_writes_to_paths() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
         let mut store = MockStore::new();
         store.expect_get_secret().returning(|_, _, _| Ok(None));
         let rules = vec![Rule {
@@ -826,11 +839,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_duplicate_and_invalid_keys() {
-        let (root, project, env) = fixture();
+    async fn rejects_duplicate_and_invalid_keys() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
         let store = MockStore::new();
         let rules = BuiltinRole::ProjectAdmin.rules();
         let c = ctx(&store, &root);
@@ -857,43 +871,46 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rollback_copies_the_old_value_into_a_new_version() {
-        let (root, project, env) = fixture();
-        let current = stored(&project, &root, "A", "v2", 2, false);
-        let old = stored(&project, &root, "A", "v1", 1, false).version;
+    async fn rollback_copies_the_old_value_into_a_new_version() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let current = stored(&project, &root, "A", "v2", 2, false)?;
+        let old = stored(&project, &root, "A", "v1", 1, false)?.version;
         let mut store = MockStore::new();
         store.expect_get_version().returning(move |_, _| Ok(Some(old.clone())));
-        let planned = plan_rollback(
-            &ctx(&store, &root),
-            &BuiltinRole::Developer.rules(),
-            &project,
-            &env,
-            &current,
-            1,
-        )
-        .await
-        .expect("plan");
-        let change = &planned.batch.expect("batch").changes[0];
+        let planned = api(
+            plan_rollback(
+                &ctx(&store, &root),
+                &BuiltinRole::Developer.rules(),
+                &project,
+                &env,
+                &current,
+                1,
+            )
+            .await,
+            "plan",
+        )?;
+        let change = &planned.batch.context("batch")?.changes[0];
         assert_eq!(change.version.version, 3);
-        let dk = data_key(&root, &project).expect("dk");
+        let dk = api(data_key(&root, &project), "dk")?;
         assert_eq!(
-            decrypt(&dk, "p1", &change.version)
-                .expect("decrypt")
+            api(decrypt(&dk, "p1", &change.version), "decrypt")?
                 .as_deref()
                 .map(String::as_str),
             Some("v1")
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_diff() {
-        let (root, project, _) = fixture();
-        let a = stored(&project, &root, "A", "x", 2, false);
-        let b = stored(&project, &root, "B", "x", 1, false);
-        let c = stored(&project, &root, "C", "x", 4, true);
+    fn snapshot_diff() -> anyhow::Result<()> {
+        let (root, project, _) = fixture()?;
+        let a = stored(&project, &root, "A", "x", 2, false)?;
+        let b = stored(&project, &root, "B", "x", 1, false)?;
+        let c = stored(&project, &root, "C", "x", 4, true)?;
         let snapshot = Snapshot {
             id: "s".into(),
             environment_id: "e1".into(),
@@ -922,20 +939,23 @@ mod tests {
             ]
         );
         assert!(snapshot_changes(&[], &snapshot, "/").is_empty());
+        Ok(())
     }
 
     #[test]
-    fn values_are_hidden_without_read_value() {
-        let (root, project, _) = fixture();
-        let s = stored(&project, &root, "A", "secret", 1, false);
-        let dk = data_key(&root, &project).expect("dk");
+    fn values_are_hidden_without_read_value() -> anyhow::Result<()> {
+        let (root, project, _) = fixture()?;
+        let s = stored(&project, &root, "A", "secret", 1, false)?;
+        let dk = api(data_key(&root, &project), "dk")?;
         let list_only = vec![Rule::allow(Subject::Secrets, &[Action::Read])];
-        let hidden = to_api(Some(&dk), &project, "dev", &s, &list_only, true).expect("api");
+        let hidden = api(to_api(Some(&dk), &project, "dev", &s, &list_only, true), "api")?;
         assert!(hidden.value.is_none() && hidden.value_hidden);
-        let shown = to_api(Some(&dk), &project, "dev", &s, &BuiltinRole::Viewer.rules(), true).expect("api");
+        let viewer = BuiltinRole::Viewer.rules();
+        let shown = api(to_api(Some(&dk), &project, "dev", &s, &viewer, true), "api")?;
         assert_eq!(shown.value.as_deref(), Some("secret"));
-        let not_requested = to_api(Some(&dk), &project, "dev", &s, &BuiltinRole::Viewer.rules(), false).expect("api");
+        let not_requested = api(to_api(Some(&dk), &project, "dev", &s, &viewer, false), "api")?;
         assert!(not_requested.value.is_none() && !not_requested.value_hidden);
         assert_eq!(shown.next_rotation_at, None, "rotation is off by default");
+        Ok(())
     }
 }

@@ -117,42 +117,46 @@ pub fn crd_yaml() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
-    fn defaults_apply_when_fields_are_omitted() {
+    fn defaults_apply_when_fields_are_omitted() -> anyhow::Result<()> {
         let spec: SekretSecretSpec = serde_json::from_value(serde_json::json!({
             "project": "app",
             "environment": "prod",
             "target": {"name": "app-env"},
             "auth": {"identityId": "id", "serviceAccountName": "app"}
         }))
-        .expect("spec");
+        .context("spec")?;
         assert_eq!(spec.path, "/");
         assert!(!spec.recursive);
         assert_eq!(spec.refresh_interval, "5m");
         assert_eq!(spec.target.secret_type, "Opaque");
         assert_eq!(spec.keys, None);
+        Ok(())
     }
 
     #[test]
-    fn crd_yaml_names_the_group_and_kind() {
-        let yaml = crd_yaml().expect("yaml");
+    fn crd_yaml_names_the_group_and_kind() -> anyhow::Result<()> {
+        let yaml = crd_yaml().context("yaml")?;
         assert!(yaml.contains("name: sekretsecrets.sekret.sam-ruff.github.io"));
         assert!(yaml.contains("kind: SekretSecret"));
+        Ok(())
     }
 
     #[test]
-    fn checked_in_chart_crd_matches_generated() {
+    fn checked_in_chart_crd_matches_generated() -> anyhow::Result<()> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../deploy/helm/sekret-operator/crds/sekretsecrets.yaml"
         );
-        let checked_in = std::fs::read_to_string(path).expect("chart CRD");
-        let generated = crd_yaml().expect("yaml");
+        let checked_in = std::fs::read_to_string(path).context("chart CRD")?;
+        let generated = crd_yaml().context("yaml")?;
         assert_eq!(
             checked_in.trim_end(),
             generated.trim_end(),
             "chart CRD is stale; regenerate it from sekret_operator::crd_yaml()"
         );
+        Ok(())
     }
 }

@@ -152,6 +152,7 @@ impl Resolved {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     fn stored(token: &str, expires_at: i64) -> Credentials {
         let mut c = Credentials::default();
@@ -166,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_beat_project_file_and_stored_login_is_used() {
+    fn flags_beat_project_file_and_stored_login_is_used() -> anyhow::Result<()> {
         let file = ProjectFile {
             server: Some("https://sekret.example.com/".into()),
             project: Some("app".into()),
@@ -182,22 +183,24 @@ mod tests {
             &stored("t", 100),
             50,
         )
-        .expect("resolve");
+        .context("resolve")?;
         assert_eq!(resolved.server, "https://sekret.example.com");
         assert_eq!(resolved.environment.as_deref(), Some("prod"));
         assert_eq!(resolved.project.as_deref(), Some("app"));
         assert_eq!(resolved.token.as_deref(), Some("t"));
         assert_eq!(resolved.path, "/");
+        Ok(())
     }
 
     #[test]
-    fn expired_stored_tokens_are_ignored() {
+    fn expired_stored_tokens_are_ignored() -> anyhow::Result<()> {
         let overrides = Overrides {
             server: Some("https://sekret.example.com".into()),
             ..Default::default()
         };
-        let resolved = resolve(overrides, ProjectFile::default(), &stored("t", 10), 50).expect("resolve");
+        let resolved = resolve(overrides, ProjectFile::default(), &stored("t", 10), 50).context("resolve")?;
         assert_eq!(resolved.token, None);
+        Ok(())
     }
 
     #[test]
@@ -206,32 +209,34 @@ mod tests {
     }
 
     #[test]
-    fn project_file_is_found_in_parent_directories() {
-        let dir = tempfile::tempdir().expect("dir");
+    fn project_file_is_found_in_parent_directories() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
         std::fs::write(
             dir.path().join(PROJECT_FILE),
             "server = \"https://s\"\nproject = \"p\"\n",
         )
-        .expect("write");
+        .context("write")?;
         let nested = dir.path().join("a").join("b");
-        std::fs::create_dir_all(&nested).expect("mkdir");
-        let file = load_project_file(&nested).expect("load");
+        std::fs::create_dir_all(&nested).context("mkdir")?;
+        let file = load_project_file(&nested).context("load")?;
         assert_eq!(file.project.as_deref(), Some("p"));
-        std::fs::write(dir.path().join(PROJECT_FILE), "unknown = 1\n").expect("write");
+        std::fs::write(dir.path().join(PROJECT_FILE), "unknown = 1\n").context("write")?;
         assert!(load_project_file(&nested).is_err());
+        Ok(())
     }
 
     #[test]
-    fn credentials_round_trip_with_private_permissions() {
-        let dir = tempfile::tempdir().expect("dir");
+    fn credentials_round_trip_with_private_permissions() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("sekret").join("credentials.toml");
-        save_credentials(&path, &stored("abc", 5)).expect("save");
-        assert_eq!(load_credentials(&path).expect("load"), stored("abc", 5));
+        save_credentials(&path, &stored("abc", 5)).context("save")?;
+        assert_eq!(load_credentials(&path).context("load")?, stored("abc", 5));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            let mode = std::fs::metadata(&path).context("meta")?.permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        Ok(())
     }
 }
