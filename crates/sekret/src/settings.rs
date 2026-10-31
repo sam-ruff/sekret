@@ -98,6 +98,9 @@ pub struct ServerArgs {
     /// When set, only users in one of these groups may sign in.
     #[arg(long, env = "SEKRET_OIDC_REQUIRED_GROUPS", value_delimiter = ',')]
     pub oidc_required_groups: Option<Vec<String>>,
+    /// When set, only ID tokens with one of these subjects (`sub`) may sign in, whatever their groups.
+    #[arg(long, env = "SEKRET_OIDC_ALLOWED_SUBJECTS", value_delimiter = ',')]
+    pub oidc_allowed_subjects: Option<Vec<String>>,
     /// Organisation role every signed-in person receives; empty for none [default: org-member].
     #[arg(long, env = "SEKRET_DEFAULT_ORG_ROLE")]
     pub default_org_role: Option<String>,
@@ -231,6 +234,7 @@ pub struct OidcSection {
     pub group_claims: Option<Vec<String>>,
     pub admin_groups: Option<Vec<String>>,
     pub required_groups: Option<Vec<String>>,
+    pub allowed_subjects: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -534,6 +538,11 @@ fn oidc(args: &ServerArgs, file: OidcSection) -> anyhow::Result<Option<HumanOidc
             .clone()
             .or(file.required_groups)
             .unwrap_or_default(),
+        allowed_subjects: args
+            .oidc_allowed_subjects
+            .clone()
+            .or(file.allowed_subjects)
+            .unwrap_or_default(),
     }))
 }
 
@@ -778,11 +787,12 @@ pub fn resolve_with(
                 ("remember secret file", remember_secret_file.as_deref()),
             ],
         )?;
+        // A subdirectory of the database's directory is usually on the same disk and in the same copies.
         if let Some(db) = &db_file
-            && parent_dir(db) == parent_dir(remember)
+            && parent_dir(remember).starts_with(parent_dir(db))
         {
             warnings.push(format!(
-                "the remember file {} is in the database's directory, so a copy of that directory can unlock the \
+                "the remember file {} is under the database's directory, so a copy of that directory can unlock the \
                  server; keep it on another disk or set seal.remember_secret_file",
                 remember.display()
             ));
@@ -993,6 +1003,44 @@ mod tests {
         let resolved = resolve(&beside, FileConfig::default())?;
         assert!(
             resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("database's directory")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        std::fs::create_dir(dir.path().join("unlock")).context("subdir")?;
+        let nested = args(&[
+            "--public-url",
+            "https://x",
+            "--database-url",
+            &url,
+            "--remember-file",
+            &dir.path().join("unlock").join("remember.key").display().to_string(),
+        ])?;
+        let resolved = resolve(&nested, FileConfig::default())?;
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("database's directory")),
+            "a remember file in a subdirectory of the database's directory still warns: {:?}",
+            resolved.report.warnings
+        );
+        let elsewhere_dir = tempfile::tempdir().context("other dir")?;
+        let elsewhere = args(&[
+            "--public-url",
+            "https://x",
+            "--database-url",
+            &url,
+            "--remember-file",
+            &elsewhere_dir.path().join("remember.key").display().to_string(),
+        ])?;
+        let resolved = resolve(&elsewhere, FileConfig::default())?;
+        assert!(
+            !resolved
                 .report
                 .warnings
                 .iter()
