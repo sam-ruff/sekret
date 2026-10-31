@@ -68,7 +68,7 @@ function EnvironmentDialog({
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="env-slug">Slug</FieldLabel>
+              <FieldLabel htmlFor="env-slug">Short name</FieldLabel>
               <Input
                 id="env-slug"
                 value={slug}

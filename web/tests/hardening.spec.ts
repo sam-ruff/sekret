@@ -167,6 +167,37 @@ test.describe("signing out", () => {
   });
 });
 
+test.describe("closing the tab with a copied secret", () => {
+  test("asks first and starts clearing the clipboard", async ({ page }) => {
+    await controlledClipboard(page);
+    await openProject(page);
+    await secretRow(page, "DATABASE_URL").getByTestId("secret-copy").click();
+    await expectToast(page, "Copied to clipboard");
+    expect(await clipboardText(page)).toBe(DEV_DATABASE_URL);
+    const asked = new Promise<string>((resolve) => {
+      page.once("dialog", (dialog) => {
+        resolve(dialog.type());
+        void dialog.dismiss();
+      });
+    });
+    await page.close({ runBeforeUnload: true });
+    expect(await asked).toBe("beforeunload");
+    // The person stayed, and the clear started anyway.
+    await expect.poll(() => clipboardText(page)).toBe("");
+  });
+
+  test("does not ask once nothing copied is outstanding", async ({ page }) => {
+    let asked = false;
+    page.on("dialog", (dialog) => {
+      asked = true;
+      void dialog.dismiss();
+    });
+    await openProject(page);
+    await page.close({ runBeforeUnload: true });
+    expect(asked).toBe(false);
+  });
+});
+
 test.describe("revealed values", () => {
   test("hide themselves after three idle minutes", async ({ page }) => {
     await page.clock.install();
@@ -179,6 +210,37 @@ test.describe("revealed values", () => {
     await page.clock.fastForward(11_000);
     await expect(row.getByTestId("secret-value")).not.toContainText(DEV_DATABASE_URL);
     await expect(page.locator("body")).not.toContainText(DEV_DATABASE_URL);
+  });
+
+  test("in the edit form close after three idle minutes, taking the value with them", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await secretRow(page, "DATABASE_URL").getByTestId("secret-actions").click();
+    await page.getByTestId("secret-edit").click();
+    const editor = page.getByTestId("edit-secret-DATABASE_URL");
+    await expect(editor.getByTestId("secret-value-input")).toHaveValue(DEV_DATABASE_URL);
+    await page.clock.fastForward(170_000);
+    await expect(editor).toBeVisible();
+    await page.clock.fastForward(11_000);
+    await expect(editor).toHaveCount(0);
+    await expectToast(page, "Closed the editor for DATABASE_URL after three idle minutes");
+    expect(await page.evaluate(() => document.body.innerHTML)).not.toContain(DEV_DATABASE_URL);
+  });
+
+  test("in the edit form go when the session ends, with nothing else revealed", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await secretRow(page, "DATABASE_URL").getByTestId("secret-actions").click();
+    await page.getByTestId("secret-edit").click();
+    await expect(page.getByTestId("edit-secret-DATABASE_URL").getByTestId("secret-value-input")).toHaveValue(DEV_DATABASE_URL);
+    await page.evaluate(async () => {
+      const path = "/src/api/mock/server.ts";
+      const mock = (await import(/* @vite-ignore */ path)) as { mockFetch: (r: Request) => Promise<Response> };
+      await mock.mockFetch(new Request(`${location.origin}/auth/logout`, { method: "POST", headers: { "x-sekret-csrf": "1" } }));
+    });
+    await page.clock.fastForward(16_000);
+    await expect(page).toHaveURL(/\/login\?return_to=/);
+    expect(await page.evaluate(() => document.body.innerHTML)).not.toContain(DEV_DATABASE_URL);
   });
 
   test("go when the session ends while they are shown", async ({ page }) => {

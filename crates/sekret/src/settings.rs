@@ -48,6 +48,8 @@ pub struct DatabaseChoice {
     pub origin: Origin,
     /// `database.url` or `database.url_file`, whichever was used.
     pub key: &'static str,
+    /// The URL file the URL was read from, when it came from one.
+    pub file: Option<PathBuf>,
     /// Sources that were set but lost.
     pub ignored: Vec<String>,
 }
@@ -94,6 +96,7 @@ pub fn choose_database(
             url: DEFAULT_DATABASE_URL.into(),
             origin: Origin::Default,
             key: "database.url",
+            file: None,
             ignored: Vec::new(),
         });
     };
@@ -103,14 +106,14 @@ pub fn choose_database(
             origin.as_str()
         );
     }
-    let url = match winner {
-        Candidate::Url(url) => url.to_string(),
+    let (url, file) = match winner {
+        Candidate::Url(url) => (url.to_string(), None),
         Candidate::File(path) => {
             let url = read_secret_file(path)?;
             if url.is_empty() {
                 bail!("the database URL file {} is empty", path.display());
             }
-            url
+            (url, Some(path.to_path_buf()))
         }
     };
     let ignored = candidates
@@ -128,6 +131,7 @@ pub fn choose_database(
         url,
         origin: *origin,
         key,
+        file,
         ignored,
     })
 }
@@ -808,15 +812,86 @@ fn check_distinct(written: &[(&str, Option<&Path>)], read: &[(&str, Option<&Path
     Ok(())
 }
 
+/// Owner, group and mode of a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirFacts {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// Why users other than `uid` (with primary group `gid`) could replace a file in `dir`. A sticky
+/// directory, such as a Kubernetes secret mount, only lets each owner replace their own entries.
+pub fn replaceable_in(dir: DirFacts, uid: u32, gid: u32) -> Option<&'static str> {
+    if dir.uid != uid && dir.uid != 0 {
+        return Some("its directory belongs to another user, who can replace it");
+    }
+    if dir.mode & 0o1000 != 0 {
+        return None;
+    }
+    if dir.mode & 0o002 != 0 {
+        return Some("its directory is writable by every user, so anyone can replace it");
+    }
+    // With user private groups the group holds only this user.
+    let private_group = dir.gid == gid && gid == uid;
+    if dir.mode & 0o020 != 0 && !private_group {
+        return Some("its directory is writable by its group, whose members can replace it");
+    }
+    None
+}
+
+#[cfg(unix)]
+fn directory_exposure(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = |p: &Path| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    };
+    let mut dirs = vec![parent(path)];
+    if let Ok(target) = std::fs::canonicalize(path) {
+        dirs.push(parent(&target));
+    }
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    dirs.iter().find_map(|dir| {
+        let meta = std::fs::metadata(dir).ok()?;
+        let facts = DirFacts {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.mode(),
+        };
+        replaceable_in(facts, uid, gid).map(|why| format!("{} is in {}, and {why}", path.display(), dir.display()))
+    })
+}
+
+#[cfg(not(unix))]
+fn directory_exposure(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Why a file holding a key, passphrase or credential is exposed: others can read it, another
+/// user owns it, or its directory lets others replace it.
+pub fn secret_file_exposure(path: &Path) -> Option<String> {
+    sekret_server::files::exposure(path).or_else(|| directory_exposure(path))
+}
+
 /// Warnings for key, passphrase and secret files that other users can read or replace.
 fn exposure_warnings(files: &[(&str, Option<&Path>)]) -> Vec<String> {
     files
         .iter()
         .filter_map(|(name, path)| {
-            path.and_then(sekret_server::files::exposure)
+            path.and_then(secret_file_exposure)
                 .map(|why| format!("the {name}: {why}"))
         })
         .collect()
+}
+
+/// Whether a database URL carries a password, in its user info or as a `password` parameter.
+fn has_password(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|url| {
+        url.password().is_some() || url.query_pairs().any(|(key, _)| key.eq_ignore_ascii_case("password"))
+    })
 }
 
 /// The remember file is meant to live apart from the database, so that a copy of the
@@ -1034,6 +1109,20 @@ pub fn resolve_with(
     let root_key_file = args.store.root_key_file.clone().or(seal.root_key_file.clone());
     let unlock = args.unlock.or(seal.unlock);
     let mode = args.seal_mode.or(seal.mode);
+    if mode == Some(SealMode::Passphrase)
+        && let Some(key) = &root_key_file
+    {
+        bail!(
+            "seal.mode is passphrase but seal.root_key_file is set to {}, which would let the server unlock \
+             itself without the passphrase; remove the root key file setting, leave seal.mode unset to use the \
+             key file as an emergency way in, or switch modes with `sekret admin set-seal-mode`",
+            key.display()
+        );
+    }
+    let client_auth_without_ca = args.tls_client_auth.or(tls_file.client_auth).is_some()
+        && args.tls_client_ca_file.is_none()
+        && tls_file.client_ca_file.is_none();
+    let config_has_password = database.url.as_deref().is_some_and(has_password);
     let web_setup = args.web_setup.or(setup.web);
     let auto_init = args.auto_init.or(setup.auto_init);
     let admin_token_file = args.setup_admin_token_file.clone().or(setup.admin_token_file.clone());
@@ -1380,6 +1469,13 @@ pub fn resolve_with(
     if let Some(warning) = default_role_warning(&default_org_role) {
         warnings.push(warning);
     }
+    if client_auth_without_ca {
+        warnings.push(
+            "tls.client_auth is set but tls.client_ca_file is not, so client certificates are not checked; set \
+             tls.client_ca_file to turn on mutual TLS"
+                .into(),
+        );
+    }
     let db_file = sqlite_path(&database_url);
     let db_parts = db_file
         .as_deref()
@@ -1424,6 +1520,14 @@ pub fn resolve_with(
         ("setup passphrase file", setup_passphrase_file.as_deref()),
         ("OIDC client secret file", oidc_secret_file.as_deref()),
         ("TLS key file", tls_key_file.as_deref()),
+        (
+            "database URL file",
+            database_choice.file.as_deref().filter(|_| has_password(&database_url)),
+        ),
+        (
+            "configuration file, which holds a database password,",
+            args.store.config.as_deref().filter(|_| config_has_password),
+        ),
     ]));
     let epoch_files =
         sekret_server::config::epoch_files(&database_url, remember_file.as_deref(), root_key_file.as_deref());
@@ -1478,6 +1582,13 @@ fn server_warnings(config: &ServerConfig, warnings: &mut Vec<String>) {
     if config.public_url.starts_with("http://") && !config.listen.ip().is_loopback() {
         warnings.push(format!(
             "the public URL {} is plain http but the server listens on {}; cookies and tokens travel unencrypted",
+            config.public_url, config.listen
+        ));
+    }
+    if config.public_url.starts_with("https://") && config.tls.is_none() && !config.listen.ip().is_loopback() {
+        warnings.push(format!(
+            "the public URL {} is https but the server itself speaks plain http on {}, so anyone who can reach that \
+             address skips the proxy's TLS; listen on 127.0.0.1 or the proxy's interface, or set tls",
             config.public_url, config.listen
         ));
     }
@@ -1760,7 +1871,7 @@ mod tests {
     fn the_remember_secret_comes_from_a_file_or_the_environment() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("secret");
-        std::fs::write(&path, format!("{}\n", "s".repeat(32))).context("write")?;
+        std::fs::write(&path, "xX0cbCqZ2IpCHTTEMxOxIhogaYMr4nufQk3TEU8lrgY=\n").context("write")?;
         let flags = args(&[
             "--public-url",
             "https://x",
@@ -1770,7 +1881,7 @@ mod tests {
         let resolved = resolve(&flags, FileConfig::default())?;
         assert!(resolved.config.seal.remember_secret.is_some());
         let env = EnvSecrets {
-            remember_secret: Some(Zeroizing::new("e".repeat(40))),
+            remember_secret: Some(Zeroizing::new("jMvJGjs1rlsZhRRrc5VnYCIQg/Hbw1zYRqMi5us1Xmw=".into())),
             ..EnvSecrets::default()
         };
         let resolved = resolve_with(
@@ -2144,6 +2255,197 @@ mod tests {
                 .locate(&Sources::none())?
                 .epoch_files()
                 .contains(&PathBuf::from("/flag.epoch"))
+        );
+        Ok(())
+    }
+
+    fn warnings_of(flags: &[&str], yaml: &str) -> anyhow::Result<String> {
+        Ok(resolve(&args(flags)?, parse(yaml)?)?.report.warnings.join("\n"))
+    }
+
+    #[test]
+    fn a_root_key_file_with_passphrase_mode_is_refused() -> anyhow::Result<()> {
+        let refusals = [
+            (vec!["--seal-mode", "passphrase", "--root-key-file", "/k"], ""),
+            (vec!["--seal-mode", "passphrase"], "seal:\n  root_key_file: /k\n"),
+            (vec!["--root-key-file", "/k"], "seal:\n  mode: passphrase\n"),
+            (vec![], "seal:\n  mode: passphrase\n  root_key_file: /k\n"),
+        ];
+        for (flags, yaml) in refusals {
+            let mut all = vec!["--public-url", "https://x"];
+            all.extend(flags.iter().copied());
+            let error = resolve(&args(&all)?, parse(yaml)?)
+                .err()
+                .with_context(|| format!("{flags:?} {yaml:?} should be refused"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("seal.mode is passphrase but seal.root_key_file is set"),
+                "{error}"
+            );
+        }
+        // The flag beats the file, so key-file mode or no mode at all keeps the key file usable.
+        let flags = args(&["--public-url", "https://x", "--seal-mode", "key-file"])?;
+        let resolved = resolve(&flags, parse("seal:\n  mode: passphrase\n  root_key_file: /k\n")?)?;
+        assert_eq!(resolved.config.seal.mode, Some(SealMode::KeyFile));
+        let resolved = resolve(
+            &args(&["--public-url", "https://x", "--root-key-file", "/k"])?,
+            FileConfig::default(),
+        )?;
+        assert_eq!(resolved.config.seal.mode, None);
+        Ok(())
+    }
+
+    #[test]
+    fn client_auth_without_a_client_ca_is_warned_about() -> anyhow::Result<()> {
+        const WARNING: &str = "tls.client_auth is set but tls.client_ca_file is not";
+        let base = ["--public-url", "https://x", "--listen", "127.0.0.1:8080"];
+        let flag = [&base[..], &["--tls-client-auth", "required"]].concat();
+        assert!(warnings_of(&flag, "")?.contains(WARNING));
+        assert!(warnings_of(&base, "tls:\n  client_auth: optional\n")?.contains(WARNING));
+        assert!(!warnings_of(&base, "")?.contains(WARNING));
+        let dir = tempfile::tempdir().context("dir")?;
+        let ca = dir.path().join("ca.pem");
+        let (cert, key) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+        for path in [&ca, &cert, &key] {
+            std::fs::write(path, "pem").context("write")?;
+        }
+        let with_ca = format!(
+            "tls:\n  client_auth: required\n  client_ca_file: {}\n  cert_file: {}\n  key_file: {}\n",
+            ca.display(),
+            cert.display(),
+            key.display()
+        );
+        assert!(!warnings_of(&base, &with_ca)?.contains(WARNING));
+        Ok(())
+    }
+
+    #[test]
+    fn plain_http_on_all_interfaces_behind_an_https_url_is_warned_about() -> anyhow::Result<()> {
+        const WARNING: &str = "speaks plain http on";
+        assert!(warnings_of(&["--public-url", "https://x", "--listen", "0.0.0.0:8080"], "")?.contains(WARNING));
+        assert!(
+            warnings_of(&["--public-url", "https://x"], "")?.contains(WARNING),
+            "the default listen"
+        );
+        assert!(warnings_of(&["--public-url", "https://x"], "server:\n  listen: \"[::]:8080\"\n")?.contains(WARNING));
+        assert!(!warnings_of(&["--public-url", "https://x", "--listen", "127.0.0.1:8080"], "")?.contains(WARNING));
+        assert!(
+            !warnings_of(
+                &["--public-url", "https://x", "--listen", "127.0.0.1:8080"],
+                "server:\n  listen: 0.0.0.0:1\n"
+            )?
+            .contains(WARNING),
+            "the flag wins"
+        );
+        let plain = warnings_of(&["--public-url", "http://x", "--listen", "0.0.0.0:8080"], "")?;
+        assert!(!plain.contains(WARNING), "an http URL has its own warning: {plain}");
+        Ok(())
+    }
+
+    #[test]
+    fn database_passwords_are_spotted_in_urls() {
+        assert!(has_password("postgres://sekret:hunter2@db/sekret"));
+        assert!(has_password("postgresql://db/sekret?user=s&password=hunter2"));
+        assert!(!has_password("postgres://sekret@db/sekret"));
+        assert!(!has_password("sqlite://sekret.db?mode=rwc"));
+        assert!(!has_password("not a url"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_url_files_and_configs_holding_passwords_get_permission_checks() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let open = std::fs::Permissions::from_mode(0o644);
+        let url_file = dir.path().join("db-url");
+        std::fs::write(&url_file, "postgres://sekret:hunter2@db/sekret\n").context("write")?;
+        std::fs::set_permissions(&url_file, open.clone()).context("chmod")?;
+        let config = dir.path().join("sekret.yaml");
+        std::fs::write(&config, "").context("write")?;
+        std::fs::set_permissions(&config, open.clone()).context("chmod")?;
+        let mut flags = args(&["--public-url", "https://x"])?;
+        flags.store.config = Some(config.clone());
+        let file = parse(&format!("database:\n  url_file: {}\n", url_file.display()))?;
+        let warnings = resolve(&flags, file)?.report.warnings.join("\n");
+        assert!(warnings.contains("the database URL file"), "{warnings}");
+        assert!(
+            !warnings.contains("configuration file"),
+            "no password in the file itself: {warnings}"
+        );
+
+        let file = parse("database:\n  url: postgres://sekret:hunter2@db/sekret\n")?;
+        let warnings = resolve(&flags, file)?.report.warnings.join("\n");
+        assert!(warnings.contains("the configuration file"), "{warnings}");
+        assert!(!warnings.contains("hunter2"), "{warnings}");
+
+        std::fs::write(&url_file, "sqlite://x.db\n").context("write")?;
+        let file = parse(&format!("database:\n  url_file: {}\n", url_file.display()))?;
+        let warnings = resolve(&flags, file)?.report.warnings.join("\n");
+        assert!(
+            !warnings.contains("database URL file"),
+            "no password to protect: {warnings}"
+        );
+
+        std::fs::write(&url_file, "postgres://sekret:hunter2@db/sekret\n").context("write")?;
+        std::fs::set_permissions(&url_file, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        let file = parse(&format!("database:\n  url_file: {}\n", url_file.display()))?;
+        let warnings = resolve(&flags, file)?.report.warnings.join("\n");
+        assert!(!warnings.contains("database URL file"), "{warnings}");
+        Ok(())
+    }
+
+    #[test]
+    fn directories_others_can_write_to_let_them_replace_files() {
+        let dir = |uid, gid, mode| DirFacts { uid, gid, mode };
+        assert_eq!(replaceable_in(dir(1000, 1000, 0o40700), 1000, 1000), None);
+        assert_eq!(replaceable_in(dir(0, 0, 0o40755), 1000, 1000), None, "root's /etc");
+        assert_eq!(
+            replaceable_in(dir(1000, 1000, 0o40775), 1000, 1000),
+            None,
+            "a user private group"
+        );
+        assert_eq!(
+            replaceable_in(dir(0, 0, 0o41777), 1000, 1000),
+            None,
+            "sticky, like a Kubernetes secret mount"
+        );
+        assert!(
+            replaceable_in(dir(1000, 50, 0o40775), 1000, 1000).is_some(),
+            "a shared group"
+        );
+        assert!(
+            replaceable_in(dir(0, 50, 0o40770), 1000, 50).is_some(),
+            "my shared group"
+        );
+        assert!(replaceable_in(dir(1000, 1000, 0o40777), 1000, 1000).is_some());
+        assert!(
+            replaceable_in(dir(2000, 2000, 0o41700), 1000, 1000).is_some(),
+            "another user's directory, sticky or not"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_in_open_directories_are_exposed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).context("mkdir")?;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let file = shared.join("pass");
+        std::fs::write(&file, "x").context("write")?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        let why = secret_file_exposure(&file).context("exposed")?;
+        assert!(why.contains("writable by every user"), "{why}");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        assert_eq!(secret_file_exposure(&file), None);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).context("symlink")?;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        assert!(
+            secret_file_exposure(&link).is_some(),
+            "the target's directory counts too"
         );
         Ok(())
     }

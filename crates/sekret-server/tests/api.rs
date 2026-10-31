@@ -780,8 +780,9 @@ async fn credentials_and_folders_are_scoped(db: String) -> anyhow::Result<()> {
     h.create_project("app").await?;
     let folders = format!("{SECRETS}/dev/folders");
 
+    // `/team/*/**` covers the folders inside `/team` but not `/team` itself.
     let role = json!({"name": "Team folders", "rules": [
-        {"effect": "allow", "subject": "folders", "actions": ["read", "create", "delete"], "conditions": {"paths": ["/team/**"]}},
+        {"effect": "allow", "subject": "folders", "actions": ["read", "create", "delete"], "conditions": {"paths": ["/team/*/**"]}},
         {"effect": "deny", "subject": "folders", "actions": ["delete"], "conditions": {"paths": ["/team/keep"]}}
     ]});
     h.put("/api/v1/projects/app/roles/team-folders", &h.admin, role).await?;

@@ -8,6 +8,7 @@ import {
   MAX_FAILED_UNSEALS,
   MOCK_BACKOFF_SECONDS,
   MOCK_CLI_ADDRESS,
+  MOCK_FOREIGN_KEY_PASSPHRASE,
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_PASSPHRASE,
   MOCK_SETUP_CODE,
@@ -109,6 +110,12 @@ describe("mock unsealing", () => {
     expect(failure(() => b.unseal(MOCK_KDF_BUSY_PASSPHRASE))).toMatchObject({ status: 429, code: "kdf_busy" });
   });
 
+  it("answers root_key_not_recognised for the restored-database stand-in and stays locked", () => {
+    const { b } = backend(mockSys("sealed"));
+    expect(failure(() => b.unseal(MOCK_FOREIGN_KEY_PASSPHRASE))).toMatchObject({ status: 409, code: "root_key_not_recognised" });
+    expect(b.sysStatus().state).toBe("sealed");
+  });
+
   it("gates other routes until unlocked", () => {
     const { b } = backend(mockSys("sealed"));
     expect(failure(() => b.requireUnsealed()).code).toBe("sealed");
@@ -203,6 +210,14 @@ describe("parseControls", () => {
 });
 
 describe("mock public status", () => {
+  it("reports a remember file before setup and to admins, and never for a key-file server", () => {
+    expect(statusOf(mockSys("uninitialised")).remember_available).toBe(true);
+    expect(statusOf({ ...mockSys("uninitialised"), rememberFile: false }).remember_available).toBe(false);
+    expect(statusOf({ ...mockSys(), mode: "key-file" }).remember_available).toBe(false);
+    expect(publicStatusOf(mockSys("uninitialised")).remember_available).toBe(true);
+    expect(parseControls("?mock-remember-file=false&mock-oidc=false")).toMatchObject({ rememberFile: false, oidc: false });
+  });
+
   it("shows anyone only the state, web setup and version once set up", () => {
     const sys = { ...mockSys(), unlockPolicy: "remember" as const, remembered: true };
     expect(publicStatusOf(sys)).toEqual({
@@ -210,12 +225,18 @@ describe("mock public status", () => {
       seal_mode: null,
       unlock_policy: null,
       configured: false,
+      remember_available: false,
       remembered: false,
       unsealed_by: null,
       web_setup: true,
       version: MOCK_VERSION,
     });
-    expect(statusOf(sys)).toMatchObject({ remembered: true, unsealed_by: "passphrase", unlock_policy: "remember" });
+    expect(statusOf(sys)).toMatchObject({
+      remembered: true,
+      unsealed_by: "passphrase",
+      unlock_policy: "remember",
+      remember_available: true,
+    });
   });
 
   it("keeps what configuration decided before setup, for the wizard", () => {

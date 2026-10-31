@@ -3964,11 +3964,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "mockall",
  "reqwest",
  "rustls",
  "sekret-api",
+ "sekret-core",
  "serde",
  "serde_json",
  "thiserror",
@@ -4035,6 +4039,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "zeroize",
 ]
 

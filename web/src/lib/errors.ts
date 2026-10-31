@@ -8,8 +8,14 @@ const FRIENDLY: Record<string, string> = {
   reauthentication_required: "Sign in again to approve this.",
 };
 
+/** Browsers' wording when a request or a lazily loaded part of the page could not be fetched. */
+const UNREACHABLE = [/failed to fetch/i, /networkerror/i, /load failed/i, /dynamically imported module/i, /importing a module script failed/i];
+
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return apiErrorMessage(error);
+  if (error instanceof Error && UNREACHABLE.some((pattern) => pattern.test(error.message))) {
+    return "Could not reach the server. Reload the page and try again.";
+  }
   if (error instanceof Error && error.message) return error.message;
   return "Something went wrong.";
 }

@@ -5819,6 +5819,10 @@
             "type": "boolean",
             "description": "The unlock policy comes from server configuration and cannot be changed through the API."
           },
+          "remember_available": {
+            "type": "boolean",
+            "description": "The configuration sets `seal.remember_file`, so the remember policy can be chosen. Shown\nbefore setup and to organisation admins."
+          },
           "remembered": {
             "type": "boolean",
             "description": "A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not\nclear it; forget the unlock for that."

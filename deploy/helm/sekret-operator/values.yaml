@@ -10,6 +10,9 @@ imagePullSecrets: []
 sekret:
   # Base URL of the sekret server, for example https://sekret.example.com
   serverUrl: ""
+  # Allow a plain http:// server that is not on loopback. Service account tokens and secret
+  # values then cross the network unencrypted.
+  allowInsecureHttp: false
   # Optional ConfigMap holding a PEM CA bundle for the sekret server.
   caBundle:
     configMapName: ""
@@ -19,9 +22,21 @@ sekret:
     secretName: ""
   requestTimeoutSeconds: 30
 
-# Restrict the operator to one namespace; empty watches every namespace.
-# When set, RBAC is granted with a Role in that namespace instead of a ClusterRole.
-watchNamespace: ""
+# Namespaces to watch. Each gets its own Role and RoleBinding. Empty means the release namespace.
+watchNamespaces: []
+
+# Watch every namespace with a ClusterRole instead. This lets the operator mint a token for any
+# service account in the cluster and read every Secret, which is close to cluster-admin.
+clusterWide: false
+
+# When set, the operator may only read and mint tokens for these service accounts, in every
+# watched namespace. Empty allows any service account there that has opted in.
+tokenServiceAccounts: []
+
+# A ValidatingAdmissionPolicy that only lets the operator request tokens with the `sekret`
+# audience, for at most 600 seconds, outside kube-system. Needs Kubernetes 1.30 or later.
+tokenPolicy:
+  enabled: true
 
 concurrency: 4
 

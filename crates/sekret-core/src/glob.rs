@@ -2,13 +2,33 @@
 ///
 /// `*` matches any run of characters except `separator` (or anything when there is none),
 /// `**` matches anything including the separator, and `?` matches one non-separator character.
+/// A trailing `/**` also matches the folder itself, so `/a/**` covers `/a`.
 /// Runs in O(pattern x text) time and O(text) memory, with no recursion.
 pub fn glob_match(pattern: &str, text: &str, separator: Option<char>) -> bool {
     let text: Vec<char> = text.chars().collect();
+    if let Some(folder) = trailing_segments_parent(pattern, separator)
+        && matches(folder, &text, separator)
+    {
+        return true;
+    }
+    matches(pattern, &text, separator)
+}
+
+/// The pattern without its trailing `<separator>**`, when it ends that way.
+fn trailing_segments_parent(pattern: &str, separator: Option<char>) -> Option<&str> {
+    let separator = separator?;
+    let stars = pattern.len() - pattern.trim_end_matches('*').len();
+    if stars < 2 {
+        return None;
+    }
+    pattern[..pattern.len() - stars].strip_suffix(separator)
+}
+
+fn matches(pattern: &str, text: &[char], separator: Option<char>) -> bool {
     let mut reach = vec![false; text.len() + 1];
     reach[0] = true;
     for token in tokens(pattern, separator) {
-        reach = advance(&reach, &text, token, separator);
+        reach = advance(&reach, text, token, separator);
         if !reach.iter().any(|r| *r) {
             return false;
         }
@@ -128,6 +148,38 @@ mod tests {
         assert!(!path("/app/**/creds", "/app/a/b/notcreds"));
         assert!(!path("/app/**", "/other/db"));
         assert!(path("/app**", "/app/x/y"));
+    }
+
+    #[test]
+    fn trailing_double_star_covers_the_folder_itself() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("/a/**", "/a", true),
+            ("/a/**", "/a/", true),
+            ("/a/**", "/a/b", true),
+            ("/a/**", "/a/b/c", true),
+            ("/a/**", "/ab", false),
+            ("/a/**", "/", false),
+            ("/a/**", "/b/a", false),
+            ("/a/***", "/a", true),
+            ("/a/b/**", "/a/b", true),
+            ("/a/b/**", "/a", false),
+            ("/a/*/**", "/a/x", true),
+            ("/a/*/**", "/a", false),
+            ("/**", "/", true),
+            ("/**", "/x", true),
+            ("/a**", "/a", true),
+            ("/a**", "/ab", true),
+            ("/a/*", "/a", false),
+        ];
+        for (pattern, text, expected) in cases {
+            assert_eq!(path(pattern, text), *expected, "{pattern} against {text}");
+        }
+    }
+
+    #[test]
+    fn trailing_double_star_without_separator_is_unchanged() {
+        assert!(!glob_match("a/**", "a", None));
+        assert!(glob_match("a/**", "a/b", None));
     }
 
     #[test]

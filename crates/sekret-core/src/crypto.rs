@@ -30,11 +30,11 @@ pub struct RootKey([u8; KEY_LEN]);
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DataKey([u8; KEY_LEN]);
 
-fn key_from_material(material: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
+/// Decodes key material straight into `out`, so no stray copy of the key is left on the stack.
+pub(crate) fn fill_from_material(material: &[u8], out: &mut [u8; KEY_LEN]) -> Result<(), CryptoError> {
     if material.len() == KEY_LEN {
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(material);
-        return Ok(key);
+        out.copy_from_slice(material);
+        return Ok(());
     }
     let text = std::str::from_utf8(material).map_err(|_| CryptoError::InvalidKey)?;
     let text = text.trim();
@@ -47,9 +47,8 @@ fn key_from_material(material: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
     if decoded.len() != KEY_LEN {
         return Err(CryptoError::InvalidKey);
     }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&decoded);
-    Ok(key)
+    out.copy_from_slice(&decoded);
+    Ok(())
 }
 
 /// Base64 of a 32-byte key plus `\n`, in a buffer sized up front so no copy is ever left behind
@@ -67,13 +66,15 @@ const KEY_TEXT_LEN: usize = 45;
 impl RootKey {
     /// Accepts 32 raw bytes, or base64 / hex text with surrounding whitespace.
     pub fn parse(material: &[u8]) -> Result<Self, CryptoError> {
-        key_from_material(material).map(Self)
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_from_material(material, &mut key.0)?;
+        Ok(key)
     }
 
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut key = [0u8; KEY_LEN];
-        fill_random(&mut key)?;
-        Ok(Self(key))
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_random(&mut key.0)?;
+        Ok(key)
     }
 
     /// Short identifier used to detect a server started with the wrong root key.
@@ -97,16 +98,22 @@ impl RootKey {
         &self.0
     }
 
-    pub(crate) fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-        Self(bytes)
+    /// Copies exactly [`KEY_LEN`] bytes into a new key, filled in place.
+    pub(crate) fn from_slice(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.len() != KEY_LEN {
+            return Err(CryptoError::Malformed);
+        }
+        let mut key = Self([0u8; KEY_LEN]);
+        key.0.copy_from_slice(bytes);
+        Ok(key)
     }
 }
 
 impl DataKey {
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut key = [0u8; KEY_LEN];
-        fill_random(&mut key)?;
-        Ok(Self(key))
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_random(&mut key.0)?;
+        Ok(key)
     }
 }
 
@@ -158,9 +165,9 @@ pub fn unwrap_data_key(root: &RootKey, wrapped: &[u8], project_id: &str) -> Resu
     if plain.len() != KEY_LEN {
         return Err(CryptoError::Malformed);
     }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&plain);
-    Ok(DataKey(key))
+    let mut key = DataKey([0u8; KEY_LEN]);
+    key.0.copy_from_slice(&plain);
+    Ok(key)
 }
 
 /// Binds a ciphertext to the exact row it was written for.

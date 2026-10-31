@@ -1,42 +1,57 @@
-{{- $namespaced := ne .Values.watchNamespace "" }}
-{{- $kind := ternary "Role" "ClusterRole" $namespaced }}
+{{- $namespaces := include "sekret-operator.watchNamespaces" . | fromJsonArray }}
+{{- $fullname := include "sekret-operator.fullname" . }}
+{{- $serviceAccount := include "sekret-operator.serviceAccountName" . }}
+{{- if .Values.clusterWide }}
 apiVersion: rbac.authorization.k8s.io/v1
-kind: {{ $kind }}
+kind: ClusterRole
 metadata:
-  name: {{ include "sekret-operator.fullname" . }}
-  {{- if $namespaced }}
-  namespace: {{ .Values.watchNamespace }}
-  {{- end }}
+  name: {{ $fullname }}
   labels:
     {{- include "sekret-operator.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
-  - apiGroups: ["sekret.sam-ruff.github.io"]
-    resources: ["sekretsecrets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["sekret.sam-ruff.github.io"]
-    resources: ["sekretsecrets/status"]
-    verbs: ["patch", "update"]
-  - apiGroups: [""]
-    resources: ["serviceaccounts/token"]
-    verbs: ["create"]
+{{ include "sekret-operator.rules" . }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: {{ $kind }}Binding
+kind: ClusterRoleBinding
 metadata:
-  name: {{ include "sekret-operator.fullname" . }}
-  {{- if $namespaced }}
-  namespace: {{ .Values.watchNamespace }}
-  {{- end }}
+  name: {{ $fullname }}
   labels:
     {{- include "sekret-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: {{ $kind }}
-  name: {{ include "sekret-operator.fullname" . }}
+  kind: ClusterRole
+  name: {{ $fullname }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "sekret-operator.serviceAccountName" . }}
+    name: {{ $serviceAccount }}
     namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $index, $namespace := $namespaces }}
+{{- if $index }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "sekret-operator.labels" $ | nindent 4 }}
+{{ include "sekret-operator.rules" $ }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "sekret-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}

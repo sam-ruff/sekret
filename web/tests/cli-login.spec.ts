@@ -112,7 +112,9 @@ test("sends the browser to sign in again when the server asks, then asks for the
 test("cancelling refuses the request on the server", async ({ page }) => {
   await page.goto(`/cli-login?code=${SAME}`);
   await typeCode(page, SAME);
+  await expect(page.getByTestId("cli-cancel")).toHaveText("Deny");
   await page.getByTestId("cli-cancel").click();
+  await expect(page.getByTestId("cli-cancelled")).toContainText("Denied");
   await expect(page.getByTestId("cli-cancelled")).toContainText("the terminal that asked is told the sign-in was refused");
   await expect(page.getByTestId("cli-approve")).toHaveCount(0);
   expect(await requests(page)).toContain("POST /api/v1/auth/cli/deny");
@@ -125,8 +127,10 @@ test("a request that has ended says only that, with nothing to type or approve",
   await page.goto("/cli-login?code=XXXX-0000");
   const ended = page.getByTestId("cli-unknown");
   await expect(ended).toHaveText(
-    "This sign-in request has endedIt expired or was already approved. Run sekret login again to get a new link.",
+    "This sign-in request has endedIt expired, was already used or refused, or the link is wrong. Run sekret login again to get a new link.",
   );
+  await page.getByTestId("cli-go-home").click();
+  await expect(page).not.toHaveURL(/cli-login/);
   await expect(page.getByTestId("cli-code-input")).toHaveCount(0);
   await expect(page.getByTestId("cli-approve")).toHaveCount(0);
   await expect(page.getByTestId("cli-warning")).toHaveCount(0);

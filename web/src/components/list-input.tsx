@@ -73,7 +73,7 @@ export function ListInput({
                 type="button"
                 onClick={() => onChange(value.filter((v) => v !== entry))}
                 aria-label={`Remove ${entry}`}
-                className="rounded-sm opacity-60 hover:opacity-100"
+                className="relative rounded-sm opacity-60 after:absolute after:-inset-1.5 after:content-[''] hover:opacity-100"
               >
                 <X className="size-3" />
               </button>

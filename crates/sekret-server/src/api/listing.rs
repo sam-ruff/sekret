@@ -57,11 +57,18 @@ fn empty_to_none(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-pub async fn audit_page(state: &AppState, project_id: Option<String>, params: AuditParams) -> ApiResult<AuditPage> {
+/// `search_actors_only` keeps `q` off environments, folders and keys the reader may not see.
+pub async fn audit_page(
+    state: &AppState,
+    project_id: Option<String>,
+    params: AuditParams,
+    search_actors_only: bool,
+) -> ApiResult<AuditPage> {
     let limit = params.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     let query = AuditQuery {
         project_id,
         search: empty_to_none(params.q),
+        search_actors_only,
         action: empty_to_none(params.action),
         actor_id: empty_to_none(params.actor_id),
         actor_kind: empty_to_none(params.actor_kind),

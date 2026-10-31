@@ -30,6 +30,53 @@ test.describe("on a 390 pixel phone", () => {
   });
 });
 
+test("opens on the history, with rotation settings below it, and returns focus to the row on close", async ({ page }) => {
+  await openProject(page);
+  await secretAction(page, "LOG_LEVEL", "secret-history");
+  const drawer = page.getByTestId("secret-drawer");
+  const versions = drawer.getByTestId("version-list");
+  await expect(versions).toBeInViewport();
+  const historyTop = (await versions.boundingBox())?.y ?? Infinity;
+  const policyTop = (await drawer.getByTestId("policy-section").boundingBox())?.y ?? -Infinity;
+  expect(historyTop).toBeLessThan(policyTop);
+
+  await page.keyboard.press("Escape");
+  await expect(drawer).toHaveCount(0);
+  await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-actions")).toBeFocused();
+
+  // Opened from the key name, focus goes back to the key name.
+  await secretRow(page, "LOG_LEVEL").getByTestId("secret-key").click();
+  await expect(versions).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-key")).toBeFocused();
+});
+
+test("says when two versions are too different to compare instead of failing", async ({ page }) => {
+  await openProject(page);
+  // Two versions of nearly 64 KiB with no line in common, written straight to the fake server.
+  await page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as { mockFetch: (r: Request) => Promise<Response> };
+    for (const line of ["a", "b"]) {
+      await mock.mockFetch(
+        new Request(`${location.origin}/api/v1/projects/storefront/environments/dev/secrets/BIG_BLOB`, {
+          method: "PUT",
+          headers: { "x-sekret-csrf": "1", "content-type": "application/json" },
+          body: JSON.stringify({ value: `${line}\n`.repeat(30_000) }),
+        }),
+      );
+    }
+  });
+  await page.reload();
+
+  await secretAction(page, "BIG_BLOB", "secret-history");
+  const drawer = page.getByTestId("secret-drawer");
+  await drawer.getByTestId("history-values-toggle").click();
+  await expect(drawer.getByTestId("diff-too-large")).toContainText("too many lines to compare");
+  await expect(page.getByTestId("app-error")).toHaveCount(0);
+  await expect(drawer.getByTestId("version-2")).toBeVisible();
+});
+
 test("hides history values until asked, then diffs versions and rolls back", async ({ page }) => {
   await openProject(page);
   await secretAction(page, "LOG_LEVEL", "secret-history");

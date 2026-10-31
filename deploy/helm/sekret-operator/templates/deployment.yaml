@@ -51,9 +51,16 @@ spec:
               value: {{ .Values.sekret.requestTimeoutSeconds | quote }}
             - name: SEKRET_LOG
               value: {{ .Values.logLevel | quote }}
-            {{- with .Values.watchNamespace }}
+            {{- if .Values.clusterWide }}
+            - name: SEKRET_OPERATOR_ALL_NAMESPACES
+              value: "true"
+            {{- else }}
             - name: SEKRET_OPERATOR_NAMESPACE
-              value: {{ . | quote }}
+              value: {{ include "sekret-operator.watchNamespaces" . | fromJsonArray | join "," | quote }}
+            {{- end }}
+            {{- if .Values.sekret.allowInsecureHttp }}
+            - name: SEKRET_OPERATOR_ALLOW_INSECURE_HTTP
+              value: "true"
             {{- end }}
             {{- if .Values.sekret.caBundle.configMapName }}
             - name: SEKRET_CA_FILE

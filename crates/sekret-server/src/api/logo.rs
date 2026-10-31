@@ -9,6 +9,7 @@ use sekret_api::Project;
 use sekret_core::permissions::{Action, Subject};
 use sekret_store::ProjectLogo;
 use serde_json::json;
+use tokio::sync::Semaphore;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -91,7 +92,7 @@ async fn put_logo(
             "logos can be at most 512 KiB",
         ));
     }
-    let png = normalise_logo(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let png = decode_off_runtime(body.clone()).await?;
     let content_type = "image/png";
     let now = state.clock.now();
     state
@@ -119,6 +120,20 @@ async fn put_logo(
     )
     .await;
     Ok(Json(api_project(&project)))
+}
+
+/// Logos decoded at once; image work stays off the async workers and cannot occupy every thread.
+static LOGO_DECODES: Semaphore = Semaphore::const_new(2);
+
+async fn decode_off_runtime(body: Bytes) -> ApiResult<Vec<u8>> {
+    let _permit = LOGO_DECODES
+        .acquire()
+        .await
+        .map_err(|e| ApiError::internal("logo decode", e))?;
+    tokio::task::spawn_blocking(move || normalise_logo(&body).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ApiError::internal("logo decode", e))?
+        .map_err(ApiError::bad_request)
 }
 
 #[utoipa::path(delete, path = "/api/v1/projects/{project}/logo", tag = "projects", params(("project" = String, Path)),

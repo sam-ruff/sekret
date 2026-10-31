@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::api::{AuditTarget, audit};
-use crate::auth::{ClientIp, Principal, SESSION_COOKIE, TokenKind, TokenRequest, cookie_value, mint_token};
+use crate::auth::{ClientIp, Principal, TokenKind, TokenRequest, cookie_value, mint_token, session_cookie_name};
 use crate::config::HumanOidcConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::jwt::{Expectations, KeySource};
@@ -118,8 +118,9 @@ fn oidc(state: &AppState) -> ApiResult<&HumanOidcConfig> {
 
 fn session_cookie(state: &AppState, value: &str, max_age: i64) -> ApiResult<HeaderValue> {
     let secure = if state.config.secure_cookies() { "; Secure" } else { "" };
+    let name = session_cookie_name(&state.config);
     HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
     ))
     .map_err(|e| ApiError::internal("cookie", e))
 }
@@ -142,7 +143,7 @@ pub struct LoginQuery {
 
 /// When the browser's current session last authenticated with the provider, if it has one.
 async fn session_auth_time(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<i64>> {
-    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+    let Some(token) = cookie_value(headers, session_cookie_name(&state.config)) else {
         return Ok(None);
     };
     Ok(state
@@ -260,6 +261,33 @@ impl LoginError {
     }
 }
 
+/// The email and display name to store for a user. The email is kept only when the provider
+/// says it verified it, since it labels the user in audit entries and member lists.
+fn user_labels(claims: &serde_json::Value, subject: &str) -> (String, String) {
+    let verified = match &claims["email_verified"] {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    let email = claims["email"]
+        .as_str()
+        .filter(|e| verified && !e.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let name = ["name", "preferred_username"]
+        .iter()
+        .find_map(|k| claims[*k].as_str().filter(|n| !n.is_empty()))
+        .or(Some(email.as_str()).filter(|e| !e.is_empty()))
+        .unwrap_or(subject)
+        .to_string();
+    (email, name)
+}
+
+/// Caller-supplied text cut short for a log line; log it with `?` so control characters are escaped.
+fn loggable(value: &str) -> String {
+    value.chars().take(64).collect()
+}
+
 fn login_error(error: LoginError) -> Response {
     Redirect::to(&format!("/login?error={}", error.code())).into_response()
 }
@@ -270,6 +298,9 @@ pub async fn callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> ApiResult<Response> {
+    if !state.login_limiter.allow_ip(ip) {
+        return Err(ApiError::too_many_requests());
+    }
     let mut response = finish_login(&state, ip, &headers, query).await?;
     response
         .headers_mut()
@@ -318,7 +349,7 @@ async fn finish_login(
 ) -> ApiResult<Response> {
     let config = oidc(state)?;
     if let Some(error) = query.error {
-        tracing::warn!(%error, "identity provider returned an error");
+        tracing::warn!(error = ?loggable(&error), "identity provider returned an error");
         return Ok(login_error(LoginError::ProviderRefused));
     }
     let (Some(code), Some(state_param)) = (query.code, query.state) else {
@@ -390,12 +421,7 @@ async fn finish_login(
         audit_refused(state, ip, subject, reason).await;
         return Ok(login_error(LoginError::NotAllowed));
     }
-    let email = claims["email"].as_str().unwrap_or_default().to_string();
-    let name = ["name", "preferred_username", "email"]
-        .iter()
-        .find_map(|k| claims[*k].as_str())
-        .unwrap_or(subject)
-        .to_string();
+    let (email, name) = user_labels(&claims, subject);
     let user = state
         .store
         .upsert_user(UserLogin {
@@ -450,7 +476,7 @@ pub async fn logout(
     principal: Principal,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    if cookie_value(&headers, SESSION_COOKIE).is_some() {
+    if cookie_value(&headers, session_cookie_name(&state.config)).is_some() {
         state.store.revoke_token(&principal.token_id).await?;
     }
     audit(&state, &principal, ip, "auth.logout", AuditTarget::default(), json!({})).await;
@@ -861,6 +887,44 @@ mod tests {
             reauth_url("/cli-login?code=AB-CD"),
             "/auth/login?reauth=1&return_to=%2Fcli-login%3Fcode%3DAB-CD"
         );
+    }
+
+    #[test]
+    fn only_a_verified_email_labels_the_user() {
+        let cases = [
+            (
+                json!({"email": "a@x", "email_verified": true, "name": "Ann"}),
+                "a@x",
+                "Ann",
+            ),
+            (json!({"email": "a@x", "email_verified": "true"}), "a@x", "a@x"),
+            (json!({"email": "cfo@x", "name": "Mallory"}), "", "Mallory"),
+            (json!({"email": "cfo@x", "email_verified": false}), "", "sub-1"),
+            (
+                json!({"email": "cfo@x", "email_verified": "no", "preferred_username": "mal"}),
+                "",
+                "mal",
+            ),
+            (json!({"email": "", "email_verified": true, "name": ""}), "", "sub-1"),
+        ];
+        for (claims, email, name) in cases {
+            assert_eq!(
+                user_labels(&claims, "sub-1"),
+                (email.to_string(), name.to_string()),
+                "{claims}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_errors_cannot_forge_log_lines() {
+        let forged = format!(
+            "x\n2026-01-01T00:00:00Z  INFO sekret_server: unsealed{}",
+            "y".repeat(500)
+        );
+        let logged = format!("{:?}", loggable(&forged));
+        assert!(!logged.contains('\n'));
+        assert!(logged.chars().count() <= 64 + 4, "{logged}");
     }
 
     #[test]

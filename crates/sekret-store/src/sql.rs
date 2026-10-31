@@ -338,15 +338,16 @@ fn audit_filter(query: &AuditQuery) -> Filter {
     }
     if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let p = filter.bind(SqlParam::Text(format!("%{}%", like_literal(&search.to_lowercase()))));
-        let columns = [
-            "action",
-            "actor_name",
-            "actor_id",
+        let actors = ["action", "actor_name", "actor_id", "ip"];
+        let secrets = [
             "COALESCE(environment, '')",
             "COALESCE(path, '')",
             "COALESCE(secret_key, '')",
-            "ip",
         ];
+        let mut columns = actors.to_vec();
+        if !query.search_actors_only {
+            columns.extend(secrets);
+        }
         let any: Vec<String> = columns
             .iter()
             .map(|c| format!("LOWER({c}) LIKE {p} ESCAPE '\\'"))
@@ -409,6 +410,11 @@ fn seal_columns(config: &SealConfig) -> StoreResult<SealColumns> {
         policy: config.unlock_policy.as_str(),
     })
 }
+
+/// Rewrites what holds a replaced seal configuration on Postgres.
+const VACUUM_SEAL: &str = "VACUUM FULL seal_config";
+/// Rewrites everything a root key replacement re-encrypts on Postgres.
+const VACUUM_REKEY: &str = "VACUUM FULL seal_config, projects, secret_versions, identity_auth_methods";
 
 const UPDATE_SEAL: &str = "UPDATE seal_config SET mode = $1, wrapped_root_key = $2, kdf_salt = $3, kdf_params = $4, \
                            unlock_policy = $5, remembered_root_key = $6, updated_at = $7, epoch = $8, config_mac = $9, \
@@ -691,10 +697,12 @@ impl SqlStore {
     }
 
     /// Folds the write-ahead log back into the database and truncates it, so pages holding a
-    /// replaced key or value do not linger beside the database. Postgres keeps its own log; see
-    /// the security docs for what that means.
-    async fn scrub_log(&self) {
+    /// replaced key or value do not linger beside the database. On Postgres, runs `vacuum`
+    /// instead, so the dead rows holding old wraps and ciphertexts go with the old table files.
+    /// Postgres keeps its own write-ahead log and archives; see the security docs for that.
+    async fn scrub_log(&self, vacuum: &'static str) {
         if self.postgres {
+            self.rewrite_tables(vacuum).await;
             return;
         }
         for _ in 0..5 {
@@ -711,6 +719,17 @@ impl SqlStore {
             }
         }
         tracing::warn!("the write-ahead log is busy, so old pages stay in it until the next checkpoint");
+    }
+
+    /// Best effort: it needs to own the tables, and briefly locks them.
+    async fn rewrite_tables(&self, vacuum: &'static str) {
+        if let Err(error) = sqlx::raw_sql(vacuum).execute(&self.pool).await {
+            tracing::warn!(
+                %error,
+                "could not rewrite the tables after replacing keys, so old copies stay in dead rows until Postgres \
+                 reuses the space; run VACUUM FULL on them as their owner"
+            );
+        }
     }
 
     pub async fn ping(&self) -> StoreResult<()> {
@@ -776,7 +795,7 @@ impl Store for SqlStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.scrub_log().await;
+        self.scrub_log(VACUUM_SEAL).await;
         Ok(())
     }
 
@@ -785,7 +804,7 @@ impl Store for SqlStore {
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound);
         }
-        self.scrub_log().await;
+        self.scrub_log(VACUUM_SEAL).await;
         Ok(())
     }
 
@@ -1438,7 +1457,7 @@ impl Store for SqlStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.scrub_log().await;
+        self.scrub_log(VACUUM_REKEY).await;
         Ok(())
     }
 

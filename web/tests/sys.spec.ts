@@ -205,6 +205,26 @@ test.describe("first-boot setup", () => {
     expect(ring).not.toBe("none");
   });
 
+  test("offers Remember only when the server has a remember file", async ({ page }) => {
+    await page.goto("/?mock-state=uninitialised&mock-remember-file=false");
+    await expect(page.getByTestId("setup-policy-remember")).toBeDisabled();
+    await expect(page.getByTestId("setup-policy-unavailable")).toContainText("does not set seal.remember_file");
+    // Clicking the greyed-out card changes nothing.
+    await page.getByTestId("setup-policy-card-remember").click({ force: true });
+    await expect(page.getByTestId("setup-policy-manual")).toHaveAttribute("data-state", "checked");
+    await expect(page.getByTestId("setup-policy-passphrase-file")).toBeEnabled();
+  });
+
+  test("says web sign-in is not ready when the server has no sign-in provider", async ({ page }) => {
+    await page.goto("/?mock-state=uninitialised&mock-oidc=false");
+    await fillSetup(page, STRONG);
+    await page.getByTestId("setup-submit").click();
+    await expect(page.getByTestId("setup-no-oidc")).toContainText("Web sign-in is not set up yet");
+    await expect(page.getByTestId("setup-oidc-docs-link")).toHaveAttribute("target", "_blank");
+    await page.getByTestId("setup-continue").click();
+    await expect(page.getByTestId("oidc-disabled")).toBeVisible();
+  });
+
   test("shows a policy fixed in configuration by name before setup", async ({ page }) => {
     await page.goto("/?mock-state=uninitialised&mock-unlock=remember");
     await expect(page.getByTestId("setup-policy-configured")).toContainText("Remember");
@@ -326,6 +346,15 @@ test.describe("unlocking", () => {
     await expect(page.getByTestId("unlock-submit")).toBeEnabled();
   });
 
+  test("explains a key the server does not recognise after the database was replaced", async ({ page }) => {
+    await page.goto("/?mock-state=sealed");
+    await unlock(page, "mock restored database");
+    const alert = page.getByTestId("unlock-key-not-recognised");
+    await expect(alert).toContainText("This passphrase opened a key this server does not recognise");
+    await expect(alert).toContainText("sekret admin reset-epoch");
+    await expect(page.getByTestId("unlock-card")).toBeVisible();
+  });
+
   test("moves an open tab to the unlock page when the server is sealed mid-session, forgetting revealed values", async ({
     page,
   }) => {
@@ -432,6 +461,13 @@ test.describe("server page", () => {
     await expect(page.getByTestId("unlock-wrong")).toBeVisible();
     await unlock(page, STRONG);
     await expect(page).toHaveURL(/\/org\/server$/);
+  });
+
+  test("disables Remember on the server page when no remember file is configured", async ({ page }) => {
+    await page.goto("/org/server?mock-remember-file=false");
+    await expect(page.getByTestId("server-policy-remember")).toBeDisabled();
+    await expect(page.getByTestId("server-policy-unavailable")).toBeVisible();
+    await expect(page.getByTestId("server-policy-passphrase-file")).toBeEnabled();
   });
 
   test("confirms a weaker policy with the passphrase, and forgets a remembered unlock only after confirming", async ({

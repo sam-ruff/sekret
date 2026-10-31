@@ -903,22 +903,77 @@ async fn project_audit(
 ) -> ApiResult<Json<AuditPage>> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::AuditLog, Action::Read)?;
-    let mut page = audit_page(&state, Some(project.id), params).await?;
+    let search_actors_only = audit_filter_scope(&rules, &params)?;
+    let mut page = audit_page(&state, Some(project.id), params, search_actors_only).await?;
     for entry in &mut page.entries {
         redact_audit_entry(&rules, entry);
     }
     Ok(Json(page))
 }
 
-/// Hides key names, folders and change lists the reader could not see in the secrets view.
+/// Whether the reader sees every environment, folder and key in the entries a filter covers:
+/// all of them, or those of the environment filtered on.
+fn sees_unredacted(rules: &[Rule], environment: Option<&str>) -> bool {
+    let scope = Resource {
+        environment,
+        ..Default::default()
+    };
+    allowed(rules, Subject::Secrets, Action::Read, &scope)
+        && allowed(rules, Subject::Environments, Action::Read, &scope)
+}
+
+/// Refuses filters that would reveal what redaction hides, since a match or a count is an
+/// answer even when the matching entries are redacted. Returns whether `q` must be limited
+/// to actions, actors and addresses.
+pub fn audit_filter_scope(rules: &[Rule], params: &AuditParams) -> ApiResult<bool> {
+    let given = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let environment = given(&params.environment);
+    if let Some(env) = environment.as_deref() {
+        let scope = Resource {
+            environment: Some(env),
+            ..Default::default()
+        };
+        if !allowed(rules, Subject::Environments, Action::Read, &scope) {
+            return Err(ApiError::forbidden());
+        }
+    }
+    if sees_unredacted(rules, environment.as_deref()) {
+        return Ok(false);
+    }
+    if given(&params.key).is_some() || given(&params.path).is_some() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "filter_hidden",
+            "some secrets here are hidden from you, so the log cannot be filtered by key or folder; \
+             filter by an environment you can fully read first",
+        ));
+    }
+    Ok(true)
+}
+
+/// Hides key names, folders, environments and change lists the reader could not see in the
+/// secrets view.
 pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
-    let Some(environment) = entry.environment.as_deref() else {
+    let Some(environment) = entry.environment.clone() else {
         return;
     };
     let whole_environment = Resource {
-        environment: Some(environment),
+        environment: Some(&environment),
         ..Default::default()
     };
+    if !allowed(rules, Subject::Environments, Action::Read, &whole_environment) {
+        entry.environment = None;
+        entry.path = None;
+        entry.secret_key = None;
+        entry.detail = json!({"redacted": true});
+        return;
+    }
+    let environment = environment.as_str();
     if allowed(rules, Subject::Secrets, Action::Read, &whole_environment) {
         return;
     }

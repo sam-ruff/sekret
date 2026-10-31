@@ -35,7 +35,7 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `server.trusted_proxies` | `--trusted-proxies` | `SEKRET_TRUSTED_PROXIES` | none | CIDRs of reverse proxies whose `X-Forwarded-For` header is believed. |
 | `server.allow_insecure_http` | `--allow-insecure-http` | `SEKRET_ALLOW_INSECURE_HTTP` | `false` | Allows `http://` OIDC issuers and Kubernetes API servers. For local testing only. |
 | `server.max_connections` | `--max-connections` | `SEKRET_MAX_CONNECTIONS` | `512` | Connections served at once, over HTTP and HTTPS. Further clients wait until one closes. Every connection must finish sending a request's headers (and its TLS handshake) within 10 seconds, and one with nothing running and no traffic for 60 seconds is closed. |
-| `server.unix_socket` | `--unix-socket` | `SEKRET_UNIX_SOCKET` | none | A Unix socket on the host serving only status and unseal, for `sekret sys unseal --socket`. The network's rate limits and back-off do not apply to it. Its directory must belong to the server's user and not be writable by other users, such as `/run/sekret` with mode 0750. |
+| `server.unix_socket` | `--unix-socket` | `SEKRET_UNIX_SOCKET` | none | A Unix socket on the host serving only status and unseal, for `sekret sys unseal --socket`. The network's rate limits and back-off do not apply to it. Its directory must belong to the server's user and not be writable by its group or other users, such as `/run/sekret` with mode 0750 (2750 to pass the group on to the socket). |
 | `server.unix_socket_mode` | `--unix-socket-mode` | `SEKRET_UNIX_SOCKET_MODE` | `0600` | `0600` for the server's user only, or `0660` to let the socket's group unseal too. Quote it in the file. |
 | `database.url` | `--database-url` | `SEKRET_DATABASE_URL` | `sqlite://sekret.db?mode=rwc` | `sqlite://path?mode=rwc` or `postgres://user:pass@host/db`. The server and the `admin` commands remove `SEKRET_DATABASE_URL` from their own environment once read. |
 | `database.url_file` | `--database-url-file` | `SEKRET_DATABASE_URL_FILE` | none | File holding the database URL, so a Postgres password stays out of the process list and the environment. Set either this or `database.url` at each level; a flag still beats an environment variable, which beats the file. |
@@ -56,12 +56,12 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `tls.cert_file` | `--tls-cert-file` | `SEKRET_TLS_CERT_FILE` | none | PEM certificate chain. With a key file, the server speaks HTTPS itself. |
 | `tls.key_file` | `--tls-key-file` | `SEKRET_TLS_KEY_FILE` | none | PEM private key for the certificate. |
 | `tls.client_ca_file` | `--tls-client-ca-file` | `SEKRET_TLS_CLIENT_CA_FILE` | none | PEM CA certificates that client certificates must chain to. Turns on mutual TLS. |
-| `tls.client_auth` | `--tls-client-auth` | `SEKRET_TLS_CLIENT_AUTH` | `required` | With a client CA, `required` refuses connections without a certificate and `optional` only checks the ones offered. |
-| `seal.mode` | `--seal-mode` | `SEKRET_SEAL_MODE` | unset | `passphrase` or `key-file`. Unset, setup offers passphrase mode and either kind of database starts. Set, a database in the other mode is refused. |
-| `seal.root_key_file` | `--root-key-file` | `SEKRET_ROOT_KEY_FILE` | none | The root key file in key-file mode, raw, base64 or hex. |
+| `tls.client_auth` | `--tls-client-auth` | `SEKRET_TLS_CLIENT_AUTH` | `required` | With a client CA, `required` refuses connections without a certificate and `optional` only checks the ones offered. Without a client CA it does nothing, and the server warns that it is set. |
+| `seal.mode` | `--seal-mode` | `SEKRET_SEAL_MODE` | unset | `passphrase` or `key-file`. Unset, setup offers passphrase mode and either kind of database starts. Set, a database in the other mode is refused. Set to `passphrase`, the server refuses to start while `seal.root_key_file` is set. |
+| `seal.root_key_file` | `--root-key-file` | `SEKRET_ROOT_KEY_FILE` | none | The root key file in key-file mode, raw, base64 or hex. With `seal.mode` unset it is also an emergency way into a passphrase-mode database. |
 | `seal.unlock` | `--unlock` | `SEKRET_UNLOCK` | unset | `manual`, `remember` or `passphrase-file`. Unset, the choice made at setup applies. See [Unlocking](unlocking.md). |
 | `seal.remember_file` | `--remember-file` | `SEKRET_REMEMBER_FILE` | none | Device key file for the `remember` policy, which needs it set. It may not be the database, root key, a passphrase file or another file sekret uses. |
-| `seal.remember_secret_file` | `--remember-secret-file` | `SEKRET_REMEMBER_SECRET_FILE` | none | File holding a secret of at least 32 characters mixed into the remember key, so the disk alone cannot unlock. `SEKRET_REMEMBER_SECRET` holding the value itself also works, and counts as an environment variable: it beats the file setting but loses to the flag and to `SEKRET_REMEMBER_SECRET_FILE`. Once an unlock is remembered with a secret, removing the secret stops the server remembering at all until the unlock is forgotten. See [Unlocking](unlocking.md#remember-secret). |
+| `seal.remember_secret_file` | `--remember-secret-file` | `SEKRET_REMEMBER_SECRET_FILE` | none | File holding a secret mixed into the remember key, so the disk alone cannot unlock: 32 random bytes, base64 or hex encoded, such as `openssl rand -base64 32`. A guessable one is refused. `SEKRET_REMEMBER_SECRET` holding the value itself also works, and counts as an environment variable: it beats the file setting but loses to the flag and to `SEKRET_REMEMBER_SECRET_FILE`. Once an unlock is remembered with a secret, removing the secret stops the server remembering at all until the unlock is forgotten. See [Unlocking](unlocking.md#remember-secret). |
 | `seal.passphrase_file` | `--unlock-passphrase-file` | `SEKRET_UNLOCK_PASSPHRASE_FILE` | none | Passphrase for the `passphrase-file` policy, read only under that policy. `SEKRET_UNLOCK_PASSPHRASE` holding the passphrase itself also works, with the same precedence as `SEKRET_REMEMBER_SECRET`; the server wipes it from its own environment, but whatever started the server still holds it. |
 | `setup.web` | `--web-setup` | `SEKRET_WEB_SETUP` | `true` | Offer first-boot setup through the API and web interface. When false, no setup code is made; set up with `auto_init` or `sekret admin init`. |
 | `setup.auto_init` | `--auto-init` | `SEKRET_AUTO_INIT` | `false` | Set up an empty database at start, without a person. Skipped when the database already has a root key; refused when it holds projects or identities. |
@@ -78,12 +78,14 @@ Every file the server reads (configuration, keys, passphrases, secrets) must be 
 At start the server logs, at `info`, every setting with its value and where it came from: flag, environment, file or default. Secrets are never shown; a database URL is shown with its password replaced by `***`, and a URL file only by its path. It warns about settings that weaken it:
 
 - `allow_insecure_http`, and an `http://` public URL with a non-loopback listen address;
+- an `https://` public URL with no `tls` and a non-loopback listen address, since anyone who can reach that address talks plain HTTP to the server and skips the proxy (inside a container, where listening on `0.0.0.0` is needed, keep the port off every network but the proxy's);
+- `tls.client_auth` set without `tls.client_ca_file`, which leaves client certificates unchecked;
 - trusted proxy ranges wider than /16 for IPv4 or /32 for IPv6, outside private address space, or covering more than a /8 between them;
 - `auth.default_org_role` set to `org-admin` or `backup-reader`;
 - the `passphrase-file` policy coming from the environment;
 - an environment variable overriding the file for any setting;
 - a secret, passphrase or database URL given in more than one way, naming the one ignored;
-- a root key, passphrase, secret, remember, OIDC client secret or TLS key file that the group or other users can read, or that another user owns (symlinks are followed, so the mounted target is what counts);
+- a root key, passphrase, secret, remember, OIDC client secret or TLS key file that the group or other users can read, that another user owns, or whose directory lets other users replace it (symlinks are followed, so the mounted target is what counts, and both directories are checked). The same goes for a database URL file, and the configuration file itself, when they hold a database password. A directory counts as safe when it belongs to sekret's user or root and only they can write to it, when it is writable by a group that holds only sekret's user, or when it has the sticky bit set, as Kubernetes secret mounts do;
 - a remember file on the same filesystem as the database, or anywhere under its directory. Set `SEKRET_LOG` to a [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) such as `info` or `sekret_server=debug` to change logging; logs go to standard error.
 
 The `admin` commands also accept `--config`, and take the database URL (or URL file) and root key file from it.
@@ -121,9 +123,9 @@ chmod 600 /etc/sekret/root.key
 sekret server --public-url https://sekret.example.com --root-key-file /etc/sekret/root.key
 ```
 
-A server started with a key file and an empty database records key-file mode and starts unlocked, which is also how installs from before sealing existed keep working unchanged. The server records the key's fingerprint and refuses to start with a different key, so pointing it at the wrong file fails loudly rather than producing unreadable data. Keep a copy of the key file somewhere other than the database backups: the database without the key is useless, and the key without the database is harmless.
+A server started with a key file and an empty database records key-file mode and starts unlocked, which is also how installs from before sealing existed keep working unchanged. The server records the key's fingerprint, in the database and in the epoch marks beside the database and key file, and refuses to start with a different key, so pointing it at the wrong file fails loudly rather than producing unreadable data. Keep a copy of the key file somewhere other than the database backups: the database without the key is useless, and the key without the database is harmless.
 
-In passphrase mode, `--root-key-file` is an emergency way in. If the file holds the right root key, the server starts unlocked without the passphrase; any other key is refused.
+With `seal.mode` unset, `--root-key-file` is an emergency way into a passphrase-mode database. If the file holds the right root key, the server starts unlocked without the passphrase and logs a warning; any other key is refused. With `seal.mode: passphrase` set explicitly, the server refuses to start while a root key file is configured at all, so a key file left behind after `sekret admin set-seal-mode passphrase` cannot quietly undo the passphrase. Remove the setting once the switch is done.
 
 ### Setting up without a person
 
@@ -141,13 +143,15 @@ With `setup.admin_token_file`, auto-setup also writes a one-hour admin token the
 If `seal.mode` is set and the database is in the other mode, the server refuses to start. Changing mode is deliberate: stop the server and run `sekret admin set-seal-mode`.
 
 ```sh
-# Passphrase mode to key-file mode: unwraps the key with the passphrase and writes it out.
+# Passphrase mode to key-file mode: asks for the passphrase and writes a new root key to the file.
 sekret admin set-seal-mode key-file --root-key-file /etc/sekret/root.key
-# Key-file mode to passphrase mode: wraps the key in the file under a new passphrase.
+# Key-file mode to passphrase mode: reads the current key and wraps a new one under a new passphrase.
 sekret admin set-seal-mode passphrase --root-key-file /etc/sekret/root.key
 ```
 
-After moving to passphrase mode, start the server without the key file, unlock it, and then delete the file.
+Either way the switch replaces the root key and re-encrypts every secret, the same as a passphrase change, so nothing that opened the database before opens it afterwards: not a copy of the old key file in a Kubernetes Secret or a host backup, and not the old passphrase together with an older wrap. The file given in key-file mode must not exist yet. Backups taken before the switch still open with the old key or passphrase. Like `rotate-root-key`, it refuses when a value or credential no longer decrypts, unless you pass `--skip-unreadable`.
+
+After moving to passphrase mode, start the server without the key file, unlock it, and then delete the file and every copy of it; the server now refuses it as the wrong key.
 
 ### Rotating the root key
 

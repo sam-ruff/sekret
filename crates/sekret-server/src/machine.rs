@@ -373,7 +373,8 @@ async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAdd
         return Err(ApiError::too_many_requests());
     }
     let Some(identity) = state.store.get_identity(identity_id).await? else {
-        audit_failure(state, ip, identity_id, "unknown identity").await;
+        // The id is the caller's choice, so it must not open a fresh audit window per guess.
+        audit_failure_as(state, ip, identity_id, "unknown identity", "unknown identity").await;
         return Err(ApiError::login_failed());
     };
     if identity.disabled {
@@ -389,11 +390,22 @@ async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAdd
 
 /// Records a refused machine login. The caller only ever sees `login_failed`.
 async fn audit_failure(state: &AppState, ip: std::net::IpAddr, identity_id: &str, reason: &str) {
+    audit_failure_as(state, ip, identity_id, identity_id, reason).await;
+}
+
+/// As [`audit_failure`], with repeats folded together under `throttle_subject`.
+async fn audit_failure_as(
+    state: &AppState,
+    ip: std::net::IpAddr,
+    identity_id: &str,
+    throttle_subject: &str,
+    reason: &str,
+) {
     let identity = audited_identity_id(identity_id);
     crate::api::audit_refusal(
         state,
         &Principal::system("system"),
-        &identity,
+        throttle_subject,
         ip,
         "auth.machine-login.failed",
         json!({"identity_id": identity, "reason": reason}),

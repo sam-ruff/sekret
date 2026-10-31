@@ -122,3 +122,28 @@ test("filters a project's log by environment and by clicking an actor", async ({
   await page.getByTestId("audit-chip-actor").getByRole("button").click();
   await expect(page.getByTestId("audit-chip-actor")).toHaveCount(0);
 });
+
+test("explains plainly when some secrets are hidden, so key and folder filters are refused", async ({ page }) => {
+  // The signed-in user cannot see some production key names in this project.
+  await page.goto("/projects/payments-api/audit?key=HSM_PIN");
+  const notice = page.getByTestId("audit-filter-hidden");
+  await expect(notice).toContainText("Cannot filter by key or folder here");
+  await expect(page.getByTestId("error-state")).toHaveCount(0);
+  await expect(page.getByTestId("audit-search")).toHaveAttribute("placeholder", "Search actions, people, addresses");
+
+  await page.getByTestId("audit-filter-hidden-clear").click();
+  await expect(page).not.toHaveURL(/key=/);
+  await expect(notice).toHaveCount(0);
+  await expect(page.getByTestId("audit-total")).toHaveText(/\d+ entries/);
+
+  // In an environment the user can read in full, keys are searchable again.
+  await choose(page, "audit-environment", "audit-environment-dev", /env=dev/);
+  await expect(page.getByTestId("audit-search")).toHaveAttribute("placeholder", "Search actions, people, keys, addresses");
+});
+
+test("lets a reader who sees everything filter by key", async ({ page }) => {
+  await page.goto("/projects/storefront/audit?key=DATABASE_URL");
+  await expect(page.getByTestId("audit-chip-key")).toContainText("DATABASE_URL");
+  await expect(page.getByTestId("audit-total")).toHaveText(/[1-9]\d* entr/);
+  await expect(page.getByTestId("audit-filter-hidden")).toHaveCount(0);
+});

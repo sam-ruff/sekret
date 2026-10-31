@@ -5,13 +5,37 @@ export interface DiffLine {
   text: string;
 }
 
-/** Line diff from `before` to `after` using a longest common subsequence table. */
-export function diffLines(before: string, after: string): DiffLine[] {
+/** The largest table the diff builds, so a value with many lines cannot exhaust memory. */
+export const MAX_DIFF_CELLS = 4_000_000;
+
+/**
+ * Line diff from `before` to `after` using a longest common subsequence table. Lines shared at the
+ * start and end are matched first; returns null when what is left is too large to compare.
+ */
+export function diffLines(before: string, after: string): DiffLine[] | null {
   const a = before === "" ? [] : before.split("\n");
   const b = after === "" ? [] : after.split("\n");
+
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start += 1;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA -= 1;
+    endB -= 1;
+  }
+
+  const middle = diffMiddle(a.slice(start, endA), b.slice(start, endB));
+  if (middle === null) return null;
+  const same = (text: string): DiffLine => ({ kind: "same", text });
+  return [...a.slice(0, start).map(same), ...middle, ...a.slice(endA).map(same)];
+}
+
+function diffMiddle(a: string[], b: string[]): DiffLine[] | null {
   const rows = a.length + 1;
   const cols = b.length + 1;
-  const lcs = new Array<number>(rows * cols).fill(0);
+  if (rows * cols > MAX_DIFF_CELLS) return null;
+  const lcs = new Uint32Array(rows * cols);
   const at = (i: number, j: number) => lcs[i * cols + j];
 
   for (let i = a.length - 1; i >= 0; i -= 1) {

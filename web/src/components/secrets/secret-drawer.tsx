@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Eye, EyeOff, History, Lock, RotateCcw, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "@/api/endpoints";
 import type { SecretVersion } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -30,6 +30,7 @@ interface SecretDrawerProps {
   canEditPolicy: boolean;
   onRotate: (key: string) => void;
   onClose: () => void;
+  onCloseAutoFocus?: (event: Event) => void;
 }
 
 function versionText(v: SecretVersion | undefined): string {
@@ -37,17 +38,22 @@ function versionText(v: SecretVersion | undefined): string {
   return v.value ?? "";
 }
 
+/** Lines drawn at most, so a long value does not stall the page. */
+const MAX_SHOWN_LINES = 2_000;
+
 function VersionDiff({ versions }: { versions: SecretVersion[] }) {
   const choices = versions.filter((v) => !v.deleted);
   const [to, setTo] = useState(String(choices[0]?.version ?? ""));
   const [from, setFrom] = useState(String(choices[1]?.version ?? choices[0]?.version ?? ""));
-  const find = (n: string) => versions.find((v) => String(v.version) === n);
-  const lines = diffLines(versionText(find(from)), versionText(find(to)));
+  const fromText = versionText(versions.find((v) => String(v.version) === from));
+  const toText = versionText(versions.find((v) => String(v.version) === to));
+  const lines = useMemo(() => diffLines(fromText, toText), [fromText, toText]);
 
   if (choices.length < 2) {
     return <p className="text-sm text-muted-foreground">There is only one version to compare.</p>;
   }
   const hidden = versions.some((v) => v.value_hidden);
+  const shown = lines?.slice(0, MAX_SHOWN_LINES) ?? [];
 
   return (
     <div className="space-y-3" data-testid="version-diff">
@@ -77,10 +83,14 @@ function VersionDiff({ versions }: { versions: SecretVersion[] }) {
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
           <Lock className="size-4" /> You cannot read these values, so they cannot be compared.
         </p>
+      ) : lines === null ? (
+        <p className="text-sm text-muted-foreground" data-testid="diff-too-large">
+          These versions differ in too many lines to compare here.
+        </p>
       ) : (
         <pre className="max-h-64 overflow-auto rounded-lg border bg-muted/40 py-2 font-mono text-xs" data-testid="diff-output">
           {lines.length === 0 && <div className="px-3 text-muted-foreground">Both versions are empty.</div>}
-          {lines.map((line, i) => (
+          {shown.map((line, i) => (
             <div
               key={i}
               className={cn(
@@ -96,6 +106,11 @@ function VersionDiff({ versions }: { versions: SecretVersion[] }) {
               {line.text || " "}
             </div>
           ))}
+          {lines.length > shown.length && (
+            <div className="px-3 pt-1 text-muted-foreground" data-testid="diff-truncated">
+              {lines.length - shown.length} more lines not shown.
+            </div>
+          )}
         </pre>
       )}
     </div>
@@ -174,7 +189,18 @@ function VersionItem({
   );
 }
 
-export function SecretDrawer({ project, env, envName, path, secretKey, canRollback, canEditPolicy, onRotate, onClose }: SecretDrawerProps) {
+export function SecretDrawer({
+  project,
+  env,
+  envName,
+  path,
+  secretKey,
+  canRollback,
+  canEditPolicy,
+  onRotate,
+  onClose,
+  onCloseAutoFocus,
+}: SecretDrawerProps) {
   const at = { project, env, path };
   const [target, setTarget] = useState<number | null>(null);
   // Values are shown only for the secret they were asked for, and hidden again on close or a switch
@@ -226,7 +252,11 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
 
   return (
     <Sheet open={secretKey !== null} onOpenChange={(open) => !open && close()}>
-      <SheetContent className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl" data-testid="secret-drawer">
+      <SheetContent
+        className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl"
+        onCloseAutoFocus={onCloseAutoFocus}
+        data-testid="secret-drawer"
+      >
         <SheetHeader className="border-b pr-12">
           <SheetTitle className="flex min-w-0 items-center gap-2 font-mono">
             <History className="size-4 shrink-0 text-muted-foreground" />
@@ -238,9 +268,6 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
-            {secretKey && (
-              <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />
-            )}
             {versions.isPending && <ListSkeleton rows={3} />}
             {versions.error && <ErrorState error={versions.error} onRetry={() => void versions.refetch()} />}
             {list.length > 0 && (
@@ -286,6 +313,9 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
                   </ol>
                 </section>
               </>
+            )}
+            {secretKey && (
+              <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />
             )}
           </div>
         </ScrollArea>

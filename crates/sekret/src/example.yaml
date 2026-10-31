@@ -65,16 +65,16 @@ tls:
   key_file: null
   # PEM CA that client certificates must chain to. Setting it turns on mutual TLS.
   client_ca_file: null
-  # With a client CA: required refuses connections without a certificate, optional only
-  # checks certificates that are offered.
-  client_auth: required
+  # With a client CA: required (the default) refuses connections without a certificate,
+  # optional only checks certificates that are offered. Ignored, with a warning, without one.
+  client_auth: null
 
 seal:
   # passphrase or key-file. Unset, setup offers passphrase mode and a database in either
   # mode starts. Set, a database initialised in the other mode is refused.
   mode: null
-  # The root key file in key-file mode. In passphrase mode it is an emergency way in,
-  # used only when the key in it matches the database.
+  # The root key file in key-file mode. With mode unset it is an emergency way into a
+  # passphrase database, used only when the key matches; with mode: passphrase it is refused.
   root_key_file: null
   # Passphrase mode only: manual, remember or passphrase-file. Unset, the choice made at
   # setup applies and an admin can change it; set, it wins and cannot be changed in the UI.
@@ -82,8 +82,8 @@ seal:
   # Device key file for the remember policy, which needs it set. Keep it off the database's
   # disk; it may not be the database, root key or a passphrase file.
   remember_file: null
-  # File with a secret of at least 32 characters mixed into the remember key, so the
-  # remember file and database alone cannot unlock. SEKRET_REMEMBER_SECRET also works.
+  # File with 32 random bytes, base64 or hex (openssl rand -base64 32), mixed into the remember
+  # key, so the remember file and database alone cannot unlock. SEKRET_REMEMBER_SECRET also works.
   remember_secret_file: null
   # Passphrase for the passphrase-file policy, read only under that policy.
   # SEKRET_UNLOCK_PASSPHRASE also works, but a file is better.

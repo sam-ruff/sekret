@@ -675,6 +675,10 @@ pub struct SysStatus {
     /// A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not
     /// clear it; forget the unlock for that.
     pub remembered: bool,
+    /// The configuration sets `seal.remember_file`, so the remember policy can be chosen. Shown
+    /// before setup and to organisation admins.
+    #[serde(default)]
+    pub remember_available: bool,
     /// How the root key got into memory, while unsealed. `key-file` with a passphrase `seal_mode`
     /// means a root key file overrode the passphrase.
     #[serde(default)]

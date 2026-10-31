@@ -16,6 +16,9 @@ fn directory_problem(dir_uid: u32, dir_mode: u32, server_uid: u32) -> Option<&'s
     if dir_mode & 0o002 != 0 {
         return Some("must not be writable by other users");
     }
+    if dir_mode & 0o020 != 0 {
+        return Some("must not be writable by its group; share the socket through its group instead");
+    }
     None
 }
 
@@ -114,5 +117,30 @@ mod tests {
         );
         assert!(directory_problem(1000, 0o40777, 1000).is_some(), "writable by anyone");
         assert!(directory_problem(1000, 0o41777, 1000).is_some(), "like /tmp");
+    }
+
+    #[test]
+    fn a_group_writable_directory_is_refused_even_with_the_sticky_bit() {
+        assert_eq!(directory_problem(1000, 0o42750, 1000), None, "setgid is fine");
+        for mode in [0o40770, 0o41770, 0o42770, 0o40730] {
+            assert!(directory_problem(1000, mode, 1000).is_some(), "{mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listen_refuses_a_group_writable_directory() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770))?;
+        let path = dir.path().join("unseal.sock");
+        let error = check_directory(&path)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected refusal"))?;
+        assert!(error.to_string().contains("group"), "{error}");
+        assert!(!path.exists());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750))?;
+        check_directory(&path)?;
+        Ok(())
     }
 }

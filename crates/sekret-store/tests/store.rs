@@ -533,6 +533,21 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
     assert_eq!(ids(search("db_")).await?, ["a1", "a0"], "underscore is literal");
     assert_eq!(ids(search("100%")).await?, ["a3"], "percent is literal");
     assert_eq!(ids(search("/app/db")).await?, ["a1"]);
+    let actors_only = |s: &str| AuditQuery {
+        search: Some(s.into()),
+        search_actors_only: true,
+        ..Default::default()
+    };
+    assert_eq!(ids(actors_only("alice")).await?, ["a4", "a2", "a0"]);
+    assert_eq!(ids(actors_only("secret.delete")).await?, ["a4"]);
+    assert_eq!(ids(actors_only("10.0.0")).await?.len(), 5, "the address is searched");
+    for hidden in ["/app/db", "API_KEY", "prod"] {
+        assert!(
+            ids(actors_only(hidden)).await?.is_empty(),
+            "{hidden} is not searched when only actors are"
+        );
+        assert_eq!(count(actors_only(hidden)).await?, 0);
+    }
     let scoped = AuditQuery {
         environment: Some("prod".into()),
         path: Some("/app".into()),
@@ -769,5 +784,43 @@ async fn postgres_store() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let again = InstanceLock::acquire(&url).await.context("lock after release")?;
     drop(again);
-    exercise(store).await
+    exercise(store).await?;
+    replacing_keys_rewrites_the_tables_on_postgres(&url).await
+}
+
+/// The table files that held old wraps and ciphertexts are replaced, so their dead rows go too.
+async fn replacing_keys_rewrites_the_tables_on_postgres(url: &str) -> anyhow::Result<()> {
+    use sqlx::Row;
+    let pool = sqlx::PgPool::connect(url).await.context("pool")?;
+    let filenodes = || async {
+        let mut nodes = Vec::new();
+        for table in ["seal_config", "projects", "secret_versions", "identity_auth_methods"] {
+            let row = sqlx::query("SELECT pg_relation_filenode($1::regclass)::bigint")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .context("filenode")?;
+            nodes.push(row.try_get::<i64, _>(0).context("node")?);
+        }
+        anyhow::Ok(nodes)
+    };
+    let store = SqlStore::connect(url).await.context("connect")?;
+    let before = filenodes().await?;
+    store.update_seal_config(seal_config(None)).await.context("update")?;
+    let after_update = filenodes().await?;
+    assert_ne!(before[0], after_update[0], "seal_config is rewritten on every change");
+    assert_eq!(before[1..], after_update[1..], "the rest only when keys are replaced");
+    store
+        .replace_wrapped_keys(Rekey {
+            fingerprint: "fp4".into(),
+            seal: Some(seal_config(None)),
+            ..Rekey::default()
+        })
+        .await
+        .context("replace")?;
+    let after_rekey = filenodes().await?;
+    for (table, (old, new)) in after_update.iter().zip(&after_rekey).enumerate() {
+        assert_ne!(old, new, "table {table} was rewritten");
+    }
+    Ok(())
 }

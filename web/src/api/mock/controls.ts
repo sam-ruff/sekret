@@ -19,19 +19,29 @@ export interface MockControls {
   orgRole?: string;
   /** Signing out continues at an identity provider's logout page. */
   idpLogout?: boolean;
+  /** `mock-remember-file=false` plays a server whose configuration names no remember file. */
+  rememberFile?: boolean;
+  /** False plays a server with no sign-in provider configured. */
+  oidc?: boolean;
+}
+
+function optionalFlag(params: URLSearchParams, name: string): boolean | undefined {
+  const value = params.get(name);
+  return value === null ? undefined : value !== "false";
 }
 
 export function parseControls(search: string): MockControls {
   const params = new URLSearchParams(search);
-  const webSetup = params.get("mock-web-setup");
   return {
     state: SEAL_STATES.find((s) => s === params.get("mock-state")),
-    webSetup: webSetup === null ? undefined : webSetup !== "false",
+    webSetup: optionalFlag(params, "mock-web-setup"),
     sealMode: SEAL_MODES.find((m) => m === params.get("mock-seal-mode")),
     configuredPolicy: UNLOCK_POLICIES.find((p) => p === params.get("mock-unlock")),
     unsealedBy: UNSEALED_BY.find((u) => u === params.get("mock-unsealed-by")),
     orgRole: params.get("mock-org-role") ?? undefined,
     idpLogout: params.has("mock-idp-logout") ? true : undefined,
+    rememberFile: optionalFlag(params, "mock-remember-file"),
+    oidc: optionalFlag(params, "mock-oidc"),
   };
 }
 

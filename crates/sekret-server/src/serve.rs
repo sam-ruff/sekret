@@ -1,11 +1,12 @@
 //! Accepts connections with a cap on how many are open at once, and closes clients that are slow
 //! to send their headers or sit idle, over plain HTTP and TLS alike.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use axum::extract::ConnectInfo;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
@@ -27,7 +29,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HTTP2_STREAMS: u32 = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionLimits {
     /// For a request's headers, and for the TLS handshake before them.
     pub header_read_timeout: Duration,
@@ -35,14 +37,84 @@ pub struct ConnectionLimits {
     pub idle_timeout: Duration,
     /// Connections served at once; further ones wait in the listen backlog.
     pub max_connections: usize,
+    /// Connections one client address (an IPv6 /64) may hold at once; more are closed straight away.
+    pub max_per_client: usize,
+    /// Peers the per-client cap does not apply to, such as reverse proxies.
+    pub exempt: Arc<[IpNet]>,
 }
 
 impl ConnectionLimits {
+    /// A quarter of the connections per client, with loopback exempt for a local proxy.
     pub fn new(max_connections: usize) -> Self {
+        let max_connections = max_connections.max(1);
         Self {
             header_read_timeout: HEADER_READ_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
-            max_connections: max_connections.max(1),
+            max_connections,
+            max_per_client: (max_connections / 4).max(1),
+            exempt: loopback().into(),
+        }
+    }
+
+    /// Also exempts `nets`, usually the trusted proxies.
+    pub fn exempting(mut self, nets: &[IpNet]) -> Self {
+        self.exempt = self.exempt.iter().chain(nets).copied().collect();
+        self
+    }
+
+    fn capped(&self, peer: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        !self.exempt.iter().any(|net| net.contains(&peer))
+    }
+}
+
+fn loopback() -> Vec<IpNet> {
+    [
+        Ipv4Net::new(Ipv4Addr::new(127, 0, 0, 0), 8).map(IpNet::V4),
+        Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).map(IpNet::V6),
+    ]
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect()
+}
+
+/// Open connections per client, each released when its slot drops.
+#[derive(Default)]
+struct PerClient {
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+struct ClientSlot {
+    owner: Arc<PerClient>,
+    key: IpAddr,
+}
+
+impl PerClient {
+    fn claim(self: &Arc<Self>, peer: IpAddr, max: usize) -> Option<ClientSlot> {
+        let key = crate::ratelimit::limiter_key(peer);
+        let mut open = self.open.lock().ok()?;
+        let count = open.entry(key).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(ClientSlot {
+            owner: self.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        let Ok(mut open) = self.owner.open.lock() else {
+            return;
+        };
+        if let Some(count) = open.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&self.key);
+            }
         }
     }
 }
@@ -58,6 +130,7 @@ pub async fn serve(
 ) {
     let max = limits.max_connections.clamp(1, Semaphore::MAX_PERMITS);
     let permits = Arc::new(Semaphore::new(max));
+    let per_client = Arc::new(PerClient::default());
     let (stop, stopping) = watch::channel(false);
     let acceptor = tls.map(TlsAcceptor::from);
     tokio::pin!(shutdown);
@@ -82,11 +155,22 @@ pub async fn serve(
                 }
             },
         };
+        let slot = if limits.capped(peer.ip()) {
+            let Some(slot) = per_client.claim(peer.ip(), limits.max_per_client) else {
+                tracing::debug!(%peer, "closed a connection over the per-client limit");
+                continue;
+            };
+            Some(slot)
+        } else {
+            None
+        };
         let app = app.clone();
         let acceptor = acceptor.clone();
         let stopping = stopping.clone();
+        let limits = limits.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _slot = slot;
             serve_connection(stream, peer, app, acceptor, limits, stopping).await;
         });
     }

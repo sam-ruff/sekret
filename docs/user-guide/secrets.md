@@ -14,7 +14,7 @@ sekret secrets get DATABASE_URL
 sekret secrets delete OLD_KEY
 ```
 
-In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. Switching to another environment or folder masks everything again, and so do three minutes without touching the page, an ended session or a locked server. A copied value is cleared from the clipboard after 45 seconds if it is still there. Browsers only allow that while the tab has focus, so if you have moved to another window by then, sekret clears it when you come back, or tells you to clear it yourself when it cannot check what the clipboard holds. Signing out, being sent to sign in again, or leaving the page clears it straight away. Pasting a `.env` file into the import dialog creates or updates every key in it in one write; closing the dialog throws the pasted text away.
+In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. Switching to another environment or folder masks everything again, and so do three minutes without touching the page, an ended session or a locked server. The same applies to the edit form, which shows the current value: it closes after three idle minutes and drops anything not yet saved. A copied value is cleared from the clipboard after 45 seconds if it is still there. Browsers only allow that while the tab has focus, so if you have moved to another window by then, sekret clears it when you come back, or tells you to clear it yourself when it cannot check what the clipboard holds. Signing out or being sent to sign in again clears it straight away. Closing or reloading the tab first asks you to confirm and tries to clear it, but the browser may refuse, for example when the tab is closed from another window, so clear the clipboard yourself if you are not sure. Pasting a `.env` file into the import dialog creates or updates every key in it in one write; closing the dialog throws the pasted text away.
 
 Reading a key name and reading its value are separate permissions, so a role can let someone see which keys exist without seeing any values.
 
@@ -26,7 +26,7 @@ sekret secrets history DATABASE_URL --diff 3 5
 sekret secrets rollback DATABASE_URL 3
 ```
 
-The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and a line diff between any two versions. Closing the drawer or opening another secret hides them again.
+The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and a line diff between any two versions. Versions that differ in a great many lines are not compared. The secret's generation and rotation settings sit below the history. Closing the drawer or opening another secret hides them again.
 
 ![A secret's history, with a diff between two versions](../assets/screenshots/history-light.png)
 

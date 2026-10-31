@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
-import { CLIPBOARD_CLEAR_MS, ClipboardGuard, type ClipboardDeps } from "./clipboard";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CLIPBOARD_CLEAR_MS, ClipboardGuard, warnBeforeUnload, type ClipboardDeps } from "./clipboard";
+import { beginLeaving, stopLeaving } from "./leaving";
 
 function setup(overrides: Partial<ClipboardDeps> = {}) {
   let contents = "";
@@ -195,5 +196,47 @@ describe("ClipboardGuard", () => {
     const failing = setup();
     failing.clipboard.writeText.mockImplementationOnce(() => Promise.reject(new Error("denied")));
     await expect(failing.guard.clearIfUnchanged("x", 0)).resolves.toBe("unverifiable");
+  });
+});
+
+describe("warnBeforeUnload", () => {
+  afterEach(() => stopLeaving());
+
+  it("does nothing when no copied secret is outstanding", () => {
+    const c = setup();
+    const event = { preventDefault: vi.fn() };
+    expect(warnBeforeUnload(c.guard, event)).toBe(false);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("asks before the tab closes with a secret on the clipboard, and starts clearing it", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    const event = { preventDefault: vi.fn() };
+    expect(warnBeforeUnload(c.guard, event)).toBe(true);
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+    await c.settle();
+    expect(c.contents).toBe("");
+    expect(c.guard.hasOutstanding()).toBe(false);
+    expect(c.onNotCleared).not.toHaveBeenCalled();
+  });
+
+  it("tells the person when the clear was refused, in case they stay", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    c.clipboard.writeText.mockImplementationOnce(() => Promise.reject(new Error("NotAllowedError")));
+    warnBeforeUnload(c.guard, { preventDefault: vi.fn() });
+    await c.settle();
+    expect(c.contents).toBe("s3cret");
+    expect(c.onNotCleared).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask while sekret itself is navigating away, such as signing out", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    beginLeaving();
+    const event = { preventDefault: vi.fn() };
+    expect(warnBeforeUnload(c.guard, event)).toBe(false);
+    expect(event.preventDefault).not.toHaveBeenCalled();
   });
 });

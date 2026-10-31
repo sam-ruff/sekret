@@ -191,13 +191,20 @@ export function seededState(realNow: number): MockState {
   // Shows conditional rules: production values stay hidden from this user even as an org admin.
   backend.putRole("payments-api", "no-prod-values", {
     name: "No production values",
-    description: "Everything except reading production secret values",
+    description: "Everything except reading production secret values and legacy production keys",
     rules: [
       {
         effect: "deny",
         subject: "secrets",
         actions: ["read-value"],
         conditions: { environments: ["prod"], paths: [], keys: [], tags: [] },
+      },
+      // Some production key names are hidden too, so the audit log refuses key and folder filters.
+      {
+        effect: "deny",
+        subject: "secrets",
+        actions: ["read"],
+        conditions: { environments: ["prod"], paths: [], keys: ["LEGACY_*"], tags: [] },
       },
     ],
   });

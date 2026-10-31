@@ -14,8 +14,12 @@ pub struct ProjectFile {
     pub project: Option<String>,
     pub environment: Option<String>,
     pub path: Option<String>,
-    /// Blocked variable names that `run`, `env use` and export load anyway.
+    /// Blocked variable names that `run`, `env use` and export load anyway, once the person has
+    /// confirmed this exact list for this file.
     pub allow: Vec<String>,
+    /// Where the file was found.
+    #[serde(skip)]
+    pub location: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +33,29 @@ pub struct StoredToken {
 pub struct Credentials {
     #[serde(default)]
     pub servers: BTreeMap<String, StoredToken>,
+    /// `allow` lists the person confirmed, keyed by the project file's path. A changed list needs
+    /// confirming again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub confirmed_allow: BTreeMap<String, Vec<String>>,
+}
+
+/// The sorted, de-duplicated form an `allow` list is confirmed and compared in.
+pub fn normalised_allow(names: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&String> = names.iter().collect();
+    set.into_iter().cloned().collect()
+}
+
+impl Credentials {
+    pub fn allow_confirmed(&self, file: &Path, names: &[String]) -> bool {
+        self.confirmed_allow
+            .get(&file.display().to_string())
+            .is_some_and(|confirmed| *confirmed == normalised_allow(names))
+    }
+
+    pub fn confirm_allow(&mut self, file: &Path, names: &[String]) {
+        self.confirmed_allow
+            .insert(file.display().to_string(), normalised_allow(names));
+    }
 }
 
 /// Owner, group and permission bits of a file or directory, as `stat` reports them.
@@ -181,7 +208,8 @@ pub fn load_project_file(start: &Path, warnings: &mut Vec<String>) -> anyhow::Re
         return Ok((ProjectFile::default(), None));
     };
     let text = read_open(opened, &path)?;
-    let file = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let mut file: ProjectFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    file.location = Some(std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
     Ok((file, Some(path)))
 }
 
@@ -285,8 +313,12 @@ pub struct Resolved {
     pub environment: Option<String>,
     pub path: String,
     pub source: ServerSource,
-    /// Blocked variable names the project file allows.
+    /// Blocked variable names the project file allows, once confirmed.
     pub allow: Vec<String>,
+    /// The project file's `allow` list while it is not yet confirmed, with the file's path.
+    pub unconfirmed_allow: Option<(PathBuf, Vec<String>)>,
+    /// The project file chose the project or environment, rather than a flag or variable.
+    pub chosen_by_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -333,6 +365,21 @@ pub fn resolve(
             .filter(|stored| stored.expires_at > now)
             .map(|stored| stored.token.clone())
     });
+    let chosen_by_file = ((overrides.project.is_none() && file.project.is_some())
+        || (overrides.environment.is_none() && file.environment.is_some()))
+    .then(|| file.location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)));
+    // A cloned repository's file must not unblock names on its own say-so.
+    let (allow, unconfirmed_allow) = match &file.location {
+        _ if file.allow.is_empty() => (Vec::new(), None),
+        Some(location) if credentials.allow_confirmed(location, &file.allow) => (file.allow, None),
+        location => (
+            Vec::new(),
+            Some((
+                location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)),
+                normalised_allow(&file.allow),
+            )),
+        ),
+    };
     Ok(Resolved {
         server,
         token,
@@ -340,7 +387,9 @@ pub fn resolve(
         environment: overrides.environment.or(file.environment),
         path: overrides.path.or(file.path).unwrap_or_else(|| "/".into()),
         source,
-        allow: file.allow,
+        allow,
+        unconfirmed_allow,
+        chosen_by_file,
     })
 }
 
@@ -705,10 +754,80 @@ mod tests {
     }
 
     #[test]
-    fn the_project_file_can_allow_blocked_names() -> anyhow::Result<()> {
-        let file: ProjectFile = toml::from_str("server = \"https://s\"\nallow = [\"KUBECONFIG\"]\n")?;
-        let resolved = resolve(Overrides::default(), file, &Credentials::default(), 0)?;
-        assert_eq!(resolved.allow, ["KUBECONFIG"]);
+    fn the_project_file_allows_blocked_names_only_once_confirmed() -> anyhow::Result<()> {
+        let mut file: ProjectFile =
+            toml::from_str("server = \"https://s\"\nallow = [\"KUBECONFIG\", \"GIT_PAGER\"]\n")?;
+        let location = PathBuf::from("/repo/.sekret.toml");
+        file.location = Some(location.clone());
+        let resolved = resolve(Overrides::default(), file.clone(), &Credentials::default(), 0)?;
+        assert!(
+            resolved.allow.is_empty(),
+            "a cloned file cannot unblock names by itself"
+        );
+        assert_eq!(
+            resolved.unconfirmed_allow,
+            Some((location.clone(), vec!["GIT_PAGER".into(), "KUBECONFIG".into()]))
+        );
+
+        let mut credentials = Credentials::default();
+        credentials.confirm_allow(
+            &location,
+            &["KUBECONFIG".into(), "GIT_PAGER".into(), "KUBECONFIG".into()],
+        );
+        let resolved = resolve(Overrides::default(), file.clone(), &credentials, 0)?;
+        assert_eq!(resolved.allow, ["KUBECONFIG", "GIT_PAGER"]);
+        assert_eq!(resolved.unconfirmed_allow, None);
+
+        // A longer list, or the same list in another file, needs confirming again.
+        let mut grown = file.clone();
+        grown.allow.push("LD_PRELOAD".into());
+        assert!(resolve(Overrides::default(), grown, &credentials, 0)?.allow.is_empty());
+        let mut elsewhere = file;
+        elsewhere.location = Some("/other/.sekret.toml".into());
+        assert!(
+            resolve(Overrides::default(), elsewhere, &credentials, 0)?
+                .allow
+                .is_empty()
+        );
+
+        let text = toml::to_string(&credentials)?;
+        let read: Credentials = toml::from_str(&text)?;
+        assert!(read.allow_confirmed(&location, &["GIT_PAGER".into(), "KUBECONFIG".into()]));
+        let old: Credentials = toml::from_str("[servers]\n")?;
+        assert!(old.confirmed_allow.is_empty(), "older credentials files still load");
+        Ok(())
+    }
+
+    #[test]
+    fn a_project_or_environment_from_the_file_is_flagged() -> anyhow::Result<()> {
+        let mut file: ProjectFile =
+            toml::from_str("server = \"https://s\"\nproject = \"p\"\nenvironment = \"prod\"\n")?;
+        file.location = Some("/repo/.sekret.toml".into());
+        let from_file = resolve(Overrides::default(), file.clone(), &Credentials::default(), 0)?;
+        assert_eq!(from_file.chosen_by_file, Some(PathBuf::from("/repo/.sekret.toml")));
+        let chosen = Overrides {
+            project: Some("p".into()),
+            environment: Some("dev".into()),
+            ..Default::default()
+        };
+        let flagged = resolve(chosen, file, &Credentials::default(), 0)?;
+        assert_eq!(flagged.chosen_by_file, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loaded_project_file_records_where_it_is() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        }
+        std::fs::write(dir.path().join(PROJECT_FILE), "allow = [\"KUBECONFIG\"]\n").context("write")?;
+        let mut warnings = Vec::new();
+        let (file, _) = load_project_file(dir.path(), &mut warnings)?;
+        let expected = std::fs::canonicalize(dir.path().join(PROJECT_FILE))?;
+        assert_eq!(file.location, Some(expected), "{warnings:?}");
         Ok(())
     }
 

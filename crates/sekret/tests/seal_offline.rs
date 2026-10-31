@@ -6,7 +6,7 @@ use std::process::{Command, Output, Stdio};
 use anyhow::Context;
 use sekret_core::crypto::RootKey;
 use sekret_core::seal::{UnlockPolicy, unwrap_root_key};
-use sekret_server::seal::{Signature, check_signature, high_water, record_epoch, signed};
+use sekret_server::seal::{Signature, accepted_roots, check_signature, high_water, record_epoch, signed};
 use sekret_store::{SealConfig, SqlStore, Store};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sekret");
@@ -102,7 +102,7 @@ async fn rolled_forward() -> anyhow::Result<(Fixture, SealConfig)> {
         high_water(&marks).floor(),
     )?;
     fixture.store().await?.update_seal_config(manual.clone()).await?;
-    record_epoch(&marks, manual.epoch);
+    record_epoch(&marks, manual.epoch, &root.fingerprint())?;
     Ok((fixture, granting))
 }
 
@@ -153,27 +153,47 @@ async fn switching_the_seal_mode_signs_above_the_marks() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lowering the marks takes this explicit command, which also re-signs the configuration.
+/// Restoring an older database in place: the reset signs above the marks and never lowers them,
+/// so nothing signed in between can be replayed, and the rolled-back configuration grants nothing.
 #[tokio::test]
-async fn reset_epoch_is_the_only_way_to_lower_the_marks() -> anyhow::Result<()> {
-    let (fixture, _) = rolled_forward().await?;
+async fn reset_epoch_signs_above_the_marks_and_never_lowers_them() -> anyhow::Result<()> {
+    let (fixture, granting) = rolled_forward().await?;
     let marks = fixture.marks();
-    record_epoch(&marks, 1000);
+    let fingerprint = Fixture::root(&granting)?.fingerprint();
+    record_epoch(&marks, 1000, &fingerprint)?;
     assert_eq!(high_water(&marks).highest, Some(1000), "raising is allowed");
-    record_epoch(&marks, 5);
+    record_epoch(&marks, 5, &fingerprint)?;
     assert_eq!(high_water(&marks).highest, Some(1000), "lowering is not");
+    fixture.store().await?.update_seal_config(granting).await?;
 
     let printed = fixture.admin(&["reset-epoch"])?;
+    assert!(printed.contains("older than the marks"), "{printed}");
     let config = fixture.config().await?;
-    assert!(config.epoch < 1000);
+    assert!(config.epoch > 1000, "{}", config.epoch);
     assert_eq!(high_water(&marks).highest, Some(config.epoch), "{printed}");
     let root = Fixture::root(&config)?;
     assert_eq!(check_signature(&root, &config), Signature::Valid);
     assert_eq!(
         config.unlock_policy,
         UnlockPolicy::Manual,
-        "a sound configuration keeps its policy"
+        "a rolled-back configuration loses its grant"
     );
+
+    // A sound configuration keeps what it grants.
+    let granting = signed(
+        &root,
+        SealConfig {
+            unlock_policy: UnlockPolicy::PassphraseFile,
+            ..config
+        },
+        high_water(&marks).floor(),
+    )?;
+    fixture.store().await?.update_seal_config(granting.clone()).await?;
+    record_epoch(&marks, granting.epoch, &fingerprint)?;
+    fixture.admin(&["reset-epoch"])?;
+    let config = fixture.config().await?;
+    assert_eq!(config.unlock_policy, UnlockPolicy::PassphraseFile);
+    assert!(config.epoch > granting.epoch);
 
     // A damaged mark is repaired the same way, and a tampered configuration loses its grant.
     for mark in &marks {
@@ -181,7 +201,7 @@ async fn reset_epoch_is_the_only_way_to_lower_the_marks() -> anyhow::Result<()> 
     }
     assert!(high_water(&marks).broken);
     let tampered = SealConfig {
-        unlock_policy: UnlockPolicy::PassphraseFile,
+        unlock_policy: UnlockPolicy::Remember,
         ..config
     };
     fixture.store().await?.update_seal_config(tampered).await?;
@@ -193,5 +213,121 @@ async fn reset_epoch_is_the_only_way_to_lower_the_marks() -> anyhow::Result<()> 
     let after = high_water(&marks);
     assert!(!after.broken);
     assert_eq!(after.highest, Some(repaired.epoch));
+    Ok(())
+}
+
+fn fingerprint_in(path: &Path) -> anyhow::Result<String> {
+    let text = std::fs::read(path).context("key file")?;
+    Ok(RootKey::parse(&text).context("parse")?.fingerprint())
+}
+
+/// Switching mode replaces the root key, so whatever opened the database before, an old key
+/// file or the old passphrase with an old wrap, opens nothing in it afterwards.
+#[tokio::test]
+async fn switching_the_seal_mode_replaces_the_root_key() -> anyhow::Result<()> {
+    let (fixture, granting) = rolled_forward().await?;
+    let first = Fixture::root(&granting)?;
+    let old_wrap = fixture.config().await?.wrapped.context("wrap")?;
+    let switch = |mode: &str| {
+        run(
+            &[
+                "admin",
+                "set-seal-mode",
+                mode,
+                "--database-url",
+                &fixture.db,
+                "--root-key-file",
+                "root.key",
+                "--passphrase-file",
+                "pass",
+            ],
+            fixture.path(),
+        )
+    };
+    let printed = ok(switch("key-file")?)?;
+    assert!(printed.contains("new root key"), "{printed}");
+    let second = fingerprint_in(&fixture.path().join("root.key"))?;
+    assert_ne!(second, first.fingerprint());
+    let store = fixture.store().await?;
+    assert_eq!(
+        store.get_meta(sekret_server::ROOT_KEY_META).await?,
+        Some(second.clone())
+    );
+    let marks = sekret_server::config::epoch_files(&fixture.db, None, Some(&fixture.path().join("root.key")));
+    assert_eq!(accepted_roots(&marks), Some(vec![second.clone()]));
+    let wrapped = unwrap_root_key(&old_wrap, PASSPHRASE).context("the old wrap still opens")?;
+    assert_ne!(wrapped.fingerprint(), second, "but only the old key");
+
+    // Back to passphrase mode: the key file that ran the server until now is refused.
+    std::fs::rename(fixture.path().join("root.key"), fixture.path().join("old.key")).context("move")?;
+    std::fs::copy(fixture.path().join("old.key"), fixture.path().join("root.key")).context("copy")?;
+    ok(switch("passphrase")?)?;
+    let config = fixture.config().await?;
+    let third = Fixture::root(&config)?.fingerprint();
+    assert_ne!(third, second);
+    assert_eq!(
+        fixture.store().await?.get_meta(sekret_server::ROOT_KEY_META).await?,
+        Some(third)
+    );
+    let bootstrap = run(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &fixture.db,
+            "--root-key-file",
+            "old.key",
+        ],
+        fixture.path(),
+    )?;
+    assert!(!bootstrap.status.success(), "the old key file opens nothing");
+    std::fs::remove_file(fixture.path().join("root.key")).context("remove")?;
+    fixture.admin(&["bootstrap"])?;
+    Ok(())
+}
+
+fn copy_database(from: &Path, to: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut source = from.as_os_str().to_os_string();
+        source.push(suffix);
+        let mut target = to.as_os_str().to_os_string();
+        target.push(suffix);
+        let _ = std::fs::remove_file(&target);
+        if Path::new(&source).exists() {
+            std::fs::copy(&source, &target).context("copy")?;
+        }
+    }
+    Ok(())
+}
+
+/// A database put back from before a root key rotation is under a key the marks no longer
+/// name. Only the explicit host command accepts it, and it moves the marks to that key.
+#[tokio::test]
+async fn only_reset_epoch_adopt_root_key_accepts_a_key_the_marks_do_not_name() -> anyhow::Result<()> {
+    let (fixture, granting) = rolled_forward().await?;
+    let first = Fixture::root(&granting)?.fingerprint();
+    let live = fixture.path().join("sekret.db");
+    let saved = fixture.path().join("saved.db");
+    copy_database(&live, &saved)?;
+    fixture.admin(&["rotate-root-key"])?;
+    let rotated = Fixture::root(&fixture.config().await?)?.fingerprint();
+    assert_eq!(accepted_roots(&fixture.marks()), Some(vec![rotated]));
+
+    copy_database(&saved, &live)?;
+    for command in [&["bootstrap"][..], &["reset-epoch"][..]] {
+        let mut full = vec!["admin"];
+        full.extend_from_slice(command);
+        full.extend_from_slice(&["--database-url", &fixture.db, "--passphrase-file", "pass"]);
+        let refused = run(&full, fixture.path())?;
+        let shown = format!("{}", String::from_utf8_lossy(&refused.stderr));
+        assert!(!refused.status.success(), "{command:?}");
+        assert!(shown.contains("--adopt-root-key"), "{command:?}: {shown}");
+    }
+    let printed = fixture.admin(&["reset-epoch", "--adopt-root-key"])?;
+    assert!(printed.contains(&first), "{printed}");
+    assert_eq!(accepted_roots(&fixture.marks()), Some(vec![first]));
+    let config = fixture.config().await?;
+    assert_eq!(high_water(&fixture.marks()).highest, Some(config.epoch));
+    fixture.admin(&["bootstrap"])?;
     Ok(())
 }

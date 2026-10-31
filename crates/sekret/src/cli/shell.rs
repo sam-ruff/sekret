@@ -93,6 +93,29 @@ const BLOCKED_EXACT: &[&str] = &[
     "MAKE",
     "MAKEFLAGS",
     "MFLAGS",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "LDLIBS",
+    "NULLCMD",
+    "READNULLCMD",
+    "VIM",
+    "VIMRUNTIME",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "BOTO_CONFIG",
+    "CLOUDSDK_CONFIG",
+    "AZURE_CONFIG_DIR",
+    "TERRAFORM_CONFIG",
+    "HGRCPATH",
+    "TCLLIBPATH",
+    "GUILE_LOAD_PATH",
+    "GUILE_LOAD_COMPILED_PATH",
+    "COR_ENABLE_PROFILING",
+    "COR_PROFILER",
+    "COR_PROFILER_PATH",
+    "GHC_ENVIRONMENT",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -132,9 +155,28 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "GTK_",
     "QT_",
     "GST_PLUGIN",
+    "DOTNET_",
+    "CORECLR_",
+    "ERL_",
+    "ELIXIR_",
+    "MAVEN_",
+    "GRADLE_",
+    "ANSIBLE_",
+    "TF_CLI_",
+    "R_PROFILE",
+    "R_ENVIRON",
+    "R_LIBS",
+    "JULIA_",
+    "UV_",
+    "POETRY_",
+    "PHP",
 ];
 
-const BLOCKED_SUFFIXES: &[&str] = &["PAGER", "EDITOR", "ASKPASS", "_COMMAND", "_OPTIONS", "_PROXY"];
+/// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
+/// `IRBRC`, `PHPRC` and `WGETRC`.
+const BLOCKED_SUFFIXES: &[&str] = &[
+    "PAGER", "EDITOR", "ASKPASS", "_COMMAND", "_OPTIONS", "_OPTS", "_FLAGS", "_PROXY", "_HOOK", "_HOOKS", "INIT", "RC",
+];
 
 /// `PS1`, `RPS2` and the like.
 fn is_numbered_prompt(upper: &str) -> bool {
@@ -553,6 +595,84 @@ mod tests {
         ] {
             assert_eq!(policy.check(fine), Ok(()), "{fine}");
         }
+    }
+
+    /// Names from the round 4 audit that make editors, database shells, build tools and runtimes
+    /// run code chosen by whoever wrote the secret.
+    const CODE_RUNNERS: &[&str] = &[
+        "VIMINIT",
+        "EXINIT",
+        "GVIMINIT",
+        "MYVIMRC",
+        "VIMRUNTIME",
+        "PSQLRC",
+        "MAVEN_OPTS",
+        "MAVEN_ARGS",
+        "GRADLE_OPTS",
+        "GRADLE_USER_HOME",
+        "SBT_OPTS",
+        "ANT_OPTS",
+        "DOTNET_STARTUP_HOOKS",
+        "CORECLR_ENABLE_PROFILING",
+        "CORECLR_PROFILER_PATH",
+        "COR_PROFILER_PATH",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "ERL_AFLAGS",
+        "ERL_FLAGS",
+        "ERL_ZFLAGS",
+        "ELIXIR_ERL_OPTIONS",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "TF_CLI_CONFIG_FILE",
+        "TERRAFORM_CONFIG",
+        "HGRCPATH",
+        "IRBRC",
+        "WGETRC",
+        "NETRC",
+        "ANSIBLE_CONFIG",
+        "NULLCMD",
+        "CFLAGS",
+        "LDFLAGS",
+        "R_PROFILE_USER",
+        "JULIA_DEPOT_PATH",
+        "UV_INDEX_URL",
+        "SOME_TOOL_OPTS",
+        "SOME_TOOL_FLAGS",
+        "PRE_COMMIT_HOOK",
+        "viminit",
+    ];
+
+    #[test]
+    fn names_that_make_tools_run_code_are_refused() {
+        let policy = strict();
+        for name in CODE_RUNNERS {
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(policy.check(name), Err(SkipReason::Blocked), "{name}");
+        }
+        for fine in ["DATABASE_URL", "PSQL_HOST", "AWS_REGION", "SENTRY_DSN", "OPTS_URL"] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
+    }
+
+    #[test]
+    fn viminit_from_a_secret_is_not_exported() -> anyhow::Result<()> {
+        let switch = switch_script(
+            Shell::Bash,
+            &[],
+            vars(&[
+                ("VIMINIT", ":silent !touch /tmp/pwned"),
+                ("MAVEN_OPTS", "-javaagent:/tmp/x.jar"),
+            ]),
+            &strict(),
+            &origin("dev"),
+        );
+        assert!(switch.loaded.is_empty());
+        assert_eq!(
+            bash_after(&switch.script, &["VIMINIT", "MAVEN_OPTS"])?,
+            ["<unset>", "<unset>"]
+        );
+        Ok(())
     }
 
     #[test]

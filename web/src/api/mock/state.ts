@@ -28,6 +28,8 @@ export interface MockSys {
   remembered: boolean;
   unsealedBy: UnsealedBy | null;
   webSetup: boolean;
+  /** The configuration names a remember file. */
+  rememberFile: boolean;
   passphrase: string;
   failedUnseals: number;
   /** Milliseconds since the epoch until which passphrase attempts are refused. */
@@ -94,6 +96,8 @@ export interface MockState {
   freshSignIn?: boolean;
   /** Where signing out continues, as a server with an identity provider's logout endpoint answers. */
   idpLogoutUrl?: string;
+  /** No sign-in provider is configured, as on a fresh server. */
+  oidcDisabled?: boolean;
   /** CLI login codes already approved or denied. */
   endedCliCodes?: string[];
   seq: number;

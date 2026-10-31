@@ -1,0 +1,39 @@
+{{- if .Values.tokenPolicy.enabled }}
+{{- $fullname := include "sekret-operator.fullname" . }}
+{{- $username := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "sekret-operator.serviceAccountName" .) }}
+# Limits the tokens the operator can mint to ones only sekret accepts, whatever its RBAC allows.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-tokens
+  labels:
+    {{- include "sekret-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["serviceaccounts/token"]
+  matchConditions:
+    - name: requested-by-the-operator
+      expression: request.userInfo.username == {{ $username | quote }}
+  validations:
+    - expression: has(object.spec.audiences) && object.spec.audiences == ["sekret"]
+      message: the sekret operator may only request tokens for the sekret audience
+    - expression: has(object.spec.expirationSeconds) && object.spec.expirationSeconds <= 600
+      message: the sekret operator may only request tokens that expire within 600 seconds
+    - expression: request.namespace != "kube-system"
+      message: the sekret operator may not request tokens in kube-system
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-tokens
+  labels:
+    {{- include "sekret-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-tokens
+  validationActions: ["Deny"]
+{{- end }}

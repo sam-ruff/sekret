@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
@@ -26,6 +28,12 @@ pub trait KubeApi: Send + Sync {
     async fn get_secret(&self, namespace: String, name: String) -> Result<Option<Secret>, KubeError>;
     async fn create_secret(&self, namespace: String, secret: Secret) -> Result<(), KubeError>;
     async fn replace_secret(&self, namespace: String, secret: Secret) -> Result<(), KubeError>;
+    /// The service account's annotations, or `None` when it does not exist.
+    async fn service_account_annotations(
+        &self,
+        namespace: String,
+        name: String,
+    ) -> Result<Option<BTreeMap<String, String>>, KubeError>;
     /// Mints a short-lived token for a service account via the TokenRequest API.
     async fn request_token(
         &self,
@@ -75,6 +83,18 @@ impl KubeApi for KubeClient {
         };
         api.replace(&name, &params, &secret).await?;
         Ok(())
+    }
+
+    async fn service_account_annotations(
+        &self,
+        namespace: String,
+        name: String,
+    ) -> Result<Option<BTreeMap<String, String>>, KubeError> {
+        let api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), &namespace);
+        Ok(api
+            .get_opt(&name)
+            .await?
+            .map(|account| account.metadata.annotations.unwrap_or_default()))
     }
 
     async fn request_token(

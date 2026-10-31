@@ -1,5 +1,5 @@
 import { Eye, Lock, MoreHorizontal, Pencil, Plus, ShieldCheck, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { PutRole, Role, Subject } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ResponsiveTable } from "@/components/responsive-table";
@@ -13,6 +13,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { focusInstead } from "@/lib/return-focus";
 import { RoleEditor } from "./role-editor";
 
 interface RolesPanelProps {
@@ -46,6 +47,9 @@ export function RolesPanel({
 }: RolesPanelProps) {
   const [editor, setEditor] = useState<EditorState>(null);
   const [deleting, setDeleting] = useState<Role | null>(null);
+  // Each row's menu button, so focus can go back to it once the editor opened from that menu closes.
+  const triggers = useRef(new Map<string, HTMLElement>());
+  const editorSlug = editor && editor.mode !== "new" ? editor.role.slug : undefined;
 
   return (
     <div className="space-y-4">
@@ -102,7 +106,16 @@ export function RolesPanel({
               cell: (r) => (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${r.name}`} data-testid={`role-actions-${r.slug}`}>
+                    <Button
+                      ref={(el) => {
+                        if (el) triggers.current.set(r.slug, el);
+                        else triggers.current.delete(r.slug);
+                      }}
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Actions for ${r.name}`}
+                      data-testid={`role-actions-${r.slug}`}
+                    >
                       <MoreHorizontal />
                     </Button>
                   </DropdownMenuTrigger>
@@ -144,6 +157,7 @@ export function RolesPanel({
           subjects={subjects}
           environments={environments}
           onSave={onSave}
+          onCloseAutoFocus={(event) => focusInstead(event, triggers.current.get(editorSlug ?? ""))}
         />
       )}
       <ConfirmDialog

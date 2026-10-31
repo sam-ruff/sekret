@@ -105,6 +105,11 @@ export function OverviewPage() {
         <EmptyState icon={<Layers />} title="No secrets in this folder" description="Keys appear here once any environment has them." testId="overview-empty" />
       )}
 
+      {shown.length > 0 && envs.length > 1 && (
+        <p className="-mb-4 text-xs text-muted-foreground md:hidden" data-testid="overview-swipe-hint">
+          Swipe the table sideways to see every environment.
+        </p>
+      )}
       {shown.length > 0 && (
         <div className="overflow-x-auto rounded-xl border bg-card" data-testid="overview-grid">
           <table className="w-full min-w-max text-sm">

@@ -306,6 +306,9 @@ pub struct AuditQuery {
     pub project_id: Option<String>,
     /// Case-insensitive substring over action, actor, environment, path, key and address.
     pub search: Option<String>,
+    /// Limit `search` to the action, actor and address, for readers who may not see every
+    /// environment, folder and key.
+    pub search_actors_only: bool,
     /// Prefix, so `secret.` matches every secret action.
     pub action: Option<String>,
     pub actor_id: Option<String>,

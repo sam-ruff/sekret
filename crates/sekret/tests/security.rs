@@ -306,7 +306,8 @@ async fn rotating_the_root_key_always_checks_the_passphrase() -> anyhow::Result<
     )?;
     assert!(!typo.status.success());
     assert!(text(&typo).contains("the passphrase is wrong"), "{}", text(&typo));
-    let rotated = ok(run(
+    // Switching mode replaced the root key, so the old key file is stale and refused.
+    let stale = run(
         &[
             "admin",
             "rotate-root-key",
@@ -314,6 +315,21 @@ async fn rotating_the_root_key_always_checks_the_passphrase() -> anyhow::Result<
             &db,
             "--root-key-file",
             "root.key",
+            "--passphrase-file",
+            "pass",
+        ],
+        &[],
+        d,
+    )?;
+    assert!(!stale.status.success());
+    assert!(text(&stale).contains("different root key"), "{}", text(&stale));
+    std::fs::remove_file(d.join("root.key")).context("remove")?;
+    let rotated = ok(run(
+        &[
+            "admin",
+            "rotate-root-key",
+            "--database-url",
+            &db,
             "--passphrase-file",
             "pass",
         ],
@@ -331,6 +347,14 @@ async fn rotating_the_root_key_always_checks_the_passphrase() -> anyhow::Result<
 
 /// A real key-file database in a `.skb` backup, and the key that opens it.
 async fn sample_backup(dir: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    sample_backup_by(dir, "test").await
+}
+
+/// [`sample_backup`] claiming to come from sekret `version`.
+async fn sample_backup_by(
+    dir: &Path,
+    version: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, String)> {
     use sekret_core::crypto::RootKey;
     use sekret_core::seal::{BackupHeader, SealMode, encrypt_backup};
     let root = RootKey::generate().context("root")?;
@@ -365,7 +389,7 @@ async fn sample_backup(dir: &Path) -> anyhow::Result<(std::path::PathBuf, std::p
             .context("snapshot")?;
     }
     let snapshot = std::fs::read(dir.join("snapshot.db")).context("read")?;
-    let header = BackupHeader::new(SealMode::KeyFile, None, &root, 1_700_000_123, "test");
+    let header = BackupHeader::new(SealMode::KeyFile, None, &root, 1_700_000_123, version);
     let file = encrypt_backup(&root, &header, &snapshot).context("encrypt")?;
     let backup = dir.join("backup.skb");
     std::fs::write(&backup, file).context("write")?;
@@ -425,6 +449,56 @@ async fn restore_refuses_leftovers_and_places_the_file_atomically() -> anyhow::R
     assert!(!names.iter().any(|n| n.contains(".restore-")), "{names:?}");
     let again = restore(&target)?;
     assert!(!again.status.success(), "an existing database is never overwritten");
+    Ok(())
+}
+
+/// A crafted `.skb` header could rewrite the terminal before anyone typed the passphrase.
+#[tokio::test]
+async fn restore_shows_header_fields_only_once_proved_and_never_raw() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let d = dir.path();
+    let hostile = "1.0\u{1b}]0;owned\u{7}\u{1b}[2J\nfake line";
+    let (backup, key, fingerprint) = sample_backup_by(d, hostile).await?;
+    let restore = |target: &str, backup: &Path| {
+        run(
+            &[
+                "admin",
+                "restore",
+                "--backup",
+                &backup.display().to_string(),
+                "--database-url",
+                target,
+                "--root-key-file",
+                &key.display().to_string(),
+            ],
+            &[],
+            d,
+        )
+    };
+
+    let mut damaged = std::fs::read(&backup).context("read")?;
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    let damaged_path = d.join("damaged.skb");
+    std::fs::write(&damaged_path, damaged).context("write")?;
+    let refused = restore(&sqlite(d, "refused.db"), &damaged_path)?;
+    let shown = text(&refused);
+    assert!(!refused.status.success(), "{shown}");
+    assert!(!shown.contains('\u{1b}') && !shown.contains("1700000123"), "{shown:?}");
+
+    let restored = restore(&sqlite(d, "restored.db"), &backup)?;
+    let shown = text(&restored);
+    assert!(restored.status.success(), "{shown}");
+    assert!(
+        shown.contains("1700000123") && shown.contains(&fingerprint),
+        "{shown:?}"
+    );
+    assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'), "{shown:?}");
+    assert!(!shown.contains("\nfake line"), "{shown:?}");
+
+    // The restore proved the key, so the restored database's own mark starts on it.
+    let marks = sekret_server::config::epoch_files(&sqlite(d, "restored.db"), None, None);
+    assert_eq!(sekret_server::seal::accepted_roots(&marks), Some(vec![fingerprint]));
     Ok(())
 }
 

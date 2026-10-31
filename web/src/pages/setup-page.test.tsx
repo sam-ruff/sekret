@@ -8,13 +8,14 @@ import { keys } from "@/hooks/queries";
 import { renderWithProviders, testQueryClient } from "@/test/render";
 import { SetupPage } from "./setup-page";
 
-vi.mock("@/api/endpoints", () => ({ api: { init: vi.fn(), sysStatus: vi.fn() } }));
+vi.mock("@/api/endpoints", () => ({ api: { init: vi.fn(), sysStatus: vi.fn(), authConfig: vi.fn() } }));
 // The local meter likes every passphrase here, so only the server can refuse one.
 vi.mock("@/hooks/use-passphrase-strength", () => ({
   usePassphraseStrength: () => ({ score: 4, acceptable: true, warning: null, suggestions: [] }),
 }));
 
 const init = vi.mocked(api.init);
+const authConfig = vi.mocked(api.authConfig);
 
 const uninitialised: SysStatus = {
   state: "uninitialised",
@@ -44,6 +45,8 @@ async function submit(passphrase: string, policy?: string) {
 describe("SetupPage", () => {
   beforeEach(() => {
     init.mockReset();
+    authConfig.mockReset();
+    authConfig.mockResolvedValue({ oidc_enabled: true, login_url: "/auth/login" });
   });
 
   it("shows the server's feedback when it refuses the passphrase", async () => {
@@ -88,6 +91,59 @@ describe("SetupPage", () => {
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
   });
 
+  it("says web sign-in is not ready and how to turn it on when the server has no sign-in provider", async () => {
+    authConfig.mockResolvedValue({ oidc_enabled: false, login_url: "/auth/login" });
+    init.mockResolvedValue({ status: { ...uninitialised, state: "unsealed" }, admin_token: "skt_abc" });
+    renderSetup();
+    await submit("plum orbit gravel lantern");
+    const notice = await screen.findByTestId("setup-no-oidc");
+    expect(notice).toHaveTextContent("Web sign-in is not set up yet");
+    expect(notice).toHaveTextContent("oidc.issuer");
+    expect(screen.getByTestId("setup-oidc-docs-link")).toHaveAttribute("href", expect.stringContaining("configuration/#signing-in-with-oidc"));
+    expect(screen.getByTestId("admin-token-help")).not.toHaveTextContent("signs you in through your identity provider");
+  });
+
+  it("leaves out the sign-in notice when a provider is configured", async () => {
+    init.mockResolvedValue({ status: { ...uninitialised, state: "unsealed" }, admin_token: "skt_abc" });
+    renderSetup();
+    await submit("plum orbit gravel lantern");
+    expect(await screen.findByTestId("admin-token")).toBeInTheDocument();
+    await waitFor(() => expect(authConfig).toHaveBeenCalled());
+    expect(screen.queryByTestId("setup-no-oidc")).toBeNull();
+  });
+
+  it("disables Remember with the reason when the server has no remember file", async () => {
+    renderSetup({ ...uninitialised, remember_available: false });
+    expect(screen.getByTestId("setup-policy-remember")).toBeDisabled();
+    expect(screen.getByTestId("setup-policy-card-remember")).toHaveAttribute("data-unavailable", "true");
+    expect(screen.getByTestId("setup-policy-unavailable")).toHaveTextContent(
+      "Not available: the server configuration does not set seal.remember_file.",
+    );
+    expect(screen.getByTestId("setup-policy-remember")).toHaveAttribute(
+      "aria-describedby",
+      "setup-policy-remember-text setup-policy-remember-unavailable",
+    );
+    await userEvent.click(screen.getByTestId("setup-policy-card-remember"));
+    expect(screen.getByTestId("setup-policy-manual")).toHaveAttribute("data-state", "checked");
+    expect(screen.getByTestId("setup-policy-passphrase-file")).toBeEnabled();
+  });
+
+  it("says the remember file is in place when the server reports one", async () => {
+    renderSetup({ ...uninitialised, remember_available: true });
+    await userEvent.click(screen.getByTestId("setup-policy-remember"));
+    expect(screen.getByTestId("setup-policy-needs")).toHaveTextContent("Uses the key file named by seal.remember_file.");
+    expect(screen.queryByTestId("setup-policy-unavailable")).toBeNull();
+  });
+
+  it("keeps Remember selectable with a hedged note when the server does not say", async () => {
+    renderSetup();
+    expect(screen.getByTestId("setup-policy-remember")).toBeEnabled();
+    await userEvent.click(screen.getByTestId("setup-policy-remember"));
+    expect(screen.getByTestId("setup-policy-needs")).toHaveTextContent(
+      "Only works if the server configuration sets seal.remember_file. If you are not sure, ask whoever runs the server.",
+    );
+  });
+
   it("moves focus to the setup code when it is wrong", async () => {
     init.mockRejectedValue(new ApiError("the setup code is wrong", 401, "invalid_setup_code"));
     renderSetup();
@@ -106,6 +162,17 @@ describe("SetupPage", () => {
     await userEvent.type(screen.getByTestId("setup-passphrase"), "plum orbit gravel lantern");
     expect(screen.getByTestId("setup-blocker")).toHaveTextContent("Type the passphrase again to continue.");
     expect(screen.getByTestId("setup-submit")).toHaveAttribute("aria-describedby", "setup-blocker");
+  });
+
+  it("marks a too-short passphrase on the field once the person moves on", async () => {
+    renderSetup();
+    await userEvent.type(screen.getByTestId("setup-passphrase"), "short one");
+    expect(screen.queryByTestId("setup-short")).toBeNull();
+    await userEvent.click(screen.getByTestId("setup-confirm"));
+    expect(screen.getByTestId("setup-short")).toHaveTextContent("Use at least 12 characters.");
+    expect(screen.getByTestId("setup-passphrase")).toHaveAttribute("aria-invalid", "true");
+    await userEvent.type(screen.getByTestId("setup-passphrase"), " made longer");
+    expect(screen.queryByTestId("setup-short")).toBeNull();
   });
 
   it("names a policy fixed in configuration and does not offer a choice", () => {

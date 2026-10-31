@@ -214,7 +214,7 @@ route("GET", "/api/v1/sys/backup", () => {
   throw new MockError(405, "method_not_allowed", "use POST to make a backup");
 });
 
-route("GET", "/api/v1/auth/config", () => ({ oidc_enabled: true, login_url: "/auth/login" }));
+route("GET", "/api/v1/auth/config", (b) => b.authConfig());
 route("GET", "/api/v1/auth/cli/pending", (b, c) => b.pendingCli(qs(c, "code", "")));
 route("POST", "/api/v1/auth/cli/approve", (b, c) => b.approveCli(body<CliApproveRequest>(c).code), 204);
 route("POST", "/api/v1/auth/cli/deny", (b, c) => b.denyCli(body<CliDenyRequest>(c).code), 204);
@@ -247,7 +247,7 @@ route("GET", `${E}/folders`, (b, c) => b.listFolders(c.params[0], c.params[1]));
 route("POST", `${E}/folders`, (b, c) => b.createFolder(c.params[0], c.params[1], body<{ path: string }>(c).path), 201);
 route("DELETE", `${E}/folders`, (b, c) => b.deleteFolder(c.params[0], c.params[1], qs(c, "path")), 204);
 
-route("GET", `${E}/secrets`, (b, c) => b.listSecrets(c.params[0], c.params[1], qs(c, "path"), flag(c, "values")));
+route("GET", `${E}/secrets`, (b, c) => b.listSecrets(c.params[0], c.params[1], qs(c, "path"), flag(c, "values"), flag(c, "recursive")));
 route("POST", `${E}/secrets/batch`, (b, c) => b.batchWrite(c.params[0], c.params[1], body<BatchWrite>(c)));
 route("GET", `${E}/secrets/{key}`, (b, c) => b.getSecret(c.params[0], c.params[1], c.params[2], qs(c, "path")));
 route("PUT", `${E}/secrets/{key}`, (b, c) => b.setSecret(c.params[0], c.params[1], c.params[2], qs(c, "path"), body<SetSecret>(c)));

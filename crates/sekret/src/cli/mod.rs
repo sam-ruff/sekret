@@ -101,6 +101,10 @@ pub enum SecretsCommand {
         key: String,
         #[arg(long)]
         json: bool,
+        /// Print the value even to a terminal when it holds control characters or escape
+        /// sequences, which could rewrite the screen or the clipboard. Pipes always get it as is.
+        #[arg(long)]
+        raw: bool,
     },
     /// Set secrets: `KEY=value`, or `KEY=-` to read the value from stdin.
     Set {
@@ -327,6 +331,9 @@ pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> 
         .transpose()
         .context("reading CA file")?
         .map(String::into_bytes);
+    if let Some(key) = &args.client_key {
+        crate::prompt::warn_if_exposed(key);
+    }
     let identity_pem = sekret_client::identity_from_files(args.client_cert.as_deref(), args.client_key.as_deref())?;
     Ok(HttpClient::new(
         &resolved.server,
@@ -335,23 +342,20 @@ pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> 
             ca_pem,
             identity_pem,
             timeout: None,
-            unix_socket: None,
         },
     )?)
 }
 
-/// A client for the server's host socket, which needs no server URL or token.
-pub fn host_socket_client(path: &std::path::Path) -> anyhow::Result<HttpClient> {
-    Ok(HttpClient::new(
-        "http://localhost",
-        None,
-        ClientOptions {
-            ca_pem: None,
-            identity_pem: None,
-            timeout: None,
-            unix_socket: Some(path.to_path_buf()),
-        },
-    )?)
+/// A client for the server's host socket that uses the one connection `socket_check` approved.
+#[cfg(unix)]
+pub async fn host_socket_client(path: &std::path::Path) -> anyhow::Result<HttpClient> {
+    let stream = crate::socket_check::connect(path).await?;
+    Ok(HttpClient::over_unix_stream(stream, None).await?)
+}
+
+#[cfg(not(unix))]
+pub async fn host_socket_client(_path: &std::path::Path) -> anyhow::Result<HttpClient> {
+    bail!("host sockets need a Unix host")
 }
 
 pub fn location(resolved: &Resolved) -> anyhow::Result<Location> {
@@ -379,7 +383,10 @@ pub async fn machine_credential(
     };
     if let Some(client_id) = &args.client_id {
         let secret = match &args.client_secret_file {
-            Some(path) => read_trimmed(path)?,
+            Some(path) => {
+                crate::prompt::warn_if_exposed(path);
+                read_trimmed(path)?
+            }
             None => std::env::var("SEKRET_CLIENT_SECRET")
                 .context("pass --client-secret-file or set SEKRET_CLIENT_SECRET")?,
         };
@@ -654,7 +661,7 @@ pub async fn secrets(
                 writeln!(out, "{}/", format::one_line(&folder))?;
             }
         }
-        SecretsCommand::Get { key, json } => {
+        SecretsCommand::Get { key, json, raw } => {
             let secret = api.get_secret(at, key.clone()).await?;
             if json {
                 writeln!(out, "{}", serde_json::to_string_pretty(&secret)?)?;
@@ -663,6 +670,13 @@ pub async fn secrets(
             let Some(value) = secret.value else {
                 bail!("you can see {key} but are not allowed to read its value");
             };
+            if !raw && sekret_client::terminal_safe(&value) != value {
+                bail!(
+                    "the value of {} holds control characters that could change what this terminal shows; \
+                     pipe it to a file or pass --raw to print it anyway",
+                    format::one_line(&key)
+                );
+            }
             writeln!(out, "{value}")?;
         }
         SecretsCommand::Set {
@@ -840,9 +854,68 @@ pub async fn snapshots(
     Ok(())
 }
 
-/// The names `run`, `env use` and export may load: `--allow` flags plus the project file's `allow`.
+/// The names `run`, `env use` and export may load: `--allow` flags plus the project file's
+/// confirmed `allow`.
 pub fn load_policy(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shell::LoadPolicy> {
     shell::LoadPolicy::new(flags.iter().chain(&resolved.allow).cloned())
+}
+
+/// Whether to honour a project file's `allow` list that has not been confirmed: asked at a
+/// terminal, and otherwise left out with a note saying how to confirm it.
+pub fn ask_project_allow(
+    file: &std::path::Path,
+    names: &[String],
+    prompter: &dyn Prompter,
+    interactive: bool,
+    notes: &mut dyn Write,
+) -> anyhow::Result<bool> {
+    let shown = format::one_line(&file.display().to_string());
+    let listed = names.iter().map(|n| format::one_line(n)).collect::<Vec<_>>().join(", ");
+    if !interactive {
+        writeln!(
+            notes,
+            "sekret: not loading {listed} although {shown} allows them; run this once at a terminal to confirm, \
+             or pass --allow NAME"
+        )?;
+        return Ok(false);
+    }
+    let answer = prompter.line(&format!(
+        "{shown} asks to load these blocked names:\n\n    {listed}\n\nThey can change what programs run or where they \
+         connect. Load them from now on, while this list is unchanged? [y/N] "
+    ))?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Like [`load_policy`], first asking about an unconfirmed project file `allow` list and saving
+/// a yes beside the stored logins.
+pub fn load_policy_confirming(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shell::LoadPolicy> {
+    let mut stderr = std::io::stderr();
+    if let Some(note) = file_choice_note(resolved) {
+        writeln!(stderr, "{note}")?;
+    }
+    let Some((file, names)) = &resolved.unconfirmed_allow else {
+        return load_policy(resolved, flags);
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
+    if !ask_project_allow(file, names, &crate::prompt::Terminal, interactive, &mut stderr)? {
+        return load_policy(resolved, flags);
+    }
+    let path = config::credentials_path()?;
+    let mut credentials = read_credentials(&path)?;
+    credentials.confirm_allow(file, names);
+    config::save_credentials(&path, &credentials)?;
+    shell::LoadPolicy::new(flags.iter().chain(&resolved.allow).chain(names).cloned())
+}
+
+/// Names the project file when it, not the person, picked the project or environment.
+pub fn file_choice_note(resolved: &Resolved) -> Option<String> {
+    let file = resolved.chosen_by_file.as_ref()?;
+    Some(format!(
+        "sekret: using {}/{} as set in {}",
+        format::one_line(resolved.project.as_deref().unwrap_or("?")),
+        format::one_line(resolved.environment.as_deref().unwrap_or("?")),
+        format::one_line(&file.display().to_string())
+    ))
 }
 
 /// Formats that get sourced into a shell leave out keys that are unsafe as variables, like `run`.
@@ -1048,6 +1121,7 @@ mod tests {
             SecretsCommand::Get {
                 key: "A".into(),
                 json: false,
+                raw: false,
             },
             &mut out,
             &mut "".as_bytes(),
@@ -1061,6 +1135,7 @@ mod tests {
             SecretsCommand::Get {
                 key: "A".into(),
                 json: false,
+                raw: false,
             },
             &mut Vec::new(),
             &mut "".as_bytes(),
@@ -1070,6 +1145,40 @@ mod tests {
             anyhow::bail!("getting a hidden value should fail");
         };
         assert!(hidden.to_string().contains("not allowed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_refuses_escape_sequences_for_a_terminal_unless_raw() -> anyhow::Result<()> {
+        const HOSTILE: &str = "x\u{1b}]52;c;cm0gLXJmIH4=\u{7}\u{1b}[2J";
+        let mut api = MockSekretApi::new();
+        api.expect_get_secret()
+            .returning(|_, _| Ok(secret(Some(HOSTILE), false)));
+        let get = |raw| SecretsCommand::Get {
+            key: "A".into(),
+            json: false,
+            raw,
+        };
+        let mut out = Vec::new();
+        let refused = secrets(&api, at(), get(false), &mut out, &mut "".as_bytes())
+            .await
+            .err()
+            .context("expected a refusal")?;
+        assert!(refused.to_string().contains("--raw"), "{refused}");
+        assert!(out.is_empty(), "nothing reaches the terminal");
+        secrets(&api, at(), get(true), &mut out, &mut "".as_bytes())
+            .await
+            .context("raw")?;
+        assert_eq!(out, format!("{HOSTILE}\n").as_bytes());
+        let mut multi = MockSekretApi::new();
+        multi
+            .expect_get_secret()
+            .returning(|_, _| Ok(secret(Some("line one\nline\ttwo"), false)));
+        let mut out = Vec::new();
+        secrets(&multi, at(), get(false), &mut out, &mut "".as_bytes())
+            .await
+            .context("multi-line")?;
+        assert_eq!(out, b"line one\nline\ttwo\n", "newlines and tabs are fine");
         Ok(())
     }
 
@@ -1326,7 +1435,63 @@ mod tests {
             path: "/".into(),
             source,
             allow: vec![],
+            unconfirmed_allow: None,
+            chosen_by_file: None,
         }
+    }
+
+    struct Answer(&'static str);
+
+    impl Prompter for Answer {
+        fn secret(&self, _: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+            anyhow::bail!("no secrets asked")
+        }
+
+        fn line(&self, _: &str) -> anyhow::Result<String> {
+            Ok(self.0.into())
+        }
+    }
+
+    #[test]
+    fn a_project_file_allow_list_needs_a_yes_at_a_terminal() -> anyhow::Result<()> {
+        let file = std::path::Path::new("/repo/.sekret.toml");
+        let names = vec!["LD_PRELOAD".to_string()];
+        let mut notes = Vec::new();
+        assert!(!ask_project_allow(file, &names, &Answer("y"), false, &mut notes)?);
+        let note = String::from_utf8(notes)?;
+        assert!(
+            note.contains("LD_PRELOAD") && note.contains("/repo/.sekret.toml"),
+            "{note}"
+        );
+        assert!(!ask_project_allow(file, &names, &Answer(""), true, &mut Vec::new())?);
+        assert!(!ask_project_allow(file, &names, &Answer("n"), true, &mut Vec::new())?);
+        assert!(ask_project_allow(file, &names, &Answer("yes"), true, &mut Vec::new())?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unconfirmed_allow_list_unblocks_nothing() -> anyhow::Result<()> {
+        let mut resolved = resolved(config::ServerSource::Explicit);
+        resolved.unconfirmed_allow = Some(("/repo/.sekret.toml".into(), vec!["LD_PRELOAD".into()]));
+        let policy = load_policy(&resolved, &[])?;
+        assert_eq!(policy.check("LD_PRELOAD"), Err(shell::SkipReason::Blocked));
+        let flagged = load_policy(&resolved, &["LD_PRELOAD".into()])?;
+        assert_eq!(flagged.check("LD_PRELOAD"), Ok(()), "a flag is the person's own choice");
+        Ok(())
+    }
+
+    #[test]
+    fn a_project_and_environment_from_the_file_are_named() {
+        let mut resolved = resolved(config::ServerSource::Explicit);
+        assert_eq!(file_choice_note(&resolved), None);
+        resolved.project = Some("payments".into());
+        resolved.environment = Some("prod".into());
+        resolved.chosen_by_file = Some("/repo/.sekret.toml".into());
+        let note = file_choice_note(&resolved).unwrap_or_default();
+        assert!(
+            note.contains("payments/prod") && note.contains("/repo/.sekret.toml"),
+            "{note}"
+        );
     }
 
     #[test]

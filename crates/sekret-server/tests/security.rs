@@ -769,7 +769,7 @@ async fn old_argon2_costs_are_upgraded_on_unseal(db: String) -> anyhow::Result<(
     let h = fresh(&db.url, SealSettings::default()).await?;
     init(&h, "manual").await?;
     let root = h.state.keyring.root().map_err(api_error("root"))?;
-    let old = KdfParams { m: 65_536, t: 3, p: 1 };
+    let old = KdfParams::new(65_536, 3, 1);
     let config = h.state.store.get_seal_config().await?.context("config")?;
     let downgraded = sekret_store::SealConfig {
         wrapped: Some(wrap_root_key_with(&root, PASSPHRASE, old).context("wrap")?),
@@ -780,6 +780,30 @@ async fn old_argon2_costs_are_upgraded_on_unseal(db: String) -> anyhow::Result<(
     assert_eq!(unseal(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
     let upgraded = restarted.state.store.get_seal_config().await?.context("config")?;
     assert_eq!(upgraded.wrapped.context("wrap")?.params, KdfParams::default());
+    let again = fresh(&db.url, SealSettings::default()).await?;
+    assert_eq!(unseal(&again, PASSPHRASE).await?.0, StatusCode::OK);
+    Ok(())
+}
+
+/// A wrap from before the form marker opens through the fallbacks once, then is made again with
+/// the marker, so later unlocks never pay for more than one derivation.
+async fn unmarked_wraps_are_marked_on_unseal(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let h = fresh(&db.url, SealSettings::default()).await?;
+    init(&h, "manual").await?;
+    let root = h.state.keyring.root().map_err(api_error("root"))?;
+    let config = h.state.store.get_seal_config().await?.context("config")?;
+    let mut wrapped = config.wrapped.clone().context("wrap")?;
+    wrapped.params.normalised = false;
+    let unmarked = sekret_store::SealConfig {
+        wrapped: Some(wrapped),
+        ..config
+    };
+    h.state.store.update_seal_config(signed(&root, unmarked, 0)?).await?;
+    let restarted = fresh(&db.url, SealSettings::default()).await?;
+    assert_eq!(unseal(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
+    let marked = restarted.state.store.get_seal_config().await?.context("config")?;
+    assert!(marked.wrapped.context("wrap")?.params.normalised);
     let again = fresh(&db.url, SealSettings::default()).await?;
     assert_eq!(unseal(&again, PASSPHRASE).await?.0, StatusCode::OK);
     Ok(())
@@ -855,6 +879,7 @@ on_both_backends!(
     status_says_how_the_server_was_unlocked,
     backups_are_one_at_a_time_and_staged_privately,
     old_argon2_costs_are_upgraded_on_unseal,
+    unmarked_wraps_are_marked_on_unseal,
     auto_init_refuses_a_database_with_data,
 );
 

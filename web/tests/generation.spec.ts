@@ -79,6 +79,20 @@ test("rotates a generated secret on demand", async ({ page }) => {
   await expect(secretRow(page, "SESSION_SECRET").getByTestId("secret-rotation-badge")).toContainText("Rotates in 30d");
 });
 
+test("warns before rotating a value someone typed, and not before rotating a generated one", async ({ page }) => {
+  await secretAction(page, "LOG_LEVEL", "secret-rotate");
+  const confirm = page.getByTestId("rotate-confirm");
+  await expect(confirm.getByTestId("rotate-typed-warning")).toContainText("The current value was typed or imported, not generated.");
+  await expect(confirm.getByTestId("confirm-action")).toHaveText("Replace with a generated value");
+  await confirm.getByTestId("confirm-cancel").click();
+  // Focus goes back to the row's menu button, which opened the dialog.
+  await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-actions")).toBeFocused();
+
+  await secretAction(page, "SESSION_SECRET", "secret-rotate");
+  await expect(confirm.getByTestId("rotate-typed-warning")).toHaveCount(0);
+  await expect(confirm.getByTestId("confirm-action")).toHaveText("Rotate now");
+});
+
 test("sets a custom policy that applies once the value is generated", async ({ page }) => {
   const drawer = await openDrawer(page, "DATABASE_URL");
   await expect(drawer.getByTestId("policy-mode-inherit")).toHaveAttribute("data-state", "on");

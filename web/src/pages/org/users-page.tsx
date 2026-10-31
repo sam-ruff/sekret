@@ -109,7 +109,7 @@ export function UsersPage() {
               cell: (u) => (
                 <div className="flex min-w-0 items-center gap-3">
                   <Avatar className="size-8">
-                    <AvatarFallback className="bg-primary/12 text-xs text-primary">{initials(u.name || u.email)}</AvatarFallback>
+                    <AvatarFallback className="bg-primary/12 text-xs font-semibold text-accent-foreground" data-testid="user-avatar-initials">{initials(u.name || u.email)}</AvatarFallback>
                   </Avatar>
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">

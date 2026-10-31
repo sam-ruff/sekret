@@ -74,7 +74,7 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
               autoFocus={isNew}
               aria-invalid={!!keyProblem}
               className="font-mono"
-              placeholder="DATABASE_URL"
+              placeholder="e.g. API_KEY"
               data-testid="secret-key-input"
               onChange={(e) => setDraft({ ...draft, key: e.target.value.trim() })}
             />

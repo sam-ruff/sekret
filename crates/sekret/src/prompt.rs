@@ -51,8 +51,21 @@ pub fn read_stdin_line() -> anyhow::Result<Zeroizing<String>> {
     Ok(line)
 }
 
-/// A secret file of at most 4 KiB, following symlinks.
+/// A warning for a file holding a secret that others could read or replace.
+pub fn exposure_note(path: &Path) -> Option<String> {
+    crate::settings::secret_file_exposure(path).map(|why| format!("sekret: warning: {why}"))
+}
+
+/// Prints [`exposure_note`] on standard error.
+pub fn warn_if_exposed(path: &Path) {
+    if let Some(note) = exposure_note(path) {
+        eprintln!("{note}");
+    }
+}
+
+/// A secret file of at most 4 KiB, following symlinks. Warns when others could read or replace it.
 pub fn read_text_file(path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    warn_if_exposed(path);
     let bytes = read_limited(path, SECRET_FILE_LIMIT).with_context(|| format!("reading {}", path.display()))?;
     let text = std::str::from_utf8(&bytes).with_context(|| format!("{} is not UTF-8", path.display()))?;
     Ok(Zeroizing::new(text.to_string()))

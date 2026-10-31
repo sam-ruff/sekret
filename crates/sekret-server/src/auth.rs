@@ -9,13 +9,32 @@ use sekret_store::{AccessToken, PrincipalKind};
 use zeroize::Zeroizing;
 
 use crate::admin::BOOTSTRAP_SUBJECT;
-use crate::config::HumanOidcConfig;
+use crate::config::{HumanOidcConfig, ServerConfig};
 use crate::error::{ApiError, ApiResult};
 use crate::human::subject_allowed;
 use crate::state::AppState;
 
 pub const SESSION_COOKIE: &str = "sekret_session";
+/// Used over HTTPS, where the prefix stops a sibling subdomain from planting or shadowing it.
+pub const SECURE_SESSION_COOKIE: &str = "__Host-sekret_session";
 pub const CSRF_HEADER: &str = "x-sekret-csrf";
+
+pub fn session_cookie_name(config: &ServerConfig) -> &'static str {
+    if config.secure_cookies() {
+        SECURE_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+/// Whether a browser sent this request from another site or as a page navigation. Requests
+/// without `Sec-Fetch-*` headers, such as from scripts and older browsers, pass.
+pub fn browser_cross_site(headers: &HeaderMap) -> bool {
+    let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let site_ok = value("sec-fetch-site").is_none_or(|site| site.eq_ignore_ascii_case("same-origin"));
+    let navigation = value("sec-fetch-mode").is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"));
+    !site_ok || navigation
+}
 pub const TOKEN_PREFIX: &str = "skt_";
 const TOUCH_INTERVAL: i64 = 60;
 
@@ -227,11 +246,20 @@ pub fn ip_allowed(cidrs: &[String], ip: IpAddr) -> bool {
 }
 
 pub async fn authenticate(state: &AppState, method: &Method, headers: &HeaderMap, ip: IpAddr) -> ApiResult<Principal> {
-    let (token, from_cookie) = match (bearer(headers), cookie_value(headers, SESSION_COOKIE)) {
+    let cookie = cookie_value(headers, session_cookie_name(&state.config));
+    let (token, from_cookie) = match (bearer(headers), cookie) {
         (Some(token), _) => (token, false),
         (None, Some(token)) => (token, true),
         (None, None) => return Err(ApiError::unauthorised()),
     };
+    // A cross-site link or page must not spend the session, even on a read.
+    if from_cookie && browser_cross_site(headers) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "cross_site",
+            "this request came from another site or a page navigation; open sekret instead",
+        ));
+    }
     // Browsers cannot add custom headers cross-site without a CORS preflight, which we never grant.
     let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if from_cookie && !safe && headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok()) != Some("1") {
@@ -534,6 +562,44 @@ mod tests {
         assert_eq!(bearer(&h), Some("skt_x"));
         assert_eq!(bearer(&headers(&[("authorization", "Basic abc")])?), None);
         Ok(())
+    }
+
+    #[test]
+    fn cross_site_and_navigation_requests_are_spotted() -> anyhow::Result<()> {
+        let cases: &[(&[(&str, &str)], bool)] = &[
+            (&[], false),
+            (&[("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "cors")], false),
+            (
+                &[("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "no-cors")],
+                false,
+            ),
+            (
+                &[("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "navigate")],
+                true,
+            ),
+            (&[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")], true),
+            (
+                &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")],
+                true,
+            ),
+            (&[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")], true),
+            (&[("sec-fetch-site", "none"), ("sec-fetch-mode", "navigate")], true),
+            (&[("sec-fetch-site", "cross-site")], true),
+            (&[("sec-fetch-mode", "navigate")], true),
+        ];
+        for (list, expected) in cases {
+            assert_eq!(browser_cross_site(&headers(list)?), *expected, "{list:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn https_servers_use_the_host_prefixed_cookie() {
+        let mut config = ServerConfig::for_tests("sqlite::memory:");
+        config.public_url = "http://localhost:8200".into();
+        assert_eq!(session_cookie_name(&config), SESSION_COOKIE);
+        config.public_url = "https://sekret.example".into();
+        assert_eq!(session_cookie_name(&config), SECURE_SESSION_COOKIE);
     }
 
     #[test]

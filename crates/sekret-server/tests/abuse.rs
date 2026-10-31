@@ -221,20 +221,32 @@ async fn refusal_floods_are_folded_in_the_audit_log(db: String) -> anyhow::Resul
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
     assert_eq!(audit_count(&h, "sys.forbidden").await?, 1);
-    let unknown = uuid::Uuid::new_v4().to_string();
-    for _ in 0..30 {
-        let login = json!({"client_id": unknown, "client_secret": "sks_wrong"});
+    // Each guess is a fresh, unknown id, which used to open a new audit window every time.
+    for _ in 0..25 {
+        let login = json!({"client_id": uuid::Uuid::new_v4().to_string(), "client_secret": "sks_wrong"});
         h.call(Method::POST, "/api/v1/auth/universal/login", None, Some(login))
             .await?;
     }
-    assert_eq!(audit_count(&h, "auth.machine-login.failed").await?, 1);
-    let other = json!({"client_id": uuid::Uuid::new_v4().to_string(), "client_secret": "sks_wrong"});
-    h.call(Method::POST, "/api/v1/auth/universal/login", None, Some(other))
+    assert_eq!(
+        audit_count(&h, "auth.machine-login.failed").await?,
+        1,
+        "unknown ids from one source share a key"
+    );
+    let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": "ci"})).await?;
+    let id = identity["id"].as_str().context("id")?.to_string();
+    h.put(
+        &format!("/api/v1/identities/{id}/auth/universal"),
+        &h.admin,
+        json!({"kind": "universal"}),
+    )
+    .await?;
+    let known = json!({"client_id": id, "client_secret": "sks_wrong"});
+    h.call(Method::POST, "/api/v1/auth/universal/login", None, Some(known))
         .await?;
     assert_eq!(
         audit_count(&h, "auth.machine-login.failed").await?,
         2,
-        "another identity is another key"
+        "a real identity is another key"
     );
     Ok(())
 }

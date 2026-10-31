@@ -23,7 +23,14 @@ pub enum ClientError {
     Decode(String),
     #[error("invalid configuration: {0}")]
     Config(String),
+    #[error("the server's response is larger than the {limit} bytes allowed")]
+    TooLarge { limit: usize },
 }
+
+/// The most any JSON response may hold, so a hostile server cannot exhaust memory.
+pub const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
+/// The most a backup download may hold, which matches the server's own backup cap.
+pub const BACKUP_RESPONSE_LIMIT: usize = 1 << 30;
 
 impl ClientError {
     pub fn code(&self) -> Option<&str> {
@@ -146,9 +153,129 @@ pub trait SekretApi: Send + Sync {
 }
 
 pub struct HttpClient {
-    http: reqwest::Client,
+    transport: Transport,
     base: url::Url,
     token: Option<String>,
+}
+
+enum Transport {
+    Reqwest(reqwest::Client),
+    /// One already connected and checked Unix socket connection, used for every request.
+    #[cfg(unix)]
+    Stream(pinned::StreamTransport),
+}
+
+/// Reads a body in chunks and stops once it passes `limit`.
+async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> ClientResult<Vec<u8>> {
+    if response.content_length().is_some_and(|len| len > limit as u64) {
+        return Err(ClientError::TooLarge { limit });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ClientError::Network(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ClientError::TooLarge { limit });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+mod pinned {
+    use std::time::Duration;
+
+    use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+    use hyper::body::Bytes;
+    use hyper::client::conn::http1::SendRequest;
+    use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST, USER_AGENT};
+    use hyper_util::rt::TokioIo;
+    use reqwest::{Method, StatusCode};
+
+    use super::{ClientError, ClientResult};
+
+    pub(super) struct StreamTransport {
+        sender: tokio::sync::Mutex<SendRequest<Full<Bytes>>>,
+        timeout: Duration,
+    }
+
+    fn network(error: impl std::fmt::Display) -> ClientError {
+        ClientError::Network(error.to_string())
+    }
+
+    impl StreamTransport {
+        pub(super) async fn new(stream: tokio::net::UnixStream, timeout: Duration) -> ClientResult<Self> {
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(network)?;
+            tokio::spawn(async move {
+                // The connection ends when the client is dropped or the server hangs up.
+                let _ = connection.await;
+            });
+            Ok(Self {
+                sender: tokio::sync::Mutex::new(sender),
+                timeout,
+            })
+        }
+
+        pub(super) async fn send(
+            &self,
+            method: Method,
+            url: &url::Url,
+            token: Option<&str>,
+            body: Option<Vec<u8>>,
+            limit: usize,
+        ) -> ClientResult<(StatusCode, Vec<u8>)> {
+            tokio::time::timeout(self.timeout, self.exchange(method, url, token, body, limit))
+                .await
+                .map_err(|_| ClientError::Network("the request timed out".into()))?
+        }
+
+        async fn exchange(
+            &self,
+            method: Method,
+            url: &url::Url,
+            token: Option<&str>,
+            body: Option<Vec<u8>>,
+            limit: usize,
+        ) -> ClientResult<(StatusCode, Vec<u8>)> {
+            let target = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().to_string(),
+            };
+            let mut request = hyper::Request::builder()
+                .method(method)
+                .uri(target)
+                .header(HOST, "localhost")
+                .header(USER_AGENT, format!("sekret-client/{}", sekret_api::VERSION));
+            if let Some(token) = token {
+                request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+            }
+            if body.is_some() {
+                request = request.header(CONTENT_TYPE, "application/json");
+            }
+            let request = request
+                .body(Full::new(Bytes::from(body.unwrap_or_default())))
+                .map_err(|e| ClientError::Config(e.to_string()))?;
+            let mut sender = self.sender.lock().await;
+            sender.ready().await.map_err(network)?;
+            let response = sender.send_request(request).await.map_err(network)?;
+            let status = response.status();
+            let collected = Limited::new(response.into_body(), limit)
+                .collect()
+                .await
+                .map_err(|error| {
+                    if error.downcast_ref::<LengthLimitError>().is_some() {
+                        return ClientError::TooLarge { limit };
+                    }
+                    network(error)
+                })?;
+            Ok((status, collected.to_bytes().to_vec()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,19 +285,9 @@ pub struct ClientOptions {
     /// PEM client certificate chain followed by its private key, for servers that require mTLS.
     pub identity_pem: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
-    /// Talk to the server's host socket instead of over the network.
-    pub unix_socket: Option<std::path::PathBuf>,
 }
 
-#[cfg(unix)]
-fn unix_socket(builder: reqwest::ClientBuilder, path: std::path::PathBuf) -> ClientResult<reqwest::ClientBuilder> {
-    Ok(builder.unix_socket(path))
-}
-
-#[cfg(not(unix))]
-fn unix_socket(_builder: reqwest::ClientBuilder, _path: std::path::PathBuf) -> ClientResult<reqwest::ClientBuilder> {
-    Err(ClientError::Config("Unix sockets need a Unix host".into()))
-}
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Joins a PEM certificate chain and a PEM private key into the form `identity_pem` expects.
 /// Both or neither must be given.
@@ -235,7 +352,7 @@ impl HttpClient {
             return Err(ClientError::Config("server url must be http or https".into()));
         }
         let mut builder = reqwest::Client::builder()
-            .timeout(options.timeout.unwrap_or(Duration::from_secs(30)))
+            .timeout(options.timeout.unwrap_or(DEFAULT_TIMEOUT))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("sekret-client/{}", sekret_api::VERSION));
         if let Some(pem) = options.ca_pem {
@@ -248,11 +365,25 @@ impl HttpClient {
                 .map_err(|e| ClientError::Config(format!("client certificate: {e}")))?;
             builder = builder.identity(identity);
         }
-        if let Some(path) = options.unix_socket {
-            builder = unix_socket(builder, path)?;
-        }
         let http = builder.build().map_err(|e| ClientError::Config(e.to_string()))?;
-        Ok(Self { http, base, token })
+        Ok(Self {
+            transport: Transport::Reqwest(http),
+            base,
+            token,
+        })
+    }
+
+    /// A client that sends every request over `stream`, a connection the caller has already
+    /// checked, so nothing can swap the socket between the check and the request.
+    #[cfg(unix)]
+    pub async fn over_unix_stream(stream: tokio::net::UnixStream, timeout: Option<Duration>) -> ClientResult<Self> {
+        let transport = pinned::StreamTransport::new(stream, timeout.unwrap_or(DEFAULT_TIMEOUT)).await?;
+        let base = url::Url::parse("http://localhost").map_err(|e| ClientError::Config(e.to_string()))?;
+        Ok(Self {
+            transport: Transport::Stream(transport),
+            base,
+            token: None,
+        })
     }
 
     fn url(&self, segments: &[&str], query: &[(&str, String)]) -> ClientResult<url::Url> {
@@ -279,7 +410,7 @@ impl HttpClient {
         url: url::Url,
         body: Option<&dyn ErasedBody>,
     ) -> ClientResult<T> {
-        let (status, bytes) = self.send_raw(method, url, body).await?;
+        let (status, bytes) = self.send_raw(method, url, body, RESPONSE_LIMIT).await?;
         let bytes = if status == StatusCode::NO_CONTENT || bytes.is_empty() {
             &b"null"[..]
         } else {
@@ -294,20 +425,30 @@ impl HttpClient {
         method: Method,
         url: url::Url,
         body: Option<&dyn ErasedBody>,
+        limit: usize,
     ) -> ClientResult<(StatusCode, Vec<u8>)> {
-        let mut request = self.http.request(method, url);
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            request = request.json(&body.as_json());
-        }
-        let response = request.send().await.map_err(|e| ClientError::Network(e.to_string()))?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+        let (status, bytes) = match &self.transport {
+            Transport::Reqwest(http) => {
+                let mut request = http.request(method, url);
+                if let Some(token) = &self.token {
+                    request = request.bearer_auth(token);
+                }
+                if let Some(body) = body {
+                    request = request.json(&body.as_json());
+                }
+                let response = request.send().await.map_err(|e| ClientError::Network(e.to_string()))?;
+                let status = response.status();
+                (status, read_limited_body(response, limit).await?)
+            }
+            #[cfg(unix)]
+            Transport::Stream(stream) => {
+                let body = body
+                    .map(|b| serde_json::to_vec(&b.as_json()))
+                    .transpose()
+                    .map_err(|e| ClientError::Config(e.to_string()))?;
+                stream.send(method, &url, self.token.as_deref(), body, limit).await?
+            }
+        };
         if !status.is_success() {
             let error: Option<ErrorBody> = serde_json::from_slice(&bytes).ok();
             return Err(ClientError::Api {
@@ -321,7 +462,7 @@ impl HttpClient {
                     .unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into()),
             });
         }
-        Ok((status, bytes.to_vec()))
+        Ok((status, bytes))
     }
 
     fn sys_url(&self, action: &str) -> ClientResult<url::Url> {
@@ -580,7 +721,9 @@ impl SekretApi for HttpClient {
     }
 
     async fn sys_backup(&self) -> ClientResult<Vec<u8>> {
-        let (_, bytes) = self.send_raw(Method::POST, self.sys_url("backup")?, None).await?;
+        let (_, bytes) = self
+            .send_raw(Method::POST, self.sys_url("backup")?, None, BACKUP_RESPONSE_LIMIT)
+            .await?;
         Ok(bytes)
     }
 }
@@ -774,6 +917,138 @@ mod tests {
         let dead = HttpClient::new("http://127.0.0.1:9", None, ClientOptions::default()).context("client")?;
         assert!(matches!(dead.me().await, Err(ClientError::Network(_))));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_refused() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; RESPONSE_LIMIT + 1]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me"))
+            .respond_with(ResponseTemplate::new(500).set_body_bytes(vec![b' '; RESPONSE_LIMIT + 1]))
+            .mount(&server)
+            .await;
+        let api = client(&server, None)?;
+        assert_eq!(
+            api.list_projects().await.err(),
+            Some(ClientError::TooLarge { limit: RESPONSE_LIMIT })
+        );
+        assert_eq!(
+            api.me().await.err(),
+            Some(ClientError::TooLarge { limit: RESPONSE_LIMIT }),
+            "error bodies are capped too"
+        );
+        Ok(())
+    }
+
+    /// Reads one HTTP/1.1 request head and its body from `stream`.
+    #[cfg(unix)]
+    async fn read_request(stream: &mut tokio::net::UnixStream) -> anyhow::Result<String> {
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.context("read")?;
+            anyhow::ensure!(n > 0, "connection closed");
+            data.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&data).to_string();
+            let Some(end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let length = text[..end]
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(String::from)
+                })
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                return Ok(text);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_request_goes_over_the_one_checked_stream() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().context("pair")?;
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let error = r#"{"error":"invalid_passphrase","message":"wrong one!"}"#;
+            for reply in [
+                "HTTP/1.1 204 No Content\r\n\r\n".to_string(),
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{error}",
+                    error.len()
+                ),
+            ] {
+                seen.push(read_request(&mut theirs).await?);
+                theirs.write_all(reply.as_bytes()).await.context("write")?;
+            }
+            anyhow::Ok(seen)
+        });
+        let api = HttpClient::over_unix_stream(ours, Some(Duration::from_secs(5)))
+            .await
+            .context("client")?;
+        api.revoke().await.context("revoke")?;
+        let error = api
+            .sys_unseal(UnsealRequest {
+                passphrase: "violet tractor sings".to_string().into(),
+            })
+            .await
+            .err()
+            .context("expected an error")?;
+        assert_eq!(error.code(), Some("invalid_passphrase"));
+        let seen = server.await.context("join")??;
+        assert!(
+            seen[0].starts_with("POST /api/v1/auth/token/revoke HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+        assert!(seen[1].starts_with("POST /api/v1/sys/unseal HTTP/1.1"), "{}", seen[1]);
+        assert!(
+            seen[1].contains(r#""passphrase":"violet tractor sings""#),
+            "{}",
+            seen[1]
+        );
+        assert!(seen[1].to_ascii_lowercase().contains("content-type: application/json"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stream_transport_caps_response_size() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().context("pair")?;
+        let server = tokio::spawn(async move {
+            read_request(&mut theirs).await?;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", RESPONSE_LIMIT + 1);
+            theirs.write_all(head.as_bytes()).await.context("head")?;
+            // The client may hang up part way through, which is the point.
+            let _ = theirs.write_all(&vec![b' '; RESPONSE_LIMIT + 1]).await;
+            anyhow::Ok(())
+        });
+        let api = HttpClient::over_unix_stream(ours, Some(Duration::from_secs(20)))
+            .await
+            .context("client")?;
+        assert_eq!(
+            api.sys_status().await.err(),
+            Some(ClientError::TooLarge { limit: RESPONSE_LIMIT })
+        );
+        server.await.context("join")??;
+        Ok(())
+    }
+
+    #[test]
+    fn backup_limit_matches_the_server() {
+        assert_eq!(BACKUP_RESPONSE_LIMIT, sekret_core::seal::MAX_BACKUP_LEN);
     }
 
     #[test]

@@ -55,7 +55,8 @@ export function UnlockPage() {
   const backingOff = error?.code === "passphrase_backoff";
   const busy = error?.code === "kdf_busy";
   const limited = error?.status === 429 && !backingOff && !busy;
-  const otherError = unseal.error && !wrong && error?.status !== 429 ? unseal.error : null;
+  const foreignKey = error?.code === "root_key_not_recognised";
+  const otherError = unseal.error && !wrong && !foreignKey && error?.status !== 429 ? unseal.error : null;
   const waiting = backingOff && waitSeconds > 0;
 
   const submit = (event: FormEvent) => {
@@ -138,6 +139,19 @@ export function UnlockPage() {
                 <AlertCircle />
                 <AlertTitle>Too many attempts</AlertTitle>
                 <AlertDescription>Wait a minute, then try again.</AlertDescription>
+              </Alert>
+            )}
+            {foreignKey && (
+              <Alert variant="destructive" data-testid="unlock-key-not-recognised">
+                <AlertCircle />
+                <AlertTitle>The server does not recognise this key</AlertTitle>
+                <AlertDescription>
+                  <p>
+                    This passphrase opened a key this server does not recognise, usually because the database was
+                    replaced or restored. The server stays locked. If the database was restored on purpose, run{" "}
+                    <code className="font-mono">sekret admin reset-epoch</code> on the host, then unlock again.
+                  </p>
+                </AlertDescription>
               </Alert>
             )}
             {otherError && (

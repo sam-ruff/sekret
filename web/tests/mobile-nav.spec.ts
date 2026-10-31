@@ -1,6 +1,18 @@
 import { expect, test } from "@playwright/test";
 import { isMobile } from "./helpers";
 
+test("settings tabs that do not fit show an arrow that scrolls to them", async ({ page }) => {
+  test.skip(!isMobile(page), "Mobile layout only");
+  await page.goto("/projects/storefront/settings/general");
+  const danger = page.getByRole("link", { name: "Danger zone" });
+  await expect(danger).not.toBeInViewport({ ratio: 1 });
+  await expect(page.getByTestId("tabs-scroll-left")).toHaveCount(0);
+  await page.getByTestId("tabs-scroll-right").click();
+  await expect(danger).toBeInViewport({ ratio: 1 });
+  await expect(page.getByTestId("tabs-scroll-left")).toBeVisible();
+  await expect(page.getByTestId("tabs-scroll-right")).toHaveCount(0);
+});
+
 test("the sidebar becomes a sheet on narrow screens", async ({ page }) => {
   test.skip(!isMobile(page), "Mobile layout only");
   await page.goto("/projects/storefront/secrets/dev");

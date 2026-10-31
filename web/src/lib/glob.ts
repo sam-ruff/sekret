@@ -1,9 +1,23 @@
 /**
  * Port of the server's glob matcher. `*` matches any run of characters except `separator`
  * (or anything when there is none), `**` also crosses the separator, and `?` matches one
- * non-separator character.
+ * non-separator character. A trailing `/**` also matches the folder itself, so `/a/**` covers `/a`.
  */
 export function globMatch(pattern: string, text: string, separator?: string): boolean {
+  const folder = trailingSegmentsParent(pattern, separator);
+  if (folder !== null && matches(folder, text, separator)) return true;
+  return matches(pattern, text, separator);
+}
+
+/** The pattern without its trailing `<separator>**`, when it ends that way. */
+function trailingSegmentsParent(pattern: string, separator?: string): string | null {
+  if (separator === undefined) return null;
+  const trimmed = pattern.replace(/\*+$/, "");
+  if (pattern.length - trimmed.length < 2 || !trimmed.endsWith(separator)) return null;
+  return trimmed.slice(0, -separator.length);
+}
+
+function matches(pattern: string, text: string, separator?: string): boolean {
   const p = Array.from(pattern);
   const t = Array.from(text);
   const memo = new Map<number, boolean>();

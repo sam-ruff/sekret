@@ -15,6 +15,8 @@ use crate::sekret::SekretApiFactory;
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const MANAGED_BY_VALUE: &str = "sekret-operator";
 pub const TOKEN_AUDIENCE: &str = "sekret";
+/// A service account must carry this annotation set to `"true"` before a SekretSecret may use it.
+pub const ALLOW_ANNOTATION: &str = "sekret.sam-ruff.github.io/allow-sekretsecret";
 /// The TokenRequest API minimum, which is plenty for one login.
 pub const TOKEN_EXPIRY_SECONDS: i64 = 600;
 
@@ -22,6 +24,13 @@ pub const TOKEN_EXPIRY_SECONDS: i64 = 600;
 pub enum SyncError {
     #[error("{0}")]
     InvalidSpec(String),
+    #[error(
+        "service account {0} does not exist or has not opted in; annotate it with \
+         sekret.sam-ruff.github.io/allow-sekretsecret: \"true\""
+    )]
+    ServiceAccountNotAllowed(String),
+    #[error("could not read service account {service_account}: {message}")]
+    ServiceAccountLookup { service_account: String, message: String },
     #[error("could not request a token for service account {service_account}: {message}")]
     TokenRequest { service_account: String, message: String },
     #[error("sekret login failed: {0}")]
@@ -49,6 +58,8 @@ impl SyncError {
     pub fn reason(&self) -> &'static str {
         match self {
             SyncError::InvalidSpec(_) => "InvalidSpec",
+            SyncError::ServiceAccountNotAllowed(_) => "ServiceAccountNotAllowed",
+            SyncError::ServiceAccountLookup { .. } => "ServiceAccountLookupFailed",
             SyncError::TokenRequest { .. } => "TokenRequestFailed",
             SyncError::Login(_) => "LoginFailed",
             SyncError::Fetch(_) => "FetchFailed",
@@ -163,6 +174,7 @@ async fn fetch(
     sekret: &dyn SekretApiFactory,
 ) -> Result<SecretData, SyncError> {
     let spec = &cr.spec;
+    require_opt_in(kube, namespace, &spec.auth.service_account_name).await?;
     // The namespace always comes from the resource itself, so a SekretSecret can
     // only act as service accounts that live alongside it.
     let sa_token = kube
@@ -196,6 +208,26 @@ async fn fetch(
     }
     let raw = raw.map_err(describe_fetch_error)?;
     Ok(build_data(raw.secrets, spec.keys.as_deref())?)
+}
+
+/// Whoever can create a SekretSecret need not be allowed to use the service account it names, so
+/// the account itself must opt in before the operator mints a token for it.
+async fn require_opt_in(kube: &dyn KubeApi, namespace: &str, service_account: &str) -> Result<(), SyncError> {
+    let annotations = kube
+        .service_account_annotations(namespace.into(), service_account.into())
+        .await
+        .map_err(|e| SyncError::ServiceAccountLookup {
+            service_account: service_account.into(),
+            message: e.to_string(),
+        })?;
+    let allowed = annotations
+        .as_ref()
+        .and_then(|a| a.get(ALLOW_ANNOTATION))
+        .is_some_and(|value| value == "true");
+    if allowed {
+        return Ok(());
+    }
+    Err(SyncError::ServiceAccountNotAllowed(service_account.into()))
 }
 
 /// Decode errors can quote the response body, which holds secret values.
@@ -432,9 +464,22 @@ mod tests {
         factory
     }
 
+    fn annotated(value: &str) -> Option<BTreeMap<String, String>> {
+        Some(BTreeMap::from([(ALLOW_ANNOTATION.to_string(), value.to_string())]))
+    }
+
+    /// Every service account has opted in.
+    fn opted_in(kube: &mut MockKubeApi) {
+        kube.expect_service_account_annotations()
+            .returning(|_, _| Ok(annotated("true")));
+    }
+
     /// A kube mock that issues tokens in `apps` and records every status patch.
     fn kube(existing: Option<Secret>, statuses: Arc<Mutex<Vec<SekretSecretStatus>>>) -> MockKubeApi {
         let mut kube = MockKubeApi::new();
+        kube.expect_service_account_annotations()
+            .with(eq("apps".to_string()), eq("reader".to_string()))
+            .returning(|_, _| Ok(annotated("true")));
         kube.expect_request_token()
             .with(
                 eq("apps".to_string()),
@@ -692,6 +737,7 @@ mod tests {
     async fn duplicate_keys_in_recursive_mode_fail_clearly() -> anyhow::Result<()> {
         let statuses: Arc<Mutex<Vec<SekretSecretStatus>>> = Arc::default();
         let mut kube = MockKubeApi::new();
+        opted_in(&mut kube);
         kube.expect_request_token().returning(|_, _, _, _| Ok(SA_TOKEN.into()));
         kube.expect_get_secret().never();
         kube.expect_create_secret().never();
@@ -747,6 +793,10 @@ mod tests {
     async fn service_account_token_is_requested_in_the_resource_namespace() -> anyhow::Result<()> {
         for namespace in ["apps", "team-b"] {
             let mut kube = MockKubeApi::new();
+            kube.expect_service_account_annotations()
+                .with(eq(namespace.to_string()), eq("reader".to_string()))
+                .times(1)
+                .returning(|_, _| Ok(annotated("true")));
             kube.expect_request_token()
                 .with(
                     eq(namespace.to_string()),
@@ -770,6 +820,68 @@ mod tests {
 
             assert_eq!(error.reason(), "TokenRequestFailed");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_accounts_that_have_not_opted_in_get_no_token() -> anyhow::Result<()> {
+        let cases: [(&str, Option<BTreeMap<String, String>>); 5] = [
+            ("missing account", None),
+            ("no annotations", Some(BTreeMap::new())),
+            ("false", annotated("false")),
+            ("not exactly true", annotated("True")),
+            (
+                "another annotation",
+                Some(BTreeMap::from([("example.com/other".to_string(), "true".to_string())])),
+            ),
+        ];
+        for (case, annotations) in cases {
+            let statuses: Arc<Mutex<Vec<SekretSecretStatus>>> = Arc::default();
+            let mut kube = MockKubeApi::new();
+            kube.expect_service_account_annotations()
+                .with(eq("apps".to_string()), eq("reader".to_string()))
+                .times(1)
+                .returning(move |_, _| Ok(annotations.clone()));
+            kube.expect_request_token().never();
+            kube.expect_get_secret().never();
+            kube.expect_create_secret().never();
+            let recorded = Arc::clone(&statuses);
+            kube.expect_patch_status().returning(move |_, _, status| {
+                recorded.lock().map(|mut s| s.push(status)).ok();
+                Ok(())
+            });
+            let mut sekret = MockSekretApiFactory::new();
+            sekret.expect_client().never();
+
+            let error = reconcile(&cr(), &kube, &sekret, NOW)
+                .await
+                .err()
+                .with_context(|| format!("expected {case} to be refused"))?;
+
+            assert_eq!(error.reason(), "ServiceAccountNotAllowed", "{case}");
+            let status = last_status(&statuses)?;
+            let ready = status.ready().context("ready")?;
+            assert_eq!(ready.status, "False", "{case}");
+            assert!(ready.message.contains(ALLOW_ANNOTATION), "{case}: {}", ready.message);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_service_account_lookup_requests_no_token() -> anyhow::Result<()> {
+        let mut kube = MockKubeApi::new();
+        kube.expect_service_account_annotations()
+            .returning(|_, _| Err(crate::kube_api::KubeError::Api("forbidden".into())));
+        kube.expect_request_token().never();
+        kube.expect_patch_status().returning(|_, _, _| Ok(()));
+
+        let error = reconcile(&cr(), &kube, &MockSekretApiFactory::new(), NOW)
+            .await
+            .err()
+            .context("expected the lookup to fail")?;
+
+        assert_eq!(error.reason(), "ServiceAccountLookupFailed");
+        assert!(error.to_string().contains("forbidden"));
         Ok(())
     }
 

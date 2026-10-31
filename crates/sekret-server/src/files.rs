@@ -288,26 +288,68 @@ pub fn exposure(path: &Path) -> Option<String> {
     None
 }
 
-const EPOCH_PREFIX: &str = "sekret-seal-epoch ";
+const EPOCH_PREFIX: &str = "sekret-seal-epoch";
+/// More than a rotation in progress ever records.
+const MAX_MARK_ROOTS: usize = 2;
 
-/// The epoch recorded in a mark file, if there is a readable one.
-pub fn read_epoch(path: &Path) -> io::Result<Option<i64>> {
+/// An epoch mark: the highest seal configuration epoch seen, and the fingerprints of the root
+/// keys the database may be under. Marks written before fingerprints were recorded name none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochMark {
+    pub epoch: i64,
+    pub roots: Vec<String>,
+}
+
+fn is_fingerprint(text: &str) -> bool {
+    (8..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn parse_mark(text: &str) -> Option<EpochMark> {
+    let mut words = text.split_ascii_whitespace();
+    if words.next()? != EPOCH_PREFIX {
+        return None;
+    }
+    let epoch = words.next()?.parse().ok()?;
+    let roots: Vec<String> = words.map(str::to_string).collect();
+    if roots.len() > MAX_MARK_ROOTS || !roots.iter().all(|r| is_fingerprint(r)) {
+        return None;
+    }
+    Some(EpochMark { epoch, roots })
+}
+
+/// The mark in a mark file, if there is one.
+pub fn read_mark(path: &Path) -> io::Result<Option<EpochMark>> {
     let bytes = match read_private(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let text = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    text.trim()
-        .strip_prefix(EPOCH_PREFIX)
-        .and_then(|n| n.parse().ok())
+    parse_mark(text)
         .map(Some)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an epoch mark"))
 }
 
-/// Replaces the mark file with `epoch`, owner-only and synced to disk.
-pub fn write_epoch(path: &Path, epoch: i64) -> io::Result<()> {
-    write_private_atomic(path, format!("{EPOCH_PREFIX}{epoch}\n").as_bytes())
+/// The epoch recorded in a mark file, if there is a readable one.
+pub fn read_epoch(path: &Path) -> io::Result<Option<i64>> {
+    Ok(read_mark(path)?.map(|mark| mark.epoch))
+}
+
+/// Replaces the mark file, owner-only and synced to disk.
+pub fn write_mark(path: &Path, mark: &EpochMark) -> io::Result<()> {
+    if mark.roots.len() > MAX_MARK_ROOTS || !mark.roots.iter().all(|r| is_fingerprint(r)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a root key fingerprint",
+        ));
+    }
+    let mut text = format!("{EPOCH_PREFIX} {}", mark.epoch);
+    for root in &mark.roots {
+        text.push(' ');
+        text.push_str(root);
+    }
+    text.push('\n');
+    write_private_atomic(path, text.as_bytes())
 }
 
 /// Whether a new file could be created at `path`: nothing is there and the directory is writable.
@@ -483,10 +525,57 @@ mod tests {
         let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("sekret.db.epoch");
         assert_eq!(read_epoch(&path).context("absent")?, None);
-        write_epoch(&path, 7).context("write")?;
+        let mark = EpochMark {
+            epoch: 7,
+            roots: vec!["0123456789abcdef".into()],
+        };
+        write_mark(&path, &mark).context("write")?;
         assert_eq!(read_epoch(&path).context("read")?, Some(7));
+        assert_eq!(read_mark(&path).context("read")?, Some(mark));
         std::fs::write(&path, b"garbage").context("garbage")?;
         assert!(read_epoch(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn marks_from_before_fingerprints_still_read() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("sekret.db.epoch");
+        std::fs::write(&path, b"sekret-seal-epoch 12\n").context("old")?;
+        assert_eq!(
+            read_mark(&path).context("read")?,
+            Some(EpochMark {
+                epoch: 12,
+                roots: Vec::new()
+            })
+        );
+        let rotating = EpochMark {
+            epoch: 13,
+            roots: vec!["0123456789abcdef".into(), "fedcba9876543210".into()],
+        };
+        write_mark(&path, &rotating).context("write")?;
+        assert_eq!(read_mark(&path).context("read")?, Some(rotating));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_fingerprints_make_a_mark_unreadable() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("sekret.db.epoch");
+        for bad in [
+            "sekret-seal-epoch 3 not-hex\n",
+            "sekret-seal-epoch 3 aaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbb cccccccccccccccc\n",
+            "sekret-seal-epoch\n",
+            "sekret-seal-epochs 3\n",
+        ] {
+            std::fs::write(&path, bad).context("write")?;
+            assert!(read_mark(&path).is_err(), "{bad}");
+        }
+        let injected = EpochMark {
+            epoch: 1,
+            roots: vec!["aa\nsekret-seal-epoch 0".into()],
+        };
+        assert!(write_mark(&path, &injected).is_err());
         Ok(())
     }
 

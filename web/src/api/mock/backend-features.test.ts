@@ -65,6 +65,28 @@ describe("audit queries", () => {
     check({ until: middle }, (e) => e.created_at <= middle);
   });
 
+  it("refuses key and folder filters on a project log whose secrets the reader cannot all see", () => {
+    const b = seeded();
+    const code = (fn: () => unknown) => {
+      try {
+        fn();
+      } catch (error) {
+        if (error instanceof MockError) return error.code;
+      }
+      return undefined;
+    };
+    expect(code(() => b.projectAudit("payments-api", { key: "HSM_PIN" }))).toBe("filter_hidden");
+    expect(code(() => b.projectAudit("payments-api", { path: "/" }))).toBe("filter_hidden");
+    // An environment the reader sees in full lifts the restriction.
+    expect(code(() => b.projectAudit("payments-api", { environment: "dev", key: "HSM_PIN" }))).toBeUndefined();
+    expect(code(() => b.projectAudit("payments-api", { environment: "prod", key: "HSM_PIN" }))).toBe("filter_hidden");
+    // Without those filters, search only looks at actions, actors and addresses.
+    expect(b.projectAudit("payments-api", { q: "HSM_PIN" }).total).toBe(0);
+    expect(b.projectAudit("payments-api", { q: "secret." }).total).toBeGreaterThan(0);
+    // A reader who sees everything may filter freely.
+    expect(b.projectAudit("storefront", { key: "DATABASE_URL" }).total).toBeGreaterThan(0);
+  });
+
   it("searches case-insensitively across actor, target and address", () => {
     const b = seeded();
     expect(b.orgAudit({ q: "BILLING-WORKER" }).entries.every((e) => e.actor_name === "billing-worker")).toBe(true);

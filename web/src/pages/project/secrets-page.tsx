@@ -1,13 +1,15 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { Link, Navigate } from "react-router";
+import { toast } from "sonner";
 import { api } from "@/api/endpoints";
 import type { Secret } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { EnvTabs } from "@/components/project/env-tabs";
 import { FolderBreadcrumbs } from "@/components/project/folder-breadcrumbs";
+import { DeleteFolderDialog } from "@/components/secrets/delete-folder-dialog";
 import { ImportEnvDialog } from "@/components/secrets/import-env-dialog";
 import { SecretDrawer } from "@/components/secrets/secret-drawer";
 import { SecretEditor, type SecretDraft } from "@/components/secrets/secret-editor";
@@ -39,6 +41,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { generatorFromDraft } from "@/lib/generation";
 import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
+import { focusInstead } from "@/lib/return-focus";
 
 function NewFolderDialog({
   open,
@@ -132,6 +135,9 @@ function SecretsView() {
   const [importing, setImporting] = useState(false);
   const [newFolder, setNewFolder] = useState(false);
   const [deletingFolder, setDeletingFolder] = useState<string | null>(null);
+  /** What had focus before a drawer or dialog opened from a row menu, whose item is gone by the time it closes. */
+  const returnFocus = useRef<HTMLElement | null>(null);
+  const rotateReturnFocus = useRef<HTMLElement | null>(null);
 
   const envSlug = env?.slug ?? "";
   const at = { project, env: envSlug, path };
@@ -167,12 +173,17 @@ function SecretsView() {
   /** Undefined while loading or not asked for. */
   const valueOf = (key: string): string | null | undefined =>
     revealAll && editing !== key ? allValues.data?.get(key) : singleQuery(key)?.data;
-  const anyRevealed = revealAll || revealed.size > 0;
+  // The editor shows the current value in plain text, so it counts as revealed.
+  const editingValue = editing !== null && list.data?.secrets.find((s) => s.key === editing)?.value_hidden !== true;
+  const anyRevealed = revealAll || revealed.size > 0 || editingValue;
   useSealWatch(anyRevealed);
   useIdle(anyRevealed, () => {
     setRevealAll(false);
     setRevealed(new Set());
     setHiddenFromAll(new Set());
+    if (editing === null) return;
+    setEditing(null);
+    toast.info(`Closed the editor for ${editing} after three idle minutes. Unsaved changes were dropped.`);
   });
 
   const invalidate = [
@@ -244,6 +255,8 @@ function SecretsView() {
 
   const resourceFor = (s: Secret) => ({ environment: envSlug, path, key: s.key, tags: s.tags });
   const drawerSecret = secrets.find((s) => s.key === drawerKey);
+  const rotatingSecret = secrets.find((s) => s.key === rotating);
+  const rotatingTyped = rotatingSecret !== undefined && !rotatingSecret.generated;
   const canCreateSecret = perms.canSomewhere("secrets", "create");
   const canCreateFolder = perms.canSomewhere("folders", "create");
   const canRollback = perms.canSomewhere("secrets", "edit");
@@ -472,8 +485,14 @@ function SecretsView() {
                     onCopyValue={() => fetchValue(secret.key)}
                     onEdit={() => setEditing(secret.key)}
                     onDelete={() => setDeleting(secret)}
-                    onHistory={() => setDrawerKey(secret.key)}
-                    onRotate={() => setRotating(secret.key)}
+                    onHistory={(returnTo) => {
+                      returnFocus.current = returnTo;
+                      setDrawerKey(secret.key);
+                    }}
+                    onRotate={(returnTo) => {
+                      rotateReturnFocus.current = returnTo;
+                      setRotating(secret.key);
+                    }}
                   />
                 ),
               )}
@@ -519,8 +538,12 @@ function SecretsView() {
             secretKey={drawerKey}
             canRollback={canRollback}
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
-            onRotate={setRotating}
+            onRotate={(key) => {
+              rotateReturnFocus.current = null;
+              setRotating(key);
+            }}
             onClose={() => setDrawerKey(null)}
+            onCloseAutoFocus={(event) => focusInstead(event, returnFocus.current)}
           />
         </>
       )}
@@ -538,20 +561,32 @@ function SecretsView() {
         open={rotating !== null}
         onOpenChange={(open) => !open && setRotating(null)}
         title={`Rotate ${rotating} now?`}
-        description="sekret replaces the value with a newly generated one using this secret's policy. The old value stays in history, but anything still using it needs the new one."
-        confirmLabel="Rotate now"
+        description={
+          <>
+            {rotatingTyped && (
+              <span className="mb-2 block font-medium text-foreground" data-testid="rotate-typed-warning">
+                The current value was typed or imported, not generated. Rotating replaces it with random characters, which
+                breaks anything that expects a particular value, such as a URL or a setting.
+              </span>
+            )}
+            sekret replaces the value with a newly generated one using this secret&apos;s policy. The old value stays in
+            history, but anything still using it needs the new one.
+          </>
+        }
+        confirmLabel={rotatingTyped ? "Replace with a generated value" : "Rotate now"}
         onConfirm={() => rotate.mutateAsync(rotating ?? "")}
+        onCloseAutoFocus={(event) => focusInstead(event, rotateReturnFocus.current)}
         testId="rotate-confirm"
       />
-      <ConfirmDialog
-        open={deletingFolder !== null}
-        onOpenChange={(open) => !open && setDeletingFolder(null)}
-        title={`Delete folder ${deletingFolder}?`}
-        description="Only empty folders can be deleted. Move or delete the secrets inside first."
-        confirmLabel="Delete folder"
-        destructive
-        onConfirm={() => removeFolder.mutateAsync(deletingFolder ?? "/")}
-      />
+      {env && (
+        <DeleteFolderDialog
+          project={project}
+          env={envSlug}
+          folder={deletingFolder}
+          onClose={() => setDeletingFolder(null)}
+          onDelete={(folder) => removeFolder.mutateAsync(folder)}
+        />
+      )}
     </div>
   );
 }

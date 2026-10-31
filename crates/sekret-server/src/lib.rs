@@ -248,6 +248,12 @@ pub fn openapi_json() -> String {
 pub enum StartupError {
     #[error("the root key does not match the one this database was created with")]
     WrongRootKey,
+    #[error(
+        "the root key is not the one recorded in the seal epoch marks beside the database, remember file or root \
+         key file, so the database may have been given another key; if this is expected, such as after restoring a \
+         database made under another root key, run `sekret admin reset-epoch --adopt-root-key` on the host"
+    )]
+    UnrecognisedRootKey,
     #[error("this database needs its root key file; pass --root-key-file or set seal.root_key_file")]
     MissingRootKey,
     #[error("root key file {0}")]
@@ -270,11 +276,14 @@ pub enum StartupError {
     Tls(#[from] tls::TlsError),
 }
 
-/// Records the root key fingerprint on first start and refuses to run with a different key.
+/// Records the root key fingerprint on first start and refuses to run with a different key. A
+/// database that already holds projects but no fingerprint is refused, since nothing here can
+/// show the key opens them; [`seal::check_root`] can.
 pub async fn check_root_key(store: &dyn Store, fingerprint: &str) -> Result<(), StartupError> {
     match store.get_meta(ROOT_KEY_META).await? {
         Some(existing) if existing != fingerprint => Err(StartupError::WrongRootKey),
         Some(_) => Ok(()),
+        None if !store.list_projects().await?.is_empty() => Err(StartupError::WrongRootKey),
         None => Ok(store.set_meta(ROOT_KEY_META, fingerprint).await?),
     }
 }
@@ -373,7 +382,7 @@ async fn serve_http(state: AppState) -> Result<(), StartupError> {
         max_connections = state.config.max_connections,
         "listening on {address}"
     );
-    let limits = serve::ConnectionLimits::new(state.config.max_connections);
+    let limits = serve::ConnectionLimits::new(state.config.max_connections).exempting(&state.config.trusted_proxies);
     serve::serve(listener, app(state), tls_config, limits, shutdown_signal()).await;
     Ok(())
 }

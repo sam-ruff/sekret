@@ -1,4 +1,5 @@
 import { toast } from "sonner";
+import { isLeaving } from "./leaving";
 
 /** How long a copied secret stays on the clipboard. */
 export const CLIPBOARD_CLEAR_MS = 45_000;
@@ -64,6 +65,10 @@ export class ClipboardGuard {
   /** Whether a clear fell due while the tab was in the background and is still waiting. */
   hasPending(): boolean {
     return this.pending !== undefined;
+  }
+
+  reportNotCleared(): void {
+    this.deps.onNotCleared();
   }
 
   /** Whether a copied secret may still be on the clipboard. */
@@ -141,6 +146,20 @@ async function readPermitted(): Promise<boolean> {
   }
 }
 
+/**
+ * A clear started while the page unloads may be refused or cut short, so closing or reloading
+ * the tab with a copied secret still outstanding asks first. The clear starts straight away;
+ * if the person stays and it could not be done, they are told.
+ */
+export function warnBeforeUnload(guard: ClipboardGuard, event: Pick<BeforeUnloadEvent, "preventDefault">): boolean {
+  if (!guard.hasOutstanding() || isLeaving()) return false;
+  event.preventDefault();
+  void guard.clearNow().then((outcome) => {
+    if (outcome === "unverifiable") guard.reportNotCleared();
+  });
+  return true;
+}
+
 let shared: ClipboardGuard | undefined;
 
 /** The page's guard, watching for copies and lost focus that may change the clipboard. */
@@ -162,6 +181,7 @@ export function clipboardGuard(): ClipboardGuard {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") retry();
   });
+  window.addEventListener("beforeunload", (event) => warnBeforeUnload(guard, event));
   window.addEventListener("pagehide", () => void guard.clearNow());
   shared = guard;
   return guard;

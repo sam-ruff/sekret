@@ -50,6 +50,7 @@ interface RoleEditorProps {
   environments?: string[];
   readOnly?: boolean;
   onSave: (slug: string, body: PutRole) => Promise<unknown>;
+  onCloseAutoFocus?: (event: Event) => void;
 }
 
 function ConditionsBuilder({
@@ -120,7 +121,8 @@ function ConditionsBuilder({
         />
       </div>
       <p className="text-xs text-muted-foreground md:col-span-2">
-        In paths, <code>*</code> stays within one folder and <code>**</code> also matches sub-folders. In keys,{" "}
+        In paths, <code>*</code> stays within one folder and <code>**</code> also matches sub-folders, so{" "}
+        <code>/app/**</code> covers <code>/app</code> and everything below it. In keys,{" "}
         <code>*</code> matches anything. Empty lists mean anywhere.
       </p>
     </div>
@@ -223,7 +225,16 @@ function RuleRow({
   );
 }
 
-export function RoleEditor({ open, onOpenChange, role, subjects, environments, readOnly, onSave }: RoleEditorProps) {
+export function RoleEditor({
+  open,
+  onOpenChange,
+  role,
+  subjects,
+  environments,
+  readOnly,
+  onSave,
+  onCloseAutoFocus,
+}: RoleEditorProps) {
   const isNew = !role;
   const [name, setName] = useState(role?.name ?? "");
   const [slug, setSlug] = useState(role?.slug ?? "");
@@ -265,7 +276,11 @@ export function RoleEditor({ open, onOpenChange, role, subjects, environments, r
 
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
-      <DialogContent className="max-h-[92svh] gap-0 overflow-hidden p-0 sm:max-w-5xl" data-testid="role-editor">
+      <DialogContent
+        className="max-h-[92svh] gap-0 overflow-hidden p-0 sm:max-w-5xl"
+        onCloseAutoFocus={onCloseAutoFocus}
+        data-testid="role-editor"
+      >
         <form onSubmit={submit} className="flex max-h-[92svh] flex-col">
           <DialogHeader className="border-b p-6">
             <DialogTitle>{readOnly ? role?.name : isNew ? "New role" : `Edit ${role?.name}`}</DialogTitle>
@@ -291,7 +306,7 @@ export function RoleEditor({ open, onOpenChange, role, subjects, environments, r
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="role-slug">Slug</FieldLabel>
+                  <FieldLabel htmlFor="role-slug">Short name</FieldLabel>
                   <Input
                     id="role-slug"
                     value={slug}

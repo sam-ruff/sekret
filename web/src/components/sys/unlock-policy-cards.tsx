@@ -21,7 +21,8 @@ const POLICY_TEXT: Record<UnlockPolicy, string> = {
 const POLICY_NEEDS: Partial<Record<UnlockPolicy, ReactNode>> = {
   remember: (
     <>
-      Needs <code className="font-mono">seal.remember_file</code> set in the server configuration.
+      Only works if the server configuration sets <code className="font-mono">seal.remember_file</code>. If you are not
+      sure, ask whoever runs the server.
     </>
   ),
   "passphrase-file": (
@@ -57,6 +58,13 @@ function PolicyTitle({ policy, id }: { policy: UnlockPolicy; id?: string }) {
   );
 }
 
+const REMEMBER_UNAVAILABLE: ReactNode = (
+  <>
+    Not available: the server configuration does not set <code className="font-mono">seal.remember_file</code>. Whoever
+    runs the server can set it and restart.
+  </>
+);
+
 function PolicyNeeds({ policy, testId, configured }: { policy: UnlockPolicy; testId: string; configured?: boolean }) {
   const needs = (configured ? CONFIGURED_NEEDS : POLICY_NEEDS)[policy];
   if (!needs) return null;
@@ -89,9 +97,11 @@ interface UnlockPolicyCardsProps {
   value: UnlockPolicy;
   onChange: (policy: UnlockPolicy) => void;
   disabled?: boolean;
+  /** From the server status: false when no remember file is configured, absent when the server does not say. */
+  rememberAvailable?: boolean | null;
 }
 
-export function UnlockPolicyCards({ idPrefix, value, onChange, disabled }: UnlockPolicyCardsProps) {
+export function UnlockPolicyCards({ idPrefix, value, onChange, disabled, rememberAvailable }: UnlockPolicyCardsProps) {
   const select = (next: string) => {
     const policy = UNLOCK_POLICIES.find((p) => p === next);
     if (policy) onChange(policy);
@@ -101,6 +111,8 @@ export function UnlockPolicyCards({ idPrefix, value, onChange, disabled }: Unloc
       <RadioGroup value={value} onValueChange={select} disabled={disabled} aria-label="Unlock policy" data-testid={`${idPrefix}-policy-options`}>
         {UNLOCK_POLICIES.map((policy) => {
           const id = `${idPrefix}-policy-${policy}`;
+          const unavailable = policy === "remember" && rememberAvailable === false;
+          const off = disabled || unavailable;
           return (
             <label
               key={policy}
@@ -108,24 +120,44 @@ export function UnlockPolicyCards({ idPrefix, value, onChange, disabled }: Unloc
               className={cn(
                 "flex gap-3 rounded-lg border p-4 transition-colors has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-primary/5",
                 "has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-background",
-                disabled ? "cursor-not-allowed opacity-70" : "cursor-pointer hover:bg-accent/50",
+                off ? "cursor-not-allowed" : "cursor-pointer hover:bg-accent/50",
+                disabled && "opacity-70",
               )}
               data-testid={`${idPrefix}-policy-card-${policy}`}
+              data-unavailable={unavailable || undefined}
             >
               <RadioGroupItem
                 value={policy}
                 id={id}
+                disabled={unavailable}
                 aria-labelledby={`${id}-title`}
-                aria-describedby={`${id}-text`}
+                aria-describedby={unavailable ? `${id}-text ${id}-unavailable` : `${id}-text`}
                 className="mt-0.5"
                 data-testid={id}
               />
-              <div className="min-w-0 space-y-2">
+              <div className={cn("min-w-0 space-y-2", unavailable && "opacity-70")}>
                 <PolicyTitle policy={policy} id={`${id}-title`} />
                 <p id={`${id}-text`} className="text-sm text-muted-foreground">
                   {POLICY_TEXT[policy]}
                 </p>
-                {policy === value && <PolicyNeeds policy={policy} testId={`${idPrefix}-policy-needs`} />}
+                {unavailable ? (
+                  <p
+                    id={`${id}-unavailable`}
+                    className="flex gap-2 rounded-md bg-muted/60 px-3 py-2 text-sm text-muted-foreground"
+                    data-testid={`${idPrefix}-policy-unavailable`}
+                  >
+                    <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                    <span>{REMEMBER_UNAVAILABLE}</span>
+                  </p>
+                ) : (
+                  policy === value && (
+                    <PolicyNeeds
+                      policy={policy}
+                      testId={`${idPrefix}-policy-needs`}
+                      configured={policy === "remember" && rememberAvailable === true}
+                    />
+                  )
+                )}
               </div>
             </label>
           );

@@ -21,6 +21,15 @@ describe("errorMessage", () => {
     expect(errorMessage(error)).toBe("Too many wrong passphrases. Try again in 42 seconds.");
   });
 
+  it.each([
+    "Failed to fetch dynamically imported module: http://localhost:5173/node_modules/.vite/deps/chunk.js",
+    "Failed to fetch",
+    "NetworkError when attempting to fetch resource.",
+    "Importing a module script failed.",
+  ])("hides the browser's network wording: %s", (message) => {
+    expect(errorMessage(new TypeError(message))).toBe("Could not reach the server. Reload the page and try again.");
+  });
+
   it("capitalises anything else", () => {
     expect(errorMessage(new ApiError("not found", 404, "not_found"))).toBe("Not found");
   });

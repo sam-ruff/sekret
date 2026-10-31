@@ -18,9 +18,10 @@ use zeroize::Zeroizing;
 use crate::config::SealSettings;
 use crate::error::{ApiError, ApiResult};
 use crate::files::{
-    SECRET_FILE_LIMIT, read_epoch, read_limited, read_private, remove_device_key_file, write_epoch, write_new_private,
+    EpochMark, SECRET_FILE_LIMIT, read_epoch, read_limited, read_mark, read_private, remove_device_key_file,
+    write_mark, write_new_private,
 };
-use crate::{ROOT_KEY_META, StartupError, check_root_key};
+use crate::{ROOT_KEY_META, StartupError};
 
 /// Shown as the address of audit entries written by the server itself.
 const LOCAL: &str = "local";
@@ -50,6 +51,8 @@ pub struct Keyring {
     /// Requests that write root-key-dependent data hold this for reading; replacing the root key
     /// holds it for writing, so nothing is written under a key that is about to go.
     rekey: tokio::sync::RwLock<()>,
+    /// Host socket attempts waiting for the gate; network attempts give way to them.
+    host_waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl Keyring {
@@ -59,6 +62,7 @@ impl Keyring {
             gate: tokio::sync::Mutex::new(()),
             kdf: Arc::new(Semaphore::new(1)),
             rekey: tokio::sync::RwLock::new(()),
+            host_waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -220,6 +224,24 @@ impl Keyring {
         self.gate.try_lock().ok()
     }
 
+    /// The gate for the host socket, ahead of every network attempt still waiting for it.
+    pub async fn lock_for_host(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.host_waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _waiting = Waiting(&self.host_waiting);
+        self.gate.lock().await
+    }
+
+    /// Whether a host socket attempt is waiting, so a network attempt should step aside.
+    pub fn host_waiting(&self) -> bool {
+        self.host_waiting.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// A permit to run one key derivation, or `kdf_busy` straight away when one is running.
     pub fn kdf_permit(&self) -> ApiResult<OwnedSemaphorePermit> {
         self.kdf.clone().try_acquire_owned().map_err(|_| ApiError::kdf_busy())
@@ -275,6 +297,7 @@ pub fn public_status(settings: &SealSettings, keyring: &Keyring) -> SysStatus {
         unlock_policy: None,
         configured: false,
         remembered: false,
+        remember_available: false,
         unsealed_by: None,
         web_setup: settings.web_setup,
         version: sekret_core::VERSION.to_string(),
@@ -293,6 +316,7 @@ pub fn status(settings: &SealSettings, keyring: &Keyring) -> SysStatus {
             unlock_policy: settings.unlock.filter(|_| passphrase),
             configured: settings.unlock.is_some(),
             remembered: false,
+            remember_available: passphrase && settings.remember_file.is_some(),
             unsealed_by: None,
             web_setup: settings.web_setup,
             version: sekret_core::VERSION.to_string(),
@@ -310,6 +334,7 @@ pub fn status(settings: &SealSettings, keyring: &Keyring) -> SysStatus {
         unlock_policy: passphrase.then(|| effective_policy(settings, keyring)),
         configured: settings.unlock.is_some(),
         remembered: passphrase && keyring.remembered() && remember_file_present,
+        remember_available: passphrase && settings.remember_file.is_some(),
         unsealed_by: keyring.unsealed_by(),
         web_setup: settings.web_setup,
         version: sekret_core::VERSION.to_string(),
@@ -421,25 +446,163 @@ pub fn high_water(paths: &[PathBuf]) -> HighWater {
     marks
 }
 
-/// Records `epoch` as the high-water mark beside each file. Marks are only ever raised here; a
-/// broken mark is replaced. Only `sekret admin reset-epoch` lowers them, through [`reset_epoch`].
-pub fn record_epoch(paths: &[PathBuf], epoch: i64) {
+/// The root key fingerprints every mark that names any agrees on, or `None` when no mark names
+/// one: there are no marks, or they were all written before fingerprints were recorded. A mark
+/// that cannot be read says nothing here; [`high_water`] already treats it as a rollback.
+pub fn accepted_roots(paths: &[PathBuf]) -> Option<Vec<String>> {
+    let mut accepted: Option<Vec<String>> = None;
     for path in paths {
-        if matches!(read_epoch(path), Ok(Some(existing)) if existing >= epoch) {
+        let Ok(Some(mark)) = read_mark(path) else {
+            continue;
+        };
+        if mark.roots.is_empty() {
             continue;
         }
-        if let Err(error) = write_epoch(path, epoch) {
-            tracing::warn!(%error, path = %path.display(), "could not record the seal configuration epoch");
-        }
+        accepted = Some(match accepted {
+            None => mark.roots,
+            Some(previous) => previous.into_iter().filter(|r| mark.roots.contains(r)).collect(),
+        });
+    }
+    accepted
+}
+
+/// Whether the marks allow a database under the root key with `fingerprint`.
+pub fn root_recognised(paths: &[PathBuf], fingerprint: &str) -> bool {
+    accepted_roots(paths).is_none_or(|roots| roots.iter().any(|r| r == fingerprint))
+}
+
+/// Whether `root` opens at least one project's data key, or there are no projects to ask.
+async fn opens_existing_data(store: &dyn Store, root: &RootKey) -> Result<bool, StoreError> {
+    let projects = store.list_projects().await?;
+    Ok(projects.is_empty()
+        || projects
+            .iter()
+            .any(|p| sekret_core::crypto::unwrap_data_key(root, &p.wrapped_key, &p.id).is_ok()))
+}
+
+/// Refuses a root key the epoch marks outside the database do not name, then one that does not
+/// match the database's fingerprint or open any of its data. The fingerprint is recorded only
+/// when the database has none and the data agrees. A database writer can change everything the
+/// database holds, but not the marks, so swapping in a root key of their own fails here.
+pub async fn check_root(store: &dyn Store, epoch_files: &[PathBuf], root: &RootKey) -> Result<(), StartupError> {
+    check_root_against(store, root, Some(epoch_files)).await
+}
+
+/// [`check_root`] without the marks, for the host command that adopts a new root key.
+pub async fn check_database_root(store: &dyn Store, root: &RootKey) -> Result<(), StartupError> {
+    check_root_against(store, root, None).await
+}
+
+/// A key that is simply not this database's is `WrongRootKey`; one the database agrees with but
+/// the marks do not is `UnrecognisedRootKey`, which is what a swapped or restored database shows.
+async fn check_root_against(
+    store: &dyn Store,
+    root: &RootKey,
+    epoch_files: Option<&[PathBuf]>,
+) -> Result<(), StartupError> {
+    let fingerprint = root.fingerprint();
+    let stored = store.get_meta(ROOT_KEY_META).await?;
+    if stored.as_ref().is_some_and(|s| *s != fingerprint) || !opens_existing_data(store, root).await? {
+        return Err(StartupError::WrongRootKey);
+    }
+    if let Some(paths) = epoch_files
+        && !root_recognised(paths, &fingerprint)
+    {
+        return Err(StartupError::UnrecognisedRootKey);
+    }
+    if stored.is_none() {
+        store.set_meta(ROOT_KEY_META, &fingerprint).await?;
+    }
+    Ok(())
+}
+
+/// The refusal a request gets when [`check_root`] fails.
+pub fn root_refused(error: StartupError) -> ApiError {
+    match error {
+        StartupError::UnrecognisedRootKey | StartupError::WrongRootKey => ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "root_key_not_recognised",
+            error.to_string(),
+        ),
+        other => ApiError::internal("root key check", other),
     }
 }
 
-/// Sets every mark to `epoch`, lowering them if need be. For the explicit operator command only.
-pub fn reset_epoch(paths: &[PathBuf], epoch: i64) -> std::io::Result<()> {
+fn write_or_skip(path: &Path, existing: &std::io::Result<Option<EpochMark>>, mark: &EpochMark) -> std::io::Result<()> {
+    match write_mark(path, mark) {
+        Ok(()) => Ok(()),
+        // Where no mark has ever been written, as beside a read-only key file, nothing goes stale.
+        Err(error) if matches!(existing, Ok(None)) => {
+            tracing::warn!(%error, path = %path.display(), "could not create a seal epoch mark");
+            Ok(())
+        }
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
+}
+
+/// Records `epoch` and the root key in use beside each file. Epochs are only ever raised here; a
+/// broken mark is replaced. Only `sekret admin reset-epoch` lowers them, through [`reset_epoch`].
+/// The caller has checked the root with [`check_root`], or is replacing it. Failing to update a
+/// mark that exists is an error, since it would otherwise go stale without anyone knowing.
+pub fn record_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io::Result<()> {
+    let mut failed = None;
     for path in paths {
-        write_epoch(path, epoch)?;
+        let existing = read_mark(path);
+        let mark = EpochMark {
+            epoch: match &existing {
+                Ok(Some(mark)) => mark.epoch.max(epoch),
+                _ => epoch,
+            },
+            roots: vec![fingerprint.to_string()],
+        };
+        if matches!(&existing, Ok(Some(current)) if *current == mark) {
+            continue;
+        }
+        if let Err(error) = write_or_skip(path, &existing, &mark) {
+            tracing::error!(%error, "could not record the seal configuration epoch");
+            failed.get_or_insert(error);
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// Before the root key is replaced, lets each existing mark accept both keys, so a crash between
+/// the database commit and [`record_epoch`] leaves a server that still starts.
+pub fn begin_rekey(paths: &[PathBuf], old: &str, new: &str) -> std::io::Result<()> {
+    for path in paths {
+        let existing = read_mark(path);
+        // A missing or broken mark names no root, so it refuses neither key meanwhile.
+        let Ok(Some(current)) = &existing else {
+            continue;
+        };
+        let epoch = current.epoch;
+        let mark = EpochMark {
+            epoch,
+            roots: vec![old.to_string(), new.to_string()],
+        };
+        write_or_skip(path, &existing, &mark)?;
     }
     Ok(())
+}
+
+/// Sets every mark to `epoch` and `fingerprint`, lowering them if need be. Only for when the
+/// epochs have run out, through the explicit operator command.
+pub fn reset_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io::Result<()> {
+    for path in paths {
+        let mark = EpochMark {
+            epoch,
+            roots: vec![fingerprint.to_string()],
+        };
+        write_mark(path, &mark)?;
+    }
+    Ok(())
+}
+
+fn mark_error(error: std::io::Error) -> ApiError {
+    ApiError::internal("recording the seal configuration epoch", error)
 }
 
 /// Signs and stores a changed configuration above the recorded marks, and raises them.
@@ -454,7 +617,7 @@ async fn save(
     let floor = high_water(&settings.epoch_files).floor();
     let config = signed(root, config, floor)?;
     store.update_seal_config(config.clone()).await?;
-    record_epoch(&settings.epoch_files, config.epoch);
+    record_epoch(&settings.epoch_files, config.epoch, &root.fingerprint()).map_err(mark_error)?;
     Ok(config)
 }
 
@@ -543,7 +706,7 @@ pub async fn check_config(
     let marks = high_water(&settings.epoch_files);
     let distrust = match verify_config(root, &config, marks) {
         Ok(false) => {
-            record_epoch(&settings.epoch_files, config.epoch);
+            record_epoch(&settings.epoch_files, config.epoch, &root.fingerprint()).map_err(mark_error)?;
             return Ok(Checked {
                 config,
                 tampered: false,
@@ -778,6 +941,10 @@ pub async fn initialise(
     if marks.highest.is_some() || marks.broken {
         config.flags.reviewer_tokens_migrated = true;
     }
+    if !root_recognised(&plan.epoch_files, &root.fingerprint()) {
+        // Only setup, which needs the host or the setup code, may move the marks to a new key.
+        tracing::warn!("the epoch marks name the root key of an earlier install; they now name the new one");
+    }
     let config = signed(&root, config, marks.floor())?;
     if let Err(error) = store.init_seal_config(config.clone(), &root.fingerprint()).await {
         if let Some(path) = written {
@@ -785,7 +952,10 @@ pub async fn initialise(
         }
         return Err(error.into());
     }
-    record_epoch(&plan.epoch_files, config.epoch);
+    // The database is set up by now, so a mark that cannot be written is reported, not undone.
+    if let Err(error) = record_epoch(&plan.epoch_files, config.epoch, &root.fingerprint()) {
+        tracing::error!(%error, "setup finished, but the seal epoch marks could not be updated");
+    }
     Ok((root, config))
 }
 
@@ -921,7 +1091,7 @@ pub async fn open_keyring(
         check_mode(settings, config.mode)?;
         return match (config.mode, key) {
             (mode, Some(key)) => {
-                check_root_key(store, &key.fingerprint()).await?;
+                check_root(store, &settings.epoch_files, &key).await?;
                 if mode == SealMode::Passphrase {
                     tracing::warn!("started unsealed from the root key file; this database is in passphrase mode");
                 }
@@ -957,7 +1127,7 @@ pub async fn open_keyring(
         // The mode is checked first, so a refused start leaves the database as it was.
         check_mode(settings, SealMode::KeyFile)?;
         let fingerprint = key.fingerprint();
-        check_root_key(store, &fingerprint).await?;
+        check_root(store, &settings.epoch_files, &key).await?;
         let config = SealConfig {
             mode: SealMode::KeyFile,
             wrapped: None,
@@ -981,7 +1151,7 @@ pub async fn open_keyring(
         };
         let config = signed(&key, config, marks.floor()).map_err(|e| StartupError::Init(e.to_string()))?;
         match store.init_seal_config(config.clone(), &fingerprint).await {
-            Ok(()) => record_epoch(&settings.epoch_files, config.epoch),
+            Ok(()) => record_epoch(&settings.epoch_files, config.epoch, &fingerprint)?,
             Err(StoreError::Conflict) => {}
             Err(error) => return Err(error.into()),
         }
@@ -1111,7 +1281,7 @@ async fn unlock_at_start(
             }
         },
     };
-    check_root_key(store, &root.fingerprint()).await?;
+    check_root(store, &settings.epoch_files, &root).await?;
     let checked = check_config(store, settings, now, LOCAL, &root, config, proven.as_ref())
         .await
         .map_err(startup)?;
@@ -1372,7 +1542,7 @@ pub mod ops {
         source: Source,
     ) -> ApiResult<(tokio::sync::MutexGuard<'_, ()>, OwnedSemaphorePermit)> {
         let Source::Network(ip) = source else {
-            let gate = state.keyring.lock().await;
+            let gate = state.keyring.lock_for_host().await;
             return Ok((gate, state.keyring.kdf_permit_queued().await?));
         };
         if let Some(wait) = state.passphrase_backoff.wait(ip) {
@@ -1381,7 +1551,7 @@ pub mod ops {
         if !state.passphrase_attempts.allow(&crate::ratelimit::prefix_key(ip)) {
             return Err(ApiError::too_many_requests());
         }
-        if state.passphrase_backoff.failures(ip) > 0 {
+        if state.passphrase_backoff.failures(ip) > 0 || state.keyring.host_waiting() {
             let gate = state.keyring.try_lock().ok_or_else(ApiError::kdf_busy)?;
             return Ok((gate, state.keyring.kdf_permit()?));
         }
@@ -1394,6 +1564,10 @@ pub mod ops {
             .await
             .map_err(|_| ApiError::kdf_busy())?;
         drop(place);
+        // However busy the network line is, an unseal from the host socket goes next.
+        if state.keyring.host_waiting() {
+            return Err(ApiError::kdf_busy());
+        }
         Ok((gate, state.keyring.kdf_permit()?))
     }
 
@@ -1478,9 +1652,19 @@ pub mod ops {
             action: "sys.unseal.failed",
         };
         let opened = open_with(state, source, wrapped.clone(), passphrase.clone(), permit, failure).await?;
-        check_root_key(state.store.as_ref(), &opened.root.fingerprint())
-            .await
-            .map_err(|e| ApiError::internal("root key check", e))?;
+        if let Err(error) = check_root(state.store.as_ref(), &state.config.seal.epoch_files, &opened.root).await {
+            let refused = root_refused(error);
+            audit(
+                state,
+                &principal,
+                source.ip(),
+                "sys.unseal.refused",
+                AuditTarget::default(),
+                json!({"reason": refused.code, "via": source.label()}),
+            )
+            .await;
+            return Err(refused);
+        }
         let ip = source.ip().to_string();
         let checked = check_config(
             state.store.as_ref(),
@@ -1574,9 +1758,9 @@ pub mod ops {
         let old_root = open_with(state, source, wrapped.clone(), current, permit, failure)
             .await?
             .root;
-        check_root_key(state.store.as_ref(), &old_root.fingerprint())
+        check_root(state.store.as_ref(), &state.config.seal.epoch_files, &old_root)
             .await
-            .map_err(|e| ApiError::internal("root key check", e))?;
+            .map_err(root_refused)?;
         let now = state.clock.now();
         let ip = source.ip().to_string();
         let settings = &state.config.seal;
@@ -1602,6 +1786,7 @@ pub mod ops {
         let rotation = crate::admin::Rotation {
             marks: high_water(&settings.epoch_files),
             skip_unreadable,
+            epoch_files: &settings.epoch_files,
         };
         let (report, still_unsealed) = {
             let _writers = state.keyring.rekeying().await?;
@@ -1611,7 +1796,6 @@ pub mod ops {
             (report, state.keyring.replace_root(new_root.clone())?)
         };
         if let Some(stored) = state.store.get_seal_config().await? {
-            record_epoch(&settings.epoch_files, stored.epoch);
             state.keyring.record(&stored)?;
         }
         if !report.skipped.is_empty() {
@@ -1933,6 +2117,120 @@ pub mod ops {
         {
             tracing::warn!(%error, "could not remove the setup code file");
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    const OLD: &str = "0123456789abcdef";
+    const NEW: &str = "fedcba9876543210";
+
+    fn marks(dir: &Path) -> Vec<PathBuf> {
+        vec![dir.join("sekret.db.epoch"), dir.join("unlock.key.epoch")]
+    }
+
+    #[test]
+    fn marks_record_the_root_and_only_raise_the_epoch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        assert_eq!(accepted_roots(&paths), None);
+        assert!(root_recognised(&paths, OLD), "no marks refuse nothing");
+        record_epoch(&paths, 5, OLD).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![OLD.to_string()]));
+        assert!(!root_recognised(&paths, NEW));
+        record_epoch(&paths, 3, OLD).context("record")?;
+        assert_eq!(high_water(&paths).highest, Some(5));
+        reset_epoch(&paths, 1, NEW).context("reset")?;
+        assert_eq!(high_water(&paths).highest, Some(1));
+        assert!(root_recognised(&paths, NEW) && !root_recognised(&paths, OLD));
+        Ok(())
+    }
+
+    #[test]
+    fn a_rekey_in_progress_accepts_both_keys_until_it_is_recorded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        record_epoch(&paths[..1], 4, OLD).context("record")?;
+        begin_rekey(&paths, OLD, NEW).context("begin")?;
+        assert!(!paths[1].exists(), "a missing mark is not created halfway");
+        assert!(root_recognised(&paths, OLD) && root_recognised(&paths, NEW));
+        assert_eq!(high_water(&paths).highest, Some(4));
+        record_epoch(&paths, 5, NEW).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![NEW.to_string()]));
+        assert!(paths[1].exists());
+        Ok(())
+    }
+
+    #[test]
+    fn marks_that_disagree_accept_only_what_they_share() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        record_epoch(&paths[..1], 4, OLD).context("record")?;
+        record_epoch(&paths[1..], 4, NEW).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![]));
+        assert!(!root_recognised(&paths, OLD) && !root_recognised(&paths, NEW));
+        // Marks from before fingerprints say nothing either way.
+        std::fs::write(&paths[1], "sekret-seal-epoch 4\n").context("old mark")?;
+        assert!(root_recognised(&paths, OLD));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn network_attempts_see_a_waiting_host_unseal() -> anyhow::Result<()> {
+        let keyring = Arc::new(Keyring::sealed(UnlockPolicy::Manual, false));
+        let held = keyring.lock().await;
+        assert!(!keyring.host_waiting());
+        let waiting = keyring.clone();
+        let host = tokio::spawn(async move {
+            let _gate = waiting.lock_for_host().await;
+        });
+        while !keyring.host_waiting() {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        host.await.context("host")?;
+        assert!(!keyring.host_waiting(), "cleared once the host has the gate");
+
+        // A host attempt abandoned while waiting does not keep network attempts out.
+        let held = keyring.lock().await;
+        let abandoned = tokio::time::timeout(Duration::from_millis(20), keyring.lock_for_host()).await;
+        assert!(abandoned.is_err());
+        assert!(!keyring.host_waiting());
+        drop(held);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_that_exists_but_cannot_be_updated_is_an_error() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir().context("dir")?;
+        let fixed = dir.path().join("fixed");
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir(&fixed).context("fixed")?;
+        std::fs::create_dir(&fresh).context("fresh")?;
+        let existing = vec![fixed.join("sekret.db.epoch")];
+        let never_written = vec![fresh.join("root.key.epoch")];
+        record_epoch(&existing, 1, OLD).context("record")?;
+        for locked in [&fixed, &fresh] {
+            std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o500)).context("chmod")?;
+        }
+        let stale = record_epoch(&existing, 2, OLD);
+        let skipped = record_epoch(&never_written, 2, OLD);
+        for locked in [&fixed, &fresh] {
+            std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        }
+        assert!(stale.is_err(), "a mark left behind would go stale unnoticed");
+        skipped.context("a mark that never existed, such as beside a read-only key file, is skipped")?;
+        assert!(begin_rekey(&existing, OLD, NEW).is_ok());
         Ok(())
     }
 }

@@ -21,6 +21,33 @@ describe("globMatch", () => {
     expect(path("/app/**", "/other/db")).toBe(false);
   });
 
+  it.each([
+    ["/a/**", "/a", true],
+    ["/a/**", "/a/", true],
+    ["/a/**", "/a/b", true],
+    ["/a/**", "/a/b/c", true],
+    ["/a/**", "/ab", false],
+    ["/a/**", "/", false],
+    ["/a/**", "/b/a", false],
+    ["/a/***", "/a", true],
+    ["/a/b/**", "/a/b", true],
+    ["/a/b/**", "/a", false],
+    ["/a/*/**", "/a/x", true],
+    ["/a/*/**", "/a", false],
+    ["/**", "/", true],
+    ["/**", "/x", true],
+    ["/a**", "/a", true],
+    ["/a**", "/ab", true],
+    ["/a/*", "/a", false],
+  ])("trailing double star covers the folder itself: %s against %s is %s", (pattern, text, expected) => {
+    expect(path(pattern, text)).toBe(expected);
+  });
+
+  it("leaves a trailing double star unchanged without a separator", () => {
+    expect(globMatch("a/**", "a")).toBe(false);
+    expect(globMatch("a/**", "a/b")).toBe(true);
+  });
+
   it("treats question marks as one non-separator character", () => {
     expect(path("/env?", "/env1")).toBe(true);
     expect(path("/env?", "/env/")).toBe(false);

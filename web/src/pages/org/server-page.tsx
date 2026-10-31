@@ -262,7 +262,13 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
         {status.configured ? (
           <ConfiguredPolicy policy={status.unlock_policy} testId="server-policy-configured" />
         ) : (
-          <UnlockPolicyCards idPrefix="server" value={policy} onChange={setPolicy} disabled={save.isPending} />
+          <UnlockPolicyCards
+            idPrefix="server"
+            value={policy}
+            onChange={setPolicy}
+            disabled={save.isPending}
+            rememberAvailable={status.remember_available}
+          />
         )}
         {current === "remember" && (
           <div

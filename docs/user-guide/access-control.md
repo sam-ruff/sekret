@@ -26,12 +26,14 @@ The actions are `read`, `read-value`, `create`, `edit` and `delete`. `read` on s
 
 Project subjects are `secrets`, `secret-versions`, `snapshots`, `folders`, `environments`, `members`, `roles`, `audit-log` and `settings`. Organisation subjects are `projects`, `identities`, `org-members`, `org-roles`, `org-audit-log` and `backups`, where `read` on `backups` allows downloading an encrypted backup.
 
+A secret's history and rollback also need `read` on the secret itself; a secret someone cannot read answers as not found, the same as one that does not exist. Snapshot descriptions leave out the folder when the reader cannot read that folder.
+
 Conditions narrow a rule to some secrets:
 
 | Condition | Matches |
 |---|---|
 | `environments` | Environment slugs, such as `["dev", "staging"]`. |
-| `paths` | Folder globs. `*` matches within one folder, `**` across folders: `/payments/**`. |
+| `paths` | Folder globs. `*` matches within one folder, `**` across folders. `/payments/**` covers `/payments` itself and every folder below it. |
 | `keys` | Key globs, such as `DB_*`. |
 | `tags` | Secrets carrying any of these tags. |
 

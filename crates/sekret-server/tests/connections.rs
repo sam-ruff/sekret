@@ -43,6 +43,7 @@ fn limits(header: u64, idle: u64, max: usize) -> ConnectionLimits {
         header_read_timeout: Duration::from_millis(header),
         idle_timeout: Duration::from_millis(idle),
         max_connections: max,
+        ..ConnectionLimits::new(max)
     }
 }
 
@@ -136,6 +137,51 @@ async fn connections_beyond_the_cap_wait_for_a_free_slot() -> anyhow::Result<()>
         .context("served once a slot frees")?
         .context("read")?;
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_client_cannot_hold_every_connection() -> anyhow::Result<()> {
+    let capped = ConnectionLimits {
+        max_per_client: 2,
+        exempt: Arc::from([]),
+        ..limits(5_000, 5_000, 16)
+    };
+    let server = run(capped, None).await?;
+    let first = TcpStream::connect(server.addr).await.context("connect")?;
+    let _second = TcpStream::connect(server.addr).await.context("connect")?;
+    let mut third = TcpStream::connect(server.addr).await.context("connect")?;
+    assert!(
+        closed_within(&mut third, Duration::from_secs(2)).await,
+        "a third connection from the same client is closed"
+    );
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut fourth = TcpStream::connect(server.addr).await.context("connect")?;
+    assert!(request(&mut fourth, "/fast").await?.starts_with("HTTP/1.1 200"));
+
+    let exempt = ConnectionLimits {
+        max_per_client: 1,
+        ..limits(5_000, 5_000, 16)
+    };
+    let server = run(exempt, None).await?;
+    let _held = TcpStream::connect(server.addr).await.context("connect")?;
+    let mut other = TcpStream::connect(server.addr).await.context("connect")?;
+    assert!(
+        request(&mut other, "/fast").await?.starts_with("HTTP/1.1 200"),
+        "loopback, where a local proxy runs, is exempt by default"
+    );
+    Ok(())
+}
+
+#[test]
+fn trusted_proxies_are_exempt_from_the_per_client_cap() -> anyhow::Result<()> {
+    let proxy: ipnet::IpNet = "10.0.0.0/24".parse().context("net")?;
+    let limits = ConnectionLimits::new(512).exempting(&[proxy]);
+    assert_eq!(limits.max_per_client, 128);
+    assert!(limits.exempt.contains(&proxy));
+    let local: std::net::IpAddr = "127.0.0.1".parse().context("ip")?;
+    assert!(limits.exempt.iter().any(|n| n.contains(&local)));
     Ok(())
 }
 

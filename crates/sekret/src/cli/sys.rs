@@ -323,6 +323,7 @@ mod tests {
             unlock_policy: Some(UnlockPolicy::Manual),
             configured: true,
             remembered: false,
+            remember_available: false,
             unsealed_by: None,
             web_setup: true,
             version: "0.1.0".into(),

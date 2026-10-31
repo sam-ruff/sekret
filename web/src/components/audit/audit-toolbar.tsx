@@ -26,9 +26,11 @@ interface AuditToolbarProps {
   scope: "project" | "org";
   /** Offered as a filter on project pages. */
   environments?: Environment[];
+  /** Search leaves out keys and folders for readers who cannot see every secret. */
+  searchesSecrets?: boolean;
 }
 
-function SearchBox({ value, onSearch }: { value: string; onSearch: (q: string) => void }) {
+function SearchBox({ value, onSearch, placeholder }: { value: string; onSearch: (q: string) => void; placeholder: string }) {
   const [text, setText] = useSearchText(value, onSearch);
   return (
     <InputGroup className="min-w-0 lg:max-w-xs">
@@ -36,7 +38,7 @@ function SearchBox({ value, onSearch }: { value: string; onSearch: (q: string) =
         <Search />
       </InputGroupAddon>
       <InputGroupInput
-        placeholder="Search actions, people, keys, addresses"
+        placeholder={placeholder}
         aria-label="Search the audit log"
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -138,7 +140,7 @@ function DateRange({ from, to, onChange }: { from: string; to: string; onChange:
   );
 }
 
-export function AuditToolbar({ filters, onChange, scope, environments }: AuditToolbarProps) {
+export function AuditToolbar({ filters, onChange, scope, environments, searchesSecrets = true }: AuditToolbarProps) {
   const set = (patch: Partial<AuditFilters>) => onChange({ ...filters, ...patch });
   const categories = ACTION_CATEGORIES.filter((c) => scope === "org" || c.scope !== "org");
   const newestFirst = filters.order === "desc";
@@ -146,7 +148,11 @@ export function AuditToolbar({ filters, onChange, scope, environments }: AuditTo
 
   return (
     <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center" data-testid="audit-toolbar">
-      <SearchBox value={filters.q} onSearch={(q) => set({ q })} />
+      <SearchBox
+        value={filters.q}
+        onSearch={(q) => set({ q })}
+        placeholder={searchesSecrets ? "Search actions, people, keys, addresses" : "Search actions, people, addresses"}
+      />
       <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
         <Select value={filters.action || ALL} onValueChange={(v) => set({ action: v === ALL ? "" : v })}>
           <SelectTrigger className="w-full sm:w-44" aria-label="Action" data-testid="audit-action-filter">

@@ -11,6 +11,8 @@ export const MAX_FAILED_UNSEALS = 5;
 export const MOCK_BACKOFF_SECONDS = 3;
 /** Typing this makes the fake answer as if another unlock were running. */
 export const MOCK_KDF_BUSY_PASSPHRASE = "mock kdf busy";
+/** Unlocking with this plays a server whose database was replaced, so the key it opens is not recognised. */
+export const MOCK_FOREIGN_KEY_PASSPHRASE = "mock restored database";
 /** CLI login codes starting with this need a fresh sign-in before they can be approved. */
 export const MOCK_REAUTH_CODE_PREFIX = "AUTH";
 /** Where every pending CLI login in the fake says it came from. */
@@ -31,6 +33,7 @@ export function mockSys(state: SealState = "unsealed"): MockSys {
     remembered: false,
     unsealedBy: state === "unsealed" ? "passphrase" : null,
     webSetup: true,
+    rememberFile: true,
     passphrase: initialised ? MOCK_PASSPHRASE : "",
     failedUnseals: 0,
     backoffUntil: 0,
@@ -38,6 +41,7 @@ export function mockSys(state: SealState = "unsealed"): MockSys {
 }
 
 export function statusOf(sys: MockSys): SysStatus {
+  const rememberAvailable = sys.rememberFile && sys.mode !== "key-file";
   if (sys.state === "uninitialised") {
     // Only what configuration has decided, so the wizard can skip it.
     const keyFile = sys.mode === "key-file";
@@ -46,6 +50,7 @@ export function statusOf(sys: MockSys): SysStatus {
       seal_mode: sys.mode,
       unlock_policy: sys.configured && !keyFile ? sys.unlockPolicy : null,
       configured: sys.configured,
+      remember_available: rememberAvailable,
       remembered: false,
       unsealed_by: null,
       web_setup: sys.webSetup,
@@ -58,6 +63,7 @@ export function statusOf(sys: MockSys): SysStatus {
     seal_mode: sys.mode,
     unlock_policy: passphrase ? sys.unlockPolicy : null,
     configured: sys.configured,
+    remember_available: rememberAvailable,
     remembered: passphrase && sys.remembered,
     unsealed_by: sys.state === "unsealed" ? sys.unsealedBy : null,
     web_setup: sys.webSetup,
@@ -73,6 +79,7 @@ export function publicStatusOf(sys: MockSys): SysStatus {
     seal_mode: null,
     unlock_policy: null,
     configured: false,
+    remember_available: false,
     remembered: false,
     unsealed_by: null,
     web_setup: sys.webSetup,
@@ -84,6 +91,7 @@ export function publicStatusOf(sys: MockSys): SysStatus {
 export function sysFromControls(current: MockSys, controls: MockControls): MockSys {
   const sys = controls.state ? mockSys(controls.state) : { ...current };
   if (controls.webSetup !== undefined) sys.webSetup = controls.webSetup;
+  if (controls.rememberFile !== undefined) sys.rememberFile = controls.rememberFile;
   if (controls.sealMode) sys.mode = controls.sealMode;
   if (controls.configuredPolicy) {
     sys.configured = true;

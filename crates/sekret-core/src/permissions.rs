@@ -509,6 +509,39 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_deny_covers_the_folder_and_everything_under_it() {
+        let paths = |p: &str| Conditions {
+            paths: vec![p.into()],
+            ..Default::default()
+        };
+        let deny = scoped(Effect::Deny, &[Action::Read, Action::ReadValue], paths("/payments/**"));
+        let allow = scoped(Effect::Allow, &[Action::Read, Action::ReadValue], paths("/payments/**"));
+        let mut denied = BuiltinRole::Developer.rules();
+        denied.push(deny);
+        let cases: &[(&[Rule], &str, Decision)] = &[
+            (&denied, "/payments", Decision::Deny),
+            (&denied, "/payments/stripe", Decision::Deny),
+            (&denied, "/payments/stripe/live", Decision::Deny),
+            (&denied, "/", Decision::Allow),
+            (&denied, "/payments-old", Decision::Allow),
+            (&denied, "/other/payments", Decision::Allow),
+            (std::slice::from_ref(&allow), "/payments", Decision::Allow),
+            (std::slice::from_ref(&allow), "/payments/stripe", Decision::Allow),
+            (std::slice::from_ref(&allow), "/paymentsx", Decision::Deny),
+            (std::slice::from_ref(&allow), "/", Decision::Deny),
+        ];
+        for (rules, path, expected) in cases {
+            for action in [Action::Read, Action::ReadValue] {
+                assert_eq!(
+                    authorise(rules, Subject::Secrets, action, &secret("prod", path, "KEY")),
+                    *expected,
+                    "{action:?} at {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deny_beats_allow_and_applies_when_resource_is_unknown() {
         let mut rules = BuiltinRole::ProjectAdmin.rules();
         rules.push(scoped(

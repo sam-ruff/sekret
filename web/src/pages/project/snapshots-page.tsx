@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Camera, ChevronRight, History, Minus, Plus, RefreshCw, Undo2 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Navigate } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Snapshot, SnapshotChange } from "@/api/types";
@@ -19,6 +19,7 @@ import { keys, useApiMutation } from "@/hooks/queries";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel, normalisePath } from "@/lib/paths";
+import { snapshotTitle } from "@/lib/snapshots";
 import { cn } from "@/lib/utils";
 
 const KIND_STYLE: Record<SnapshotChange["kind"], { label: string; className: string; icon: typeof Plus }> = {
@@ -67,6 +68,7 @@ function SnapshotSheet({
 }) {
   const [folder, setFolder] = useState("/");
   const [confirming, setConfirming] = useState(false);
+  const content = useRef<HTMLDivElement>(null);
   const path = normalisePath(folder);
   const id = snapshot?.id ?? "";
 
@@ -97,11 +99,20 @@ function SnapshotSheet({
         onClose();
       }}
     >
-      <SheetContent className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl" data-testid="snapshot-sheet">
+      <SheetContent
+        ref={content}
+        className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl"
+        // Focusing the folder field first would open the on-screen keyboard over the changes.
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          content.current?.focus();
+        }}
+        data-testid="snapshot-sheet"
+      >
         <SheetHeader className="border-b pr-12">
           <SheetTitle>Snapshot from {snapshot && formatRelative(snapshot.created_at)}</SheetTitle>
           <SheetDescription>
-            {snapshot?.reason} · {snapshot?.actor} · {envName}
+            {snapshot && snapshotTitle(snapshot.reason)} · {snapshot?.actor} · {envName}
           </SheetDescription>
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
@@ -210,7 +221,9 @@ export function SnapshotsPage() {
                   >
                     <History className="size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium">{s.reason}</div>
+                      <div className="line-clamp-2 text-sm font-medium break-words" title={s.reason} data-testid="snapshot-title">
+                        {snapshotTitle(s.reason)}
+                      </div>
                       <div className="truncate text-xs text-muted-foreground" title={formatDateTime(s.created_at)}>
                         {s.actor} · {formatRelative(s.created_at)} · {s.secret_count} {s.secret_count === 1 ? "secret" : "secrets"}
                       </div>

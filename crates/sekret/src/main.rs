@@ -129,8 +129,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::Admin(command) => server::run_admin(command, sources).await?,
         Command::Sys(command) if command.socket().is_some() => {
             let path = command.socket().map(std::path::Path::to_path_buf).unwrap_or_default();
-            socket_check::check(&path)?;
-            let api = cli::host_socket_client(&path)?;
+            let api = cli::host_socket_client(&path).await?;
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }
         Command::Sys(command) => {
@@ -196,7 +195,11 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
                 .collect();
             print!("{}", cli::format::table(&["SLUG", "NAME", "ID"], &rows));
         }
-        Command::Secrets(command) => {
+        Command::Secrets(mut command) => {
+            // Pipes and files get the value exactly; only a terminal is protected.
+            if let cli::SecretsCommand::Get { raw, .. } = &mut command {
+                *raw |= !std::io::IsTerminal::is_terminal(&std::io::stdout());
+            }
             let (resolved, api) = authenticated(&cli.client).await?;
             cli::secrets(
                 &api,
@@ -209,13 +212,13 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         }
         Command::Export(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            let policy = cli::load_policy(&resolved, &args.allow)?;
+            let policy = cli::load_policy_confirming(&resolved, &args.allow)?;
             let at = cli::location(&resolved)?;
             cli::export(&api, at, &args, &policy, &mut out, &mut std::io::stderr()).await?;
         }
         Command::Run(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            let policy = cli::load_policy(&resolved, &args.allow)?;
+            let policy = cli::load_policy_confirming(&resolved, &args.allow)?;
             let at = cli::location(&resolved)?;
             return cli::run_command(&api, at, &args, &policy, &mut std::io::stderr()).await;
         }
@@ -262,7 +265,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
             }
             let (resolved, api) = authenticated(&args).await?;
             let previous = cli::shell::previously_loaded(std::env::var(cli::shell::LOADED_KEYS_VAR).ok().as_deref());
-            let policy = cli::load_policy(&resolved, &allow)?;
+            let policy = cli::load_policy_confirming(&resolved, &allow)?;
             let options = cli::EnvUse {
                 shell,
                 recursive,

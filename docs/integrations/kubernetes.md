@@ -15,11 +15,44 @@ helm install sekret-operator deploy/helm/sekret-operator \
   --set sekret.serverUrl=https://sekret.example.com
 ```
 
-With `watchNamespace` empty, the operator watches every namespace and is granted cluster-wide rights to read and write `Secret` objects and create service account tokens. Set `watchNamespace` to confine it to one namespace with a `Role` instead, which is the safer choice if only one namespace needs it. For a server with a private CA, put the CA certificate in a ConfigMap and set `sekret.caBundle.configMapName`.
+By default the operator watches only the namespace it is installed in. List the namespaces it should serve in `watchNamespaces`, and the chart gives it a `Role` and `RoleBinding` in each one and nothing anywhere else:
+
+```sh
+helm install sekret-operator deploy/helm/sekret-operator \
+  --namespace sekret-system --create-namespace \
+  --set image.repository=ghcr.io/sam-ruff/sekret \
+  --set sekret.serverUrl=https://sekret.example.com \
+  --set 'watchNamespaces={web,api}'
+```
+
+| Value | Default | What it does |
+|---|---|---|
+| `sekret.serverUrl` | none | The sekret server. Required. |
+| `sekret.allowInsecureHttp` | `false` | Allows a plain `http://` server that is not on loopback. Service account tokens and secret values then cross the network unencrypted, so the operator refuses such a URL without it. |
+| `sekret.caBundle.configMapName` | none | A ConfigMap holding the CA certificate of a server with a private CA. |
+| `sekret.clientCertificate.secretName` | none | A `kubernetes.io/tls` Secret to present to a server that requires mutual TLS. |
+| `watchNamespaces` | the release namespace | The namespaces to watch, each with its own `Role`. |
+| `clusterWide` | `false` | Watches every namespace with a `ClusterRole`. Cannot be combined with `watchNamespaces`. |
+| `tokenServiceAccounts` | all | Names of the only service accounts the operator may read and mint tokens for, in every watched namespace. |
+| `tokenPolicy.enabled` | `true` | Installs a `ValidatingAdmissionPolicy` that lets the operator request only tokens with the `sekret` audience that expire within ten minutes, and none in `kube-system`. Needs Kubernetes 1.30 or later; set it to `false` on older clusters. |
+
+!!! warning "Cluster-wide mode is close to cluster-admin"
+    With `clusterWide: true` the operator can read and write every `Secret` in the cluster and mint a token for any service account, including powerful ones in `kube-system`. Anyone who takes over the operator's pod or token gets the same reach. The token policy narrows what those tokens can be used for, but prefer listing namespaces in `watchNamespaces` unless you really need every one.
+
+The chart's old `watchNamespace` value has gone. A release that still sets it fails to render, with a message saying to use `watchNamespaces` or `clusterWide` instead.
+
+When running the binary directly, `sekret operator` needs either `--namespace web,api` (or `SEKRET_OPERATOR_NAMESPACE`) or `--all-namespaces` (or `SEKRET_OPERATOR_ALL_NAMESPACES=true`). It does not fall back to watching the whole cluster. `--allow-insecure-http` (or `SEKRET_OPERATOR_ALLOW_INSECURE_HTTP`) matches `sekret.allowInsecureHttp`.
 
 ## Configure sekret
 
 Create a machine identity with a [Kubernetes auth method](../user-guide/machine-identities.md#kubernetes) that allows the namespace and service account you will use, and give it a role on the project.
+
+## Let a service account be used
+
+The operator only mints a token for a service account that carries the annotation `sekret.sam-ruff.github.io/allow-sekretsecret: "true"`. Without it, the `SekretSecret` stays not ready with the reason `ServiceAccountNotAllowed`, and no token is requested.
+
+!!! warning "Creating a SekretSecret is a powerful right"
+    The operator acts with its own rights, not those of whoever created the `SekretSecret`. Anyone who can create a `SekretSecret` in a namespace, and read the `Secret` it writes, can use the sekret access of every opted-in service account there, without being allowed to create pods or tokens for those accounts. Grant `create` on `sekretsecrets` only to people who may already act as those service accounts. The right to annotate service accounts (`update` or `patch` on `serviceaccounts`) is just as powerful, because it can opt an account in. Give each workload its own service account and opt in only the ones meant for the operator.
 
 ## Sync a secret
 
@@ -29,6 +62,8 @@ kind: ServiceAccount
 metadata:
   name: web-secrets
   namespace: web
+  annotations:
+    sekret.sam-ruff.github.io/allow-sekretsecret: "true"
 ---
 apiVersion: sekret.sam-ruff.github.io/v1alpha1
 kind: SekretSecret

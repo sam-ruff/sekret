@@ -257,8 +257,15 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> anyhow::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut builder = tempfile::Builder::new();
+        // Private whatever the umask, as the unseal socket's directory must be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
         Ok(Self {
-            dir: tempfile::tempdir().context("sandbox")?,
+            dir: builder.tempdir().context("sandbox")?,
         })
     }
 
@@ -1854,6 +1861,87 @@ async fn tls_settings_must_come_in_pairs() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn tls_client_auth_without_a_client_ca_is_warned_about() -> anyhow::Result<()> {
+    const WARNING: &str = "tls.client_auth is set but tls.client_ca_file is not";
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        pki(&sb)?;
+        let key = sb.root_key("root.key")?;
+        let server = sb
+            .keyed(&key)
+            .https(tls_client(&sb, None)?)
+            .default("tls.cert_file", &sb.p("server.pem"))
+            .default("tls.key_file", &sb.p("server-key.pem"))
+            .set(way, "tls.client_auth", "required")
+            .start()
+            .await?;
+        assert!(server.log().contains(WARNING), "{way:?}: {}", server.log());
+        assert!(
+            reaches(&tls_client(&sb, None)?, &server.url).await,
+            "{way:?}: no certificate is asked for"
+        );
+        drop(server);
+        let server = sb.keyed(&key).set(way, "tls.client_auth", "optional").start().await?;
+        assert!(server.log().contains(WARNING), "{way:?}: without TLS at all");
+    }
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = tls_base(&sb)?
+        .set(Way::Env, "tls.client_auth", "required")
+        .start()
+        .await?;
+    assert!(!server.log().contains(WARNING), "{}", server.log());
+    drop(server);
+    let server = sb.keyed(&key).start().await?;
+    assert!(!server.log().contains(WARNING), "{}", server.log());
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_http_on_all_interfaces_behind_an_https_url_is_warned_about() -> anyhow::Result<()> {
+    const WARNING: &str = "speaks plain http on";
+    const PUBLIC: &str = "https://sekret.example.com";
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let server = sb
+            .keyed(&key)
+            .set(way, "server.listen", "0.0.0.0:0")
+            .set(way, "server.public_url", PUBLIC)
+            .start()
+            .await?;
+        assert!(server.log().contains(WARNING), "{way:?}: {}", server.log());
+        drop(server);
+        let server = sb
+            .keyed(&key)
+            .set(way, "server.listen", "127.0.0.1:0")
+            .set(way, "server.public_url", PUBLIC)
+            .start()
+            .await?;
+        assert!(!server.log().contains(WARNING), "{way:?}: loopback is fine");
+    }
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = sb
+        .keyed(&key)
+        .set(Way::File, "server.listen", "0.0.0.0:0")
+        .set(Way::Env, "server.listen", "127.0.0.1:0")
+        .set(Way::File, "server.public_url", PUBLIC)
+        .start()
+        .await?;
+    assert!(!server.log().contains(WARNING), "the environment beats the file");
+    drop(server);
+    let server = sb
+        .keyed(&key)
+        .set(Way::Env, "server.listen", "0.0.0.0:0")
+        .set(Way::Flag, "server.public_url", PUBLIC)
+        .start()
+        .await?;
+    assert!(server.log().contains(WARNING), "{}", server.log());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // seal.*
 // ---------------------------------------------------------------------------------------------
@@ -1877,7 +1965,7 @@ async fn seal_mode_picks_the_mode_and_refuses_the_other() -> anyhow::Result<()> 
             "{way:?}"
         );
         drop(server);
-        let log = sb.keyed(&key).set(way, "seal.mode", "passphrase").refused().await?;
+        let log = sb.launch().set(way, "seal.mode", "passphrase").refused().await?;
         assert!(
             log.contains("seal mode passphrase but the database is in key-file mode")
                 && log.contains("sekret admin set-seal-mode"),
@@ -1939,30 +2027,18 @@ async fn root_key_file_unlocks_key_file_mode() -> anyhow::Result<()> {
 }
 
 /// A passphrase-mode database whose root key is also in `root.key`, with a secret and a token.
+/// Switching mode replaces the root key, so the key is put in place by a rotation instead.
 fn passphrase_db_with_known_key(sb: &Sandbox) -> anyhow::Result<(String, String)> {
-    let key = sb.p("root.key");
     let pass = sb.passphrase_file()?;
+    sb.passphrase_db("manual")?;
+    let key = sb.root_key("root.key")?;
     ok(sb.cli(
         &[
             "admin",
-            "init",
-            "--key-file-mode",
+            "rotate-root-key",
             "--database-url",
             &sb.db(),
-            "--root-key-file",
-            &key,
-        ],
-        &[],
-        None,
-    )?)?;
-    ok(sb.cli(
-        &[
-            "admin",
-            "set-seal-mode",
-            "passphrase",
-            "--database-url",
-            &sb.db(),
-            "--root-key-file",
+            "--new-root-key-file",
             &key,
             "--passphrase-file",
             &pass,
@@ -2012,6 +2088,53 @@ async fn root_key_file_is_an_emergency_way_into_passphrase_mode() -> anyhow::Res
             "{way:?}: an absent key file is not an error"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn passphrase_mode_refuses_a_root_key_file() -> anyhow::Result<()> {
+    const REFUSAL: &str = "seal.mode is passphrase but seal.root_key_file is set";
+    for mode_way in WAYS {
+        for key_way in WAYS {
+            let sb = Sandbox::new()?;
+            let key = sb.root_key("root.key")?;
+            let log = sb
+                .launch()
+                .set(mode_way, "seal.mode", "passphrase")
+                .set(key_way, "seal.root_key_file", &key)
+                .refused()
+                .await?;
+            assert!(log.contains(REFUSAL), "{mode_way:?} {key_way:?}: {log}");
+        }
+    }
+    // A key-file mode that wins over passphrase lower down uses the key file as usual.
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = sb
+        .keyed(&key)
+        .set(Way::File, "seal.mode", "passphrase")
+        .set(Way::Env, "seal.mode", "key-file")
+        .arg("--auto-init")
+        .start()
+        .await?;
+    let status = server.detail(&sb.bootstrap(&key)?).await?;
+    assert_eq!(status["seal_mode"], "key-file");
+    drop(server);
+    let server = sb
+        .keyed(&key)
+        .set(Way::Env, "seal.mode", "passphrase")
+        .set(Way::Flag, "seal.mode", "key-file")
+        .start()
+        .await?;
+    assert_eq!(server.state().await?, "unsealed");
+    drop(server);
+    let log = sb
+        .keyed(&key)
+        .set(Way::Flag, "seal.mode", "passphrase")
+        .set(Way::Env, "seal.mode", "key-file")
+        .refused()
+        .await?;
+    assert!(log.contains(REFUSAL), "the flag wins: {log}");
     Ok(())
 }
 
@@ -3342,7 +3465,7 @@ async fn seal_remember_secret_file_is_needed_to_unlock_from_the_remember_file() 
     for way in WAYS {
         let sb = Sandbox::new()?;
         sb.passphrase_db("remember")?;
-        let secret = sb.write("remember-secret", &format!("{}\n", "r".repeat(40)))?;
+        let secret = sb.write("remember-secret", "xX0cbCqZ2IpCHTTEMxOxIhogaYMr4nufQk3TEU8lrgY=\n")?;
         let with_secret = || sb.remembering().set(way, "seal.remember_secret_file", &secret);
         let server = with_secret().start().await?;
         assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK, "{way:?}");
@@ -3363,10 +3486,23 @@ async fn seal_remember_secret_file_is_needed_to_unlock_from_the_remember_file() 
             .refused()
             .await?;
         assert!(log.contains("at least 32"), "{way:?}: {log}");
+        let guessable = sb.write("guessable", &format!("{}\n", "r".repeat(40)))?;
+        let log = sb
+            .remembering()
+            .set(way, "seal.remember_secret_file", &guessable)
+            .refused()
+            .await?;
+        assert!(log.contains("too easy to guess"), "{way:?}: {log}");
     }
     let sb = Sandbox::new()?;
     sb.passphrase_db("remember")?;
-    let value = "e".repeat(40);
+    let log = sb
+        .remembering()
+        .env("SEKRET_REMEMBER_SECRET", &"e".repeat(40))
+        .refused()
+        .await?;
+    assert!(log.contains("too easy to guess"), "{log}");
+    let value = "jMvJGjs1rlsZhRRrc5VnYCIQg/Hbw1zYRqMi5us1Xmw=".to_string();
     let server = sb.remembering().env("SEKRET_REMEMBER_SECRET", &value).start().await?;
     assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK);
     drop(server);
@@ -3481,7 +3617,7 @@ async fn server_unix_socket_unseals_on_the_host() -> anyhow::Result<()> {
 async fn secrets_from_the_environment_are_wiped_from_the_process() -> anyhow::Result<()> {
     let sb = Sandbox::new()?;
     sb.passphrase_db("passphrase-file")?;
-    let remember = "q".repeat(40);
+    let remember = "cJX/vpMVpBxjSDbMhicakdkcJMocZMmeEPyCOuUhips=".to_string();
     let server = sb
         .remembering()
         .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
@@ -3619,6 +3755,52 @@ async fn key_files_others_can_read_are_warned_about() -> anyhow::Result<()> {
     assert!(!server.log().contains("other users can read it"), "{}", server.log());
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn files_holding_a_database_password_or_in_open_directories_are_warned_about() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    // The flag's SQLite database wins, but the file still holds the password.
+    let with_password = "database:\n  url: postgres://sekret:hunter2@db.invalid/sekret\n";
+    let server = sb.keyed(&key).raw_config(with_password).start().await?;
+    let log = server.log();
+    assert!(
+        log.contains("the configuration file, which holds a database password,") && log.contains(READABLE_BY_OTHERS),
+        "{log}"
+    );
+    assert!(!log.contains("hunter2"), "{log}");
+    drop(server);
+    let server = sb
+        .keyed(&key)
+        .raw_config("database:\n  snapshots_to_keep: 5\n")
+        .start()
+        .await?;
+    assert!(!server.log().contains("the configuration file"), "{}", server.log());
+    drop(server);
+
+    let open = sb.path("open");
+    std::fs::create_dir(&open).context("mkdir")?;
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+    let moved = open.join("root.key");
+    std::fs::rename(&key, &moved).context("move key")?;
+    std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let moved = moved.display().to_string();
+    for way in WAYS {
+        let server = sb.launch().set(way, "seal.root_key_file", &moved).start().await?;
+        assert!(
+            server
+                .log()
+                .contains("writable by every user, so anyone can replace it"),
+            "{way:?}: {}",
+            server.log()
+        );
+    }
+    Ok(())
+}
+
+const READABLE_BY_OTHERS: &str = "other users can read it";
 
 #[tokio::test]
 async fn restore_clears_what_an_interrupted_restore_left() -> anyhow::Result<()> {
@@ -4042,6 +4224,40 @@ async fn the_unseal_socket_needs_a_private_directory() -> anyhow::Result<()> {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("can be written by other users"), "{stderr}");
     drop(planted);
+    Ok(())
+}
+
+/// A group member could swap the socket in a group-writable directory, sticky bit or not.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_unseal_socket_refuses_a_group_writable_directory() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o770, 0o1770] {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        let shared = sb.path("shared");
+        std::fs::create_dir(&shared).context("dir")?;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode)).context("chmod")?;
+        let socket = shared.join("sekret.sock").display().to_string();
+        let log = sb
+            .launch()
+            .set(Way::Flag, "server.unix_socket", &socket)
+            .refused()
+            .await?;
+        assert!(log.contains("writable by its group"), "{mode:o}: {log}");
+
+        let planted = std::os::unix::net::UnixListener::bind(&socket).context("bind")?;
+        let pass = sb.passphrase_file()?;
+        let output = sb.cli(
+            &["sys", "unseal", "--socket", &socket, "--passphrase-file", &pass],
+            &[],
+            None,
+        )?;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains("written by its group"), "{mode:o}: {stderr}");
+        drop(planted);
+    }
     Ok(())
 }
 

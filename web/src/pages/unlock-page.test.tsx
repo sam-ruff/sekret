@@ -136,6 +136,17 @@ describe("UnlockPage", () => {
     expect(screen.getByTestId("unlock-submit")).toBeEnabled();
   });
 
+  it("explains a key the server does not recognise and how to fix it after a restore", async () => {
+    unseal.mockRejectedValue(new ApiError("the passphrase opened a root key this server does not recognise", 409, "root_key_not_recognised"));
+    renderUnlock();
+    await attempt("plum orbit gravel lantern");
+    const alert = screen.getByTestId("unlock-key-not-recognised");
+    expect(alert).toHaveTextContent("This passphrase opened a key this server does not recognise");
+    expect(alert).toHaveTextContent("sekret admin reset-epoch");
+    expect(screen.queryByTestId("unlock-error")).toBeNull();
+    expect(screen.queryByTestId("unlock-wrong")).toBeNull();
+  });
+
   it("keeps the general rate limit message for other 429s", async () => {
     unseal.mockRejectedValue(new ApiError("too many requests", 429, "rate_limited"));
     renderUnlock();

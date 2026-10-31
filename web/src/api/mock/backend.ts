@@ -7,6 +7,7 @@ import type {
   Action,
   AddMembership,
   AddOrgBinding,
+  AuthConfig,
   AuditEntry,
   AuditPage,
   AuthMethodConfig,
@@ -69,6 +70,7 @@ import {
   compactUtc,
   MAX_FAILED_UNSEALS,
   MOCK_BACKOFF_SECONDS,
+  MOCK_FOREIGN_KEY_PASSPHRASE,
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_CLI_ADDRESS,
   MOCK_CLI_USER_AGENT,
@@ -295,6 +297,10 @@ export class MockBackend {
     this.state.freshSignIn = fresh;
   }
 
+  authConfig(): AuthConfig {
+    return { oidc_enabled: !this.state.oidcDisabled, login_url: "/auth/login" };
+  }
+
   logout(): { logout_url: string | null } {
     this.state.signedOut = true;
     this.state.freshSignIn = false;
@@ -351,6 +357,7 @@ export class MockBackend {
     this.state.sys = sysFromControls(this.state.sys, controls);
     if (controls.orgRole) this.setMyOrgRole(controls.orgRole);
     if (controls.idpLogout) this.state.idpLogoutUrl = MOCK_IDP_LOGOUT_URL;
+    if (controls.oidc !== undefined) this.state.oidcDisabled = !controls.oidc;
   }
 
   // Projects
@@ -755,14 +762,14 @@ export class MockBackend {
     };
   }
 
-  listSecrets(projectId: string, envSlug: string, rawPath: string, values: boolean): SecretList {
+  listSecrets(projectId: string, envSlug: string, rawPath: string, values: boolean, recursive = false): SecretList {
     const { project, rules } = this.loadProject(projectId);
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(rawPath);
     const secrets = this.state.secrets
-      .filter((s) => s.envId === env.id && s.path === path && !isDeleted(s))
+      .filter((s) => s.envId === env.id && (recursive ? within(s.path, path) : s.path === path) && !isDeleted(s))
       .filter((s) => authorise(rules, "secrets", "read", this.resource(env, s, currentVersion(s).tags)))
-      .sort((a, b) => a.key.localeCompare(b.key))
+      .sort((a, b) => a.path.localeCompare(b.path) || a.key.localeCompare(b.key))
       .map((s) => this.toApi(env, s, rules, values));
     const prefix = path === "/" ? "/" : `${path}/`;
     const folders = this.state.folders
@@ -773,7 +780,7 @@ export class MockBackend {
     if (values) {
       this.audit("secret.read", { project_id: project.id, environment: env.slug, path }, {
         count: secrets.filter((s) => s.value != null).length,
-        recursive: false,
+        recursive,
       });
     }
     return { secrets, folders };
@@ -1245,7 +1252,31 @@ export class MockBackend {
   projectAudit(projectId: string, query: AuditQuery = {}): AuditPage {
     const { project, rules } = this.loadProject(projectId);
     this.require(rules, "audit-log", "read");
-    return this.auditPage(this.state.audit.filter((e) => e.project_id === project.id), query);
+    const actorsOnly = this.auditFilterScope(rules, query);
+    const entries = this.state.audit.filter((e) => e.project_id === project.id);
+    if (!actorsOnly) return this.auditPage(entries, query);
+    // `q` may only search what redaction leaves alone.
+    const search = emptyToUndefined(query.q)?.toLowerCase();
+    const searched = search
+      ? entries.filter((e) => [e.action, e.actor_name, e.actor_id, e.ip].some((f) => f.toLowerCase().includes(search)))
+      : entries;
+    return this.auditPage(searched, { ...query, q: undefined });
+  }
+
+  /** As the server: refuses filters that would reveal what redaction hides, and says whether `q` is limited. */
+  private auditFilterScope(rules: Rule[], query: AuditQuery): boolean {
+    const environment = emptyToUndefined(query.environment?.trim());
+    if (environment !== undefined && !authorise(rules, "environments", "read", { environment })) throw forbidden();
+    const scope: Resource = { environment };
+    if (authorise(rules, "secrets", "read", scope) && authorise(rules, "environments", "read", scope)) return false;
+    if (emptyToUndefined(query.key?.trim()) !== undefined || emptyToUndefined(query.path?.trim()) !== undefined) {
+      throw new MockError(
+        403,
+        "filter_hidden",
+        "some secrets here are hidden from you, so the log cannot be filtered by key or folder; filter by an environment you can fully read first",
+      );
+    }
+    return true;
   }
 
   orgAudit(query: AuditQuery = {}): AuditPage {
@@ -1665,6 +1696,13 @@ export class MockBackend {
     const sys = this.state.sys;
     if (sys.state === "unsealed") return this.sysStatus();
     this.requireUnsealedOrSealed();
+    if (passphrase === MOCK_FOREIGN_KEY_PASSPHRASE) {
+      throw new MockError(
+        409,
+        "root_key_not_recognised",
+        "the passphrase opened a root key this server does not recognise; if the database was restored, run sekret admin reset-epoch",
+      );
+    }
     if (!this.verifyPassphrase(passphrase)) {
       this.systemAudit("sys.unseal.failed", "unseal");
       throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");

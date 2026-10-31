@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use sekret_api::AuthMethodConfig;
 use sekret_core::crypto::{
     DataKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
@@ -87,11 +89,13 @@ pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater
 
 /// How a root key replacement treats the seal configuration and data it cannot read.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Rotation {
+pub struct Rotation<'a> {
     /// The epoch marks recorded outside the database; the new signature goes above them.
     pub marks: HighWater,
     /// Leave unreadable rows as they are instead of refusing.
     pub skip_unreadable: bool,
+    /// Where the marks are, so they move to the new root key with the database.
+    pub epoch_files: &'a [PathBuf],
 }
 
 /// What a root key replacement did.
@@ -156,7 +160,7 @@ pub async fn rotate_root_key(
     old_root: &RootKey,
     new_root: &RootKey,
     seal: Option<SealConfig>,
-    rotation: Rotation,
+    rotation: Rotation<'_>,
 ) -> ApiResult<RotationReport> {
     let seal = match seal {
         Some(config) => Some(config),
@@ -212,15 +216,34 @@ pub async fn rotate_root_key(
     let seal = seal
         .map(|config| crate::seal::signed(new_root, config, rotation.marks.floor()))
         .transpose()?;
-    store
+    let epoch = seal.as_ref().map_or(rotation.marks.floor(), |config| config.epoch);
+    let fingerprint = new_root.fingerprint();
+    crate::seal::begin_rekey(rotation.epoch_files, &old_root.fingerprint(), &fingerprint)
+        .map_err(|e| ApiError::internal("preparing the seal epoch marks for the new root key", e))?;
+    let replaced = store
         .replace_wrapped_keys(Rekey {
             keys: rewrapped,
             values,
             auth_methods: resealed,
-            fingerprint: new_root.fingerprint(),
+            fingerprint: fingerprint.clone(),
             seal,
         })
-        .await?;
+        .await;
+    if let Err(error) = replaced {
+        if let Err(error) =
+            crate::seal::record_epoch(rotation.epoch_files, rotation.marks.floor(), &old_root.fingerprint())
+        {
+            tracing::warn!(%error, "could not put the seal epoch marks back to the old root key");
+        }
+        return Err(error.into());
+    }
+    // The database has moved on; marks that still name both keys keep working until fixed.
+    if let Err(error) = crate::seal::record_epoch(rotation.epoch_files, epoch, &fingerprint) {
+        tracing::error!(
+            %error,
+            "the root key was replaced, but an epoch mark still accepts the old one; check it can be written"
+        );
+    }
     Ok(RotationReport {
         projects,
         skipped: unreadable,

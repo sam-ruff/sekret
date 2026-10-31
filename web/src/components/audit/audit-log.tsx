@@ -1,11 +1,13 @@
 import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
-import { ScrollText, SearchX, X } from "lucide-react";
+import { EyeOff, ScrollText, SearchX, X } from "lucide-react";
 import { useCallback, useMemo } from "react";
 import { useSearchParams } from "react-router";
+import { ApiError } from "@/api/client";
 import type { AuditQuery } from "@/api/endpoints";
 import type { AuditEntry, AuditPage, Environment } from "@/api/types";
 import { ResponsiveTable } from "@/components/responsive-table";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -27,6 +29,11 @@ interface AuditLogProps {
   fetchPage: (query: AuditQuery) => Promise<AuditPage>;
   scope: "project" | "org";
   environments?: Environment[];
+  /**
+   * Whether the reader sees every secret in the entries for this environment filter (or all of
+   * them). When not, the server refuses key and folder filters and search skips them.
+   */
+  seesEverything?: (environment: string | undefined) => boolean;
 }
 
 function target(entry: AuditEntry): string {
@@ -55,7 +62,7 @@ function FilterChip({ label, value, onClear, testId }: { label: string; value: s
   );
 }
 
-export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogProps) {
+export function AuditLog({ queryKey, fetchPage, scope, environments, seesEverything }: AuditLogProps) {
   const [params, setParams] = useSearchParams();
   const filters = useMemo(() => parseAuditFilters(params), [params]);
   const setFilters = useCallback(
@@ -77,10 +84,18 @@ export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogP
   const filtered = hasActiveFilters(filters);
   const actorName = entries.find((e) => e.actor_id === filters.actorId)?.actor_name ?? filters.actorId;
   const clear = () => setFilters({ ...EMPTY_AUDIT_FILTERS, order: filters.order });
+  const filterHidden = pages.error instanceof ApiError && pages.error.code === "filter_hidden";
+  const searchesSecrets = seesEverything?.(filters.environment || undefined) ?? true;
 
   return (
     <div className="space-y-4">
-      <AuditToolbar filters={filters} onChange={setFilters} scope={scope} environments={environments} />
+      <AuditToolbar
+        filters={filters}
+        onChange={setFilters}
+        scope={scope}
+        environments={environments}
+        searchesSecrets={searchesSecrets}
+      />
 
       <div className="flex min-h-7 flex-wrap items-center gap-2 text-sm">
         <span
@@ -89,7 +104,7 @@ export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogP
           data-fetching={pages.isFetching}
           data-filters={auditSearchParams(filters).toString()}
         >
-          {pages.isSuccess ? `${total} ${total === 1 ? "entry" : "entries"}` : "Loading"}
+          {pages.isSuccess ? `${total} ${total === 1 ? "entry" : "entries"}` : pages.isError ? "" : "Loading"}
         </span>
         {pages.isFetching && !pages.isFetchingNextPage && pages.isSuccess && <Spinner className="size-3.5" />}
         {filters.actorId && (
@@ -106,7 +121,28 @@ export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogP
         )}
       </div>
 
-      {pages.error && <ErrorState error={pages.error} onRetry={() => void pages.refetch()} />}
+      {filterHidden && (
+        <Alert data-testid="audit-filter-hidden">
+          <EyeOff />
+          <AlertTitle>Cannot filter by key or folder here</AlertTitle>
+          <AlertDescription>
+            <p>
+              Some secrets in this log are hidden from you, so it cannot be filtered by key or folder. Remove those
+              filters, or choose an environment whose secrets you can all read.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={() => setFilters({ ...filters, key: "", path: "" })}
+              data-testid="audit-filter-hidden-clear"
+            >
+              Remove key and folder filters
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+      {pages.error && !filterHidden && <ErrorState error={pages.error} onRetry={() => void pages.refetch()} />}
       {pages.isPending && <ListSkeleton rows={6} />}
       {pages.isSuccess && entries.length === 0 && filtered && (
         <EmptyState
@@ -149,7 +185,7 @@ export function AuditLog({ queryKey, fetchPage, scope, environments }: AuditLogP
               cell: (e) => (
                 <button
                   type="button"
-                  className="max-w-full truncate text-left hover:text-primary hover:underline"
+                  className="-my-1 min-h-7 max-w-full truncate py-1 text-left hover:text-primary hover:underline"
                   title={`${e.actor_kind} ${e.actor_id} from ${e.ip}. Show only this actor.`}
                   onClick={() => setFilters({ ...filters, actorId: e.actor_id })}
                   data-testid="audit-actor"

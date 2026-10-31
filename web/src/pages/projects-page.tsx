@@ -102,7 +102,7 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="project-slug">Slug</FieldLabel>
+              <FieldLabel htmlFor="project-slug">Short name</FieldLabel>
               <Input
                 id="project-slug"
                 value={slug}

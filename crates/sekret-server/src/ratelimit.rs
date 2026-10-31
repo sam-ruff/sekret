@@ -15,21 +15,19 @@ const EVICT_BATCH: usize = MAX_KEYS / 16;
 
 /// Removes the `count` entries with the oldest timestamps.
 fn evict_oldest<K: Eq + Hash + Clone, V>(map: &mut HashMap<K, V>, count: usize, at: impl Fn(&V) -> Instant) {
-    let mut ages: Vec<Instant> = map.values().map(&at).collect();
+    take_oldest(map, count, at);
+}
+
+/// Removes and returns the `count` entries with the oldest timestamps.
+fn take_oldest<K: Eq + Hash + Clone, V>(map: &mut HashMap<K, V>, count: usize, at: impl Fn(&V) -> Instant) -> Vec<V> {
+    let mut ages: Vec<(Instant, K)> = map.iter().map(|(k, v)| (at(v), k.clone())).collect();
     if count == 0 || ages.is_empty() {
-        return;
+        return Vec::new();
     }
     let index = count.min(ages.len()) - 1;
-    let (_, cutoff, _) = ages.select_nth_unstable(index);
-    let cutoff = *cutoff;
-    let mut removed = 0;
-    map.retain(|_, value| {
-        if removed < count && at(value) <= cutoff {
-            removed += 1;
-            return false;
-        }
-        true
-    });
+    ages.select_nth_unstable_by_key(index, |(age, _)| *age);
+    ages.truncate(index + 1);
+    ages.into_iter().filter_map(|(_, key)| map.remove(&key)).collect()
 }
 
 struct Buckets<K> {
@@ -265,6 +263,8 @@ impl FailureBackoff {
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
 /// Callers and sources remembered at once; the least recently refused are forgotten first.
 const MAX_REFUSAL_KEYS: usize = 10_000;
+/// Windows opened across all keys in a minute before further new keys share one per action.
+const MAX_NEW_WINDOWS: u32 = 1_000;
 
 struct Folded {
     started: Instant,
@@ -273,11 +273,24 @@ struct Folded {
     latest: AuditEntry,
 }
 
+impl Folded {
+    fn open(now: Instant, entry: AuditEntry) -> Self {
+        Self {
+            started: now,
+            last: now,
+            repeats: 0,
+            latest: entry,
+        }
+    }
+}
+
 /// Folds a flood of refusal audit entries into one entry a minute per key, typically a caller
 /// and source, with a count of the repeats, so refusals cannot flood the audit log.
 #[derive(Default)]
 pub struct AuditThrottle {
     keys: Mutex<HashMap<String, Folded>>,
+    /// When the current minute of new windows began, and how many have opened in it.
+    opened: Mutex<(Option<Instant>, u32)>,
 }
 
 impl AuditThrottle {
@@ -291,6 +304,11 @@ impl AuditThrottle {
         let Ok(mut keys) = self.keys.lock() else {
             return vec![entry];
         };
+        let mut key = key;
+        if !keys.contains_key(&key) && !self.may_open_window(now) {
+            // Past the overall cap, every new caller and source shares one window per action.
+            key = format!("overflow|{}", entry.action);
+        }
         if let Some(folded) = keys.get_mut(&key)
             && now.saturating_duration_since(folded.started) < REFUSAL_WINDOW
         {
@@ -299,19 +317,29 @@ impl AuditThrottle {
             folded.latest = entry;
             return Vec::new();
         }
+        let mut written = Vec::new();
         if !keys.contains_key(&key) && keys.len() >= MAX_REFUSAL_KEYS {
-            evict_oldest(&mut keys, MAX_REFUSAL_KEYS / 16, |f| f.last);
+            let evicted = take_oldest(&mut keys, MAX_REFUSAL_KEYS / 16, |f| f.last);
+            written.extend(evicted.into_iter().filter_map(summary));
         }
-        let previous = keys.insert(
-            key,
-            Folded {
-                started: now,
-                last: now,
-                repeats: 0,
-                latest: entry.clone(),
-            },
-        );
-        previous.and_then(summary).into_iter().chain([entry]).collect()
+        let previous = keys.insert(key, Folded::open(now, entry.clone()));
+        written.extend(previous.and_then(summary));
+        written.push(entry);
+        written
+    }
+
+    /// Counts a new window against the overall cap, answering whether it is still under it.
+    fn may_open_window(&self, now: Instant) -> bool {
+        let Ok(mut opened) = self.opened.lock() else {
+            return true;
+        };
+        let (since, count) = &mut *opened;
+        if since.is_none_or(|s| now.saturating_duration_since(s) >= REFUSAL_WINDOW) {
+            *since = Some(now);
+            *count = 0;
+        }
+        *count = count.saturating_add(1);
+        *count <= MAX_NEW_WINDOWS
     }
 
     /// Summaries of windows that have closed with repeats in them; their keys are forgotten.
@@ -576,6 +604,44 @@ mod tests {
                 .all(|e| e.created_at != 4),
             "a window with no repeats needs no summary"
         );
+    }
+
+    #[test]
+    fn evicted_windows_still_write_their_counts() {
+        let throttle = AuditThrottle::default();
+        let start = Instant::now();
+        let mut written = throttle.admit_at("k0".into(), refusal(0), start);
+        written.extend(throttle.admit_at("k0".into(), refusal(1), start));
+        for i in 1..=MAX_REFUSAL_KEYS as u64 {
+            // Spaced out so the overall cap on new windows is not what folds them.
+            let at = start + Duration::from_millis(i * 61);
+            written.extend(throttle.admit_at(format!("k{i}"), refusal(2), at));
+        }
+        let summaries: Vec<_> = written.iter().filter(|e| e.detail.get("repeats").is_some()).collect();
+        assert_eq!(summaries.len(), 1, "the evicted window with a repeat is summarised");
+        assert_eq!(summaries[0].created_at, 1);
+        assert_eq!(summaries[0].detail["repeats"], 1);
+    }
+
+    #[test]
+    fn new_windows_are_capped_across_all_keys() {
+        let throttle = AuditThrottle::default();
+        let start = Instant::now();
+        let mut written = Vec::new();
+        let flood = MAX_NEW_WINDOWS as usize + 500;
+        for i in 0..flood {
+            written.extend(throttle.admit_at(format!("fresh-{i}"), refusal(5), start));
+        }
+        assert_eq!(
+            written.len(),
+            MAX_NEW_WINDOWS as usize + 1,
+            "past the cap, one shared window per action"
+        );
+        let summaries = throttle.drain_at(start + REFUSAL_WINDOW);
+        let overflow: Vec<_> = summaries.iter().filter(|e| e.detail["repeats"] == 499).collect();
+        assert_eq!(overflow.len(), 1);
+        let later = throttle.admit_at("fresh-again".into(), refusal(6), start + REFUSAL_WINDOW);
+        assert_eq!(later.len(), 1, "the cap resets each minute");
     }
 
     #[test]

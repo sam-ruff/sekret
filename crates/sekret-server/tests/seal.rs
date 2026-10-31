@@ -186,6 +186,20 @@ async fn init_flow(db: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn setup_says_whether_remember_is_available(db: String) -> anyhow::Result<()> {
+    let h = fresh(&db, SealSettings::default()).await?;
+    assert_eq!(status(&h).await?["remember_available"], false);
+
+    let dir = tempfile::tempdir().context("dir")?;
+    let h = fresh(&db, remembering(dir.path())).await?;
+    assert_eq!(status(&h).await?["remember_available"], true);
+    init(&h, UnlockPolicy::Manual).await?;
+    // Once set up, only admins learn how the server is configured.
+    assert_eq!(status(&h).await?["remember_available"], false);
+    assert_eq!(detail(&h)?["remember_available"], true);
+    Ok(())
+}
+
 async fn key_file_init(db: String) -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("dir")?;
     let h = fresh(&db, SealSettings::default()).await?;
@@ -735,6 +749,7 @@ async fn existing_data_needs_its_key(db: String) -> anyhow::Result<()> {
 
 on_both_backends!(
     init_flow,
+    setup_says_whether_remember_is_available,
     key_file_init,
     restart_is_sealed_until_unsealed,
     seal_and_unseal,

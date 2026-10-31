@@ -21,8 +21,12 @@ interface ConfirmDialogProps {
   confirmLabel: string;
   destructive?: boolean;
   confirmDisabled?: boolean;
+  /** The action cannot go ahead, so only a Close button is shown. */
+  blocked?: boolean;
   /** The dialog stays open with a spinner until this settles, and closes only on success. */
   onConfirm: () => Promise<unknown>;
+  /** Where focus goes on close, for dialogs opened from a menu. */
+  onCloseAutoFocus?: (event: Event) => void;
   testId?: string;
 }
 
@@ -35,14 +39,16 @@ export function ConfirmDialog({
   confirmLabel,
   destructive,
   confirmDisabled,
+  blocked,
   onConfirm,
+  onCloseAutoFocus,
   testId = "confirm-dialog",
 }: ConfirmDialogProps) {
   const [busy, setBusy] = useState(false);
 
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy || confirmDisabled) return;
+    if (busy || confirmDisabled || blocked) return;
     setBusy(true);
     try {
       await onConfirm();
@@ -56,7 +62,7 @@ export function ConfirmDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
-      <AlertDialogContent data-testid={testId}>
+      <AlertDialogContent data-testid={testId} onCloseAutoFocus={onCloseAutoFocus}>
         <form onSubmit={(event) => void confirm(event)} noValidate className="grid gap-4">
           <AlertDialogHeader>
             <AlertDialogTitle>{title}</AlertDialogTitle>
@@ -64,18 +70,20 @@ export function ConfirmDialog({
           </AlertDialogHeader>
           {children}
           <AlertDialogFooter>
-            <AlertDialogCancel type="button" disabled={busy}>
-              Cancel
+            <AlertDialogCancel type="button" disabled={busy} data-testid="confirm-cancel">
+              {blocked ? "Close" : "Cancel"}
             </AlertDialogCancel>
-            <Button
-              type="submit"
-              variant={destructive ? "destructive" : "default"}
-              disabled={busy || confirmDisabled}
-              data-testid="confirm-action"
-            >
-              {busy && <Spinner />}
-              {confirmLabel}
-            </Button>
+            {!blocked && (
+              <Button
+                type="submit"
+                variant={destructive ? "destructive" : "default"}
+                disabled={busy || confirmDisabled}
+                data-testid="confirm-action"
+              >
+                {busy && <Spinner />}
+                {confirmLabel}
+              </Button>
+            )}
           </AlertDialogFooter>
         </form>
       </AlertDialogContent>

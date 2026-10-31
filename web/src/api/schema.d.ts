@@ -1583,6 +1583,11 @@ export interface components {
             /** @description The unlock policy comes from server configuration and cannot be changed through the API. */
             configured: boolean;
             /**
+             * @description The configuration sets `seal.remember_file`, so the remember policy can be chosen. Shown
+             *     before setup and to organisation admins.
+             */
+            remember_available?: boolean;
+            /**
              * @description A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not
              *     clear it; forget the unlock for that.
              */

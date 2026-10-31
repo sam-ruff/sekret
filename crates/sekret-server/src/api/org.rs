@@ -800,5 +800,5 @@ async fn org_audit(
         Subject::OrgAuditLog,
         Action::Read,
     )?;
-    Ok(Json(audit_page(&state, None, params).await?))
+    Ok(Json(audit_page(&state, None, params, false).await?))
 }

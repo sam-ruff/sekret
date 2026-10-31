@@ -84,6 +84,31 @@ fn error_policy(_: Arc<SekretSecret>, error: &Infallible, _: Arc<Context>) -> Ac
     match *error {}
 }
 
+/// Where the operator looks for `SekretSecret` resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchScope {
+    AllNamespaces,
+    Namespaces(Vec<String>),
+}
+
+/// Runs one controller per watched namespace, or one cluster-wide, until a shutdown signal arrives.
+pub async fn run_controllers(
+    client: Client,
+    ctx: Arc<Context>,
+    scope: &WatchScope,
+    concurrency: u16,
+) -> anyhow::Result<()> {
+    let namespaces = match scope {
+        WatchScope::AllNamespaces => return run_controller(client, ctx, None, concurrency).await,
+        WatchScope::Namespaces(namespaces) => namespaces,
+    };
+    let runs = namespaces
+        .iter()
+        .map(|ns| run_controller(client.clone(), Arc::clone(&ctx), Some(ns.as_str()), concurrency));
+    futures::future::try_join_all(runs).await?;
+    Ok(())
+}
+
 /// Runs the controller until a shutdown signal arrives.
 ///
 /// Watches `SekretSecret` resources and the Secrets they own, in `namespace` or cluster-wide.

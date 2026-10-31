@@ -91,6 +91,27 @@ async fn load_secret(state: &AppState, scope: &Scope, path: &str, key: &str) -> 
     readable.map(|s| (path, s)).ok_or_else(|| ApiError::not_found("secret"))
 }
 
+/// Like `load_secret`, but also finds a deleted secret, whose history can bring it back.
+/// Anything the caller may not read is reported as missing, so a refusal cannot confirm a key.
+async fn load_history(
+    state: &AppState,
+    scope: &Scope,
+    path: &str,
+    key: &str,
+) -> ApiResult<(String, SecretWithVersion)> {
+    let path = validate::folder_path(path)?;
+    let found = state.store.get_secret(&scope.env.id, &path, key).await?;
+    let readable = found.filter(|s| {
+        allowed(
+            &scope.rules,
+            Subject::Secrets,
+            Action::Read,
+            &secret_resource(&scope.env.slug, &path, key, &s.version.tags),
+        )
+    });
+    readable.map(|s| (path, s)).ok_or_else(|| ApiError::not_found("secret"))
+}
+
 #[utoipa::path(get, path = "/api/v1/projects/{project}/environments/{env}/secrets", tag = "secrets",
     params(("project" = String, Path), ("env" = String, Path), ListParams),
     responses((status = 200, body = SecretList)), security(("bearer" = [])))]
@@ -315,12 +336,7 @@ async fn list_versions(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Vec<SecretVersion>>> {
     let scope = scope(&state, &principal, &project, &env).await?;
-    let path = validate::folder_path(&params.path)?;
-    let s = state
-        .store
-        .get_secret(&scope.env.id, &path, &key)
-        .await?
-        .ok_or_else(|| ApiError::not_found("secret"))?;
+    let (path, s) = load_history(&state, &scope, &params.path, &key).await?;
     let resource = secret_resource(&scope.env.slug, &path, &key, &s.version.tags);
     require(&scope.rules, Subject::SecretVersions, Action::Read, &resource)?;
     let may_reveal = |resource: &Resource<'_>| {
@@ -382,12 +398,7 @@ async fn rollback(
     Json(request): Json<RollbackRequest>,
 ) -> ApiResult<Json<BatchResult>> {
     let scope = scope(&state, &principal, &project, &env).await?;
-    let path = validate::folder_path(&params.path)?;
-    let current = state
-        .store
-        .get_secret(&scope.env.id, &path, &key)
-        .await?
-        .ok_or_else(|| ApiError::not_found("secret"))?;
+    let (path, current) = load_history(&state, &scope, &params.path, &key).await?;
     let ctx = secret_ctx(&state, &principal)?;
     let planned = plan_rollback(
         &ctx,
@@ -562,10 +573,33 @@ async fn overview(
     Ok(Json(Overview { environments, rows }))
 }
 
-fn api_snapshot(s: &sekret_store::Snapshot) -> Snapshot {
+/// A snapshot reason without its folder when the reader may not see that folder.
+fn visible_reason(reason: &str, may_see: impl Fn(&str) -> bool) -> String {
+    for marker in [" in /", " for /"] {
+        if let Some(at) = reason.find(marker) {
+            let path = &reason[at + marker.len() - 1..];
+            return if may_see(path) {
+                reason.to_string()
+            } else {
+                reason[..at].to_string()
+            };
+        }
+    }
+    reason.to_string()
+}
+
+fn api_snapshot(scope: &Scope, s: &sekret_store::Snapshot) -> Snapshot {
+    let may_see = |path: &str| {
+        let folder = Resource {
+            environment: Some(&scope.env.slug),
+            path: Some(path),
+            ..Default::default()
+        };
+        allowed(&scope.rules, Subject::Folders, Action::Read, &folder)
+    };
     Snapshot {
         id: s.id.clone(),
-        reason: s.reason.clone(),
+        reason: visible_reason(&s.reason, may_see),
         actor: s.actor.clone(),
         created_at: s.created_at,
         secret_count: s.entries.len() as i64,
@@ -586,7 +620,7 @@ async fn list_snapshots(
     };
     require(&scope.rules, Subject::Snapshots, Action::Read, &env_resource)?;
     let snapshots = state.store.list_snapshots(&scope.env.id, 200).await?;
-    Ok(Json(snapshots.iter().map(api_snapshot).collect()))
+    Ok(Json(snapshots.iter().map(|s| api_snapshot(&scope, s)).collect()))
 }
 
 async fn load_snapshot(state: &AppState, scope: &Scope, id: &str) -> ApiResult<sekret_store::Snapshot> {
@@ -624,7 +658,7 @@ async fn get_snapshot(
         })
         .collect();
     Ok(Json(SnapshotDetail {
-        snapshot: api_snapshot(&snapshot),
+        snapshot: api_snapshot(&scope, &snapshot),
         changes: snapshot_changes(&readable, &snapshot, &path),
     }))
 }
@@ -729,4 +763,30 @@ async fn raw_secrets(
         environment: scope.env.slug,
         secrets,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_reasons_drop_folders_the_reader_cannot_see() {
+        let may_see = |path: &str| !path.starts_with("/payments");
+        let cases = [
+            (
+                "1 created, 0 updated, 0 deleted in /payments/stripe",
+                "1 created, 0 updated, 0 deleted",
+            ),
+            (
+                "1 created, 0 updated, 0 deleted in /web",
+                "1 created, 0 updated, 0 deleted in /web",
+            ),
+            ("restored snapshot abc for /payments", "restored snapshot abc"),
+            ("restored snapshot abc for /", "restored snapshot abc for /"),
+            ("rolled back to version 3", "rolled back to version 3"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(visible_reason(reason, may_see), expected);
+        }
+    }
 }

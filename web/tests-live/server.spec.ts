@@ -27,6 +27,28 @@ test("asks for a backup with POST, and the server refuses GET and a POST without
   expect(made.headers()["x-sekret-csrf"]).toBe("1");
 });
 
+test("the API refuses cookie requests from other sites and top-level navigations, while the interface keeps working", async ({ page }) => {
+  await page.goto("/projects");
+  await expect(page.getByTestId("new-project")).toBeVisible();
+
+  const crossSite = await page.request.get("/api/v1/me", { headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "cors" } });
+  expect(crossSite.status()).toBe(403);
+  expect(((await crossSite.json()) as { error: string }).error).toBe("cross_site");
+  const navigation = await page.request.get("/api/v1/me", {
+    headers: { "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate" },
+  });
+  expect(navigation.status()).toBe(403);
+  // A real browser opening an API address in a tab sends the navigate mode itself.
+  const opened = await page.goto("/api/v1/me");
+  expect(opened?.status()).toBe(403);
+
+  // The interface's own fetches are same-origin, so they still work.
+  await page.goto("/projects");
+  await expect(page.getByTestId("new-project")).toBeVisible();
+  const inPage = await page.evaluate(async () => (await fetch("/api/v1/me")).status);
+  expect(inPage).toBe(200);
+});
+
 test("pages are isolated from the window that opened them", async ({ page }) => {
   for (const path of ["/", "/projects", "/login"]) {
     const response = await page.request.get(path);

@@ -81,6 +81,33 @@ for (const theme of ["light", "dark"] as const) {
       }
     });
 
+    test("the inactive Danger zone tab and the users list initials meet AA", async ({ page }) => {
+      await page.goto("/projects/storefront/settings/general");
+      const danger = page.getByRole("link", { name: "Danger zone" });
+      await expect(danger).not.toHaveAttribute("aria-current", "page");
+      expect(await contrastOf(danger)).toBeGreaterThanOrEqual(AA);
+
+      await page.goto("/org/users");
+      const initials = page.getByTestId("user-avatar-initials").first();
+      await expect(initials).toBeVisible();
+      expect(await contrastOf(initials)).toBeGreaterThanOrEqual(AA);
+    });
+
+    test("removed diff lines and the snapshot Changed badge meet AA", async ({ page }) => {
+      await page.goto("/projects/storefront/secrets/dev");
+      await page.getByTestId("secret-row-LOG_LEVEL").getByTestId("secret-key").click();
+      await page.getByTestId("history-values-toggle").click();
+      const removed = page.getByTestId("diff-output").locator('[data-kind="removed"]').first();
+      await expect(removed).toBeVisible();
+      expect(await contrastOf(removed)).toBeGreaterThanOrEqual(AA);
+
+      await page.goto("/projects/storefront/snapshots/dev");
+      await page.getByTestId("snapshot-list").locator("li").last().getByRole("button").click();
+      const changed = page.getByTestId("change-LOG_LEVEL").locator("[data-slot=badge]");
+      await expect(changed).toContainText("Changed");
+      expect(await contrastOf(changed)).toBeGreaterThanOrEqual(AA);
+    });
+
     test("avatar initials and the Configured badge meet AA", async ({ page }) => {
       await page.goto("/org/identities");
       await page.getByTestId("identity-link-billing-worker").click();

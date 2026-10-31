@@ -80,15 +80,22 @@ test("creates and deletes a folder", async ({ page }) => {
   await expectToast(page, "Created /analytics");
 
   await page.getByTestId("delete-folder-analytics").click();
-  await page.getByTestId("confirm-action").click();
+  const dialog = page.getByTestId("delete-folder-dialog");
+  await expect(dialog.getByTestId("delete-folder-contents")).toContainText("holds no secrets");
+  await dialog.getByTestId("confirm-action").click();
   await expectToast(page, "Deleted /analytics");
   await expect(page.getByTestId("folder-row-analytics")).toHaveCount(0);
 });
 
-test("refuses to delete a folder that still has secrets", async ({ page }) => {
+test("does not offer to delete a folder that still has secrets, and says how many", async ({ page }) => {
   await page.getByTestId("delete-folder-payments").click();
-  await page.getByTestId("confirm-action").click();
-  await expectToast(page, "The folder still contains secrets");
+  const dialog = page.getByTestId("delete-folder-dialog");
+  await expect(dialog).toContainText("/payments is not empty");
+  await expect(dialog.getByTestId("delete-folder-contents")).toContainText(/It still holds \d+ secrets?/);
+  await expect(dialog.getByTestId("confirm-action")).toHaveCount(0);
+  await dialog.getByTestId("confirm-cancel").click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByTestId("folder-row-payments")).toBeVisible();
 });
 
 test("imports a pasted .env file in one batch", async ({ page }) => {

@@ -74,7 +74,7 @@ async fn browser_login(
     assert_eq!(params["code_challenge_method"], "S256");
     assert_eq!(params["redirect_uri"], format!("{}/auth/callback", h.base));
     let nonce = nonce_override.unwrap_or(&params["nonce"]).to_string();
-    let id_token = issuer.sign(json!({"aud": "sekret", "sub": "alice", "email": "alice@example.com", "name": "Alice", "nonce": nonce, "roles": roles}))?;
+    let id_token = issuer.sign(json!({"aud": "sekret", "sub": "alice", "email": "alice@example.com", "email_verified": true, "name": "Alice", "nonce": nonce, "roles": roles}))?;
     server.reset().await;
     mount_keys(server, issuer).await;
     Mock::given(method("POST"))
@@ -436,7 +436,127 @@ async fn cli_requests_can_be_denied_and_are_audited_with_their_origin(database_u
     Ok(())
 }
 
-on_both_backends!(cli_requests_can_be_denied_and_are_audited_with_their_origin);
+/// A session-cookie GET with the given `Sec-Fetch-*` headers.
+async fn browser_get(
+    h: &Harness,
+    path: &str,
+    session: &str,
+    fetch: &[(&str, &str)],
+) -> anyhow::Result<(StatusCode, Value)> {
+    let mut request = h
+        .client
+        .get(format!("{}{path}", h.base))
+        .header("cookie", format!("sekret_session={session}"));
+    for (name, value) in fetch {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await.context("request")?;
+    let status = response.status();
+    Ok((status, response.json().await.unwrap_or(Value::Null)))
+}
+
+/// The attack: another site links or navigates to a value-reading GET, so the victim's browser
+/// sends the session cookie, puts plaintext on screen and forges `secret.read` audit entries.
+async fn cross_site_navigations_cannot_spend_a_session(database_url: String) -> anyhow::Result<()> {
+    let (_server, issuer) = issuer().await;
+    let h = start(Options {
+        oidc: Some(oidc_config(&issuer)),
+        ..common::options(database_url)
+    })
+    .await?;
+    let (_, session) = stored_session(&h, &format!("{}|alice", issuer.url), &["sekret-admin"]).await?;
+    h.create_project("app").await?;
+    h.set_secrets("app", "prod", "/", &[("DB_PASSWORD", "hunter2")]).await?;
+    let single = "/api/v1/projects/app/environments/prod/secrets/DB_PASSWORD";
+    let listing = "/api/v1/projects/app/environments/prod/secrets?values=true&recursive=true";
+    let raw = "/api/v1/secrets/raw?project=app&environment=prod&recursive=true";
+
+    let refused: &[&[(&str, &str)]] = &[
+        &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")],
+        &[("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "navigate")],
+        &[("sec-fetch-site", "none"), ("sec-fetch-mode", "navigate")],
+        &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "no-cors")],
+        &[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")],
+    ];
+    for path in [single, listing, raw] {
+        for fetch in refused {
+            let (status, body) = browser_get(&h, path, &session, fetch).await?;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::FORBIDDEN, Some("cross_site")),
+                "{path} {fetch:?}"
+            );
+            assert!(!body.to_string().contains("hunter2"));
+        }
+    }
+    let (_, audit) = h.get("/api/v1/audit?action=secret.read", &h.admin).await?;
+    assert_eq!(audit["total"], 0, "refused requests leave no audit entry: {audit}");
+
+    // The interface's own fetches, and clients that send no Sec-Fetch headers, still work.
+    let same_origin = [("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "cors")];
+    let (status, body) = browser_get(&h, single, &session, &same_origin).await?;
+    assert_eq!((status, body["value"].as_str()), (StatusCode::OK, Some("hunter2")));
+    let (status, _) = browser_get(&h, single, &session, &[]).await?;
+    assert_eq!(status, StatusCode::OK);
+    let (_, audit) = h.get("/api/v1/audit?action=secret.read", &h.admin).await?;
+    assert_eq!(audit["total"], 2, "{audit}");
+
+    // Bearer tokens are never sent by a browser on its own, so these headers do not matter.
+    let response = h
+        .client
+        .get(format!("{}{single}", h.base))
+        .bearer_auth(&h.admin)
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .context("bearer")?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Sign-in is a top-level navigation from the provider, so it is not refused.
+    let navigate = [("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")];
+    let mut login = h
+        .client
+        .get(format!("{}/auth/login?return_to=/projects", h.base))
+        .header("cookie", format!("sekret_session={session}"));
+    let mut callback = h
+        .client
+        .get(format!("{}/auth/callback?error=access_denied", h.base))
+        .header("cookie", format!("sekret_session={session}"));
+    for (name, value) in navigate {
+        login = login.header(name, value);
+        callback = callback.header(name, value);
+    }
+    let login = login.send().await.context("login")?;
+    assert!(login.status().is_redirection(), "{}", login.status());
+    let callback = callback.send().await.context("callback")?;
+    assert!(callback.status().is_redirection(), "{}", callback.status());
+    Ok(())
+}
+
+/// The callback is unauthenticated, so it shares the sign-in rate limit.
+#[tokio::test]
+async fn the_sign_in_callback_is_rate_limited() -> anyhow::Result<()> {
+    let (_server, issuer) = issuer().await;
+    let h = start(Options {
+        oidc: Some(oidc_config(&issuer)),
+        ..Default::default()
+    })
+    .await?;
+    let callback = format!("{}/auth/callback?error=x%0Aforged", h.base);
+    let first = h.client.get(&callback).send().await.context("callback")?;
+    assert!(first.status().is_redirection(), "{}", first.status());
+    let local: std::net::IpAddr = "127.0.0.1".parse().context("ip")?;
+    while h.state.login_limiter.allow_ip(local) {}
+    let flooded = h.client.get(&callback).send().await.context("callback")?;
+    assert_eq!(flooded.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+on_both_backends!(
+    cli_requests_can_be_denied_and_are_audited_with_their_origin,
+    cross_site_navigations_cannot_spend_a_session,
+);
 
 /// Narrowing the sign-in lists takes effect at once, not at each person's next sign-in.
 #[tokio::test]

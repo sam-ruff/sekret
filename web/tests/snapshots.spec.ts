@@ -8,10 +8,16 @@ test("previews and restores a snapshot", async ({ page }) => {
 
   const list = page.getByTestId("snapshot-list");
   await expect(list.locator("li").first()).toContainText("Latest");
+  // Titles leave out zero counts and wrap rather than cut off the folder.
+  const titles = await list.getByTestId("snapshot-title").allTextContents();
+  expect(titles.some((t) => / 0 (created|updated|deleted|added|changed)/.test(t) || /^0 /.test(t))).toBe(false);
   // The first write in dev, before LOG_LEVEL changed and the later secrets existed.
   await list.locator("li").last().getByRole("button").click();
 
   const sheet = page.getByTestId("snapshot-sheet");
+  await expect(sheet).toBeVisible();
+  // Nothing is typed into on opening, so no on-screen keyboard covers the changes.
+  await expect(sheet.getByTestId("restore-path")).not.toBeFocused();
   const changes = sheet.getByTestId("snapshot-changes");
   await expect(changes.getByTestId("change-LOG_LEVEL")).toContainText("Changed");
   await expect(changes.getByTestId("change-FEATURE_FLAGS")).toContainText("Removed");

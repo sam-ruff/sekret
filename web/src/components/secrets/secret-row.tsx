@@ -1,4 +1,5 @@
 import { Eye, EyeOff, History, Lock, MessageSquare, MoreHorizontal, Pencil, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { useRef } from "react";
 import type { Secret } from "@/api/types";
 import { CopyButton } from "@/components/copy-button";
 import { Badge } from "@/components/ui/badge";
@@ -57,8 +58,9 @@ interface SecretRowProps {
   onCopyValue: () => Promise<string | null | undefined>;
   onEdit: () => void;
   onDelete: () => void;
-  onHistory: () => void;
-  onRotate: () => void;
+  /** `returnTo` is what should get focus back once the drawer or dialog closes. */
+  onHistory: (returnTo: HTMLElement | null) => void;
+  onRotate: (returnTo: HTMLElement | null) => void;
 }
 
 const MASK = "•".repeat(12);
@@ -76,6 +78,7 @@ export function SecretRow({
   onRotate,
 }: SecretRowProps) {
   const hidden = secret.value_hidden;
+  const actions = useRef<HTMLButtonElement>(null);
 
   return (
     <div
@@ -85,7 +88,7 @@ export function SecretRow({
       <div className="min-w-0">
         <button
           type="button"
-          onClick={onHistory}
+          onClick={(event) => onHistory(event.currentTarget)}
           className="block max-w-full truncate text-left font-mono text-sm font-medium hover:text-primary"
           data-testid="secret-key"
         >
@@ -157,7 +160,7 @@ export function SecretRow({
         </span>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${secret.key}`} data-testid="secret-actions">
+            <Button ref={actions} variant="ghost" size="icon-sm" aria-label={`Actions for ${secret.key}`} data-testid="secret-actions">
               <MoreHorizontal />
             </Button>
           </DropdownMenuTrigger>
@@ -169,13 +172,13 @@ export function SecretRow({
               </DropdownMenuItem>
             )}
             {abilities.edit && (
-              <DropdownMenuItem onSelect={onRotate} data-testid="secret-rotate">
+              <DropdownMenuItem onSelect={() => onRotate(actions.current)} data-testid="secret-rotate">
                 <RefreshCw />
                 Rotate now
               </DropdownMenuItem>
             )}
             {abilities.history && (
-              <DropdownMenuItem onSelect={onHistory} data-testid="secret-history">
+              <DropdownMenuItem onSelect={() => onHistory(actions.current)} data-testid="secret-history">
                 <History />
                 History
               </DropdownMenuItem>

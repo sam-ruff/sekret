@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, ArrowRight, FileKey, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
+import { AlertCircle, ArrowRight, ExternalLink, FileKey, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
 import { useRef, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router";
 import { ApiError } from "@/api/client";
@@ -16,10 +16,11 @@ import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { SecretInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
-import { keys, useSysStatus } from "@/hooks/queries";
+import { keys, useAuthConfig, useSysStatus } from "@/hooks/queries";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { errorMessage } from "@/lib/errors";
 import { formatExpiry } from "@/lib/format";
+import { DOCS_URL } from "@/lib/links";
 import { passphraseProblem, problemText } from "@/lib/passphrase";
 
 /** What the person keeps from setup; the mutation's own copy is dropped straight away. */
@@ -171,7 +172,12 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
                     {status.configured ? (
                       <ConfiguredPolicy policy={status.unlock_policy} testId="setup-policy-configured" />
                     ) : (
-                      <UnlockPolicyCards idPrefix="setup" value={policy} onChange={setPolicy} />
+                      <UnlockPolicyCards
+                        idPrefix="setup"
+                        value={policy}
+                        onChange={setPolicy}
+                        rememberAvailable={status.remember_available}
+                      />
                     )}
                     <UnlockDocsLink />
                   </FieldSet>
@@ -182,7 +188,7 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
                 <Alert variant="destructive" data-testid="setup-error">
                   <AlertCircle />
                   <AlertTitle>Setup did not finish</AlertTitle>
-                  <AlertDescription>{errorMessage(otherError)}</AlertDescription>
+                  <AlertDescription className="break-words">{errorMessage(otherError)}</AlertDescription>
                 </Alert>
               )}
             </FieldGroup>
@@ -211,8 +217,38 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
   );
 }
 
+function NoSignInProvider() {
+  return (
+    <Alert data-testid="setup-no-oidc">
+      <Info />
+      <AlertTitle>Web sign-in is not set up yet</AlertTitle>
+      <AlertDescription>
+        <p>
+          This server has no sign-in provider, so nobody can sign in to the web interface yet. Use the admin token with
+          the CLI for now. To turn on web sign-in, set <code className="font-mono">oidc.issuer</code> and the client
+          secret in the server configuration, then restart the server. See{" "}
+          <a
+            href={`${DOCS_URL}configuration/#signing-in-with-oidc`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
+            data-testid="setup-oidc-docs-link"
+          >
+            signing in with OIDC
+            <ExternalLink className="size-3" aria-hidden />
+            <span className="sr-only">(opens in a new tab)</span>
+          </a>
+          .
+        </p>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 function AdminTokenCard({ created }: { created: Created }) {
   const navigate = useNavigate();
+  const { data: config } = useAuthConfig();
+  const noProvider = config?.oidc_enabled === false;
   const expiry = created.expiresAt ? `expires ${formatExpiry(created.expiresAt)}` : "expires after a while";
   const snippet = (token: string) => `export SEKRET_URL=${window.location.origin}\nexport SEKRET_TOKEN=${token}`;
   return (
@@ -225,7 +261,8 @@ function AdminTokenCard({ created }: { created: Created }) {
             <AlertTitle>Save the admin token</AlertTitle>
             <AlertDescription data-testid="admin-token-help">
               Copy this token now. It is shown once and {expiry}. It lets the CLI act as an organisation admin, for
-              example to add users or set up sign-in. The web interface signs you in through your identity provider.
+              example to add users or set up sign-in.
+              {!noProvider && " The web interface signs you in through your identity provider."}
             </AlertDescription>
           </Alert>
           <div className="space-y-1.5">
@@ -254,6 +291,7 @@ function AdminTokenCard({ created }: { created: Created }) {
               />
             </div>
           </div>
+          {noProvider && <NoSignInProvider />}
         </CardContent>
         <CardFooter>
           <Button size="lg" className="w-full" onClick={() => void navigate("/login")} data-testid="setup-continue">

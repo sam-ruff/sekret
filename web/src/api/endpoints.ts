@@ -106,6 +106,13 @@ export const api = {
         params: { path: { project: at.project, env: at.env }, query: { path: at.path, values } },
       }),
     ),
+  /** Every secret in a folder and the folders below it, without values. */
+  secretsUnder: (at: SecretLocation) =>
+    unwrap(
+      client.GET("/api/v1/projects/{project}/environments/{env}/secrets", {
+        params: { path: { project: at.project, env: at.env }, query: { path: at.path, recursive: true } },
+      }),
+    ),
   /** One secret with its value, when the caller may read it. */
   secret: (at: SecretLocation, key: string) =>
     unwrap(client.GET("/api/v1/projects/{project}/environments/{env}/secrets/{key}", { params: secretParams(at, key) })),

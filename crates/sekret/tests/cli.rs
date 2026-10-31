@@ -56,6 +56,29 @@ fn ok(output: Output) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("utf8")
 }
 
+/// Records the yes a person gives at a terminal to a project file's `allow` list.
+fn confirm_allow(home: &Path, project_file: &Path, names: &[&str]) -> anyhow::Result<()> {
+    let dir = home.join("config").join("sekret");
+    std::fs::create_dir_all(&dir).context("config dir")?;
+    let path = dir.join("credentials.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let key = std::fs::canonicalize(project_file).context("canonical")?;
+    let list: Vec<String> = names.iter().map(|n| format!("{n:?}")).collect();
+    let text = format!(
+        "{existing}\n[confirmed_allow]\n{:?} = [{}]\n",
+        key.display().to_string(),
+        list.join(", ")
+    );
+    std::fs::write(&path, text).context("write credentials")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    }
+    Ok(())
+}
+
 /// How the round-trip server keeps its root key.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -341,9 +364,25 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
     );
     let exported = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
     assert!(!exported.contains("GIT_EXTERNAL_DIFF"), "{exported}");
+    // A project file comes with the repository, so its `allow` list needs the person's yes first.
     std::fs::write(h.join(".sekret.toml"), "allow = [\"GIT_EXTERNAL_DIFF\"]\n").context("project file")?;
+    let unconfirmed = run(&["export", "--format", "shell"], &env, h, Some(""))?;
+    let notes = String::from_utf8_lossy(&unconfirmed.stderr).into_owned();
+    assert!(!ok(unconfirmed)?.contains("GIT_EXTERNAL_DIFF"));
+    assert!(notes.contains("confirm"), "{notes}");
+    confirm_allow(h, &h.join(".sekret.toml"), &["GIT_EXTERNAL_DIFF"])?;
     let from_file = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
     assert!(from_file.contains("export GIT_EXTERNAL_DIFF="), "{from_file}");
+    std::fs::write(
+        h.join(".sekret.toml"),
+        "allow = [\"GIT_EXTERNAL_DIFF\", \"LD_PRELOAD\"]\n",
+    )
+    .context("grown project file")?;
+    let grown = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
+    assert!(
+        !grown.contains("GIT_EXTERNAL_DIFF"),
+        "a changed list needs a new yes: {grown}"
+    );
     std::fs::remove_file(h.join(".sekret.toml")).context("remove project file")?;
     let refused = run(&["run", "--allow", "SEKRET_URL", "--", "true"], &env, h, None)?;
     assert!(!refused.status.success());

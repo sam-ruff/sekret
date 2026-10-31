@@ -15,7 +15,8 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config, CustomResourceExt};
 use sekret_client::ClientOptions;
 use sekret_operator::{
-    AuthSpec, Context, HttpSekretFactory, KubeClient, SekretSecret, SekretSecretSpec, TargetSpec, run_controller,
+    ALLOW_ANNOTATION, AuthSpec, Context, HttpSekretFactory, KubeClient, SekretSecret, SekretSecretSpec, TargetSpec,
+    run_controller,
 };
 use sekret_server::clock::{Clock, SystemClock};
 use sekret_server::config::ServerConfig;
@@ -33,6 +34,8 @@ const K3S_TAG: &str = "v1.33.5-k3s1";
 const PASSPHRASE: &str = "violet tractor sings beneath";
 const NAMESPACE: &str = "apps";
 const SERVICE_ACCOUNT: &str = "reader";
+/// Exists in the namespace but has not opted in to SekretSecrets.
+const UNAPPROVED_ACCOUNT: &str = "payments";
 
 struct Cluster {
     client: Client,
@@ -350,11 +353,24 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
         },
     )
     .await?;
+    let accounts = Api::<ServiceAccount>::namespaced(client.clone(), NAMESPACE);
     create_named(
-        &Api::<ServiceAccount>::namespaced(client.clone(), NAMESPACE),
+        &accounts,
         ServiceAccount {
             metadata: ObjectMeta {
                 name: Some(SERVICE_ACCOUNT.into()),
+                annotations: Some([(ALLOW_ANNOTATION.to_string(), "true".to_string())].into()),
+                ..ObjectMeta::default()
+            },
+            ..ServiceAccount::default()
+        },
+    )
+    .await?;
+    create_named(
+        &accounts,
+        ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some(UNAPPROVED_ACCOUNT.into()),
                 ..ObjectMeta::default()
             },
             ..ServiceAccount::default()
@@ -415,7 +431,12 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
             },
         },
     );
+    let mut unapproved = resource.clone();
+    unapproved.metadata.name = Some("unapproved".into());
+    unapproved.spec.target.name = "unapproved-env".into();
+    unapproved.spec.auth.service_account_name = UNAPPROVED_ACCOUNT.into();
     create_named(&resources, resource).await?;
+    create_named(&resources, unapproved).await?;
 
     let secrets: Api<Secret> = Api::namespaced(client.clone(), NAMESPACE);
     let secret = wait_for("the synced Secret", Duration::from_secs(60), || async {
@@ -444,6 +465,21 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
     .await;
     assert_eq!(status.secret_count, Some(2));
     assert!(status.last_synced_at.is_some());
+
+    let refused = wait_for(
+        "the unapproved account to be refused",
+        Duration::from_secs(30),
+        || async {
+            let status = resources.get("unapproved").await.ok()?.status?;
+            status.ready().filter(|c| c.status == "False").map(|c| c.reason.clone())
+        },
+    )
+    .await;
+    assert_eq!(refused, "ServiceAccountNotAllowed");
+    assert!(
+        secrets.get_opt("unapproved-env").await.context("get")?.is_none(),
+        "no Secret for an account that has not opted in"
+    );
 
     token_review_logins(&cluster, &sekret, &issuer).await?;
 

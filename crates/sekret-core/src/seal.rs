@@ -12,7 +12,9 @@ use unicode_normalization::UnicodeNormalization;
 use utoipa::ToSchema;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::crypto::{CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_random, key_text, open, seal};
+use crate::crypto::{
+    CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_from_material, fill_random, key_text, open, seal,
+};
 
 pub const MIN_PASSPHRASE_LEN: usize = 12;
 /// Longer passphrases are refused before any key derivation runs.
@@ -133,6 +135,10 @@ pub struct KdfParams {
     pub m: u32,
     pub t: u32,
     pub p: u32,
+    /// The wrap was made from the NFKC form of the passphrase, so no other form is ever tried.
+    /// Left out when false, so wraps made before it existed are stored and signed as they were.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub normalised: bool,
 }
 
 impl Default for KdfParams {
@@ -141,6 +147,7 @@ impl Default for KdfParams {
             m: 256 * 1024,
             t: 3,
             p: 1,
+            normalised: true,
         }
     }
 }
@@ -151,7 +158,18 @@ impl KdfParams {
         m: MIN_KDF_MEMORY,
         t: MIN_KDF_ITERATIONS,
         p: 1,
+        normalised: true,
     };
+
+    /// Argon2id at the given cost, for a new NFKC wrap.
+    pub const fn new(m: u32, t: u32, p: u32) -> Self {
+        Self {
+            m,
+            t,
+            p,
+            normalised: true,
+        }
+    }
 
     /// Cheaper than today's default, so the wrap should be redone at the next chance.
     pub fn needs_upgrade(self) -> bool {
@@ -364,6 +382,10 @@ pub fn wrap_root_key(root: &RootKey, passphrase: &str) -> Result<WrappedRootKey,
 
 /// Wraps under the NFKC form of `passphrase`.
 pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -> Result<WrappedRootKey, CryptoError> {
+    let params = KdfParams {
+        normalised: true,
+        ..params
+    };
     let mut salt = vec![0u8; SALT_LEN];
     fill_random(&mut salt)?;
     let kek = derive_kek(&nfkc(passphrase), &salt, params)?;
@@ -378,8 +400,8 @@ pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -
 /// A root key opened with a passphrase.
 pub struct Unwrapped {
     pub root: RootKey,
-    /// The wrap was made from an older form of the passphrase (NFC, or as typed) rather than its
-    /// NFKC form, so it should be made again.
+    /// The wrap was made from an older form of the passphrase (NFC, or as typed), or does not
+    /// record which form it used, so it should be made again.
     pub needs_rewrap: bool,
 }
 
@@ -388,19 +410,32 @@ pub fn unwrap_root_key(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Roo
     unwrap_root_key_checked(wrapped, passphrase).map(|u| u.root)
 }
 
-/// Tries the NFKC form first, then the NFC form and the passphrase as typed, which older wraps
-/// used. Each distinct form costs one derivation.
-pub fn unwrap_root_key_checked(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Unwrapped, CryptoError> {
+/// The most derivations one unwrap can cost: one per distinct form of the passphrase.
+pub const MAX_UNWRAP_DERIVATIONS: usize = 3;
+
+/// The forms of `passphrase` to try against `wrapped`, in order, with whether a match means the
+/// wrap should be made again. A wrap that records its form gets exactly one; an older one also
+/// gets the NFC form and the passphrase as typed, each only when it differs from those before.
+fn passphrase_forms(wrapped: &WrappedRootKey, passphrase: &str) -> Vec<(Zeroizing<String>, bool)> {
     let compatible = nfkc(passphrase);
-    let composed = nfc(passphrase);
-    let raw = Zeroizing::new(passphrase.to_string());
-    let mut tried: Vec<&str> = Vec::with_capacity(3);
-    for (form, needs_rewrap) in [(&compatible, false), (&composed, true), (&raw, true)] {
-        if tried.contains(&form.as_str()) {
-            continue;
+    if wrapped.params.normalised {
+        return vec![(compatible, false)];
+    }
+    let mut forms = Vec::with_capacity(MAX_UNWRAP_DERIVATIONS);
+    forms.push((compatible, true));
+    for form in [nfc(passphrase), Zeroizing::new(passphrase.to_string())] {
+        if forms.iter().all(|(tried, _)| tried.as_str() != form.as_str()) {
+            forms.push((form, true));
         }
-        tried.push(form.as_str());
-        match open_with_passphrase(wrapped, form) {
+    }
+    forms
+}
+
+/// Derives once per form from [`passphrase_forms`], so a passphrase whose normalised forms are
+/// all the same costs one derivation, and none costs more than [`MAX_UNWRAP_DERIVATIONS`].
+pub fn unwrap_root_key_checked(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Unwrapped, CryptoError> {
+    for (form, needs_rewrap) in passphrase_forms(wrapped, passphrase) {
+        match open_with_passphrase(wrapped, &form) {
             Ok(root) => return Ok(Unwrapped { root, needs_rewrap }),
             Err(CryptoError::Decrypt) => {}
             Err(error) => return Err(error),
@@ -415,12 +450,7 @@ fn open_with_passphrase(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Ro
 }
 
 fn root_from_plain(plain: &[u8]) -> Result<RootKey, CryptoError> {
-    if plain.len() != KEY_LEN {
-        return Err(CryptoError::Malformed);
-    }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(plain);
-    Ok(RootKey::from_bytes(key))
+    RootKey::from_slice(plain)
 }
 
 /// A per-host key kept in a file, under which the root key is remembered in the database.
@@ -429,15 +459,16 @@ pub struct DeviceKey([u8; KEY_LEN]);
 
 impl DeviceKey {
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut key = [0u8; KEY_LEN];
-        fill_random(&mut key)?;
-        Ok(Self(key))
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_random(&mut key.0)?;
+        Ok(key)
     }
 
     /// Accepts the same encodings as a root key file.
     pub fn parse(material: &[u8]) -> Result<Self, CryptoError> {
-        let root = RootKey::parse(material)?;
-        Ok(Self(*root.bytes()))
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_from_material(material, &mut key.0)?;
+        Ok(key)
     }
 
     pub fn to_base64(&self) -> Zeroizing<String> {
@@ -468,10 +499,44 @@ pub enum RememberSecretError {
     TooShort,
     #[error("the remember secret must not contain control characters")]
     ControlCharacters,
+    #[error(
+        "the remember secret is too easy to guess; use 32 random bytes, base64 or hex encoded, such as the output \
+         of `openssl rand -base64 32`"
+    )]
+    Guessable,
+}
+
+/// Fewer distinct bytes than this in a decoded key means it was not drawn at random.
+const MIN_DISTINCT_KEY_BYTES: usize = 16;
+
+/// Whether `text` decodes, as hex or base64, to at least [`KEY_LEN`] bytes that look random.
+fn is_random_key_text(text: &str) -> bool {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let decoded = hex::decode(text)
+        .ok()
+        .or_else(|| {
+            [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+                .iter()
+                .find_map(|engine| engine.decode(text).ok())
+        })
+        .map(Zeroizing::new);
+    let Some(bytes) = decoded else {
+        return false;
+    };
+    if bytes.len() < KEY_LEN {
+        return false;
+    }
+    let mut seen = [false; 256];
+    for byte in bytes.iter() {
+        seen[usize::from(*byte)] = true;
+    }
+    seen.iter().filter(|s| **s).count() >= MIN_DISTINCT_KEY_BYTES
 }
 
 impl RememberSecret {
-    /// Drops one trailing line ending, then checks length and characters.
+    /// Drops one trailing line ending, then checks length, characters and that it cannot be
+    /// guessed: an encoded random key of at least 32 bytes, or text with the score a passphrase
+    /// needs.
     pub fn new(text: &str) -> Result<Self, RememberSecretError> {
         let text = trim_input(text);
         if has_control_characters(text) {
@@ -479,6 +544,12 @@ impl RememberSecret {
         }
         if text.chars().count() < MIN_REMEMBER_SECRET_LEN {
             return Err(RememberSecretError::TooShort);
+        }
+        let strong = is_random_key_text(text)
+            || (text.len() <= MAX_PASSPHRASE_BYTES
+                && u8::from(zxcvbn::zxcvbn(text, &["sekret"]).score()) >= MIN_PASSPHRASE_SCORE);
+        if !strong {
+            return Err(RememberSecretError::Guessable);
         }
         Ok(Self(Zeroizing::new(text.to_string())))
     }
@@ -604,7 +675,13 @@ impl SealBinding<'_> {
         let wrap = self
             .wrapped
             .map(|w| {
-                let params = serde_json::to_vec(&w.params).map_err(|_| CryptoError::Malformed)?;
+                // The form marker is left out, so versions from before it still verify. Clearing
+                // it only costs the server extra derivations.
+                let signed = KdfParams {
+                    normalised: false,
+                    ..w.params
+                };
+                let params = serde_json::to_vec(&signed).map_err(|_| CryptoError::Malformed)?;
                 let mut bytes = Vec::new();
                 push_field(&mut bytes, &w.salt);
                 push_field(&mut bytes, &params);
@@ -801,6 +878,11 @@ mod tests {
 
     /// The production cost is exercised elsewhere; these only need the wrapping logic.
     const CHEAP: KdfParams = KdfParams::FLOOR;
+    /// What wraps from before the form marker store.
+    const LEGACY: KdfParams = KdfParams {
+        normalised: false,
+        ..CHEAP
+    };
 
     #[test]
     fn passphrase_wrap_round_trips() -> anyhow::Result<()> {
@@ -815,7 +897,8 @@ mod tests {
     fn production_parameters_round_trip() -> anyhow::Result<()> {
         let root = RootKey::generate().context("root")?;
         let wrapped = wrap_root_key(&root, "correct horse battery").context("wrap")?;
-        assert_eq!(wrapped.params, KdfParams { m: 262_144, t: 3, p: 1 });
+        assert_eq!(wrapped.params, KdfParams::new(262_144, 3, 1));
+        assert!(wrapped.params.normalised);
         assert!(!wrapped.params.needs_upgrade());
         let back = unwrap_root_key(&wrapped, "correct horse battery").context("unwrap")?;
         assert_eq!(back.fingerprint(), root.fingerprint());
@@ -825,7 +908,7 @@ mod tests {
     #[test]
     fn wraps_at_the_old_default_still_open_and_ask_for_an_upgrade() -> anyhow::Result<()> {
         let root = RootKey::generate().context("root")?;
-        let old = KdfParams { m: 65_536, t: 3, p: 1 };
+        let old = KdfParams::new(65_536, 3, 1);
         let wrapped = wrap_root_key_with(&root, "correct horse battery", old).context("wrap")?;
         assert!(wrapped.params.needs_upgrade());
         let back = unwrap_root_key(&wrapped, "correct horse battery").context("unwrap")?;
@@ -838,9 +921,9 @@ mod tests {
         let root = RootKey::generate().context("root")?;
         let mut wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
         for weak in [
-            KdfParams { m: 64, t: 3, p: 1 },
-            KdfParams { m: 65_535, t: 3, p: 1 },
-            KdfParams { m: 262_144, t: 2, p: 1 },
+            KdfParams::new(64, 3, 1),
+            KdfParams::new(65_535, 3, 1),
+            KdfParams::new(262_144, 2, 1),
         ] {
             wrapped.params = weak;
             assert_eq!(
@@ -861,13 +944,9 @@ mod tests {
         let root = RootKey::generate().context("root")?;
         let mut wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
         for excessive in [
-            KdfParams { m: 65_536, t: 11, p: 1 },
-            KdfParams {
-                m: 512 * 1024 + 1,
-                t: 3,
-                p: 1,
-            },
-            KdfParams { m: 65_536, t: 3, p: 17 },
+            KdfParams::new(65_536, 11, 1),
+            KdfParams::new(512 * 1024 + 1, 3, 1),
+            KdfParams::new(65_536, 3, 17),
         ] {
             wrapped.params = excessive;
             assert_eq!(
@@ -877,7 +956,7 @@ mod tests {
             );
         }
         assert!(KdfParams::default().argon2().is_ok());
-        assert!(KdfParams { m: 65_536, t: 10, p: 1 }.argon2().is_ok());
+        assert!(KdfParams::new(65_536, 10, 1).argon2().is_ok());
         Ok(())
     }
 
@@ -951,11 +1030,11 @@ mod tests {
         // What an older version stored: a key derived from the passphrase exactly as typed.
         let mut salt = vec![0u8; SALT_LEN];
         fill_random(&mut salt).context("salt")?;
-        let kek = derive_kek(decomposed, &salt, CHEAP).context("kek")?;
+        let kek = derive_kek(decomposed, &salt, LEGACY).context("kek")?;
         let legacy = WrappedRootKey {
             ciphertext: seal(&kek, root.bytes(), ROOT_KEY_AAD).context("seal")?,
             salt,
-            params: CHEAP,
+            params: LEGACY,
         };
         let opened = unwrap_root_key_checked(&legacy, decomposed).context("unwrap")?;
         assert_eq!(opened.root.fingerprint(), root.fingerprint());
@@ -1161,16 +1240,82 @@ mod tests {
         // What the previous version stored: the NFC form, which keeps the full-width letter.
         let mut salt = vec![0u8; SALT_LEN];
         fill_random(&mut salt).context("salt")?;
-        let kek = derive_kek(&nfc(typed), &salt, CHEAP).context("kek")?;
+        let kek = derive_kek(&nfc(typed), &salt, LEGACY).context("kek")?;
         let legacy = WrappedRootKey {
             ciphertext: seal(&kek, root.bytes(), ROOT_KEY_AAD).context("seal")?,
             salt,
-            params: CHEAP,
+            params: LEGACY,
         };
         let opened = unwrap_root_key_checked(&legacy, typed).context("unwrap")?;
         assert_eq!(opened.root.fingerprint(), root.fingerprint());
         assert!(opened.needs_rewrap, "an NFC wrap is redone under NFKC");
         assert_eq!(unwrap_root_key(&legacy, folded).err(), Some(CryptoError::Decrypt));
+        Ok(())
+    }
+
+    /// A passphrase whose NFKC, NFC and typed forms all differ: a ligature and a combining accent.
+    const THREE_FORMS: &str = "\u{fb01}nds cafe\u{301} violet tractor";
+
+    #[test]
+    fn a_marked_wrap_costs_one_derivation_whatever_the_passphrase() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
+        assert!(wrapped.params.normalised);
+        assert_eq!(passphrase_forms(&wrapped, THREE_FORMS).len(), 1);
+        assert_eq!(passphrase_forms(&wrapped, "plain ascii").len(), 1);
+
+        let legacy = WrappedRootKey {
+            params: LEGACY,
+            ..wrapped
+        };
+        assert_eq!(passphrase_forms(&legacy, THREE_FORMS).len(), MAX_UNWRAP_DERIVATIONS);
+        assert_eq!(
+            passphrase_forms(&legacy, "plain ascii").len(),
+            1,
+            "identical forms are derived once"
+        );
+        assert_eq!(passphrase_forms(&legacy, "cafe\u{301} violet").len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unmarked_nfkc_wrap_opens_and_asks_to_be_marked() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let mut wrapped = wrap_root_key_with(&root, THREE_FORMS, CHEAP).context("wrap")?;
+        wrapped.params.normalised = false;
+        let opened = unwrap_root_key_checked(&wrapped, THREE_FORMS).context("unwrap")?;
+        assert_eq!(opened.root.fingerprint(), root.fingerprint());
+        assert!(opened.needs_rewrap);
+        Ok(())
+    }
+
+    #[test]
+    fn the_form_marker_is_stored_but_not_signed() -> anyhow::Result<()> {
+        let json = serde_json::to_string(&LEGACY).context("json")?;
+        assert!(!json.contains("normalised"), "{json}");
+        let back: KdfParams = serde_json::from_str(&json).context("parse")?;
+        assert!(!back.normalised, "older wraps read as unmarked");
+        let marked: KdfParams =
+            serde_json::from_str(&serde_json::to_string(&CHEAP).context("json")?).context("parse")?;
+        assert!(marked.normalised);
+
+        // Configurations signed by versions without the marker still verify once it is set.
+        let root = RootKey::generate().context("root")?;
+        let wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
+        let mut unmarked = wrapped.clone();
+        unmarked.params.normalised = false;
+        let fingerprint = root.fingerprint();
+        let binding = |w| SealBinding {
+            mode: SealMode::Passphrase,
+            policy: UnlockPolicy::Manual,
+            fingerprint: &fingerprint,
+            epoch: 1,
+            wrapped: Some(w),
+            remembered: None,
+            flags: SealFlags::default(),
+        };
+        let mac = seal_config_mac(&root, &binding(&unmarked)).context("mac")?;
+        verify_seal_config(&root, &binding(&wrapped), &mac).context("verify")?;
         Ok(())
     }
 
@@ -1272,7 +1417,7 @@ mod tests {
     fn a_remember_secret_is_needed_alongside_the_device_key() -> anyhow::Result<()> {
         let root = RootKey::generate().context("root")?;
         let device = DeviceKey::generate().context("device")?;
-        let secret = RememberSecret::new("a remember secret of at least 32 characters\n").context("secret")?;
+        let secret = RememberSecret::new(&format!("{}\n", *DeviceKey::generate()?.to_base64())).context("secret")?;
         let remembered = remember_root_key(&root, &device, Some(&secret)).context("remember")?;
         assert_eq!(
             recall_root_key(&remembered, &device, Some(&secret))
@@ -1281,7 +1426,7 @@ mod tests {
             root.fingerprint()
         );
         assert!(recall_root_key(&remembered, &device, None).is_err());
-        let wrong = RememberSecret::new("another remember secret of 32 characters").context("secret")?;
+        let wrong = RememberSecret::new(&DeviceKey::generate()?.to_base64()).context("secret")?;
         assert!(recall_root_key(&remembered, &device, Some(&wrong)).is_err());
         let without = remember_root_key(&root, &device, None).context("remember")?;
         assert!(recall_root_key(&without, &device, Some(&secret)).is_err());
@@ -1294,6 +1439,42 @@ mod tests {
             Some(RememberSecretError::ControlCharacters)
         );
         assert_eq!(format!("{secret:?}"), "RememberSecret(redacted)");
+        Ok(())
+    }
+
+    #[test]
+    fn a_remember_secret_must_not_be_guessable() -> anyhow::Result<()> {
+        let mut key = [0u8; KEY_LEN];
+        fill_random(&mut key)?;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        for strong in [
+            STANDARD.encode(key),
+            URL_SAFE_NO_PAD.encode(key),
+            hex::encode(key),
+            "kT9#vQ2!mZ7&pL4@xR8^wN3*bY6%hJ1$".to_string(),
+        ] {
+            assert!(RememberSecret::new(&strong).is_ok(), "{strong}");
+        }
+        for weak in [
+            "a".repeat(32),
+            "a".repeat(44),
+            "e".repeat(40),
+            "A".repeat(64),
+            hex::encode([7u8; 32]),
+            "passwordpasswordpasswordpassword".to_string(),
+            "abcdefghijklmnopqrstuvwxyz012345".to_string(),
+        ] {
+            assert_eq!(
+                RememberSecret::new(&weak).err(),
+                Some(RememberSecretError::Guessable),
+                "{weak}"
+            );
+        }
+        assert!(
+            RememberSecretError::Guessable
+                .to_string()
+                .contains("openssl rand -base64 32")
+        );
         Ok(())
     }
 

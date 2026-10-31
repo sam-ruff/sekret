@@ -9,11 +9,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use common::{Harness, api_error, opened, persistent, start};
 use reqwest::{Method, StatusCode};
-use sekret_core::crypto::{RootKey, seal_credential};
-use sekret_core::seal::{RememberSecret, SealFlags, UnlockPolicy, decrypt_backup, parse_backup, unwrap_root_key};
+use sekret_core::crypto::{DataKey, RootKey, seal_credential, wrap_data_key};
+use sekret_core::seal::{
+    KdfParams, RememberSecret, SealFlags, UnlockPolicy, decrypt_backup, parse_backup, unwrap_root_key,
+    wrap_root_key_with,
+};
+use sekret_server::StartupError;
 use sekret_server::config::SealSettings;
-use sekret_server::seal::{Signature, StartupSecrets, check_signature, high_water, signed};
-use sekret_store::{EncryptedValue, Rekey, SealConfig, SqlStore, Store};
+use sekret_server::seal::{
+    Signature, StartupSecrets, accepted_roots, check_root, check_signature, high_water, root_recognised, signed,
+};
+use sekret_store::{EncryptedValue, Project, Rekey, SealConfig, SqlStore, Store};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -528,6 +534,190 @@ async fn unreadable_values_are_listed_or_skipped(db: String) -> anyhow::Result<(
     Ok(())
 }
 
+/// What a database writer with no key material does: wraps a root key of their own under a
+/// passphrase they chose, records its fingerprint and signs the configuration with it far above
+/// any mark. Returns their key.
+async fn swap_in_a_forged_root(h: &Harness) -> anyhow::Result<RootKey> {
+    let forged = RootKey::generate().context("forged")?;
+    let config = SealConfig {
+        wrapped: Some(wrap_root_key_with(&forged, NEW_PASSPHRASE, KdfParams::FLOOR).context("wrap")?),
+        mac: None,
+        ..stored(h).await?
+    };
+    let config = signed(&forged, config, 1 << 40)?;
+    h.state.store.update_seal_config(config).await?;
+    h.state
+        .store
+        .set_meta(sekret_server::ROOT_KEY_META, &forged.fingerprint())
+        .await?;
+    Ok(forged)
+}
+
+async fn unseal_with(h: &Harness, passphrase: &str) -> anyhow::Result<(StatusCode, Value)> {
+    let body = json!({"passphrase": passphrase});
+    h.call(Method::POST, "/api/v1/sys/unseal", None, Some(body)).await
+}
+
+/// The demonstrated attack: a database writer installed their own root key on a sealed server
+/// and unsealed it with their own passphrase.
+async fn a_database_writer_cannot_swap_in_their_own_root_key(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h, "manual").await?;
+    let real = root(&h)?.fingerprint();
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real.clone()]));
+    let original = stored(&h).await?;
+
+    swap_in_a_forged_root(&h).await?;
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    let (code, body) = unseal_with(&restarted, NEW_PASSPHRASE).await?;
+    assert_eq!(
+        (code, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("root_key_not_recognised")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("reset-epoch --adopt-root-key")),
+        "{body}"
+    );
+    assert_eq!(state_of(&restarted).await?, "sealed");
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real.clone()]));
+
+    // Putting the owner's rows back, as a restore would, lets the owner in, and the refusal shows.
+    restarted.state.store.update_seal_config(original).await?;
+    restarted
+        .state
+        .store
+        .set_meta(sekret_server::ROOT_KEY_META, &real)
+        .await?;
+    assert_eq!(unseal(&restarted).await?, StatusCode::OK);
+    let actions = audit_actions(&restarted, &admin).await?;
+    assert!(actions.contains(&"sys.unseal.refused".to_string()), "{actions:?}");
+    Ok(())
+}
+
+/// Without any marks, a forged root key still has to open the data that is already there.
+async fn a_forged_root_key_must_open_the_existing_data(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let h = fresh(&db.url, SealSettings::default()).await?;
+    let admin = init(&h, "manual").await?;
+    h.create_project_as("app", &admin).await?;
+    swap_in_a_forged_root(&h).await?;
+    let restarted = fresh(&db.url, SealSettings::default()).await?;
+    let (code, body) = unseal_with(&restarted, NEW_PASSPHRASE).await?;
+    assert_eq!(
+        (code, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("root_key_not_recognised")),
+        "{body}"
+    );
+    assert_eq!(state_of(&restarted).await?, "sealed");
+    Ok(())
+}
+
+/// A database with projects but no recorded fingerprint is never handed to a key that cannot
+/// read them; the key that can is recorded.
+async fn a_missing_fingerprint_is_only_adopted_by_a_key_that_opens_the_data(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let store = SqlStore::connect(&db.url).await.context("store")?;
+    let real = RootKey::generate().context("real")?;
+    let data_key = DataKey::generate().context("data key")?;
+    let project = Project {
+        id: "p1".into(),
+        slug: "app".into(),
+        name: "App".into(),
+        description: String::new(),
+        wrapped_key: wrap_data_key(&real, &data_key, "p1").context("wrap")?,
+        created_at: 1,
+        logo_updated_at: None,
+        secret_policy: None,
+    };
+    store.create_project(project, vec![]).await?;
+    let stranger = RootKey::generate().context("stranger")?;
+    assert!(matches!(
+        sekret_server::check_root_key(&store, &stranger.fingerprint()).await,
+        Err(StartupError::WrongRootKey)
+    ));
+    assert!(matches!(
+        check_root(&store, &[], &stranger).await,
+        Err(StartupError::WrongRootKey)
+    ));
+    assert_eq!(store.get_meta(sekret_server::ROOT_KEY_META).await?, None);
+    check_root(&store, &[], &real).await.context("the real key")?;
+    assert_eq!(
+        store.get_meta(sekret_server::ROOT_KEY_META).await?,
+        Some(real.fingerprint())
+    );
+    Ok(())
+}
+
+/// Marks written before fingerprints existed name the root key from the next unlock on.
+async fn marks_without_a_fingerprint_learn_it_at_the_next_unlock(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    init(&h, "manual").await?;
+    let real = root(&h)?.fingerprint();
+    let epoch = stored(&h).await?.epoch;
+    let mark = db.dir.path().join("sekret.db.epoch");
+    std::fs::write(&mark, format!("sekret-seal-epoch {epoch}\n")).context("old mark")?;
+    assert_eq!(accepted_roots(&settings.epoch_files), None);
+
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal(&restarted).await?, StatusCode::OK);
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real]));
+    assert_eq!(high_water(&settings.epoch_files).highest, Some(epoch));
+    Ok(())
+}
+
+/// A passphrase change replaces the root key, so the marks follow it and the old key is refused.
+async fn a_passphrase_change_moves_the_marks_to_the_new_key(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h, "manual").await?;
+    let old = root(&h)?;
+    let change = json!({"current": PASSPHRASE, "new": NEW_PASSPHRASE});
+    let (status, body) = h.post("/api/v1/sys/passphrase", &admin, change).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let new = root(&h)?.fingerprint();
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![new.clone()]));
+    assert!(!root_recognised(&settings.epoch_files, &old.fingerprint()));
+
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal_with(&restarted, NEW_PASSPHRASE).await?.0, StatusCode::OK);
+    assert_eq!(root(&restarted)?.fingerprint(), new);
+    Ok(())
+}
+
+/// A crash between the database commit and the final mark leaves marks naming both keys, and
+/// the server still starts on the new one.
+async fn a_rotation_cut_short_still_unlocks(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h, "manual").await?;
+    let old = root(&h)?.fingerprint();
+    let change = json!({"current": PASSPHRASE, "new": NEW_PASSPHRASE});
+    let (status, body) = h.post("/api/v1/sys/passphrase", &admin, change).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let new = root(&h)?.fingerprint();
+    let epoch = high_water(&settings.epoch_files).highest.context("mark")?;
+    let mark = db.dir.path().join("sekret.db.epoch");
+    std::fs::write(&mark, format!("sekret-seal-epoch {epoch} {old} {new}\n")).context("mark")?;
+
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal_with(&restarted, NEW_PASSPHRASE).await?.0, StatusCode::OK);
+    assert_eq!(
+        accepted_roots(&settings.epoch_files),
+        Some(vec![new]),
+        "the unlock narrows the mark again"
+    );
+    Ok(())
+}
+
 on_both_backends!(
     a_tampered_configuration_is_never_backed_up,
     backups_never_share_an_epoch_with_the_live_configuration,
@@ -537,6 +727,12 @@ on_both_backends!(
     a_wiped_database_never_lowers_the_marks,
     tampered_fields_are_never_signed_without_proof,
     unreadable_values_are_listed_or_skipped,
+    a_database_writer_cannot_swap_in_their_own_root_key,
+    a_forged_root_key_must_open_the_existing_data,
+    a_missing_fingerprint_is_only_adopted_by_a_key_that_opens_the_data,
+    marks_without_a_fingerprint_learn_it_at_the_next_unlock,
+    a_passphrase_change_moves_the_marks_to_the_new_key,
+    a_rotation_cut_short_still_unlocks,
 );
 
 #[test]

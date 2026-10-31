@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, Info, LogIn, ShieldAlert, Terminal, XCircle } from "lucide-react";
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { ApiError, reauthUrl, startReauth } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { PendingCliLogin } from "@/api/types";
@@ -196,10 +196,15 @@ export function CliLoginPage() {
                 <XCircle />
                 <AlertTitle>This sign-in request has ended</AlertTitle>
                 <AlertDescription>
-                  It expired or was already approved. Run <code className="font-mono">sekret login</code> again to get a
-                  new link.
+                  It expired, was already used or refused, or the link is wrong. Run{" "}
+                  <code className="font-mono">sekret login</code> again to get a new link.
                 </AlertDescription>
               </Alert>
+            )}
+            {outcome === "pending" && ended && (
+              <Button asChild variant="outline" className="w-full" data-testid="cli-go-home">
+                <Link to="/">Go to sekret</Link>
+              </Button>
             )}
             {asking && signedInAgain && !reauthenticating && (
               <Alert data-testid="cli-signed-in-again">
@@ -232,8 +237,8 @@ export function CliLoginPage() {
                   autoFocus
                   inputMode="text"
                   maxLength={12}
-                  placeholder="XXXX-XXXX"
-                  className="font-mono text-lg tracking-[0.2em] uppercase"
+                  placeholder="e.g. ABCD-1234"
+                  className="font-mono text-lg tracking-[0.2em] uppercase placeholder:font-sans placeholder:text-sm placeholder:tracking-normal placeholder:normal-case placeholder:text-muted-foreground/70"
                   aria-invalid={mismatch}
                   aria-describedby={mismatch ? CODE_ERROR_ID : "cli-code-hint"}
                   onChange={(e) => setTyped(e.target.value)}
@@ -268,7 +273,7 @@ export function CliLoginPage() {
             {outcome === "cancelled" && (
               <Alert data-testid="cli-cancelled">
                 <XCircle />
-                <AlertTitle>Cancelled</AlertTitle>
+                <AlertTitle>Denied</AlertTitle>
                 <AlertDescription>
                   {deny.isSuccess
                     ? "Nothing was approved, and the terminal that asked is told the sign-in was refused."
@@ -281,7 +286,7 @@ export function CliLoginPage() {
             <CardFooter className="mt-6 flex justify-end gap-2">
               <Button type="button" variant="outline" onClick={cancel} disabled={busy} data-testid="cli-cancel">
                 {deny.isPending && <Spinner />}
-                Cancel
+                Deny
               </Button>
               <Button type="submit" disabled={!ready || busy} data-testid="cli-approve">
                 {(approve.isPending || reauthenticating) && <Spinner />}
