@@ -43,6 +43,11 @@ async fn status(h: &Harness) -> anyhow::Result<Value> {
     Ok(body)
 }
 
+/// Every status field, as organisation admins see them.
+fn detail(h: &Harness) -> anyhow::Result<Value> {
+    serde_json::to_value(sekret_server::seal::status(&h.state.config.seal, &h.state.keyring)).context("status")
+}
+
 async fn init(h: &Harness, policy: &str) -> anyhow::Result<Value> {
     let code = h.state.keyring.setup_code().context("setup code")?;
     let (status, body) = h
@@ -146,7 +151,11 @@ async fn a_flipped_unlock_policy_is_caught_and_never_remembered(db: String) -> a
     assert_eq!(status(&h).await?["state"], "sealed");
     let (code, body) = unseal(&h, PASSPHRASE).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
-    assert_eq!(body["unlock_policy"], "manual", "the flipped policy is not trusted");
+    assert_eq!(
+        detail(&h)?["unlock_policy"],
+        "manual",
+        "the flipped policy is not trusted"
+    );
     assert!(!file.exists(), "no remember file is written for a tampered policy");
     assert!(
         audit_actions(&h, &admin)
@@ -184,40 +193,156 @@ async fn a_tampered_configuration_never_unlocks_at_start(db: String) -> anyhow::
     Ok(())
 }
 
-async fn unsigned_configurations_are_signed_on_unlock(db: String) -> anyhow::Result<()> {
+async fn unsigned_configurations_are_only_signed_when_they_grant_nothing(db: String) -> anyhow::Result<()> {
     let db = persistent(&db)?;
     let settings = remembering(db.dir.path());
     let first = fresh(&db.url, settings.clone()).await?;
-    init(&first, "manual").await?;
-    // As a database from before signing: no MAC, and a remember policy nothing confirms.
+    let admin = token(&init(&first, "manual").await?)?;
+    // As a database from before signing, which granted nothing: signed quietly.
     let mut config = first.state.store.get_seal_config().await?.context("config")?;
     config.mac = None;
-    config.unlock_policy = UnlockPolicy::Remember;
     first.state.store.update_seal_config(config.clone()).await?;
     let h = fresh(&db.url, settings.clone()).await?;
-    let (code, body) = unseal(&h, PASSPHRASE).await?;
-    assert_eq!(code, StatusCode::OK);
-    assert_eq!(body["unlock_policy"], "manual");
-    assert!(!db.dir.path().join("unlock.key").exists());
+    assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
+    let root = h.state.keyring.root().map_err(api_error("root"))?;
+    let stored = h.state.store.get_seal_config().await?.context("config")?;
+    assert_eq!(check_signature(&root, &stored), Signature::Valid);
+    assert!(
+        !audit_actions(&h, &admin)
+            .await?
+            .contains(&"sys.seal_config.tampered".to_string())
+    );
 
-    // An unsigned passphrase-file policy is kept and signed.
-    config.mac = None;
-    config.unlock_policy = UnlockPolicy::PassphraseFile;
-    let current = h.state.store.get_seal_config().await?.context("config")?;
-    h.state
+    // Clearing the signature does not launder a policy or wrap a database writer put there.
+    for policy in [UnlockPolicy::Remember, UnlockPolicy::PassphraseFile] {
+        let current = h.state.store.get_seal_config().await?.context("config")?;
+        h.state
+            .store
+            .update_seal_config(sekret_store::SealConfig {
+                mac: None,
+                unlock_policy: policy,
+                ..current
+            })
+            .await?;
+        let restarted = start(opened(
+            &db.url,
+            settings.clone(),
+            StartupSecrets {
+                unlock_passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
+                auto_init: None,
+            },
+        ))
+        .await?;
+        assert_eq!(
+            status(&restarted).await?["state"],
+            "sealed",
+            "{policy:?}: an unsigned grant never unlocks at start"
+        );
+        assert_eq!(unseal(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
+        let stored = restarted.state.store.get_seal_config().await?.context("config")?;
+        assert_eq!(stored.unlock_policy, UnlockPolicy::Manual, "{policy:?}");
+        assert!(stored.mac.is_some());
+    }
+    let tampered = audit_actions(&h, &admin)
+        .await?
+        .iter()
+        .filter(|a| *a == "sys.seal_config.tampered")
+        .count();
+    assert_eq!(tampered, 2);
+    Ok(())
+}
+
+/// The demonstrated attack: no signature, junk in the remembered wrap and the remember policy.
+async fn a_cleared_signature_with_a_planted_wrap_is_tampering(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = remembering(db.dir.path());
+    let file = db.dir.path().join("unlock.key");
+    let first = fresh(&db.url, settings.clone()).await?;
+    let admin = token(&init(&first, "manual").await?)?;
+    let current = first.state.store.get_seal_config().await?.context("config")?;
+    first
+        .state
         .store
         .update_seal_config(sekret_store::SealConfig {
-            epoch: current.epoch,
-            ..config
+            mac: None,
+            unlock_policy: UnlockPolicy::Remember,
+            remembered: Some(vec![0x41; 72]),
+            ..current
         })
         .await?;
-    let h = fresh(&db.url, settings).await?;
-    let (code, body) = unseal(&h, PASSPHRASE).await?;
-    assert_eq!(code, StatusCode::OK);
-    assert_eq!(body["unlock_policy"], "passphrase-file");
+    let h = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(status(&h).await?["state"], "sealed");
+    assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
     let stored = h.state.store.get_seal_config().await?.context("config")?;
-    let root = h.state.keyring.root().map_err(api_error("root"))?;
-    assert_eq!(check_signature(&root, &stored), Signature::Valid);
+    assert_eq!(stored.unlock_policy, UnlockPolicy::Manual);
+    assert_eq!(stored.remembered, None);
+    assert!(!file.exists(), "the tampered policy is never acted on");
+    assert!(
+        audit_actions(&h, &admin)
+            .await?
+            .contains(&"sys.seal_config.tampered".to_string())
+    );
+    let again = fresh(&db.url, settings).await?;
+    assert_eq!(status(&again).await?["state"], "sealed");
+    Ok(())
+}
+
+/// A signed configuration from earlier, put back into the database, is caught by the epoch kept
+/// beside the database.
+async fn an_older_signed_configuration_is_a_rollback(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let marks = vec![db.dir.path().join("sekret.db.epoch")];
+    let settings = SealSettings {
+        epoch_files: marks.clone(),
+        ..SealSettings::default()
+    };
+    let first = fresh(&db.url, settings.clone()).await?;
+    let admin = token(&init(&first, "manual").await?)?;
+    let (code, _) = first
+        .put(
+            "/api/v1/sys/unlock-policy",
+            &admin,
+            json!({"policy": "passphrase-file", "passphrase": PASSPHRASE}),
+        )
+        .await?;
+    assert_eq!(code, StatusCode::OK);
+    let granting = first.state.store.get_seal_config().await?.context("config")?;
+    let (code, _) = first
+        .put("/api/v1/sys/unlock-policy", &admin, json!({"policy": "manual"}))
+        .await?;
+    assert_eq!(code, StatusCode::OK);
+    let mark = sekret_server::seal::high_water(&marks).context("mark")?;
+    assert!(mark > granting.epoch);
+
+    // A database writer puts the old, validly signed passphrase-file configuration back.
+    first.state.store.update_seal_config(granting).await?;
+    let with_passphrase = || StartupSecrets {
+        unlock_passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
+        auto_init: None,
+    };
+    let h = start(opened(&db.url, settings.clone(), with_passphrase())).await?;
+    assert_eq!(status(&h).await?["state"], "sealed", "the rollback does not unlock");
+    let stored = h.state.store.get_seal_config().await?.context("config")?;
+    assert_eq!(stored.unlock_policy, UnlockPolicy::Manual);
+    assert!(
+        stored.epoch > mark,
+        "reset past the mark, so it is not taken for a rollback again"
+    );
+    assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
+    assert!(
+        audit_actions(&h, &admin)
+            .await?
+            .contains(&"sys.seal_config.rolled_back".to_string())
+    );
+    let again = start(opened(&db.url, settings, with_passphrase())).await?;
+    assert_eq!(status(&again).await?["state"], "sealed");
+    assert_eq!(unseal(&again, PASSPHRASE).await?.0, StatusCode::OK);
+    let rollbacks = audit_actions(&again, &admin)
+        .await?
+        .iter()
+        .filter(|a| *a == "sys.seal_config.rolled_back")
+        .count();
+    assert_eq!(rollbacks, 1, "the reset itself is accepted");
     Ok(())
 }
 
@@ -317,7 +442,7 @@ async fn weakening_the_unlock_policy_needs_the_passphrase(db: String) -> anyhow:
 async fn key_derivations_run_one_at_a_time_and_survive_cancellation() -> anyhow::Result<()> {
     let db = persistent(common::SQLITE)?;
     let first = fresh(&db.url, SealSettings::default()).await?;
-    init(&first, "manual").await?;
+    let admin = token(&init(&first, "manual").await?)?;
     let h = fresh(&db.url, SealSettings::default()).await?;
 
     let permit = h.state.keyring.kdf_permit().map_err(api_error("permit"))?;
@@ -351,12 +476,32 @@ async fn key_derivations_run_one_at_a_time_and_survive_cancellation() -> anyhow:
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // The abandoned attempt still counts against its source and is still audited.
+    let mut counted = false;
+    for _ in 0..50 {
+        let failures = h.state.passphrase_backoff.failures(LOCALHOST);
+        let audited = h
+            .state
+            .store
+            .count_audit(sekret_store::AuditQuery {
+                action: Some("sys.unseal.failed".into()),
+                ..Default::default()
+            })
+            .await?;
+        if failures == 1 && audited == 1 {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(counted, "the abandoned unseal was counted and audited");
     assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
+    assert!(!admin.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn wrong_passphrases_back_off_for_everyone() -> anyhow::Result<()> {
+async fn wrong_passphrases_back_off_their_source_without_saying_for_how_long() -> anyhow::Result<()> {
     let db = persistent(common::SQLITE)?;
     let first = fresh(&db.url, SealSettings::default()).await?;
     let admin = token(&init(&first, "manual").await?)?;
@@ -364,11 +509,41 @@ async fn wrong_passphrases_back_off_for_everyone() -> anyhow::Result<()> {
     for _ in 0..6 {
         assert_eq!(unseal(&h, NEW_PASSPHRASE).await?.0, StatusCode::UNAUTHORIZED);
     }
-    let (code, body) = unseal(&h, PASSPHRASE).await?;
+    let response = h
+        .client
+        .post(format!("{}/api/v1/sys/unseal", h.base))
+        .json(&json!({"passphrase": PASSPHRASE}))
+        .send()
+        .await
+        .context("unseal")?;
     assert_eq!(
-        (code, body["error"].clone()),
-        (StatusCode::TOO_MANY_REQUESTS, json!("passphrase_backoff")),
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
         "even the right passphrase waits"
+    );
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .context("retry-after")?;
+    assert_eq!(retry_after % 5, 0, "rounded, so the exact back-off is not given away");
+    let body: Value = response.json().await.context("body")?;
+    assert_eq!(body["error"], "passphrase_backoff");
+    assert!(
+        !body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .any(|c| c.is_ascii_digit()),
+        "{body}"
+    );
+    // Another source is not held back.
+    assert!(
+        h.state
+            .passphrase_backoff
+            .wait("198.51.100.20".parse().context("ip")?)
+            .is_none()
     );
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
@@ -502,7 +677,10 @@ async fn status_says_how_the_server_was_unlocked(db: String) -> anyhow::Result<(
         "configured choices show before setup"
     );
     let admin = token(&init(&h, "manual").await?)?;
-    assert_eq!(status(&h).await?["unsealed_by"], "passphrase");
+    assert_eq!(status(&h).await?["unsealed_by"], Value::Null, "only admins learn how");
+    let (code, full) = h.get("/api/v1/sys/status/detail", &admin).await?;
+    assert_eq!(code, StatusCode::OK, "{full}");
+    assert_eq!(full["unsealed_by"], "passphrase");
     let (code, me) = h.get("/api/v1/me", &admin).await?;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(me["is_org_admin"], true);
@@ -528,13 +706,22 @@ async fn status_says_how_the_server_was_unlocked(db: String) -> anyhow::Result<(
         },
     )
     .await?;
-    let body = status(&keyed).await?;
+    let body = detail(&keyed)?;
     assert_eq!(
         (body["seal_mode"].clone(), body["unsealed_by"].clone()),
         (json!("passphrase"), json!("key-file"))
     );
+    let (_, starts) = keyed.get("/api/v1/audit?limit=200", &admin).await?;
+    assert!(
+        starts["entries"]
+            .as_array()
+            .context("entries")?
+            .iter()
+            .any(|e| e["action"] == "sys.unseal" && e["actor_id"] == "key-file"),
+        "an unlock at start is audited with how it happened"
+    );
     let sealed = fresh(&db.url, SealSettings::default()).await?;
-    assert_eq!(status(&sealed).await?["unsealed_by"], Value::Null);
+    assert_eq!(detail(&sealed)?["unsealed_by"], Value::Null);
     Ok(())
 }
 
@@ -604,8 +791,10 @@ async fn auto_init_refuses_a_database_with_data(db: String) -> anyhow::Result<()
         })
         .await?;
     let secrets = StartupSecrets {
-        unlock_passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
-        auto_init: Some(AutoInit { passphrase: None }),
+        unlock_passphrase: None,
+        auto_init: Some(AutoInit {
+            passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
+        }),
     };
     let result = open_keyring(&store, 1, &SealSettings::default(), secrets).await;
     assert!(result.is_err_and(|e| e.to_string().contains("already holds data")));
@@ -613,10 +802,43 @@ async fn auto_init_refuses_a_database_with_data(db: String) -> anyhow::Result<()
     Ok(())
 }
 
+/// The unlock passphrase only stands in for the setup passphrase under the policy that keeps it.
+async fn auto_init_uses_the_unlock_passphrase_only_under_passphrase_file(db: String) -> anyhow::Result<()> {
+    let only_unlock = || StartupSecrets {
+        unlock_passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
+        auto_init: Some(AutoInit { passphrase: None }),
+    };
+    let manual = persistent(&db)?;
+    let store = SqlStore::connect(&manual.url).await.context("store")?;
+    let result = open_keyring(&store, 1, &SealSettings::default(), only_unlock()).await;
+    assert!(
+        result.is_err_and(|e| e.to_string().contains("setup.passphrase_file")),
+        "manual needs a setup passphrase of its own"
+    );
+    assert!(store.get_seal_config().await?.is_none());
+
+    let file_policy = persistent(&db)?;
+    let settings = SealSettings {
+        unlock: Some(UnlockPolicy::PassphraseFile),
+        ..SealSettings::default()
+    };
+    let h = start(opened(&file_policy.url, settings, only_unlock())).await?;
+    assert_eq!(status(&h).await?["state"], "unsealed");
+    let stored = h.state.store.get_seal_config().await?.context("config")?;
+    assert_eq!(stored.unlock_policy, UnlockPolicy::PassphraseFile);
+    let opened = unwrap_root_key(&stored.wrapped.context("wrap")?, PASSPHRASE).context("unwrap")?;
+    let root = h.state.keyring.root().map_err(api_error("root"))?;
+    assert_eq!(opened.fingerprint(), root.fingerprint());
+    Ok(())
+}
+
 on_both_backends!(
     a_flipped_unlock_policy_is_caught_and_never_remembered,
     a_tampered_configuration_never_unlocks_at_start,
-    unsigned_configurations_are_signed_on_unlock,
+    unsigned_configurations_are_only_signed_when_they_grant_nothing,
+    a_cleared_signature_with_a_planted_wrap_is_tampering,
+    an_older_signed_configuration_is_a_rollback,
+    auto_init_uses_the_unlock_passphrase_only_under_passphrase_file,
     changing_the_passphrase_replaces_the_root_key,
     weakening_the_unlock_policy_needs_the_passphrase,
     setup_codes_are_checked_and_audited,
@@ -669,7 +891,7 @@ async fn approve(h: &Harness, session: &str, user_code: &str) -> anyhow::Result<
         .post(format!("{}/api/v1/auth/cli/approve", h.base))
         .header("cookie", format!("sekret_session={session}"))
         .header("x-sekret-csrf", "1")
-        .json(&json!({"user_code": user_code}))
+        .json(&json!({"code": user_code}))
         .send()
         .await
         .context("approve")?;

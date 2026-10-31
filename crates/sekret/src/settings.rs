@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use clap::Args;
 use sekret_core::seal::{RememberSecret, SealMode, UnlockPolicy};
-use sekret_server::config::{HumanOidcConfig, SealSettings, ServerConfig, TlsSettings};
+use sekret_server::config::{HumanOidcConfig, SealSettings, ServerConfig, TlsSettings, UnixSocketSettings};
 use sekret_server::files::{SECRET_FILE_LIMIT, TEXT_FILE_LIMIT, read_limited};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -35,6 +35,18 @@ pub struct StoreArgs {
 pub struct StoreLocation {
     pub database_url: String,
     pub root_key_file: Option<PathBuf>,
+    /// From the configuration file only, to keep the epoch mark beside it up to date.
+    pub remember_file: Option<PathBuf>,
+}
+
+impl StoreLocation {
+    pub fn epoch_files(&self) -> Vec<PathBuf> {
+        sekret_server::config::epoch_files(
+            &self.database_url,
+            self.remember_file.as_deref(),
+            self.root_key_file.as_deref(),
+        )
+    }
 }
 
 impl StoreArgs {
@@ -47,6 +59,7 @@ impl StoreArgs {
                 .or(file.database.url)
                 .unwrap_or_else(|| DEFAULT_DATABASE_URL.into()),
             root_key_file: self.root_key_file.clone().or(file.seal.root_key_file),
+            remember_file: file.seal.remember_file,
         })
     }
 }
@@ -177,6 +190,12 @@ pub struct ServerArgs {
     /// Where to write the one-time setup code (mode 0600), as well as the log.
     #[arg(long, env = "SEKRET_SETUP_CODE_FILE")]
     pub setup_code_file: Option<PathBuf>,
+    /// Unix socket for `sekret sys unseal --socket`, outside the network's rate limits.
+    #[arg(long, env = "SEKRET_UNIX_SOCKET")]
+    pub unix_socket: Option<PathBuf>,
+    /// 0600, or 0660 to let the socket's group unseal too [default: 0600].
+    #[arg(long, env = "SEKRET_UNIX_SOCKET_MODE")]
+    pub unix_socket_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +224,8 @@ pub struct ServerSection {
     pub public_url: Option<String>,
     pub trusted_proxies: Option<Vec<String>>,
     pub allow_insecure_http: Option<bool>,
+    pub unix_socket: Option<PathBuf>,
+    pub unix_socket_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -357,22 +378,64 @@ pub const UNLOCK_PASSPHRASE_ENV: &str = "SEKRET_UNLOCK_PASSPHRASE";
 pub const REMEMBER_SECRET_ENV: &str = "SEKRET_REMEMBER_SECRET";
 
 impl EnvSecrets {
-    /// Reads and removes the secret variables. Only call this while the process has one thread.
-    pub fn take() -> Self {
-        let take = |name: &str| {
-            let value = std::env::var(name).ok().map(Zeroizing::new);
-            if value.is_some() {
-                // SAFETY: called from `main` before the runtime or any other thread starts.
-                unsafe { std::env::remove_var(name) };
+    /// Reads and removes the secret variables, overwriting their values first so they no longer
+    /// show in `/proc/<pid>/environ`. Only call this from `main` while the process has one thread.
+    pub fn take() -> anyhow::Result<Self> {
+        Ok(Self {
+            unlock_passphrase: take_secret(UNLOCK_PASSPHRASE_ENV)?,
+            remember_secret: take_secret(REMEMBER_SECRET_ENV)?,
+        })
+    }
+}
+
+fn take_secret(name: &str) -> anyhow::Result<Option<Zeroizing<String>>> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    scrub_environ(name);
+    // SAFETY: called from `main` before the runtime or any other thread starts, so nothing else
+    // reads or changes the environment while it is changed here.
+    unsafe { std::env::remove_var(name) };
+    let value = raw
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))?;
+    Ok(Some(Zeroizing::new(value)))
+}
+
+/// Overwrites the value of `name` with zero bytes in the process's own environment block. The
+/// kernel serves `/proc/<pid>/environ` from that memory, and removing a variable only unlinks
+/// it, so without this the value stays readable there for the life of the process.
+#[cfg(unix)]
+fn scrub_environ(name: &str) {
+    unsafe extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+    let prefix = format!("{name}=");
+    // SAFETY: only called from `main` while the process has one thread, so nothing reads or
+    // changes the environment meanwhile. `environ` is the C library's null-terminated array of
+    // pointers to NUL-terminated strings that the process owns and may write. Each string's
+    // length is measured before it is touched, and the writes stay within those bytes.
+    unsafe {
+        let mut entry = environ;
+        if entry.is_null() {
+            return;
+        }
+        while !(*entry).is_null() {
+            let text = (*entry).cast::<u8>();
+            let len = libc::strlen(*entry);
+            let matches = len >= prefix.len() && std::slice::from_raw_parts(text, prefix.len()) == prefix.as_bytes();
+            if matches {
+                for offset in prefix.len()..len {
+                    std::ptr::write_volatile(text.add(offset), 0);
+                }
             }
-            value
-        };
-        Self {
-            unlock_passphrase: take(UNLOCK_PASSPHRASE_ENV),
-            remember_secret: take(REMEMBER_SECRET_ENV),
+            entry = entry.add(1);
         }
     }
 }
+
+#[cfg(not(unix))]
+fn scrub_environ(_name: &str) {}
 
 /// The remember secret from its file, else from the environment.
 fn remember_secret(file: Option<&Path>, env: Option<&Zeroizing<String>>) -> anyhow::Result<Option<RememberSecret>> {
@@ -468,37 +531,121 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
+/// Where `path` really is: relative paths are taken from the working directory and the nearest
+/// existing ancestor is resolved through any symlinks, so a file that does not exist yet still
+/// compares correctly with one that does.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut missing = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return missing.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// The device of the nearest existing ancestor of `path`.
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    resolved(path)
+        .ancestors()
+        .find_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device(_path: &Path) -> Option<u64> {
+    None
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    a == b || resolved(a) == resolved(b)
 }
 
-fn parent_dir(path: &Path) -> PathBuf {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
-/// The remember file must be a file of its own, never one sekret already uses.
-fn check_remember_file(remember: &Path, others: &[(&str, Option<&Path>)]) -> anyhow::Result<()> {
-    for (name, other) in others {
-        if let Some(other) = other
-            && same_path(remember, other)
-        {
-            bail!(
-                "the remember file {} is the same as the {name}; choose a separate file",
-                remember.display()
-            );
+/// Files the server writes or deletes must each be a file of their own, never one sekret reads,
+/// another one it writes, or a part of the database.
+fn check_distinct(written: &[(&str, Option<&Path>)], read: &[(&str, Option<&Path>)]) -> anyhow::Result<()> {
+    for (index, (name, path)) in written.iter().enumerate() {
+        let Some(path) = path else {
+            continue;
+        };
+        let others = written.iter().skip(index + 1).chain(read.iter());
+        for (other_name, other) in others {
+            if let Some(other) = other
+                && same_path(path, other)
+            {
+                bail!(
+                    "the {name} {} is the same file as the {other_name}; choose a separate file",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Warnings for key, passphrase and secret files that other users can read or replace.
+fn exposure_warnings(files: &[(&str, Option<&Path>)]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|(name, path)| {
+            path.and_then(sekret_server::files::exposure)
+                .map(|why| format!("the {name}: {why}"))
+        })
+        .collect()
+}
+
+/// The remember file is meant to live apart from the database, so that a copy of the
+/// database's disk or directory cannot unlock the server on its own.
+fn remember_warnings(remember: &Path, database: Option<&Path>, warnings: &mut Vec<String>) {
+    let Some(database) = database else {
+        return;
+    };
+    let db_dir = resolved(database)
+        .parent()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    // A subdirectory of the database's directory is usually on the same disk and in the same copies.
+    if resolved(remember).starts_with(&db_dir) {
+        warnings.push(format!(
+            "the remember file {} is under the database's directory, so a copy of that directory can unlock the \
+             server; keep it on another disk or set seal.remember_secret_file",
+            remember.display()
+        ));
+        return;
+    }
+    if device(remember).is_some() && device(remember) == device(database) {
+        warnings.push(format!(
+            "the remember file {} is on the same filesystem as the database, so a copy of that disk can unlock the \
+             server; keep it on another disk or set seal.remember_secret_file",
+            remember.display()
+        ));
+    }
+}
+
+fn parse_socket_mode(raw: &str) -> anyhow::Result<u32> {
+    match raw.trim_start_matches("0o") {
+        "0600" | "600" => Ok(0o600),
+        "0660" | "660" => Ok(0o660),
+        _ => bail!("unix_socket_mode must be 0600 or 0660, not {raw}"),
+    }
 }
 
 fn oidc(args: &ServerArgs, file: OidcSection) -> anyhow::Result<Option<HumanOidcConfig>> {
@@ -603,6 +750,34 @@ pub fn resolve_with(
     if !public_url.starts_with("http://") && !public_url.starts_with("https://") {
         bail!("the public URL must start with http:// or https://");
     }
+    let proxies_in_file = server.trusted_proxies.is_some();
+    let insecure_in_file = server.allow_insecure_http.is_some();
+    let allow_insecure_http = args.allow_insecure_http.or(server.allow_insecure_http).unwrap_or(false);
+    let role_in_file = auth.default_org_role.is_some();
+    let default_org_role = args
+        .default_org_role
+        .clone()
+        .or(auth.default_org_role.clone())
+        .unwrap_or_else(|| "org-member".into());
+    let oidc_lists_in_file = [
+        ("oidc.group_claims", oidc_file.group_claims.is_some()),
+        ("oidc.admin_groups", oidc_file.admin_groups.is_some()),
+        ("oidc.required_groups", oidc_file.required_groups.is_some()),
+        ("oidc.allowed_subjects", oidc_file.allowed_subjects.is_some()),
+    ];
+    let oidc_secret_file = args
+        .oidc_client_secret_file
+        .clone()
+        .or(oidc_file.client_secret_file.clone());
+    let tls_key_file = args.tls_key_file.clone().or(tls_file.key_file.clone());
+    let socket_path = args.unix_socket.clone().or(server.unix_socket.clone());
+    let socket_mode = args
+        .unix_socket_mode
+        .clone()
+        .or(server.unix_socket_mode.clone())
+        .map(|raw| parse_socket_mode(&raw))
+        .transpose()?
+        .unwrap_or(0o600);
     let trusted_proxies = match (&args.trusted_proxies, server.trusted_proxies) {
         (Some(flag), _) => flag.clone(),
         (None, Some(file)) => file
@@ -647,7 +822,7 @@ pub fn resolve_with(
     if max_auth_age.is_some_and(|age| age <= 0) {
         bail!("cli_login_max_auth_age must be a positive number of seconds");
     }
-    note(
+    let mode_origin = note(
         "seal.mode",
         "seal-mode",
         "SEKRET_SEAL_MODE",
@@ -661,13 +836,58 @@ pub fn resolve_with(
         unlock.map(|u| u.as_str().into()),
         seal.unlock.is_some(),
     );
-    note(
+    let root_key_origin = note(
         "seal.root_key_file",
         "root-key-file",
         "SEKRET_ROOT_KEY_FILE",
         shown(&root_key_file),
         seal.root_key_file.is_some(),
     );
+    let role_origin = note(
+        "auth.default_org_role",
+        "default-org-role",
+        "SEKRET_DEFAULT_ORG_ROLE",
+        Some(default_org_role.clone()),
+        role_in_file,
+    );
+    let proxies_origin = note(
+        "server.trusted_proxies",
+        "trusted-proxies",
+        "SEKRET_TRUSTED_PROXIES",
+        (!trusted_proxies.is_empty()).then(|| {
+            trusted_proxies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }),
+        proxies_in_file,
+    );
+    let insecure_origin = note(
+        "server.allow_insecure_http",
+        "allow-insecure-http",
+        "SEKRET_ALLOW_INSECURE_HTTP",
+        Some(allow_insecure_http.to_string()),
+        insecure_in_file,
+    );
+    let oidc_list_origins: Vec<(&str, Origin, bool)> = oidc_lists_in_file
+        .iter()
+        .map(|(name, in_file)| {
+            let (flag, env) = match *name {
+                "oidc.group_claims" => ("oidc-group-claims", "SEKRET_OIDC_GROUP_CLAIMS"),
+                "oidc.admin_groups" => ("oidc-admin-groups", "SEKRET_OIDC_ADMIN_GROUPS"),
+                "oidc.required_groups" => ("oidc-required-groups", "SEKRET_OIDC_REQUIRED_GROUPS"),
+                _ => ("oidc-allowed-subjects", "SEKRET_OIDC_ALLOWED_SUBJECTS"),
+            };
+            let set = match *name {
+                "oidc.group_claims" => args.oidc_group_claims.is_some(),
+                "oidc.admin_groups" => args.oidc_admin_groups.is_some(),
+                "oidc.required_groups" => args.oidc_required_groups.is_some(),
+                _ => args.oidc_allowed_subjects.is_some(),
+            };
+            (*name, sources.origin(flag, env, set || *in_file, *in_file), *in_file)
+        })
+        .collect();
     note(
         "seal.remember_file",
         "remember-file",
@@ -682,7 +902,7 @@ pub fn resolve_with(
         shown(&unlock_passphrase_file),
         seal.passphrase_file.is_some(),
     );
-    note(
+    let web_origin = note(
         "setup.web",
         "web-setup",
         "SEKRET_WEB_SETUP",
@@ -759,8 +979,14 @@ pub fn resolve_with(
             setup_file_origin,
             setup.passphrase_file.is_some(),
         ),
+        ("setup.web", web_origin, setup.web.is_some()),
+        ("seal.mode", mode_origin, seal.mode.is_some()),
+        ("seal.root_key_file", root_key_origin, seal.root_key_file.is_some()),
+        ("auth.default_org_role", role_origin, role_in_file),
+        ("server.trusted_proxies", proxies_origin, proxies_in_file),
+        ("server.allow_insecure_http", insecure_origin, insecure_in_file),
     ];
-    for (name, origin, in_file) in overrides_file {
+    for (name, origin, in_file) in overrides_file.into_iter().chain(oidc_list_origins) {
         if origin == Origin::Env && in_file {
             warnings.push(format!(
                 "{name} in the configuration file is overridden by an environment variable; check the service's \
@@ -775,44 +1001,66 @@ pub fn resolve_with(
                 .into(),
         );
     }
-    let db_file = sqlite_path(&database_url);
-    if let Some(remember) = &remember_file {
-        check_remember_file(
-            remember,
-            &[
-                ("database", db_file.as_deref()),
-                ("root key file", root_key_file.as_deref()),
-                ("unlock passphrase file", unlock_passphrase_file.as_deref()),
-                ("setup passphrase file", setup_passphrase_file.as_deref()),
-                ("remember secret file", remember_secret_file.as_deref()),
-            ],
-        )?;
-        // A subdirectory of the database's directory is usually on the same disk and in the same copies.
-        if let Some(db) = &db_file
-            && parent_dir(remember).starts_with(parent_dir(db))
-        {
-            warnings.push(format!(
-                "the remember file {} is under the database's directory, so a copy of that directory can unlock the \
-                 server; keep it on another disk or set seal.remember_secret_file",
-                remember.display()
-            ));
-        }
+    if let Some(warning) = default_role_warning(&default_org_role) {
+        warnings.push(warning);
     }
+    let db_file = sqlite_path(&database_url);
+    let db_parts = db_file.as_deref().map(|db| {
+        [
+            sibling(db, "-wal"),
+            sibling(db, "-shm"),
+            sibling(db, ".lock"),
+            sibling(db, ".epoch"),
+        ]
+    });
+    let db_part = |i: usize| db_parts.as_ref().map(|parts| parts[i].as_path());
+    check_distinct(
+        &[
+            ("remember file", remember_file.as_deref()),
+            ("setup code file", code_file.as_deref()),
+            ("setup admin token file", admin_token_file.as_deref()),
+            ("unix socket", socket_path.as_deref()),
+        ],
+        &[
+            ("database", db_file.as_deref()),
+            ("database's write-ahead log", db_part(0)),
+            ("database's shared memory file", db_part(1)),
+            ("database's lock file", db_part(2)),
+            ("database's epoch file", db_part(3)),
+            ("root key file", root_key_file.as_deref()),
+            ("unlock passphrase file", unlock_passphrase_file.as_deref()),
+            ("setup passphrase file", setup_passphrase_file.as_deref()),
+            ("remember secret file", remember_secret_file.as_deref()),
+            ("configuration file", args.store.config.as_deref()),
+            ("OIDC client secret file", oidc_secret_file.as_deref()),
+            ("TLS key file", tls_key_file.as_deref()),
+        ],
+    )?;
+    if let Some(remember) = &remember_file {
+        remember_warnings(remember, db_file.as_deref(), warnings);
+    }
+    warnings.extend(exposure_warnings(&[
+        ("root key file", root_key_file.as_deref()),
+        ("remember file", remember_file.as_deref()),
+        ("remember secret file", remember_secret_file.as_deref()),
+        ("unlock passphrase file", unlock_passphrase_file.as_deref()),
+        ("setup passphrase file", setup_passphrase_file.as_deref()),
+        ("OIDC client secret file", oidc_secret_file.as_deref()),
+        ("TLS key file", tls_key_file.as_deref()),
+    ]));
+    let epoch_files =
+        sekret_server::config::epoch_files(&database_url, remember_file.as_deref(), root_key_file.as_deref());
     let config = ServerConfig {
         listen,
         public_url: public_url.trim_end_matches('/').to_string(),
         oidc: oidc(args, oidc_file)?,
-        default_org_role: args
-            .default_org_role
-            .clone()
-            .or(auth.default_org_role)
-            .unwrap_or_else(|| "org-member".into()),
+        default_org_role,
         session_ttl: args.session_ttl.or(auth.session_ttl).unwrap_or(12 * 3600),
         cli_token_ttl: args.cli_token_ttl.or(auth.cli_token_ttl).unwrap_or(24 * 3600),
         cli_login_max_auth_age: max_auth_age,
         backup_temp_dir: args.backup_temp_dir.clone().or(backup.temp_dir),
         trusted_proxies,
-        allow_insecure_http: args.allow_insecure_http.or(server.allow_insecure_http).unwrap_or(false),
+        allow_insecure_http,
         snapshots_to_keep: args
             .snapshots_to_keep
             .or(database.snapshots_to_keep)
@@ -827,8 +1075,14 @@ pub fn resolve_with(
             remember_file,
             remember_secret: remember_secret(remember_secret_file.as_deref(), env_secrets.remember_secret.as_ref())?,
             web_setup: web_setup.unwrap_or(true),
-            setup_code_file: code_file.clone(),
+            // Filled in once the code is written.
+            setup_code_file: None,
+            epoch_files,
         },
+        unix_socket: socket_path.map(|path| UnixSocketSettings {
+            path,
+            mode: socket_mode,
+        }),
         database_url,
     };
     server_warnings(&config, &mut report.warnings);
@@ -853,17 +1107,19 @@ fn server_warnings(config: &ServerConfig, warnings: &mut Vec<String>) {
             config.public_url, config.listen
         ));
     }
-    for net in sekret_server::auth::broad_proxy_ranges(&config.trusted_proxies) {
-        let everything = net.prefix_len() == 0;
-        warnings.push(format!(
-            "trusted proxy range {net} is {}; any client in it can set its own address with X-Forwarded-For",
-            if everything {
-                "the whole internet"
-            } else {
-                "shorter than /8"
-            }
-        ));
-    }
+    warnings.extend(sekret_server::auth::proxy_range_warnings(&config.trusted_proxies));
+}
+
+/// Giving every signed-in person a powerful organisation role is almost never meant.
+fn default_role_warning(role: &str) -> Option<String> {
+    let what = match role {
+        "org-admin" => "makes everyone who can sign in an organisation admin",
+        "backup-reader" => "lets everyone who can sign in download encrypted backups of the whole database",
+        _ => return None,
+    };
+    Some(format!(
+        "auth.default_org_role is {role}, which {what}; use org-member unless that is really intended"
+    ))
 }
 
 #[cfg(test)]
@@ -1048,6 +1304,81 @@ mod tests {
             "{:?}",
             resolved.report.warnings
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remember_files_reached_through_symlinks_or_missing_folders_still_warn() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let db = dir.path().join("data").join("sekret.db");
+        std::fs::create_dir(dir.path().join("data")).context("data")?;
+        // A symlink elsewhere that leads back into the database's directory.
+        let elsewhere = tempfile::tempdir().context("elsewhere")?;
+        let link = elsewhere.path().join("keys");
+        std::os::unix::fs::symlink(dir.path().join("data"), &link).context("symlink")?;
+        let mut warnings = Vec::new();
+        remember_warnings(&link.join("not-yet").join("unlock.key"), Some(&db), &mut warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("database's directory")),
+            "{warnings:?}"
+        );
+        // On the same filesystem but outside the directory.
+        let mut warnings = Vec::new();
+        remember_warnings(&elsewhere.path().join("unlock.key"), Some(&db), &mut warnings);
+        let same_disk = device(elsewhere.path()) == device(&db);
+        assert_eq!(
+            warnings.iter().any(|w| w.contains("same filesystem")),
+            same_disk,
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relative_and_missing_paths_resolve_from_the_nearest_existing_folder() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let real = std::fs::canonicalize(dir.path()).context("canonical")?;
+        assert_eq!(resolved(&dir.path().join("a/b/c.key")), real.join("a/b/c.key"));
+        let cwd = std::env::current_dir().context("cwd")?;
+        assert_eq!(resolved(Path::new("x.key")), resolved(&cwd.join("x.key")));
+        Ok(())
+    }
+
+    #[test]
+    fn written_files_must_each_be_their_own_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let db = dir.path().join("sekret.db");
+        let url = format!("sqlite://{}?mode=rwc", db.display());
+        let wal = format!("{}-wal", db.display());
+        for clash in [db.display().to_string(), wal] {
+            let flags = args(&[
+                "--public-url",
+                "https://x",
+                "--database-url",
+                &url,
+                "--setup-code-file",
+                &clash,
+            ])?;
+            let error = resolve(&flags, FileConfig::default()).err().context("refused")?;
+            assert!(error.to_string().contains("same file"), "{error}");
+        }
+        let token = dir.path().join("token").display().to_string();
+        let flags = args(&[
+            "--public-url",
+            "https://x",
+            "--setup-code-file",
+            &token,
+            "--setup-admin-token-file",
+            &token,
+        ])?;
+        assert!(resolve(&flags, FileConfig::default()).is_err());
+        assert!(
+            default_role_warning("org-admin").is_some(),
+            "org-admin for everyone is warned about"
+        );
+        assert!(default_role_warning("backup-reader").is_some());
+        assert!(default_role_warning("org-member").is_none());
         Ok(())
     }
 

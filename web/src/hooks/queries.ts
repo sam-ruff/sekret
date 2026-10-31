@@ -15,6 +15,8 @@ import { errorMessage } from "@/lib/errors";
 
 export const keys = {
   sysStatus: ["sys-status"] as const,
+  /** Kept apart from `sysStatus` so it is dropped with everything else when the server locks. */
+  sysStatusDetail: ["sys-status-detail"] as const,
   authConfig: ["auth-config"] as const,
   me: ["me"] as const,
   projects: ["projects"] as const,
@@ -23,6 +25,9 @@ export const keys = {
   environments: (p: string) => ["project", p, "environments"] as const,
   secrets: (p: string, env: string, path: string) => ["project", p, "secrets", env, path] as const,
   secretValues: (p: string, env: string, path: string) => ["project", p, "secret-values", env, path] as const,
+  /** One value; shares the prefix of `secretValues` so refreshing a folder's values refreshes these too. */
+  secretValue: (p: string, env: string, path: string, key: string) =>
+    ["project", p, "secret-values", env, path, "key", key] as const,
   versions: (p: string, env: string, path: string, key: string) => ["project", p, "versions", env, path, key] as const,
   overview: (p: string, path: string) => ["project", p, "overview", path] as const,
   snapshots: (p: string, env: string) => ["project", p, "snapshots", env] as const,
@@ -53,11 +58,15 @@ export function useSysStatus(fresh = false) {
 /** Revealed values and history leave the cache as soon as nothing shows them. */
 export const SECRET_VALUE_GC_TIME = 0;
 
-/** Drops everything cached but the server status, so no secret outlives a sealed server. */
+/**
+ * Drops everything cached but the server status, so no secret outlives a sealed server. Mutations
+ * go too, since their variables and results can hold passphrases, values or client secrets.
+ */
 export function forgetAllButStatus(queryClient: QueryClient): void {
   const predicate = (query: Query) => query.queryKey[0] !== keys.sysStatus[0];
   void queryClient.cancelQueries({ predicate });
   queryClient.removeQueries({ predicate });
+  queryClient.getMutationCache().clear();
 }
 
 export const SEAL_WATCH_INTERVAL_MS = 15_000;
@@ -141,6 +150,8 @@ interface MutationOptions<TVars, TResult> {
   onSuccess?: (result: TResult, vars: TVars) => void;
   /** Return true to say the error was handled and needs no toast. */
   onError?: (error: unknown) => boolean | void;
+  /** How long the finished mutation, with its variables and result, stays cached once unused. */
+  gcTime?: number;
 }
 
 /** A mutation that refreshes affected queries, toasts the outcome and surfaces server messages. */
@@ -148,6 +159,7 @@ export function useApiMutation<TVars = void, TResult = unknown>(options: Mutatio
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: options.mutationFn,
+    ...(options.gcTime !== undefined && { gcTime: options.gcTime }),
     onSuccess: async (result, vars) => {
       await Promise.all((options.invalidate ?? []).map((queryKey) => queryClient.invalidateQueries({ queryKey })));
       const message = typeof options.success === "function" ? options.success(result, vars) : options.success;

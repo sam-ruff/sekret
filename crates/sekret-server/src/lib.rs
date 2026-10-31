@@ -8,6 +8,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod files;
+mod host_socket;
 pub mod human;
 pub mod images;
 pub mod jwt;
@@ -26,7 +27,7 @@ mod web;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Request, State};
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -35,6 +36,7 @@ use axum::{Json, Router};
 use sekret_core::seal::SealState;
 use sekret_store::Store;
 use serde_json::{Value, json};
+use tower_http::timeout::RequestBodyTimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::error::{ApiError, ApiResult};
@@ -71,9 +73,10 @@ async fn security_headers(State(state): State<AppState>, request: Request, next:
 }
 
 /// Paths that answer whether or not the server is sealed. Signing out and revoking a token need
-/// no root key, and should work while sealed.
-const OPEN_WHILE_SEALED: [&str; 8] = [
+/// no root key, and should work while sealed; so does an admin reading the full status.
+const OPEN_WHILE_SEALED: [&str; 9] = [
     "/api/v1/sys/status",
+    "/api/v1/sys/status/detail",
     "/api/v1/sys/init",
     "/api/v1/sys/unseal",
     "/api/v1/sys/passphrase-strength",
@@ -91,18 +94,68 @@ async fn seal_gate(State(state): State<AppState>, request: Request, next: Next) 
         return next.run(request).await;
     }
     match state.keyring.state() {
-        SealState::Unsealed => {}
-        SealState::Sealed => return ApiError::sealed().into_response(),
-        SealState::Uninitialised => return ApiError::uninitialised().into_response(),
+        SealState::Unsealed => next.run(request).await,
+        SealState::Sealed => ApiError::sealed().into_response(),
+        SealState::Uninitialised => ApiError::uninitialised().into_response(),
     }
-    // Changes outside the system routes may encrypt under the root key, so they wait while the
-    // root key is being replaced. The system routes replace it themselves.
+}
+
+/// The largest body any route accepts, read in full before a change may wait on a rotation.
+const MAX_BODY: usize = 4 * 1024 * 1024;
+/// How long a client may take to send its body.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long any request may take, and a backup, which reads and encrypts the whole database.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Changes outside the system and sign-in routes may encrypt under the root key, so they wait
+/// while it is being replaced. They only start waiting once their body has arrived and the caller
+/// is authenticated, so a slow or anonymous request cannot hold a rotation, and every writer
+/// queued behind it, up. Before writing, the database must still hold this server's root key.
+async fn write_gate(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
     let writes = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if !writes || path.starts_with("/api/v1/sys/") {
+    let exempt = path.starts_with("/api/v1/sys/") || path.starts_with("/api/v1/auth/");
+    if !writes || exempt || !path.starts_with("/api/v1/") {
         return next.run(request).await;
     }
+    let (mut parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
+        return ApiError::new(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "the request body is too large or arrived too slowly",
+        )
+        .into_response();
+    };
+    let principal = match auth::Principal::from_request_parts(&mut parts, &state).await {
+        Ok(principal) => principal,
+        Err(error) => return error.into_response(),
+    };
+    parts.extensions.insert(principal);
     let _writing = state.keyring.writing().await;
-    next.run(request).await
+    if let Err(error) = state.keyring.check_fingerprint(state.store.as_ref()).await {
+        return error.into_response();
+    }
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
+/// Ends a request that runs too long. Work that must not stop halfway runs as its own task.
+async fn request_timeout(request: Request, next: Next) -> Response {
+    let limit = match request.uri().path() {
+        "/api/v1/sys/backup" => BACKUP_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    };
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "timeout",
+            "the request took too long",
+        )
+        .into_response(),
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -125,10 +178,13 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/login", get(human::login))
         .route("/auth/callback", get(human::callback))
         .fallback(web::static_handler)
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(state.clone(), write_gate))
         .layer(TraceLayer::new_for_http())
         // Outside tracing, so a sealed server does not log every refused request as an error.
         .layer(middleware::from_fn_with_state(state.clone(), seal_gate))
+        .layer(RequestBodyTimeoutLayer::new(BODY_TIMEOUT))
+        .layer(middleware::from_fn(request_timeout))
         .layer(middleware::from_fn_with_state(state.clone(), security_headers))
         .with_state(state)
 }
@@ -208,6 +264,25 @@ pub async fn serve(state: AppState) -> Result<(), StartupError> {
     if !web::embedded() {
         tracing::warn!("this build has no web interface; build web/ before the binary to embed it");
     }
+    api::clean_stale_staging(&api::staging_base(
+        state.config.backup_temp_dir.as_deref(),
+        &state.config.database_url,
+    ));
+    if let Err(error) = auth::revoke_disallowed_users(&state).await {
+        tracing::warn!(error = %error.message, "could not check signed-in users against the sign-in lists");
+    }
+    let socket = state.config.unix_socket.clone();
+    if let Some(socket) = &socket {
+        host_socket::spawn(state.clone(), socket)?;
+    }
+    let served = serve_http(state).await;
+    if let Some(socket) = &socket {
+        host_socket::remove(&socket.path);
+    }
+    served
+}
+
+async fn serve_http(state: AppState) -> Result<(), StartupError> {
     let purge_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(600));

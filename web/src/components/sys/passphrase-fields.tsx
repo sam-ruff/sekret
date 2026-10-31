@@ -1,6 +1,6 @@
 import type { PassphraseStrength } from "@/api/types";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { SecretInput } from "@/components/secret-field";
 import { PassphraseMeter } from "./passphrase-meter";
 
 interface PassphraseFieldsProps {
@@ -32,7 +32,7 @@ export function PassphraseFields({
     <>
       <Field>
         <FieldLabel htmlFor={`${idPrefix}-passphrase`}>{label}</FieldLabel>
-        <Input
+        <SecretInput
           id={`${idPrefix}-passphrase`}
           type="password"
           autoComplete="new-password"
@@ -46,7 +46,7 @@ export function PassphraseFields({
       </Field>
       <Field data-invalid={mismatch}>
         <FieldLabel htmlFor={`${idPrefix}-confirm`}>Type it again</FieldLabel>
-        <Input
+        <SecretInput
           id={`${idPrefix}-confirm`}
           type="password"
           autoComplete="new-password"

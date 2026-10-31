@@ -7,10 +7,12 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 use utoipa::ToSchema;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::crypto::{CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_random, open, seal};
+use crate::crypto::{CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_random, key_text, open, seal};
 
 pub const MIN_PASSPHRASE_LEN: usize = 12;
 /// Longer passphrases are refused before any key derivation runs.
@@ -30,6 +32,11 @@ const BACKUP_INFO: &[u8] = b"sekret/backup/v1";
 /// Argon2 memory floor in KiB, and iteration floor, for stored parameters.
 const MIN_KDF_MEMORY: u32 = 64 * 1024;
 const MIN_KDF_ITERATIONS: u32 = 3;
+/// Ceilings for stored or backup parameters, so a crafted file cannot tie the server up for long.
+const MAX_KDF_MEMORY: u32 = 512 * 1024;
+const MAX_KDF_ITERATIONS: u32 = 10;
+const MAX_KDF_LANES: u32 = 16;
+const BOM: char = '\u{feff}';
 const SALT_LEN: usize = 16;
 const MAX_HEADER_LEN: usize = 64 * 1024;
 const SETUP_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
@@ -155,7 +162,7 @@ impl KdfParams {
     /// Parameters read from a database or a backup are bounded on both sides: a crafted file can
     /// neither exhaust memory nor make the passphrase cheap to guess.
     fn argon2(self) -> Result<Argon2<'static>, CryptoError> {
-        if self.m > 1024 * 1024 || self.t > 64 || self.p > 16 {
+        if self.m > MAX_KDF_MEMORY || self.t > MAX_KDF_ITERATIONS || self.p > MAX_KDF_LANES {
             return Err(CryptoError::Kdf);
         }
         if self.m < MIN_KDF_MEMORY || self.t < MIN_KDF_ITERATIONS {
@@ -206,9 +213,42 @@ pub fn strip_line_ending(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+/// Drops a leading byte order mark, which some editors add, then one trailing line ending. Every
+/// passphrase source goes through this: files, the environment, stdin, prompts and JSON.
+pub fn trim_input(text: &str) -> &str {
+    strip_line_ending(text.strip_prefix(BOM).unwrap_or(text))
+}
+
 /// Characters below 0x20 and DEL, which no prompt can reproduce reliably.
 pub fn has_control_characters(text: &str) -> bool {
     text.chars().any(|c| u32::from(c) < 0x20 || c == '\u{7f}')
+}
+
+/// Controls (C0, C1 and DEL), invisible format characters such as zero-width spaces, line and
+/// paragraph separators, and the non-breaking space: none can be typed back reliably.
+pub fn is_forbidden_char(c: char) -> bool {
+    c == '\u{a0}'
+        || matches!(
+            c.general_category(),
+            GeneralCategory::Control
+                | GeneralCategory::Format
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+        )
+}
+
+pub fn has_forbidden_characters(text: &str) -> bool {
+    text.chars().any(is_forbidden_char)
+}
+
+/// The NFC form, so the same passphrase typed on systems that compose accents differently opens
+/// the same wrap. NFC grows UTF-8 at most threefold, so the buffer never reallocates.
+pub fn nfc(text: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len().saturating_mul(3)));
+    for c in text.nfc() {
+        out.push(c);
+    }
+    out
 }
 
 fn refused(score: u8, warning: &str, suggestion: &str) -> PassphraseStrength {
@@ -229,13 +269,15 @@ pub fn passphrase_strength(passphrase: &str) -> PassphraseStrength {
             "Use a shorter passphrase.",
         );
     }
-    if has_control_characters(passphrase) {
+    if has_forbidden_characters(passphrase) {
         return refused(
             0,
-            "Remove tabs, line breaks and other control characters.",
+            "Remove tabs, line breaks, non-breaking spaces and other invisible characters.",
             "Use letters, digits, spaces and punctuation only.",
         );
     }
+    let passphrase = nfc(passphrase);
+    let passphrase = passphrase.as_str();
     let entropy = zxcvbn::zxcvbn(passphrase, &["sekret"]);
     let score = u8::from(entropy.score());
     let long_enough = passphrase.chars().count() >= MIN_PASSPHRASE_LEN;
@@ -296,10 +338,11 @@ pub fn wrap_root_key(root: &RootKey, passphrase: &str) -> Result<WrappedRootKey,
     wrap_root_key_with(root, passphrase, KdfParams::default())
 }
 
+/// Wraps under the NFC form of `passphrase`.
 pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -> Result<WrappedRootKey, CryptoError> {
     let mut salt = vec![0u8; SALT_LEN];
     fill_random(&mut salt)?;
-    let kek = derive_kek(passphrase, &salt, params)?;
+    let kek = derive_kek(&nfc(passphrase), &salt, params)?;
     let ciphertext = seal(&kek, root.bytes(), ROOT_KEY_AAD)?;
     Ok(WrappedRootKey {
         salt,
@@ -308,8 +351,40 @@ pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -
     })
 }
 
+/// A root key opened with a passphrase.
+pub struct Unwrapped {
+    pub root: RootKey,
+    /// The wrap was made from a passphrase as typed rather than its NFC form, so it should be
+    /// made again.
+    pub needs_rewrap: bool,
+}
+
 /// Fails with [`CryptoError::Decrypt`] when the passphrase is wrong or the wrap was altered.
 pub fn unwrap_root_key(wrapped: &WrappedRootKey, passphrase: &str) -> Result<RootKey, CryptoError> {
+    unwrap_root_key_checked(wrapped, passphrase).map(|u| u.root)
+}
+
+/// Tries the NFC form first, then the passphrase as typed, which wraps made before
+/// normalisation used.
+pub fn unwrap_root_key_checked(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Unwrapped, CryptoError> {
+    let normal = nfc(passphrase);
+    match open_with_passphrase(wrapped, &normal) {
+        Ok(root) => {
+            return Ok(Unwrapped {
+                root,
+                needs_rewrap: false,
+            });
+        }
+        Err(CryptoError::Decrypt) if normal.as_str() != passphrase => {}
+        Err(error) => return Err(error),
+    }
+    open_with_passphrase(wrapped, passphrase).map(|root| Unwrapped {
+        root,
+        needs_rewrap: true,
+    })
+}
+
+fn open_with_passphrase(wrapped: &WrappedRootKey, passphrase: &str) -> Result<RootKey, CryptoError> {
     let kek = derive_kek(passphrase, &wrapped.salt, wrapped.params)?;
     root_from_plain(&open(&kek, &wrapped.ciphertext, ROOT_KEY_AAD)?)
 }
@@ -341,7 +416,14 @@ impl DeviceKey {
     }
 
     pub fn to_base64(&self) -> Zeroizing<String> {
-        Zeroizing::new(STANDARD.encode(self.0))
+        let mut text = key_text(&self.0);
+        text.pop();
+        text
+    }
+
+    /// The key as written to the remember file: base64 and a newline.
+    pub fn to_key_file_text(&self) -> Zeroizing<String> {
+        key_text(&self.0)
     }
 
     /// Whether a file of `len` bytes could hold a device key in one of its encodings.
@@ -366,7 +448,7 @@ pub enum RememberSecretError {
 impl RememberSecret {
     /// Drops one trailing line ending, then checks length and characters.
     pub fn new(text: &str) -> Result<Self, RememberSecretError> {
-        let text = strip_line_ending(text);
+        let text = trim_input(text);
         if has_control_characters(text) {
             return Err(RememberSecretError::ControlCharacters);
         }
@@ -698,6 +780,118 @@ mod tests {
                 Some(CryptoError::Kdf)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_iterations_and_memory_are_capped() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let mut wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
+        for excessive in [
+            KdfParams { m: 65_536, t: 11, p: 1 },
+            KdfParams {
+                m: 512 * 1024 + 1,
+                t: 3,
+                p: 1,
+            },
+            KdfParams { m: 65_536, t: 3, p: 17 },
+        ] {
+            wrapped.params = excessive;
+            assert_eq!(
+                unwrap_root_key(&wrapped, "correct horse battery").err(),
+                Some(CryptoError::Kdf),
+                "{excessive:?}"
+            );
+        }
+        assert!(KdfParams::default().argon2().is_ok());
+        assert!(KdfParams { m: 65_536, t: 10, p: 1 }.argon2().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn key_file_text_is_built_without_reallocating() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let text = root.to_key_file_text();
+        assert_eq!(text.len(), 45);
+        assert_eq!(
+            text.capacity(),
+            45,
+            "sized up front, so pushing the newline never copied it"
+        );
+        assert!(text.ends_with('\n'));
+        assert_eq!(*root.to_base64(), text[..44]);
+        let device = DeviceKey::generate().context("device")?;
+        let text = device.to_key_file_text();
+        assert_eq!((text.len(), text.capacity()), (45, 45));
+        assert_eq!(
+            DeviceKey::parse(text.as_bytes()).context("parse")?.to_base64(),
+            device.to_base64()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_byte_order_mark_and_one_line_ending_are_dropped() {
+        assert_eq!(trim_input("\u{feff}violet tractor\r\n"), "violet tractor");
+        assert_eq!(trim_input("\u{feff}\u{feff}x"), "\u{feff}x", "only one");
+        assert_eq!(trim_input("x\u{feff}"), "x\u{feff}", "only a leading one");
+        assert_eq!(trim_input("plain"), "plain");
+    }
+
+    #[test]
+    fn invisible_and_separator_characters_are_refused_in_new_passphrases() {
+        for bad in [
+            "violet tractor\u{200b}sings beneath",
+            "violet tractor\u{a0}sings beneath",
+            "violet tractor\u{2028}sings beneath",
+            "violet tractor\u{2029}sings beneath",
+            "violet tractor\u{85}sings beneath",
+            "violet tractor\u{feff}sings beneath",
+            "violet tractor\u{202e}sings beneath",
+        ] {
+            assert!(has_forbidden_characters(bad), "{bad:?}");
+            assert!(!passphrase_strength(bad).acceptable, "{bad:?}");
+        }
+        assert!(!has_forbidden_characters("violet tractor sings beneath ünïcödé"));
+    }
+
+    #[test]
+    fn composed_and_decomposed_passphrases_open_the_same_wrap() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let composed = "caf\u{e9} violet tractor";
+        let decomposed = "cafe\u{301} violet tractor";
+        let wrapped = wrap_root_key_with(&root, decomposed, CHEAP).context("wrap")?;
+        let opened = unwrap_root_key_checked(&wrapped, composed).context("unwrap")?;
+        assert_eq!(opened.root.fingerprint(), root.fingerprint());
+        assert!(!opened.needs_rewrap);
+        assert_eq!(
+            passphrase_strength(composed).score,
+            passphrase_strength(decomposed).score
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wraps_made_before_normalisation_still_open_and_ask_to_be_redone() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let decomposed = "cafe\u{301} violet tractor";
+        // What an older version stored: a key derived from the passphrase exactly as typed.
+        let mut salt = vec![0u8; SALT_LEN];
+        fill_random(&mut salt).context("salt")?;
+        let kek = derive_kek(decomposed, &salt, CHEAP).context("kek")?;
+        let legacy = WrappedRootKey {
+            ciphertext: seal(&kek, root.bytes(), ROOT_KEY_AAD).context("seal")?,
+            salt,
+            params: CHEAP,
+        };
+        let opened = unwrap_root_key_checked(&legacy, decomposed).context("unwrap")?;
+        assert_eq!(opened.root.fingerprint(), root.fingerprint());
+        assert!(opened.needs_rewrap);
+        assert_eq!(
+            unwrap_root_key(&legacy, "caf\u{e9} violet tractor").err(),
+            Some(CryptoError::Decrypt),
+            "the composed form was never used for this wrap"
+        );
         Ok(())
     }
 

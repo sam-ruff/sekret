@@ -3,6 +3,7 @@ use sekret_core::crypto::{
     DataKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
 };
 use sekret_core::permissions::BuiltinRole;
+use sekret_core::seal::UnlockPolicy;
 use sekret_store::{Binding, EncryptedValue, PrincipalKind, Rekey, SealConfig, Store, UserLogin};
 
 use crate::auth::{TokenKind, TokenRequest, mint_token};
@@ -57,6 +58,23 @@ pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(Str
     Ok((minted.token.to_string(), minted.record.expires_at))
 }
 
+/// A stored configuration about to be signed again with a new key: kept as it is when its
+/// signature holds under `old_root`, otherwise reset to grant no unlock, so a database writer's
+/// change is never signed.
+pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig) -> SealConfig {
+    if crate::seal::check_signature(old_root, &config) == crate::seal::Signature::Valid {
+        return config;
+    }
+    tracing::error!(
+        "the seal configuration was changed without the root key; resetting it to the manual unlock policy"
+    );
+    SealConfig {
+        unlock_policy: UnlockPolicy::Manual,
+        remembered: None,
+        ..config
+    }
+}
+
 /// Re-encrypts each value under a fresh data key for its project, so nothing written under the
 /// old keys stays readable with them.
 fn reencrypt_values(
@@ -86,13 +104,21 @@ fn reencrypt_values(
 /// Replaces the root key: every project gets a fresh data key wrapped under `new_root`, every
 /// secret value (history included) is re-encrypted under it, machine credentials are resealed
 /// and the fingerprint recorded, all in one transaction. In passphrase mode `seal` carries the new
-/// wrap; its epoch goes up and it is signed with the new root key.
+/// wrap. Either way the stored seal configuration moves to its next epoch and is signed with the
+/// new root key, so the next start does not take the old signature for tampering.
 pub async fn rotate_root_key(
     store: &dyn Store,
     old_root: &RootKey,
     new_root: &RootKey,
     seal: Option<SealConfig>,
 ) -> ApiResult<usize> {
+    let seal = match seal {
+        Some(config) => Some(config),
+        None => store
+            .get_seal_config()
+            .await?
+            .map(|config| trusted_or_reset(old_root, config)),
+    };
     let projects = store.list_projects().await?;
     let mut rewrapped = Vec::with_capacity(projects.len());
     let mut values = Vec::new();

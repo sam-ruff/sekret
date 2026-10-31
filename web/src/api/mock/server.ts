@@ -5,6 +5,7 @@ import type {
   AuthMethodKind,
   BatchWrite,
   ChangePassphrase,
+  CliApproveRequest,
   CreateClientSecret,
   CreateEnvironment,
   CreateIdentity,
@@ -190,7 +191,8 @@ const identityQuery = (ctx: Ctx): IdentityQuery => ({
 const P = "/api/v1/projects/{project}";
 const E = `${P}/environments/{env}`;
 
-route("GET", "/api/v1/sys/status", (b) => b.sysStatus());
+route("GET", "/api/v1/sys/status", (b) => b.publicStatus());
+route("GET", "/api/v1/sys/status/detail", (b) => b.statusDetail());
 route("POST", "/api/v1/sys/init", async (b, c) => b.init(body<InitRequest>(c), await loadStrengthChecker()));
 route("POST", "/api/v1/sys/unseal", (b, c) => b.unseal(body<UnsealRequest>(c).passphrase));
 route("POST", "/api/v1/sys/passphrase-strength", async (b, c) =>
@@ -212,7 +214,8 @@ route("GET", "/api/v1/sys/backup", () => {
 });
 
 route("GET", "/api/v1/auth/config", () => ({ oidc_enabled: true, login_url: "/auth/login" }));
-route("POST", "/api/v1/auth/cli/approve", (b, c) => b.approveCli(body<{ user_code: string }>(c).user_code), 204);
+route("GET", "/api/v1/auth/cli/pending", (b, c) => b.pendingCli(qs(c, "code", "")));
+route("POST", "/api/v1/auth/cli/approve", (b, c) => b.approveCli(body<CliApproveRequest>(c).code), 204);
 route("POST", "/auth/logout", (b) => b.logout());
 route("GET", "/api/v1/me", (b) => b.me());
 
@@ -313,11 +316,19 @@ const OPEN_WHILE_SEALED = new Set([
 ]);
 const PUBLIC = new Set(["/api/v1/auth/config", ...OPEN_WHILE_SEALED]);
 
+const requestLog: string[] = [];
+
+/** Every request answered so far in this page, as `METHOD /path?query`, for tests to check what was asked for. */
+export function mockRequestLog(): string[] {
+  return [...requestLog];
+}
+
 /** Answers a request the way the real server would, against in-memory state. */
 export async function mockFetch(request: Request): Promise<Response> {
-  await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
+  requestLog.push(`${method} ${url.pathname}${url.search}`);
+  await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
   const match = routes
     .filter((r) => r.method === method)
     .map((r) => ({ r, m: url.pathname.match(r.pattern) }))

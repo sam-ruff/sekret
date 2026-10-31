@@ -5,18 +5,22 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use sekret_core::crypto::RootKey;
 use sekret_core::seal::{
-    MAX_BACKUP_LEN, SealMode, UnlockPolicy, decrypt_backup, parse_backup, strip_line_ending, unwrap_root_key,
-    validate_passphrase, wrap_root_key,
+    MAX_BACKUP_LEN, SealMode, UnlockPolicy, decrypt_backup, parse_backup, trim_input, unwrap_root_key,
+    unwrap_root_key_checked, validate_passphrase, wrap_root_key,
 };
 use sekret_server::clock::{Clock, SystemClock};
 use sekret_server::config::{SealSettings, ServerConfig};
-use sekret_server::files::{SECRET_FILE_LIMIT, can_create, read_limited, write_new_private, write_private};
+use sekret_server::files::{
+    SECRET_FILE_LIMIT, WrittenFile, can_create, read_limited, write_new_private, write_new_recorded,
+};
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
 use sekret_server::seal::{
-    AutoInit, InitPlan, Keyring, Signature, StartupSecrets, check_signature, initialise, open_keyring, signed,
+    AutoInit, InitPlan, Keyring, Signature, StartupSecrets, audit_as, check_signature, initialise, open_keyring,
+    record_epoch, signed,
 };
 use sekret_server::state::{AppState, Dependencies, build_state};
-use sekret_store::{SealConfig, SqlStore, Store};
+use sekret_store::{InstanceLock, SealConfig, SqlStore, Store};
+use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::prompt::{Prompter, Terminal, read_new_passphrase, read_passphrase};
@@ -123,18 +127,19 @@ fn state(config: ServerConfig, store: Arc<dyn Store>, keyring: Keyring) -> anyho
     }))
 }
 
-/// A passphrase file, with one trailing line ending dropped like every other source.
+/// A passphrase file, with a leading byte order mark and one trailing line ending dropped like
+/// every other source.
 fn read_passphrase_source(path: &Path) -> anyhow::Result<Zeroizing<String>> {
     let text = read_secret_bytes(path)?;
     let text = std::str::from_utf8(&text).context("the passphrase file is not UTF-8")?;
-    Ok(Zeroizing::new(strip_line_ending(text).to_string()))
+    Ok(Zeroizing::new(trim_input(text).to_string()))
 }
 
 /// The passphrase for the passphrase-file policy: the file when configured, else the value taken
 /// from the environment. A file that cannot be read leaves the server sealed instead of stopping it.
 fn unlock_passphrase(path: Option<&Path>, env: Option<Zeroizing<String>>) -> Option<Zeroizing<String>> {
     let Some(path) = path else {
-        return env.map(|value| Zeroizing::new(strip_line_ending(&value).to_string()));
+        return env.map(|value| Zeroizing::new(trim_input(&value).to_string()));
     };
     match read_passphrase_source(path) {
         Ok(passphrase) => Some(passphrase),
@@ -145,8 +150,8 @@ fn unlock_passphrase(path: Option<&Path>, env: Option<Zeroizing<String>>) -> Opt
     }
 }
 
-/// Reads only the passphrases this start can use: the unlock passphrase for the passphrase-file
-/// policy or automatic setup, and the setup passphrase only for a database without a root key.
+/// Reads only the passphrases this start can use: the unlock passphrase under the
+/// passphrase-file policy, and the setup passphrase only for a database without a root key.
 async fn startup_secrets(
     store: &dyn Store,
     seal: &SealSettings,
@@ -164,8 +169,7 @@ async fn startup_secrets(
         .unlock
         .or(stored.as_ref().map(|c| c.unlock_policy))
         .unwrap_or_default();
-    let wants_unlock = auto_init_runs || (passphrase_mode && policy == UnlockPolicy::PassphraseFile);
-    let unlock_passphrase = match wants_unlock {
+    let unlock_passphrase = match passphrase_mode && policy == UnlockPolicy::PassphraseFile {
         true => unlock_passphrase(setup.unlock_passphrase_file.as_deref(), env_unlock),
         false => {
             if env_unlock.is_some() {
@@ -219,15 +223,31 @@ fn log_report(report: &Report) {
     }
 }
 
+/// Takes the database's instance lock, or explains that something else has it.
+async fn lock(database_url: &str) -> anyhow::Result<InstanceLock> {
+    InstanceLock::acquire(database_url).await.map_err(|error| {
+        if InstanceLock::is_held_error(&error) {
+            anyhow::anyhow!("{error}")
+        } else {
+            anyhow::anyhow!("taking the database lock: {error}")
+        }
+    })
+}
+
 pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Result<()> {
     if args.print_config {
         print!("{}", settings::EXAMPLE);
         return Ok(());
     }
     let file = settings::load(args.store.config.as_deref())?;
-    let settings::Resolved { config, setup, report } =
-        settings::resolve_with(&args, file, &env_secrets, &Sources::process())?;
+    let settings::Resolved {
+        mut config,
+        setup,
+        report,
+    } = settings::resolve_with(&args, file, &env_secrets, &Sources::process())?;
     log_report(&report);
+    // Held for the life of the server, so admin commands cannot write underneath it.
+    let _lock = lock(&config.database_url).await?;
     let store: Arc<dyn Store> = Arc::new(
         SqlStore::connect(&config.database_url)
             .await
@@ -237,9 +257,9 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Re
     drop(env_secrets.remember_secret);
     let opened = open_keyring(store.as_ref(), SystemClock.now(), &config.seal, secrets).await?;
     if let Some(code) = opened.keyring.setup_code() {
-        announce_setup_code(&config, &code, setup.code_file.as_deref())?;
+        config.seal.setup_code_file = announce_setup_code(&config, &code, setup.code_file.as_deref())?;
     } else if opened.keyring.state() == sekret_core::seal::SealState::Uninitialised {
-        let message = "sekret is not set up and web setup is off; run `sekret admin init` on this host, then restart";
+        let message = "sekret is not set up and web setup is off; stop the server, run `sekret admin init` on this host, then start it";
         tracing::warn!("{message}");
         eprintln!("{message}");
     }
@@ -264,8 +284,8 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Re
 }
 
 /// The only place the setup code is shown. It goes to stderr as well as the log, so a quiet log
-/// level cannot hide it.
-fn announce_setup_code(config: &ServerConfig, code: &str, file: Option<&Path>) -> anyhow::Result<()> {
+/// level cannot hide it. Returns the code file written, so setup can remove it once used.
+fn announce_setup_code(config: &ServerConfig, code: &str, file: Option<&Path>) -> anyhow::Result<Option<WrittenFile>> {
     let where_to = format!(
         "finish setting up at {}/setup or with `sekret sys init`; a restart makes a new code",
         config.public_url
@@ -273,17 +293,23 @@ fn announce_setup_code(config: &ServerConfig, code: &str, file: Option<&Path>) -
     tracing::info!("setup code: {code}");
     tracing::info!("{where_to}");
     eprintln!("sekret setup code: {code}\n{where_to}");
-    if let Some(path) = file {
-        write_private(path, format!("{code}\n").as_bytes())
-            .with_context(|| format!("writing the setup code to {}", path.display()))?;
-    }
-    Ok(())
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let written = write_new_recorded(path, format!("{code}\n").as_bytes())
+        .with_context(|| format!("writing the setup code to {}", path.display()))?;
+    Ok(Some(written))
 }
 
 fn admin_config(database_url: &str) -> ServerConfig {
     let mut config = ServerConfig::for_tests(database_url);
     config.allow_insecure_http = false;
     config
+}
+
+/// Records what an admin command on the host did, from the address `local`.
+async fn audit_admin(store: &dyn Store, action: &str, detail: serde_json::Value) {
+    audit_as(store, SystemClock.now(), "local", "admin-cli", action, detail).await;
 }
 
 /// Warns, without changing anything, when the stored configuration fails its signature.
@@ -330,7 +356,9 @@ fn unwrap_with_passphrase(
         .clone()
         .context("passphrase mode without a wrapped root key")?;
     let passphrase = read_passphrase(passphrase_file, "Passphrase: ", prompter)?;
-    let root = unwrap_root_key(&wrapped, &passphrase).map_err(|_| anyhow::anyhow!("the passphrase is wrong"))?;
+    let root = unwrap_root_key_checked(&wrapped, &passphrase)
+        .map_err(|_| anyhow::anyhow!("the passphrase is wrong"))?
+        .root;
     Ok((root, passphrase))
 }
 
@@ -355,14 +383,21 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             ttl,
             passphrase_file,
         } => {
+            // No instance lock: this writes nothing under the root key, and it is how admin
+            // access is recovered on a server that is running.
             let location = store.locate()?;
             let sql: Arc<dyn Store> = Arc::new(connect(&location.database_url).await?);
             let (root, config, _) = obtain_root(sql.as_ref(), &location, passphrase_file.as_deref(), &prompter).await?;
             let mode = config.map_or(SealMode::KeyFile, |c| c.mode);
-            let state = state(admin_config(&location.database_url), sql, Keyring::unsealed(root, mode))?;
+            let state = state(
+                admin_config(&location.database_url),
+                sql.clone(),
+                Keyring::unsealed(root, mode),
+            )?;
             let token = sekret_server::admin::bootstrap_admin(&state, ttl)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
+            audit_admin(sql.as_ref(), "admin.bootstrap", json!({"ttl": ttl})).await;
             println!("{token}");
         }
         AdminCommand::Init {
@@ -373,6 +408,7 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             ttl,
         } => {
             let location = store.locate()?;
+            let _lock = lock(&location.database_url).await?;
             let sql: Arc<dyn Store> = Arc::new(connect(&location.database_url).await?);
             let mode = if key_file_mode {
                 SealMode::KeyFile
@@ -389,16 +425,23 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
                 unlock_policy: unlock,
                 key_file: location.root_key_file.clone(),
                 reuse_key_file: false,
+                epoch_files: location.epoch_files(),
             };
             let (root, _) = initialise(sql.as_ref(), SystemClock.now(), plan, None).await?;
             let state = state(
                 admin_config(&location.database_url),
-                sql,
+                sql.clone(),
                 Keyring::unsealed_shared(root, mode),
             )?;
             let token = sekret_server::admin::bootstrap_admin(&state, ttl)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
+            audit_admin(
+                sql.as_ref(),
+                "admin.init",
+                json!({"mode": mode.as_str(), "unlock_policy": unlock.as_str()}),
+            )
+            .await;
             eprintln!(
                 "initialised in {} mode; restart the server, then sign in with this token:",
                 mode.as_str()
@@ -414,6 +457,7 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             passphrase_file,
         } => {
             let location = store.locate()?;
+            let _lock = lock(&location.database_url).await?;
             let sql = connect(&location.database_url).await?;
             rotate(
                 &sql,
@@ -430,6 +474,7 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             passphrase_file,
         } => {
             let location = store.locate()?;
+            let _lock = lock(&location.database_url).await?;
             let sql = connect(&location.database_url).await?;
             set_seal_mode(&sql, &location, mode, passphrase_file.as_deref(), &prompter).await?;
         }
@@ -439,6 +484,7 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             passphrase_file,
             root_key_file,
         } => {
+            let _lock = lock(&database_url).await?;
             restore(
                 &backup,
                 &database_url,
@@ -476,7 +522,8 @@ async fn rotate(
             }
             validate_passphrase(&passphrase)?;
             sekret_server::check_root_key(sql, &old.fingerprint()).await?;
-            let tampered = check_signature(&old, &config) == Signature::Invalid;
+            // Only a configuration signed by the server keeps what it grants.
+            let tampered = check_signature(&old, &config) != Signature::Valid;
             warn_if_tampered(&old, Some(&config));
             (old, Some((config, passphrase, tampered)))
         }
@@ -514,6 +561,15 @@ async fn rotate(
     let count = sekret_server::admin::rotate_root_key(sql, &old, &new, seal_config)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
+    if let Some(stored) = sql.get_seal_config().await? {
+        record_epoch(&location.epoch_files(), stored.epoch, false);
+    }
+    audit_admin(
+        sql,
+        "admin.rotate_root_key",
+        json!({"projects": count, "fingerprint": new.fingerprint()}),
+    )
+    .await;
     match seal {
         Some(_) => eprintln!(
             "replaced the root key and re-encrypted the secrets of {count} projects; it is wrapped under the \
@@ -540,7 +596,7 @@ async fn set_seal_mode(
         bail!("the database is already in {} mode", mode.as_str());
     }
     let now = SystemClock.now();
-    match mode {
+    let config = match mode {
         SealMode::KeyFile => {
             let path = location
                 .root_key_file
@@ -549,11 +605,11 @@ async fn set_seal_mode(
             let empty = StoreLocation {
                 database_url: location.database_url.clone(),
                 root_key_file: None,
+                remember_file: None,
             };
             let (root, config, _) = obtain_root(sql, &empty, passphrase_file, prompter).await?;
-            let mut text = root.to_base64();
-            text.push('\n');
-            write_new_private(path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+            write_new_private(path, root.to_key_file_text().as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
             let config = config.context("no seal configuration")?;
             let config = SealConfig {
                 mode: SealMode::KeyFile,
@@ -563,11 +619,13 @@ async fn set_seal_mode(
                 updated_at: now,
                 ..config
             };
-            sql.update_seal_config(signed(&root, config)?).await?;
+            let config = signed(&root, config)?;
+            sql.update_seal_config(config.clone()).await?;
             eprintln!(
                 "now in key-file mode; start the server with --root-key-file {}",
                 path.display()
             );
+            config
         }
         SealMode::Passphrase => {
             let path = location
@@ -589,15 +647,18 @@ async fn set_seal_mode(
             };
             let config = signed(&root, config)?;
             match current {
-                Some(_) => sql.update_seal_config(config).await?,
-                None => sql.init_seal_config(config, &root.fingerprint()).await?,
+                Some(_) => sql.update_seal_config(config.clone()).await?,
+                None => sql.init_seal_config(config.clone(), &root.fingerprint()).await?,
             }
             eprintln!(
                 "now in passphrase mode; start the server without --root-key-file and unseal it, then remove {}",
                 path.display()
             );
+            config
         }
-    }
+    };
+    record_epoch(&location.epoch_files(), config.epoch, false);
+    audit_admin(sql, "admin.set_seal_mode", json!({"mode": mode.as_str()})).await;
     Ok(())
 }
 
@@ -639,6 +700,130 @@ async fn verify_restored(path: &Path, fingerprint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The temporary name a restore uses beside `target`, before the process id.
+fn restore_prefix(target: &Path) -> anyhow::Result<std::ffi::OsString> {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target.file_name().context("the target has no file name")?);
+    name.push(".restore-");
+    Ok(name)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Removes what an interrupted restore left beside `target`: staging directories and files.
+fn clean_stale_restores(target: &Path) -> anyhow::Result<()> {
+    let prefix = restore_prefix(target)?;
+    let prefix = prefix.to_string_lossy();
+    let Ok(entries) = std::fs::read_dir(parent_dir(target)) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(prefix.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(kind) if kind.is_file() => std::fs::remove_file(&path),
+            _ => continue,
+        };
+        match removed {
+            Ok(()) => eprintln!("removed {} left by an interrupted restore", path.display()),
+            Err(error) => eprintln!("could not remove {}: {error}", path.display()),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `file` is still the file at `path`.
+#[cfg(unix)]
+fn same_file(file: &std::fs::File, path: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file.metadata().context("the open file")?;
+    let named = std::fs::symlink_metadata(path).with_context(|| format!("{}", path.display()))?;
+    Ok(named.is_file() && (open.dev(), open.ino()) == (named.dev(), named.ino()))
+}
+
+#[cfg(not(unix))]
+fn same_file(_file: &std::fs::File, _path: &Path) -> anyhow::Result<bool> {
+    Ok(true)
+}
+
+/// A path that reaches an open file through its descriptor, whatever happens to its name.
+#[cfg(target_os = "linux")]
+fn fd_path(file: &std::fs::File) -> PathBuf {
+    use std::os::unix::io::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Creates `target` from an open file, never through a name someone else could swap. A hard
+/// link fails if the target appeared meanwhile, so nothing is ever overwritten.
+#[cfg(target_os = "linux")]
+fn link_open_file(file: &std::fs::File, _staged: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from = CString::new(fd_path(file).as_os_str().as_bytes()).context("descriptor path")?;
+    let to = CString::new(target.as_os_str().as_bytes()).context("target path")?;
+    // SAFETY: both arguments are NUL-terminated strings that outlive the call.
+    let linked = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if linked != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("creating {}", target.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn link_open_file(_file: &std::fs::File, staged: &Path, target: &Path) -> anyhow::Result<()> {
+    std::fs::hard_link(staged, target).with_context(|| format!("moving the database to {}", target.display()))
+}
+
+/// Writes the snapshot into a fresh owner-only directory beside the target, so nobody else can
+/// reach or swap it, checks it, confirms through the open handle that the checked file is the one
+/// written, then gives that file the target's name.
+async fn place_restored(target: &Path, snapshot: &[u8], fingerprint: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let prefix = restore_prefix(target)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir_in(parent_dir(target))
+        .context("creating a private staging directory")?;
+    let staged = staging.path().join("restored.db");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&staged)
+        .with_context(|| format!("creating {}", staged.display()))?;
+    file.write_all(snapshot).context("writing the restored database")?;
+    file.sync_all().context("syncing the restored database")?;
+    verify_restored(&staged, fingerprint).await?;
+    if !same_file(&file, &staged)? {
+        bail!(
+            "{} was replaced while it was checked; not restoring it",
+            staged.display()
+        );
+    }
+    link_open_file(&file, &staged, target)?;
+    sekret_server::files::sync_parent(target).context("syncing the directory")?;
+    Ok(())
+}
+
 async fn restore(
     backup: &Path,
     database_url: &str,
@@ -648,6 +833,7 @@ async fn restore(
 ) -> anyhow::Result<()> {
     let target =
         sqlite_path(database_url).context("restore writes a SQLite database; pass --database-url sqlite://FILE")?;
+    clean_stale_restores(&target)?;
     if target.symlink_metadata().is_ok() {
         bail!(
             "{} already exists; restore refuses to overwrite a database",
@@ -681,21 +867,14 @@ async fn restore(
         bail!("that root key does not belong to this backup");
     }
     let snapshot = decrypt_backup(&root, &parsed).context("the backup is damaged or was changed")?;
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(target.file_name().context("the target has no file name")?);
-    temp_name.push(format!(".restore-{}", std::process::id()));
-    let temp = target.with_file_name(temp_name);
-    write_new_private(&temp, &snapshot).with_context(|| format!("writing {}", temp.display()))?;
-    let placed = async {
-        verify_restored(&temp, &root.fingerprint()).await?;
-        // A hard link fails if the target appeared meanwhile, so nothing is ever overwritten.
-        std::fs::hard_link(&temp, &target).with_context(|| format!("moving the database to {}", target.display()))?;
-        sekret_server::files::sync_parent(&target).context("syncing the directory")?;
-        anyhow::Ok(())
-    }
+    place_restored(&target, &snapshot, &root.fingerprint()).await?;
+    let restored = connect(database_url).await?;
+    audit_admin(
+        &restored,
+        "admin.restore",
+        json!({"backup_created_at": parsed.header.created_at, "backup_version": parsed.header.version}),
+    )
     .await;
-    let _ = std::fs::remove_file(&temp);
-    placed?;
     eprintln!(
         "restored {} from a backup taken by sekret {}; start a server on it",
         target.display(),

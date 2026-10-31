@@ -10,6 +10,7 @@ import { ServerPage } from "./server-page";
 vi.mock("@/api/endpoints", () => ({
   api: {
     sysStatus: vi.fn(),
+    sysStatusDetail: vi.fn(),
     me: vi.fn(),
     seal: vi.fn(),
     setUnlockPolicy: vi.fn(),
@@ -51,8 +52,20 @@ const backupReader: Me = {
   org_rules: [{ effect: "allow", subject: "backups", actions: ["read"] }],
 };
 
+/** What the server shows anyone once set up. */
+const publicView = (status: SysStatus): SysStatus => ({
+  ...status,
+  seal_mode: null,
+  unlock_policy: null,
+  configured: false,
+  remembered: false,
+  unsealed_by: null,
+});
+
+/** `status` is the detail an admin may read; the public status carries only the state. */
 function renderServer(status: SysStatus = unlocked, me: Me = admin) {
-  mocked.sysStatus.mockResolvedValue(status);
+  mocked.sysStatus.mockResolvedValue(publicView(status));
+  mocked.sysStatusDetail.mockResolvedValue(status);
   mocked.me.mockResolvedValue(me);
   return renderWithProviders(<ServerPage />);
 }
@@ -93,6 +106,54 @@ describe("ServerPage", () => {
     expect(screen.queryByTestId("seal-now")).toBeNull();
     expect(screen.queryByTestId("server-unlock-policy")).toBeNull();
     expect(screen.queryByTestId("server-passphrase")).toBeNull();
+    // Backup readers get only the public status: no admin-only detail is asked for or shown.
+    expect(mocked.sysStatusDetail).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("server-unsealed-by")).toBeNull();
+    expect(screen.queryByTestId("server-mode")).toBeNull();
+    expect(screen.getByTestId("server-backup")).toHaveTextContent(
+      "Restoring it needs the passphrase or root key file that was in use when it was made.",
+    );
+  });
+
+  it("reads how the server was unlocked from the admin detail, not the public status", async () => {
+    renderServer({ ...unlocked, unlock_policy: "remember", remembered: true, unsealed_by: "remember" });
+    expect(await screen.findByTestId("server-unsealed-by")).toHaveTextContent("Remembered unlock");
+    expect(screen.getByTestId("server-remembered")).toHaveTextContent("Remembered: yes");
+    expect(mocked.sysStatusDetail).toHaveBeenCalled();
+  });
+
+  it("shows an error when the admin detail cannot be read", async () => {
+    mocked.sysStatus.mockResolvedValue(publicView(unlocked));
+    mocked.sysStatusDetail.mockRejectedValue(new ApiError("You do not have permission to do that.", 403, "forbidden"));
+    mocked.me.mockResolvedValue(admin);
+    renderWithProviders(<ServerPage />);
+    expect(await screen.findByTestId("error-state")).toHaveTextContent("You do not have permission to do that.");
+  });
+
+  it("forgets the policy passphrase from the mutation cache once saved", async () => {
+    mocked.setUnlockPolicy.mockResolvedValue({ ...unlocked, unlock_policy: "remember", remembered: true });
+    const { client } = renderServer();
+    await userEvent.click(await screen.findByTestId("server-policy-card-remember"));
+    await userEvent.click(screen.getByTestId("policy-save"));
+    const dialog = await screen.findByTestId("policy-dialog");
+    await userEvent.type(within(dialog).getByTestId("policy-passphrase"), "the right one");
+    await userEvent.click(within(dialog).getByTestId("confirm-action"));
+    await waitFor(() => expect(screen.queryByTestId("policy-dialog")).toBeNull());
+    await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
+  });
+
+  it("marks every passphrase field as a secret for spellcheckers and writing assistants", async () => {
+    renderServer();
+    await screen.findByTestId("current-passphrase");
+    for (const id of ["current-passphrase", "change-passphrase", "change-confirm"]) {
+      const field = screen.getByTestId(id);
+      expect(field).toHaveAttribute("spellcheck", "false");
+      expect(field).toHaveAttribute("data-gramm", "false");
+      expect(field).toHaveAttribute("autocorrect", "off");
+      expect(field).toHaveAttribute("autocapitalize", "off");
+    }
+    expect(screen.getByTestId("current-passphrase")).toHaveAttribute("autocomplete", "current-password");
+    expect(screen.getByTestId("change-passphrase")).toHaveAttribute("autocomplete", "new-password");
   });
 
   it("asks for the current passphrase before switching to remember", async () => {

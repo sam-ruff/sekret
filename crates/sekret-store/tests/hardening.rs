@@ -149,6 +149,91 @@ async fn the_database_and_its_wal_are_owner_only() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn only_one_process_holds_a_database_at_a_time() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let database = url(dir.path());
+    let held = InstanceLock::acquire(&database).await.context("first")?;
+    let refused = InstanceLock::acquire(&database).await;
+    assert!(refused.as_ref().is_err_and(InstanceLock::is_held_error), "{refused:?}");
+    drop(held);
+    InstanceLock::acquire(&database).await.context("after release")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(lock_file(&dir.path().join("sekret.db")))
+            .context("lock file")?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert!(matches!(
+        InstanceLock::acquire("sqlite::memory:").await,
+        Ok(InstanceLock::Private)
+    ));
+    Ok(())
+}
+
+/// Before the fix, a custom role at the built-in slug stayed there when `backup-reader-custom`
+/// was already taken, silently shadowed by the built-in role.
+#[tokio::test]
+async fn a_custom_backup_reader_role_moves_to_a_free_slug_whatever_is_taken() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let database = url(dir.path());
+    let store = SqlStore::connect(&database).await.context("store")?;
+    for (id, slug) in [
+        ("r1", "backup-reader-custom"),
+        ("r2", "backup-reader-custom-2"),
+        ("r3", "backup-reader"),
+    ] {
+        store
+            .upsert_role(Role {
+                id: id.into(),
+                project_id: String::new(),
+                slug: slug.into(),
+                name: slug.into(),
+                description: String::new(),
+                rules: vec![],
+                created_at: 1,
+            })
+            .await
+            .context("role")?;
+    }
+    store
+        .add_org_binding(Binding {
+            principal_kind: PrincipalKind::User,
+            principal_id: "u1".into(),
+            role_slug: "backup-reader".into(),
+            created_at: 1,
+        })
+        .await
+        .context("binding")?;
+    drop(store);
+    let store = SqlStore::connect(&database).await.context("restart")?;
+    let mut slugs: Vec<String> = store
+        .list_roles("")
+        .await
+        .context("roles")?
+        .into_iter()
+        .map(|r| r.slug)
+        .collect();
+    slugs.sort();
+    assert_eq!(
+        slugs,
+        vec![
+            "backup-reader-custom",
+            "backup-reader-custom-2",
+            "backup-reader-custom-3"
+        ]
+    );
+    let bindings = store.list_org_bindings().await.context("bindings")?;
+    assert_eq!(
+        bindings.iter().map(|b| b.role_slug.as_str()).collect::<Vec<_>>(),
+        vec!["backup-reader-custom-3"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_custom_backup_reader_role_is_renamed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("dir")?;
     let migrations = dir.path().join("migrations");

@@ -2,6 +2,7 @@ import { LockKeyhole } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { REDACTED_CREDENTIAL, type KubernetesAuthConfig, type KubernetesMode } from "@/api/types";
 import { ListInput } from "@/components/list-input";
+import { SecretInput } from "@/components/secret-field";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -60,11 +61,9 @@ function ReviewerTokenField({ value, hadStored, disabled, onChange }: ReviewerTo
         </div>
       ) : (
         <div className="flex gap-2">
-          <Input
+          <SecretInput
             id="k8s-reviewer-jwt"
             type="password"
-            autoComplete="off"
-            spellCheck={false}
             value={value.value}
             disabled={disabled}
             placeholder={hadStored ? "Paste a new token, or leave empty to remove it" : "eyJhbGciOi..."}

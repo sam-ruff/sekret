@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, LockKeyhole, LockOpen, Timer } from "lucide-react";
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import { PassphraseAccountField } from "@/components/sys/passphrase-fields";
@@ -9,17 +9,15 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { SecretInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
-import { keys, useSysStatus } from "@/hooks/queries";
+import { keys } from "@/hooks/queries";
 import { useCountdown } from "@/hooks/use-countdown";
 import { backoffSeconds, errorMessage } from "@/lib/errors";
-import { unlockPolicyLine } from "@/lib/sys-gate";
 
 const INPUT_ERROR_ID = "unlock-passphrase-error";
 
 export function UnlockPage() {
-  const { data: status } = useSysStatus();
   const queryClient = useQueryClient();
   const input = useRef<HTMLInputElement>(null);
   const [passphrase, setPassphrase] = useState("");
@@ -29,7 +27,9 @@ export function UnlockPage() {
 
   const unseal = useMutation({
     mutationFn: () => api.unseal(passphrase),
+    gcTime: 0,
     onSuccess: async (next) => {
+      setPassphrase("");
       // Anything that failed while sealed is fetched again; the status gate then returns to where the user was going.
       await queryClient.invalidateQueries({ predicate: (query) => query.queryKey[0] !== keys.sysStatus[0] });
       queryClient.setQueryData(keys.sysStatus, next);
@@ -41,6 +41,11 @@ export function UnlockPage() {
     },
   });
 
+  const { isSuccess: unlocked, reset: resetUnseal } = unseal;
+  useEffect(() => {
+    if (unlocked) resetUnseal();
+  }, [unlocked, resetUnseal]);
+
   const error = unseal.error instanceof ApiError ? unseal.error : null;
   const wrong = error?.code === "invalid_passphrase";
   const backingOff = error?.code === "passphrase_backoff";
@@ -48,7 +53,6 @@ export function UnlockPage() {
   const limited = error?.status === 429 && !backingOff && !busy;
   const otherError = unseal.error && !wrong && error?.status !== 429 ? unseal.error : null;
   const waiting = backingOff && waitSeconds > 0;
-  const policyLine = status ? unlockPolicyLine(status) : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -76,7 +80,7 @@ export function UnlockPage() {
             <PassphraseAccountField />
             <Field data-invalid={!!inputError}>
               <FieldLabel htmlFor="unlock-passphrase">Passphrase</FieldLabel>
-              <Input
+              <SecretInput
                 ref={input}
                 id="unlock-passphrase"
                 type="password"
@@ -130,11 +134,6 @@ export function UnlockPage() {
                 <AlertTitle>Unlocking failed</AlertTitle>
                 <AlertDescription>{errorMessage(otherError)}</AlertDescription>
               </Alert>
-            )}
-            {policyLine && (
-              <p className="text-sm text-muted-foreground" data-testid="unlock-policy">
-                {policyLine}
-              </p>
             )}
           </CardContent>
           <CardFooter className="mt-6">

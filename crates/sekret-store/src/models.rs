@@ -339,6 +339,9 @@ pub struct CliLogin {
     pub expires_at: i64,
     pub approved_user_id: Option<String>,
     pub consumed: bool,
+    /// The client address that started the login.
+    pub requested_from_ip: String,
+    pub user_agent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -48,7 +48,12 @@ test("creates an identity and configures every auth method", async ({ page }) =>
   await page.getByTestId("client-secret-create").click();
   const once = page.getByTestId("client-secret-once-dialog");
   await expect(once).toContainText("You will not see this secret again");
-  await expect(once.getByTestId("client-secret-value")).toContainText("sks_");
+  const value = once.getByTestId("client-secret-value");
+  await expect(value).toHaveValue(/^sks_/);
+  // Shown in a field writing assistants and spellcheckers are told to leave alone.
+  await expect(value).toHaveAttribute("spellcheck", "false");
+  await expect(value).toHaveAttribute("data-gramm", "false");
+  await expect(value).toHaveAttribute("readonly", "");
   await once.getByTestId("client-secret-done").click();
   await expect(universal.getByTestId("client-secrets")).toContainText("CI runner");
 
@@ -83,6 +88,8 @@ test("keeps, replaces and clears a stored Kubernetes reviewer token", async ({ p
 
   // Replacing with a new token stores it without echoing it back.
   await k8s.getByTestId("k8s-reviewer-jwt-replace").click();
+  await expect(k8s.getByTestId("k8s-reviewer-jwt")).toHaveAttribute("data-gramm", "false");
+  await expect(k8s.getByTestId("k8s-reviewer-jwt")).toHaveAttribute("autocomplete", "off");
   await k8s.getByTestId("k8s-reviewer-jwt").fill("eyJhbGciOiJSUzI1NiJ9.rotated.sig");
   await k8s.getByTestId("k8s-save").click();
   await expect(k8s.getByTestId("k8s-reviewer-jwt-stored")).toBeVisible();

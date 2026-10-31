@@ -262,6 +262,49 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
     )?;
     assert_eq!(status.status.code(), Some(3));
 
+    // The child gets the secrets but never the credentials, and no secret can redirect it.
+    ok(run(
+        &[
+            "secrets",
+            "set",
+            "HTTPS_PROXY=http://evil.test:3128",
+            "SEKRET_URL=https://evil.test",
+        ],
+        &env,
+        h,
+        None,
+    )?)?;
+    let leak_env = [
+        ("SEKRET_CLIENT_SECRET", "sks_client"),
+        ("SEKRET_UNLOCK_PASSPHRASE", "violet tractor sings beneath"),
+        ("SEKRET_REMEMBER_SECRET", "a remember secret of at least 32 chars"),
+    ];
+    let mut with_leaks = env.to_vec();
+    with_leaks.extend_from_slice(&leak_env);
+    let child = run(
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "test -z \"${SEKRET_TOKEN-}${SEKRET_CLIENT_SECRET-}${SEKRET_UNLOCK_PASSPHRASE-}${SEKRET_REMEMBER_SECRET-}\" \
+             && test -z \"${HTTPS_PROXY-}\" && test \"$SEKRET_URL\" != https://evil.test && exit 4",
+        ],
+        &with_leaks,
+        h,
+        None,
+    )?;
+    assert_eq!(
+        child.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stderr).contains("HTTPS_PROXY"));
+    let dotenv = ok(run(&["export"], &env, h, None)?)?;
+    assert!(dotenv.contains("DB_URL") && !dotenv.contains("HTTPS_PROXY") && !dotenv.contains("evil.test"));
+    ok(run(&["secrets", "delete", "HTTPS_PROXY", "SEKRET_URL"], &env, h, None)?)?;
+
     ok(run(
         &["secrets", "set", "DB_URL=postgres://three", "EXTRA=added-later"],
         &env,
@@ -342,7 +385,18 @@ async fn machine_login_saves_and_uses_a_token(mode: Mode) -> anyhow::Result<()> 
     .context("project file")?;
     let secret_value = secret["client_secret"].as_str().context("secret")?;
     let login_env = [("SEKRET_CLIENT_SECRET", secret_value)];
-    ok(run(&["login", "--client-id", &id], &login_env, h, None)?)?;
+    let unconfirmed = run(&["login", "--client-id", &id], &login_env, h, None)?;
+    assert!(
+        !unconfirmed.status.success(),
+        "a client secret is not sent to a server only the project file names"
+    );
+    assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("no credential is sent"));
+    ok(run(
+        &["login", "--client-id", &id, "--server", &server.url],
+        &login_env,
+        h,
+        None,
+    )?)?;
     let saved = std::fs::read_to_string(h.join("config/sekret/credentials.toml")).context("credentials")?;
     assert!(saved.contains(&server.url));
 

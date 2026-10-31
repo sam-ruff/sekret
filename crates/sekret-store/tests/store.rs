@@ -414,9 +414,20 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
             expires_at: 100,
             approved_user_id: None,
             consumed: false,
+            requested_from_ip: "203.0.113.9".into(),
+            user_agent: "sekret/1.0".into(),
         })
         .await
         .context("cli")?;
+    let pending = store
+        .get_cli_login("ABCD-EFGH", 2)
+        .await
+        .context("pending")?
+        .context("found")?;
+    assert_eq!(
+        (pending.requested_from_ip.as_str(), pending.user_agent.as_str()),
+        ("203.0.113.9", "sekret/1.0")
+    );
     assert_eq!(store.poll_cli_login("dc", 2).await.context("poll")?, CliPoll::Pending);
     assert!(
         store
@@ -741,5 +752,16 @@ async fn postgres_store() -> anyhow::Result<()> {
         store.snapshot_to("/tmp/never-written.db", seal_config(None)).await,
         Err(StoreError::Unsupported(_))
     ));
+    // One server or admin command per database, through an advisory lock.
+    let held = InstanceLock::acquire(&url).await.context("lock")?;
+    assert!(
+        InstanceLock::acquire(&url)
+            .await
+            .is_err_and(|e| InstanceLock::is_held_error(&e))
+    );
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let again = InstanceLock::acquire(&url).await.context("lock after release")?;
+    drop(again);
     exercise(store).await
 }

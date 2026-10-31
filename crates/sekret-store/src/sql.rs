@@ -251,6 +251,8 @@ fn cli_login_from(row: &AnyRow) -> StoreResult<CliLogin> {
         expires_at: row.try_get("expires_at")?,
         approved_user_id: row.try_get("approved_user_id")?,
         consumed: get_flag(row, "consumed")?,
+        requested_from_ip: row.try_get("requested_from_ip")?,
+        user_agent: row.try_get("user_agent")?,
     })
 }
 
@@ -490,7 +492,7 @@ fn tighten(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Custom organisation roles that migration 0006 renames; zero on a fresh or already migrated database.
+/// Custom organisation roles called backup-reader before migrating; zero on a fresh or migrated database.
 async fn custom_backup_reader_roles(pool: &AnyPool) -> i64 {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM roles WHERE project_id = '' AND slug = 'backup-reader'")
         .fetch_one(pool)
@@ -531,14 +533,17 @@ impl SqlStore {
                 Box::pin(async move {
                     // Overwrites freed pages, so an old seal configuration does not linger in the file.
                     if !postgres {
-                        sqlx::query("PRAGMA secure_delete = ON").execute(conn).await?;
+                        sqlx::query("PRAGMA secure_delete = ON").execute(&mut *conn).await?;
+                        // A checkpoint then shrinks the write-ahead log to nothing rather than
+                        // leaving old pages in a file that is merely reused.
+                        sqlx::query("PRAGMA journal_size_limit = 0").execute(&mut *conn).await?;
                     }
                     Ok(())
                 })
             })
             .connect(url)
             .await?;
-        let renamed = custom_backup_reader_roles(&pool).await;
+        let before = custom_backup_reader_roles(&pool).await;
         if postgres {
             sqlx::migrate!("./migrations/postgres").run(&pool).await?;
         } else {
@@ -547,7 +552,15 @@ impl SqlStore {
             }
             sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
         }
-        if renamed > 0 {
+        let store = Self { pool, postgres };
+        // Migration 0006 renames it when backup-reader-custom is free; this covers the rest.
+        if let Some(slug) = store.rename_custom_role("backup-reader").await? {
+            tracing::warn!(
+                slug,
+                "a custom organisation role used the slug backup-reader, which is now built in; \
+                 it was renamed along with its bindings"
+            );
+        } else if before > 0 {
             tracing::warn!(
                 "a custom organisation role used the slug backup-reader, which is now built in; \
                  it was renamed to backup-reader-custom along with its bindings"
@@ -558,7 +571,69 @@ impl SqlStore {
                 tighten(&sibling(path, suffix)).map_err(|e| StoreError::Database(e.to_string()))?;
             }
         }
-        Ok(Self { pool, postgres })
+        Ok(store)
+    }
+
+    /// Moves a custom organisation role off a slug that is now built in, to the first free of
+    /// `<slug>-custom`, `<slug>-custom-2` and so on, with its bindings. Returns the new slug
+    /// when anything changed.
+    async fn rename_custom_role(&self, slug: &str) -> StoreResult<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query("SELECT 1 FROM roles WHERE project_id = '' AND slug = $1")
+            .bind(slug)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let mut target = format!("{slug}-custom");
+        for n in 2.. {
+            let taken = sqlx::query("SELECT 1 FROM roles WHERE project_id = '' AND slug = $1")
+                .bind(&target)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            if !taken {
+                break;
+            }
+            target = format!("{slug}-custom-{n}");
+        }
+        sqlx::query("UPDATE org_bindings SET role_slug = $1 WHERE role_slug = $2")
+            .bind(&target)
+            .bind(slug)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE roles SET slug = $1 WHERE project_id = '' AND slug = $2")
+            .bind(&target)
+            .bind(slug)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(target))
+    }
+
+    /// Folds the write-ahead log back into the database and truncates it, so pages holding a
+    /// replaced key or value do not linger beside the database. Postgres keeps its own log; see
+    /// the security docs for what that means.
+    async fn scrub_log(&self) {
+        if self.postgres {
+            return;
+        }
+        for _ in 0..5 {
+            match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.pool)
+                .await
+            {
+                Ok(row) if row.try_get::<i64, _>(0).unwrap_or(1) == 0 => return,
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                Err(error) => {
+                    tracing::warn!(%error, "could not checkpoint the write-ahead log");
+                    return;
+                }
+            }
+        }
+        tracing::warn!("the write-ahead log is busy, so old pages stay in it until the next checkpoint");
     }
 
     pub async fn ping(&self) -> StoreResult<()> {
@@ -623,6 +698,7 @@ impl Store for SqlStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.scrub_log().await;
         Ok(())
     }
 
@@ -631,6 +707,7 @@ impl Store for SqlStore {
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound);
         }
+        self.scrub_log().await;
         Ok(())
     }
 
@@ -1283,6 +1360,7 @@ impl Store for SqlStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.scrub_log().await;
         Ok(())
     }
 
@@ -1823,8 +1901,8 @@ impl Store for SqlStore {
 
     async fn create_cli_login(&self, login: CliLogin) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO cli_logins (device_code_hash, user_code, created_at, expires_at, approved_user_id, consumed) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO cli_logins (device_code_hash, user_code, created_at, expires_at, approved_user_id, consumed, \
+             requested_from_ip, user_agent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(&login.device_code_hash)
         .bind(&login.user_code)
@@ -1832,6 +1910,8 @@ impl Store for SqlStore {
         .bind(login.expires_at)
         .bind(login.approved_user_id.clone())
         .bind(flag(login.consumed))
+        .bind(&login.requested_from_ip)
+        .bind(&login.user_agent)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -2,13 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use sekret_api::SysStatus;
 use sekret_core::crypto::{CryptoError, RootKey};
 use sekret_core::seal::{
     DeviceKey, MAX_PASSPHRASE_BYTES, PassphraseError, SealBinding, SealMode, SealState, UnlockPolicy, UnsealedBy,
-    WrappedRootKey, generate_setup_code, recall_root_key, remember_root_key, seal_config_mac, setup_code_matches,
-    unwrap_root_key, validate_passphrase, verify_seal_config, wrap_root_key,
+    Unwrapped, WrappedRootKey, generate_setup_code, recall_root_key, remember_root_key, seal_config_mac,
+    setup_code_matches, unwrap_root_key_checked, validate_passphrase, verify_seal_config, wrap_root_key,
 };
 use sekret_store::{AuditEntry, SealConfig, Store, StoreError};
 use tokio::sync::{OwnedSemaphorePermit, RwLockReadGuard, RwLockWriteGuard, Semaphore};
@@ -16,11 +17,15 @@ use zeroize::Zeroizing;
 
 use crate::config::SealSettings;
 use crate::error::{ApiError, ApiResult};
-use crate::files::{SECRET_FILE_LIMIT, read_limited, read_private, remove_device_key_file, write_new_private};
+use crate::files::{
+    SECRET_FILE_LIMIT, read_epoch, read_limited, read_private, remove_device_key_file, write_epoch, write_new_private,
+};
 use crate::{ROOT_KEY_META, StartupError, check_root_key};
 
 /// Shown as the address of audit entries written by the server itself.
 const LOCAL: &str = "local";
+/// How long replacing the root key waits for changes already being written.
+const REKEY_WAIT: Duration = Duration::from_secs(30);
 
 struct Slot {
     root: Option<Arc<RootKey>>,
@@ -37,7 +42,7 @@ struct Slot {
 /// error otherwise.
 pub struct Keyring {
     slot: RwLock<Slot>,
-    /// Serialises setup, unlocking and changes to the seal configuration.
+    /// Serialises setup, unlocking, sealing and changes to the seal configuration.
     gate: tokio::sync::Mutex<()>,
     /// One Argon2 derivation at a time. The permit moves into the blocking task, so a cancelled
     /// request cannot let another derivation start while its own still runs.
@@ -107,13 +112,12 @@ impl Keyring {
         Ok(f(&slot))
     }
 
-    fn write(&self, f: impl FnOnce(&mut Slot)) -> ApiResult<()> {
+    fn write<T>(&self, f: impl FnOnce(&mut Slot) -> T) -> ApiResult<T> {
         let mut slot = self
             .slot
             .write()
             .map_err(|_| ApiError::internal("keyring", "lock poisoned"))?;
-        f(&mut slot);
-        Ok(())
+        Ok(f(&mut slot))
     }
 
     /// The root key, or 503 while sealed or uninitialised.
@@ -186,12 +190,19 @@ impl Keyring {
         })
     }
 
-    fn replace_root(&self, root: Arc<RootKey>) -> ApiResult<()> {
-        self.write(|slot| slot.root = Some(root))
+    /// Swaps in a new root key, but only while unsealed: a seal that got in first stays sealed.
+    fn replace_root(&self, root: Arc<RootKey>) -> ApiResult<bool> {
+        self.write(|slot| {
+            if slot.root.is_none() {
+                return false;
+            }
+            slot.root = Some(root);
+            true
+        })
     }
 
     /// Drops the root key from memory. Other holders of the `Arc` finish their request first.
-    fn seal(&self) -> ApiResult<()> {
+    fn drop_root(&self) -> ApiResult<()> {
         self.write(|slot| {
             slot.root = None;
             slot.unsealed_by = None;
@@ -207,13 +218,36 @@ impl Keyring {
         self.kdf.clone().try_acquire_owned().map_err(|_| ApiError::kdf_busy())
     }
 
+    /// A permit to run one key derivation, waiting for the one running to finish.
+    pub async fn kdf_permit_queued(&self) -> ApiResult<OwnedSemaphorePermit> {
+        self.kdf
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal("keyring", "derivation permits closed"))
+    }
+
     /// Held while writing anything encrypted under the root key or a project's data key.
     pub async fn writing(&self) -> RwLockReadGuard<'_, ()> {
         self.rekey.read().await
     }
 
-    async fn rekeying(&self) -> RwLockWriteGuard<'_, ()> {
-        self.rekey.write().await
+    /// Waits for writes in progress, but not forever: a stuck request fails the rotation cleanly
+    /// rather than holding every other writer up behind it.
+    async fn rekeying(&self) -> ApiResult<RwLockWriteGuard<'_, ()>> {
+        tokio::time::timeout(REKEY_WAIT, self.rekey.write())
+            .await
+            .map_err(|_| ApiError::rekey_busy())
+    }
+
+    /// Refuses when the database's root key is not the one in memory, as after the key was
+    /// rotated on the host while this server ran. Checked before writing under the root key.
+    pub async fn check_fingerprint(&self, store: &dyn Store) -> ApiResult<()> {
+        let root = self.root()?;
+        match store.get_meta(ROOT_KEY_META).await? {
+            Some(stored) if stored == root.fingerprint() => Ok(()),
+            _ => Err(ApiError::root_key_changed()),
+        }
     }
 }
 
@@ -222,6 +256,25 @@ pub fn effective_policy(settings: &SealSettings, keyring: &Keyring) -> UnlockPol
     settings.unlock.unwrap_or_else(|| keyring.stored_policy())
 }
 
+/// What anyone may see: the state, and before setup what configuration has already decided.
+pub fn public_status(settings: &SealSettings, keyring: &Keyring) -> SysStatus {
+    let state = keyring.state();
+    if state == SealState::Uninitialised {
+        return status(settings, keyring);
+    }
+    SysStatus {
+        state,
+        seal_mode: None,
+        unlock_policy: None,
+        configured: false,
+        remembered: false,
+        unsealed_by: None,
+        web_setup: settings.web_setup,
+        version: sekret_core::VERSION.to_string(),
+    }
+}
+
+/// Everything, for organisation admins.
 pub fn status(settings: &SealSettings, keyring: &Keyring) -> SysStatus {
     let state = keyring.state();
     if state == SealState::Uninitialised {
@@ -278,14 +331,25 @@ pub fn signed(root: &RootKey, mut config: SealConfig) -> Result<SealConfig, Cryp
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signature {
     Valid,
-    /// Written before configurations were signed.
+    /// Written before configurations were signed, and grants no unlock without a person.
     Missing,
     /// Changed by something that did not hold the root key.
     Invalid,
 }
 
+/// Whether a configuration lets the server unlock without a person: a remembered wrap or a
+/// policy other than `manual`.
+fn grants_unlock(config: &SealConfig) -> bool {
+    config.unlock_policy != UnlockPolicy::Manual || config.remembered.is_some()
+}
+
+/// A missing signature is only accepted from a configuration that grants nothing; otherwise
+/// clearing the signature would launder whatever a database writer put there.
 pub fn check_signature(root: &RootKey, config: &SealConfig) -> Signature {
     let Some(mac) = &config.mac else {
+        if grants_unlock(config) {
+            return Signature::Invalid;
+        }
         return Signature::Missing;
     };
     let fingerprint = root.fingerprint();
@@ -295,22 +359,61 @@ pub fn check_signature(root: &RootKey, config: &SealConfig) -> Signature {
     }
 }
 
-/// Signs and stores a changed configuration.
-async fn save(store: &dyn Store, root: &RootKey, now: i64, mut config: SealConfig) -> ApiResult<SealConfig> {
+/// The highest seal configuration epoch recorded outside the database.
+pub fn high_water(paths: &[PathBuf]) -> Option<i64> {
+    paths
+        .iter()
+        .filter_map(|path| match read_epoch(path) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "ignoring an unreadable seal epoch file");
+                None
+            }
+        })
+        .max()
+}
+
+/// Records `epoch` as the high-water mark beside each file. Marks are only raised, except when
+/// `reset`, which a fresh setup uses so files left by an older install do not count against it.
+pub fn record_epoch(paths: &[PathBuf], epoch: i64, reset: bool) {
+    for path in paths {
+        if !reset && matches!(read_epoch(path), Ok(Some(existing)) if existing >= epoch) {
+            continue;
+        }
+        if let Err(error) = write_epoch(path, epoch) {
+            tracing::warn!(%error, path = %path.display(), "could not record the seal configuration epoch");
+        }
+    }
+}
+
+/// Signs and stores a changed configuration, and raises the epoch marks.
+async fn save(
+    store: &dyn Store,
+    settings: &SealSettings,
+    root: &RootKey,
+    now: i64,
+    mut config: SealConfig,
+) -> ApiResult<SealConfig> {
     config.updated_at = now;
     let config = signed(root, config)?;
     store.update_seal_config(config.clone()).await?;
+    record_epoch(&settings.epoch_files, config.epoch, false);
     Ok(config)
 }
 
 /// Writes an audit entry for something the server did on its own behalf.
 pub async fn audit_system(store: &dyn Store, now: i64, ip: &str, action: &str, detail: serde_json::Value) {
+    audit_as(store, now, ip, "system", action, detail).await;
+}
+
+/// Writes an audit entry under a named system actor, such as `remember` for an unlock at start.
+pub async fn audit_as(store: &dyn Store, now: i64, ip: &str, actor: &str, action: &str, detail: serde_json::Value) {
     let entry = AuditEntry {
         id: uuid::Uuid::now_v7().to_string(),
         created_at: now,
         actor_kind: "identity".into(),
-        actor_id: "system".into(),
-        actor_name: "identity:system".into(),
+        actor_id: actor.into(),
+        actor_name: format!("identity:{actor}"),
         action: action.to_string(),
         project_id: None,
         environment: None,
@@ -330,10 +433,10 @@ pub struct Checked {
     pub tampered: bool,
 }
 
-/// Verifies the seal configuration once the root key is known. An unsigned one, from before
-/// signing existed, is signed now. One whose signature fails was changed by a database writer:
-/// it falls back to the `manual` policy with nothing remembered, is signed again and audited as
-/// `sys.seal_config.tampered`.
+/// Verifies the seal configuration once the root key is known. An unsigned one that grants
+/// nothing, from before signing existed, is signed now. One whose signature fails, or that is
+/// older than the epoch recorded outside the database, was changed by a database writer: it falls
+/// back to the `manual` policy with nothing remembered, is signed again and audited.
 pub async fn check_config(
     store: &dyn Store,
     settings: &SealSettings,
@@ -342,32 +445,41 @@ pub async fn check_config(
     root: &RootKey,
     mut config: SealConfig,
 ) -> ApiResult<Checked> {
-    match check_signature(root, &config) {
-        Signature::Valid => Ok(Checked {
-            config,
-            tampered: false,
-        }),
-        Signature::Missing => {
-            // Only the server writes a remembered wrap, so one being there shows remember was chosen.
-            if config.unlock_policy == UnlockPolicy::Remember && config.remembered.is_none() {
-                tracing::warn!(
-                    "the seal configuration predates signing and asks to remember the unlock with nothing \
-                     remembered yet; using manual until an admin sets the policy again"
-                );
-                config.unlock_policy = UnlockPolicy::Manual;
-            }
-            let config = save(store, root, now, config).await?;
+    let signature = check_signature(root, &config);
+    let high_water = high_water(&settings.epoch_files);
+    let rolled_back = signature == Signature::Valid && high_water.is_some_and(|mark| config.epoch < mark);
+    match (signature, rolled_back) {
+        (Signature::Valid, false) => {
+            record_epoch(&settings.epoch_files, config.epoch, false);
+            Ok(Checked {
+                config,
+                tampered: false,
+            })
+        }
+        (Signature::Missing, _) => {
+            let config = save(store, settings, root, now, config).await?;
             tracing::info!("signed the seal configuration");
             Ok(Checked {
                 config,
                 tampered: false,
             })
         }
-        Signature::Invalid => {
-            tracing::error!(
-                "the seal configuration was changed without the root key; using the manual unlock policy and \
-                 forgetting any remembered unlock"
-            );
+        (Signature::Invalid, _) | (Signature::Valid, true) => {
+            let action = if rolled_back {
+                tracing::error!(
+                    epoch = config.epoch,
+                    recorded = high_water,
+                    "the seal configuration is older than the one last seen; it was put back from an earlier copy. \
+                     Using the manual unlock policy and forgetting any remembered unlock"
+                );
+                "sys.seal_config.rolled_back"
+            } else {
+                tracing::error!(
+                    "the seal configuration was changed without the root key; using the manual unlock policy and \
+                     forgetting any remembered unlock"
+                );
+                "sys.seal_config.tampered"
+            };
             if let Some(path) = &settings.remember_file
                 && let Err(error) = remove_device_key_file(path)
             {
@@ -375,11 +487,26 @@ pub async fn check_config(
             }
             config.unlock_policy = UnlockPolicy::Manual;
             config.remembered = None;
-            let config = save(store, root, now, config).await?;
-            audit_system(store, now, ip, "sys.seal_config.tampered", serde_json::json!({})).await;
+            // Past the mark, so the reset itself is not taken for a rollback next time.
+            config.epoch = config.epoch.max(high_water.unwrap_or(0));
+            let config = save(store, settings, root, now, config).await?;
+            audit_system(store, now, ip, action, serde_json::json!({})).await;
             Ok(Checked { config, tampered: true })
         }
     }
+}
+
+/// The stored configuration, checked with `root` before anything is changed and saved again, so
+/// a change made by a database writer is never signed as if the server had made it.
+async fn load_checked(
+    store: &dyn Store,
+    settings: &SealSettings,
+    now: i64,
+    ip: &str,
+    root: &RootKey,
+) -> ApiResult<Checked> {
+    let config = store.get_seal_config().await?.ok_or_else(ApiError::uninitialised)?;
+    check_config(store, settings, now, ip, root, config).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -438,10 +565,13 @@ impl From<InitError> for ApiError {
 pub struct InitPlan {
     pub mode: SealMode,
     pub passphrase: Option<Zeroizing<String>>,
+    /// The policy in force: configuration's when it sets one, else the one asked for.
     pub unlock_policy: UnlockPolicy,
     pub key_file: Option<PathBuf>,
     /// Use a key file that is already there instead of refusing; for unattended setup.
     pub reuse_key_file: bool,
+    /// Where to start the epoch marks.
+    pub epoch_files: Vec<PathBuf>,
 }
 
 /// Whether the database holds anything a new root key could not read.
@@ -499,6 +629,7 @@ pub async fn initialise(
         }
         return Err(error.into());
     }
+    record_epoch(&plan.epoch_files, config.epoch, true);
     Ok((root, config))
 }
 
@@ -522,9 +653,7 @@ fn key_file_root(path: &Path, reuse: bool, existing: Option<&str>) -> Result<(Ro
         return Err(InitError::ExistingData);
     }
     let root = RootKey::generate()?;
-    let mut text = root.to_base64();
-    text.push('\n');
-    write_new_private(path, text.as_bytes()).map_err(io)?;
+    write_new_private(path, root.to_key_file_text().as_bytes()).map_err(io)?;
     Ok((root, Some(path.to_path_buf())))
 }
 
@@ -547,10 +676,10 @@ pub async fn unwrap_blocking(
     wrapped: WrappedRootKey,
     passphrase: Zeroizing<String>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<RootKey, CryptoError> {
+) -> Result<Unwrapped, CryptoError> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        unwrap_root_key(&wrapped, &passphrase)
+        unwrap_root_key_checked(&wrapped, &passphrase)
     })
     .await
     .map_err(|_| CryptoError::Kdf)?
@@ -566,7 +695,8 @@ pub struct StartupSecrets {
 }
 
 pub struct AutoInit {
-    /// The first passphrase in passphrase mode; the unlock passphrase is used when absent.
+    /// The first passphrase in passphrase mode, from `setup.passphrase_file`. Under the
+    /// `passphrase-file` policy the unlock passphrase is used when absent.
     pub passphrase: Option<Zeroizing<String>>,
 }
 
@@ -597,6 +727,25 @@ fn startup(error: ApiError) -> StartupError {
     StartupError::Init(error.message)
 }
 
+/// Records an unlock that happened without anyone entering the passphrase.
+async fn audit_unlock_at_start(store: &dyn Store, now: i64, by: UnsealedBy) {
+    let actor = match by {
+        UnsealedBy::Remember => "remember",
+        UnsealedBy::PassphraseFile => "passphrase-file",
+        UnsealedBy::KeyFile => "key-file",
+        UnsealedBy::Passphrase => "unseal",
+    };
+    audit_as(
+        store,
+        now,
+        LOCAL,
+        actor,
+        "sys.unseal",
+        serde_json::json!({"at_start": true}),
+    )
+    .await;
+}
+
 /// Decides how the server starts from what the database and configuration hold.
 pub async fn open_keyring(
     store: &dyn Store,
@@ -623,10 +772,12 @@ pub async fn open_keyring(
                 let checked = check_config(store, settings, now, LOCAL, &key, config)
                     .await
                     .map_err(startup)?;
+                crate::machine::migrate_reviewer_tokens(store, &key).await;
                 let keyring = Keyring::unsealed(key, SealMode::KeyFile);
                 keyring
                     .install(keyring.root().map_err(startup)?, &checked.config, UnsealedBy::KeyFile)
                     .map_err(startup)?;
+                audit_unlock_at_start(store, now, UnsealedBy::KeyFile).await;
                 Ok(opened(keyring))
             }
             (SealMode::KeyFile, None) => Err(StartupError::MissingRootKey),
@@ -647,6 +798,8 @@ pub async fn open_keyring(
     }
     if let Some(key) = key {
         // An install from before sealing existed, or a test: record key-file mode and carry on.
+        // The mode is checked first, so a refused start leaves the database as it was.
+        check_mode(settings, SealMode::KeyFile)?;
         let fingerprint = key.fingerprint();
         check_root_key(store, &fingerprint).await?;
         let config = SealConfig {
@@ -660,11 +813,13 @@ pub async fn open_keyring(
             updated_at: now,
         };
         let config = signed(&key, config).map_err(|e| StartupError::Init(e.to_string()))?;
-        match store.init_seal_config(config, &fingerprint).await {
-            Ok(()) | Err(StoreError::Conflict) => {}
+        match store.init_seal_config(config.clone(), &fingerprint).await {
+            Ok(()) => record_epoch(&settings.epoch_files, config.epoch, true),
+            Err(StoreError::Conflict) => {}
             Err(error) => return Err(error.into()),
         }
-        check_mode(settings, SealMode::KeyFile)?;
+        crate::machine::migrate_reviewer_tokens(store, &key).await;
+        audit_unlock_at_start(store, now, UnsealedBy::KeyFile).await;
         return Ok(opened(Keyring::unsealed(key, SealMode::KeyFile)));
     }
     if has_root {
@@ -692,12 +847,23 @@ async fn auto_initialise(
             "the remember policy needs seal.remember_file to be set".into(),
         ));
     }
+    // The unlock passphrase only stands in under the policy that keeps it anyway.
+    let fallback = unlock_passphrase.filter(|_| unlock_policy == UnlockPolicy::PassphraseFile);
+    let passphrase = auto.passphrase.or(fallback);
+    if mode == SealMode::Passphrase && passphrase.is_none() {
+        return Err(StartupError::Init(
+            "automatic setup in passphrase mode needs setup.passphrase_file (or, with the passphrase-file unlock \
+             policy, seal.passphrase_file or SEKRET_UNLOCK_PASSPHRASE)"
+                .into(),
+        ));
+    }
     let plan = InitPlan {
         mode,
-        passphrase: auto.passphrase.or(unlock_passphrase),
+        passphrase,
         unlock_policy,
         key_file: settings.root_key_file.clone(),
         reuse_key_file: true,
+        epoch_files: settings.epoch_files.clone(),
     };
     let (root, config) = initialise(store, now, plan, None)
         .await
@@ -709,6 +875,14 @@ async fn auto_initialise(
     {
         tracing::warn!(error = %error.message, "could not remember the unlock");
     }
+    audit_system(
+        store,
+        now,
+        LOCAL,
+        "sys.init",
+        serde_json::json!({"mode": mode.as_str(), "automatic": true}),
+    )
+    .await;
     tracing::info!(mode = mode.as_str(), "initialised automatically");
     Ok(Opened {
         keyring,
@@ -735,7 +909,7 @@ async fn unlock_at_start(
     config: SealConfig,
     passphrase: Option<Zeroizing<String>>,
 ) -> Result<(), StartupError> {
-    let (root, by, passphrase) = match effective_policy(settings, keyring) {
+    let (root, by, rewrap) = match effective_policy(settings, keyring) {
         UnlockPolicy::Manual => return Ok(()),
         UnlockPolicy::PassphraseFile => {
             let Some(passphrase) = passphrase else {
@@ -749,7 +923,11 @@ async fn unlock_at_start(
             };
             let permit = keyring.kdf_permit().ok();
             match unwrap_blocking(wrapped, passphrase.clone(), permit).await {
-                Ok(root) => (root, UnsealedBy::PassphraseFile, Some(passphrase)),
+                Ok(opened) => (
+                    opened.root,
+                    UnsealedBy::PassphraseFile,
+                    Some((passphrase, opened.needs_rewrap)),
+                ),
                 Err(error) => {
                     tracing::warn!(%error, "the unlock passphrase did not open the root key; staying sealed");
                     return Ok(());
@@ -773,45 +951,49 @@ async fn unlock_at_start(
         tracing::error!("not unlocking automatically after the seal configuration was tampered with; unlock by hand");
         return Ok(());
     }
+    crate::machine::migrate_reviewer_tokens(store, &root).await;
     let root = Arc::new(root);
     keyring.install(root.clone(), &checked.config, by).map_err(startup)?;
+    audit_unlock_at_start(store, now, by).await;
     tracing::info!("unlocked at start");
-    if let Some(passphrase) = passphrase {
-        upgrade_wrap(store, now, keyring, &root, passphrase).await;
+    if let Some((passphrase, force)) = rewrap {
+        upgrade_wrap(store, settings, now, keyring, &root, passphrase, force).await;
     }
     Ok(())
 }
 
-/// Re-wraps the root key at today's Argon2 cost when the stored wrap is cheaper. Best effort.
+/// Re-wraps the root key when the stored wrap is cheaper than today's Argon2 cost, or when
+/// `force`, as for a wrap made before passphrases were normalised. Best effort.
 async fn upgrade_wrap(
     store: &dyn Store,
+    settings: &SealSettings,
     now: i64,
     keyring: &Keyring,
     root: &Arc<RootKey>,
     passphrase: Zeroizing<String>,
+    force: bool,
 ) {
     let result: ApiResult<bool> = async {
-        let Some(config) = store.get_seal_config().await? else {
-            return Ok(false);
-        };
-        if !config.wrapped.as_ref().is_some_and(|w| w.params.needs_upgrade()) {
+        let config = load_checked(store, settings, now, LOCAL, root).await?.config;
+        let cheap = config.wrapped.as_ref().is_some_and(|w| w.params.needs_upgrade());
+        if config.wrapped.is_none() || !(cheap || force) {
             return Ok(false);
         }
-        let permit = keyring.kdf_permit()?;
+        let permit = keyring.kdf_permit_queued().await?;
         let wrapped = wrap_blocking(root.clone(), passphrase, Some(permit)).await?;
         let config = SealConfig {
             wrapped: Some(wrapped),
             ..config
         };
-        let config = save(store, root, now, config).await?;
+        let config = save(store, settings, root, now, config).await?;
         keyring.record(&config)?;
         Ok(true)
     }
     .await;
     match result {
-        Ok(true) => tracing::info!("re-wrapped the root key at the current key derivation cost"),
+        Ok(true) => tracing::info!("re-wrapped the root key"),
         Ok(false) => {}
-        Err(error) => tracing::warn!(error = %error.message, "could not re-wrap the root key at the current cost"),
+        Err(error) => tracing::warn!(error = %error.message, "could not re-wrap the root key"),
     }
 }
 
@@ -852,20 +1034,17 @@ pub async fn remember_after_unlock(
         tracing::warn!("unlock policy is remember but no remember file is configured; set seal.remember_file");
         return Ok(());
     };
-    let Some(mut config) = store.get_seal_config().await? else {
-        return Err(ApiError::uninitialised());
-    };
+    let root = keyring.root()?;
+    let mut config = load_checked(store, settings, now, LOCAL, &root).await?.config;
     if config.remembered.is_some() && recall(settings, &config).is_ok() {
         return Ok(());
     }
-    let root = keyring.root()?;
     let device = DeviceKey::generate()?;
     remove_device_key_file(path).map_err(|e| ApiError::internal("removing the old remember file", e))?;
-    let mut text = device.to_base64();
-    text.push('\n');
-    write_new_private(path, text.as_bytes()).map_err(|e| ApiError::internal("writing the remember file", e))?;
+    write_new_private(path, device.to_key_file_text().as_bytes())
+        .map_err(|e| ApiError::internal("writing the remember file", e))?;
     config.remembered = Some(remember_root_key(&root, &device, settings.remember_secret.as_ref())?);
-    let config = save(store, &root, now, config).await?;
+    let config = save(store, settings, &root, now, config).await?;
     keyring.record(&config)?;
     tracing::info!(path = %path.display(), "remembered the unlock for later starts");
     Ok(())
@@ -879,22 +1058,65 @@ pub async fn forget(store: &dyn Store, now: i64, settings: &SealSettings, keyrin
     {
         tracing::warn!(%error, "could not remove the remember file");
     }
-    let Some(mut config) = store.get_seal_config().await? else {
-        return Err(ApiError::uninitialised());
-    };
+    let root = keyring.root()?;
+    let mut config = load_checked(store, settings, now, LOCAL, &root).await?.config;
     if config.remembered.is_none() {
         return Ok(());
     }
     config.remembered = None;
-    let root = keyring.root()?;
-    let config = save(store, &root, now, config).await?;
+    let config = save(store, settings, &root, now, config).await?;
     keyring.record(&config)
 }
 
-/// Request-level operations on the keyring, shared by the API handlers.
+/// Request-level operations on the keyring, shared by the API handlers and the host socket.
 pub mod ops {
+    use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use serde_json::json;
+
     use super::*;
+    use crate::api::{AuditTarget, audit};
+    use crate::auth::Principal;
     use crate::state::AppState;
+
+    /// Where an attempt came from. The host socket is reached only through file permissions,
+    /// so it is not held back by the network's rate limits and back-off.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Source {
+        Network(IpAddr),
+        HostSocket,
+    }
+
+    impl Source {
+        pub fn ip(self) -> IpAddr {
+            match self {
+                Source::Network(ip) => ip,
+                Source::HostSocket => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            }
+        }
+
+        fn limited(self) -> bool {
+            matches!(self, Source::Network(_))
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Source::Network(_) => "network",
+                Source::HostSocket => "host-socket",
+            }
+        }
+    }
+
+    /// Runs `work` as a task of its own and waits for it. A client that hangs up then cannot
+    /// stop a key change, an install and its audit entry, or a failure count, halfway.
+    pub async fn detached<T: Send + 'static>(
+        work: impl Future<Output = ApiResult<T>> + Send + 'static,
+    ) -> ApiResult<T> {
+        tokio::spawn(work)
+            .await
+            .map_err(|e| ApiError::internal("background task", e))?
+    }
 
     pub fn require_passphrase_mode(state: &AppState) -> ApiResult<()> {
         if state.keyring.mode() != Some(SealMode::Passphrase) {
@@ -913,10 +1135,20 @@ pub mod ops {
         Ok(())
     }
 
-    fn not_backing_off(state: &AppState) -> ApiResult<()> {
-        match state.passphrase_backoff.wait() {
+    fn not_backing_off(state: &AppState, source: Source) -> ApiResult<()> {
+        if !source.limited() {
+            return Ok(());
+        }
+        match state.passphrase_backoff.wait(source.ip()) {
             Some(wait) => Err(ApiError::passphrase_backoff(wait)),
             None => Ok(()),
+        }
+    }
+
+    async fn permit(state: &AppState, source: Source) -> ApiResult<OwnedSemaphorePermit> {
+        match source {
+            Source::Network(_) => state.keyring.kdf_permit(),
+            Source::HostSocket => state.keyring.kdf_permit_queued().await,
         }
     }
 
@@ -933,20 +1165,43 @@ pub mod ops {
         Ok((config, wrapped))
     }
 
-    /// Unwraps with `passphrase`, counting a wrong one against the server-wide backoff.
+    /// Who to blame for a wrong passphrase, and the audit action that records it.
+    struct Failure<'a> {
+        principal: &'a Principal,
+        action: &'a str,
+    }
+
+    /// Unwraps with `passphrase`. A wrong one counts against the source's back-off and is
+    /// audited here, inside the detached task, so abandoning the request skips neither.
     async fn open_with(
         state: &AppState,
+        source: Source,
         wrapped: WrappedRootKey,
         passphrase: Zeroizing<String>,
         permit: OwnedSemaphorePermit,
-    ) -> ApiResult<RootKey> {
+        failure: Failure<'_>,
+    ) -> ApiResult<Unwrapped> {
         match unwrap_blocking(wrapped, passphrase, Some(permit)).await {
-            Ok(root) => {
-                state.passphrase_backoff.succeeded();
-                Ok(root)
+            Ok(opened) => {
+                if source.limited() {
+                    state.passphrase_backoff.succeeded(source.ip());
+                }
+                Ok(opened)
             }
             Err(CryptoError::Decrypt) => {
-                state.passphrase_backoff.failed();
+                if source.limited() {
+                    state.passphrase_backoff.failed(source.ip());
+                }
+                let failures = state.passphrase_backoff.failures(source.ip());
+                audit(
+                    state,
+                    failure.principal,
+                    source.ip(),
+                    failure.action,
+                    AuditTarget::default(),
+                    json!({"consecutive_failures": failures, "via": source.label()}),
+                )
+                .await;
                 Err(ApiError::invalid_passphrase())
             }
             Err(error) => Err(error.into()),
@@ -958,49 +1213,82 @@ pub mod ops {
         Now { tampered: bool },
     }
 
-    /// Unseals with the passphrase. A wrong one is `invalid_passphrase`.
-    pub async fn unseal(state: &AppState, ip: &str, passphrase: Zeroizing<String>) -> ApiResult<Unsealed> {
+    /// Unseals with the passphrase, audits it, and runs the steps after an unlock. A wrong
+    /// passphrase is `invalid_passphrase`. Call it through [`detached`].
+    pub async fn unseal(state: &AppState, source: Source, passphrase: Zeroizing<String>) -> ApiResult<Unsealed> {
         check_length(&passphrase)?;
         match state.keyring.state() {
             SealState::Unsealed => return Ok(Unsealed::Already),
             SealState::Uninitialised => return Err(ApiError::uninitialised()),
             SealState::Sealed => {}
         }
-        not_backing_off(state)?;
-        let permit = state.keyring.kdf_permit()?;
+        not_backing_off(state, source)?;
+        let permit = permit(state, source).await?;
         let _gate = state.keyring.lock().await;
         if state.keyring.state() == SealState::Unsealed {
             return Ok(Unsealed::Already);
         }
         let (config, wrapped) = passphrase_config(state).await?;
-        let root = open_with(state, wrapped, passphrase, permit).await?;
-        check_root_key(state.store.as_ref(), &root.fingerprint())
+        let principal = Principal::system("unseal");
+        let failure = Failure {
+            principal: &principal,
+            action: "sys.unseal.failed",
+        };
+        let opened = open_with(state, source, wrapped, passphrase.clone(), permit, failure).await?;
+        check_root_key(state.store.as_ref(), &opened.root.fingerprint())
             .await
             .map_err(|e| ApiError::internal("root key check", e))?;
+        let ip = source.ip().to_string();
         let checked = check_config(
             state.store.as_ref(),
             &state.config.seal,
             state.clock.now(),
-            ip,
-            &root,
+            &ip,
+            &opened.root,
             config,
         )
         .await?;
+        crate::machine::migrate_reviewer_tokens(state.store.as_ref(), &opened.root).await;
+        let root = Arc::new(opened.root);
         state
             .keyring
-            .install(Arc::new(root), &checked.config, UnsealedBy::Passphrase)?;
+            .install(root.clone(), &checked.config, UnsealedBy::Passphrase)?;
+        audit(
+            state,
+            &principal,
+            source.ip(),
+            "sys.unseal",
+            AuditTarget::default(),
+            json!({"via": source.label()}),
+        )
+        .await;
+        after_unlock_locked(state, &root, Some((passphrase, opened.needs_rewrap)), checked.tampered).await;
         Ok(Unsealed::Now {
             tampered: checked.tampered,
         })
     }
 
-    /// The optional steps after a manual unlock: re-wrapping at today's cost and remembering the
-    /// unlock. Neither fails the request.
-    pub async fn after_unlock(state: &AppState, passphrase: Option<Zeroizing<String>>, tampered: bool) {
-        let _gate = state.keyring.lock().await;
+    /// The optional steps after an unlock: re-wrapping when the wrap is cheap or predates
+    /// normalisation, and remembering the unlock. Neither fails the request. The caller holds
+    /// the gate.
+    async fn after_unlock_locked(
+        state: &AppState,
+        root: &Arc<RootKey>,
+        rewrap: Option<(Zeroizing<String>, bool)>,
+        tampered: bool,
+    ) {
         let now = state.clock.now();
-        if let (Some(passphrase), Ok(root)) = (passphrase, state.keyring.root()) {
-            upgrade_wrap(state.store.as_ref(), now, &state.keyring, &root, passphrase).await;
+        if let Some((passphrase, force)) = rewrap {
+            upgrade_wrap(
+                state.store.as_ref(),
+                &state.config.seal,
+                now,
+                &state.keyring,
+                root,
+                passphrase,
+                force,
+            )
+            .await;
         }
         if tampered {
             return;
@@ -1010,16 +1298,21 @@ pub mod ops {
         }
     }
 
-    pub fn seal(state: &AppState) -> ApiResult<()> {
+    /// Drops the root key. Waits for any unlock or passphrase change in progress, so one that
+    /// finishes after the seal cannot put a key back.
+    pub async fn seal(state: &AppState) -> ApiResult<()> {
         require_passphrase_mode(state)?;
-        state.keyring.seal()
+        let _gate = state.keyring.lock().await;
+        state.keyring.drop_root()
     }
 
     /// Replaces the root key under a new passphrase and re-encrypts everything, so the old
     /// passphrase opens nothing in the live database. Returns whether the stored configuration had
-    /// been tampered with.
+    /// been tampered with. Call it through [`detached`].
     pub async fn change_passphrase(
         state: &AppState,
+        source: Source,
+        principal: &Principal,
         current: Zeroizing<String>,
         new: Zeroizing<String>,
     ) -> ApiResult<bool> {
@@ -1027,103 +1320,138 @@ pub mod ops {
         check_length(&current)?;
         check_length(&new)?;
         validate_passphrase(&new).map_err(ApiError::weak_passphrase)?;
-        not_backing_off(state)?;
-        let permit = state.keyring.kdf_permit()?;
+        not_backing_off(state, source)?;
+        let permit = permit(state, source).await?;
         let _gate = state.keyring.lock().await;
         let (config, wrapped) = passphrase_config(state).await?;
-        let old_root = open_with(state, wrapped, current, permit).await?;
+        let failure = Failure {
+            principal,
+            action: "sys.passphrase.failed",
+        };
+        let old_root = open_with(state, source, wrapped, current, permit, failure).await?.root;
         check_root_key(state.store.as_ref(), &old_root.fingerprint())
             .await
             .map_err(|e| ApiError::internal("root key check", e))?;
-        let tampered = check_signature(&old_root, &config) == Signature::Invalid;
+        let now = state.clock.now();
+        let ip = source.ip().to_string();
+        let settings = &state.config.seal;
+        let checked = check_config(state.store.as_ref(), settings, now, &ip, &old_root, config).await?;
         let new_root = Arc::new(RootKey::generate()?);
-        let permit = state.keyring.kdf_permit()?;
+        let permit = state.keyring.kdf_permit_queued().await?;
         let wrapped = wrap_blocking(new_root.clone(), new, Some(permit)).await?;
         let config = SealConfig {
             wrapped: Some(wrapped),
             remembered: None,
-            unlock_policy: if tampered {
-                UnlockPolicy::Manual
-            } else {
-                config.unlock_policy
-            },
-            updated_at: state.clock.now(),
-            ..config
+            updated_at: now,
+            ..checked.config
         };
-        {
-            let _writers = state.keyring.rekeying().await;
+        let still_unsealed = {
+            let _writers = state.keyring.rekeying().await?;
             crate::admin::rotate_root_key(state.store.as_ref(), &old_root, &new_root, Some(config)).await?;
-            state.keyring.replace_root(new_root)?;
-        }
+            state.keyring.replace_root(new_root.clone())?
+        };
         if let Some(stored) = state.store.get_seal_config().await? {
+            record_epoch(&settings.epoch_files, stored.epoch, false);
             state.keyring.record(&stored)?;
         }
-        if let Some(path) = &state.config.seal.remember_file
+        if let Some(path) = &settings.remember_file
             && let Err(error) = remove_device_key_file(path)
         {
             tracing::warn!(%error, "could not remove the old remember file");
         }
-        Ok(tampered)
+        audit(
+            state,
+            principal,
+            source.ip(),
+            "sys.passphrase",
+            AuditTarget::default(),
+            json!({"root_key_rotated": true}),
+        )
+        .await;
+        if still_unsealed {
+            after_unlock_locked(state, &new_root, None, checked.tampered).await;
+        }
+        Ok(checked.tampered)
     }
 
     /// `remember` and `passphrase-file` keep the root key or passphrase reachable without a
-    /// person, so they need the current passphrase; going back to `manual` does not.
+    /// person, so they need the current passphrase; going back to `manual` does not. Call it
+    /// through [`detached`].
     pub async fn set_unlock_policy(
         state: &AppState,
+        source: Source,
+        principal: &Principal,
         policy: UnlockPolicy,
         passphrase: Option<Zeroizing<String>>,
     ) -> ApiResult<()> {
         require_passphrase_mode(state)?;
-        if state.config.seal.unlock.is_some() {
+        let settings = &state.config.seal;
+        if settings.unlock.is_some() {
             return Err(ApiError::conflict(
                 "the unlock policy is set in the server configuration; change it there",
             ));
         }
-        if policy == UnlockPolicy::Remember && state.config.seal.remember_file.is_none() {
+        if policy == UnlockPolicy::Remember && settings.remember_file.is_none() {
             return Err(ApiError::bad_request(
                 "the remember policy needs seal.remember_file in the server configuration",
             ));
         }
-        let permit = match policy {
+        let confirm = match policy {
             UnlockPolicy::Manual => None,
             UnlockPolicy::Remember | UnlockPolicy::PassphraseFile => {
-                let passphrase = passphrase.as_ref().ok_or_else(ApiError::passphrase_required)?;
-                check_length(passphrase)?;
-                not_backing_off(state)?;
-                Some(state.keyring.kdf_permit()?)
+                let passphrase = passphrase.ok_or_else(ApiError::passphrase_required)?;
+                check_length(&passphrase)?;
+                not_backing_off(state, source)?;
+                Some((passphrase, permit(state, source).await?))
             }
         };
         let _gate = state.keyring.lock().await;
-        let mut config = state
-            .store
-            .get_seal_config()
-            .await?
-            .ok_or_else(ApiError::uninitialised)?;
         let root = state.keyring.root()?;
-        if let (Some(permit), Some(passphrase)) = (permit, passphrase) {
+        let now = state.clock.now();
+        let ip = source.ip().to_string();
+        let mut config = load_checked(state.store.as_ref(), settings, now, &ip, &root)
+            .await?
+            .config;
+        if let Some((passphrase, permit)) = confirm {
             let wrapped = config
                 .wrapped
                 .clone()
                 .ok_or_else(|| ApiError::conflict("only a server in passphrase mode can do that"))?;
-            let opened = open_with(state, wrapped, passphrase, permit).await?;
-            if opened.fingerprint() != root.fingerprint() {
+            let failure = Failure {
+                principal,
+                action: "sys.passphrase.failed",
+            };
+            let opened = open_with(state, source, wrapped, passphrase, permit, failure).await?;
+            if opened.root.fingerprint() != root.fingerprint() {
                 return Err(ApiError::invalid_passphrase());
             }
         }
         config.unlock_policy = policy;
         if policy != UnlockPolicy::Remember {
-            if let Some(path) = &state.config.seal.remember_file
+            if let Some(path) = &settings.remember_file
                 && let Err(error) = remove_device_key_file(path)
             {
                 tracing::warn!(%error, "could not remove the remember file");
             }
             config.remembered = None;
         }
-        let config = save(state.store.as_ref(), &root, state.clock.now(), config).await?;
-        state.keyring.record(&config)
+        let config = save(state.store.as_ref(), settings, &root, now, config).await?;
+        state.keyring.record(&config)?;
+        audit(
+            state,
+            principal,
+            source.ip(),
+            "sys.unlock_policy",
+            AuditTarget::default(),
+            json!({"policy": policy.as_str()}),
+        )
+        .await;
+        after_unlock_locked(state, &root, None, false).await;
+        Ok(())
     }
 
-    pub async fn forget_unlock(state: &AppState) -> ApiResult<()> {
+    /// Call it through [`detached`].
+    pub async fn forget_unlock(state: &AppState, principal: &Principal, ip: IpAddr) -> ApiResult<()> {
         require_passphrase_mode(state)?;
         let _gate = state.keyring.lock().await;
         forget(
@@ -1132,7 +1460,17 @@ pub mod ops {
             &state.config.seal,
             &state.keyring,
         )
-        .await
+        .await?;
+        audit(
+            state,
+            principal,
+            ip,
+            "sys.forget_unlock",
+            AuditTarget::default(),
+            json!({}),
+        )
+        .await;
+        Ok(())
     }
 
     pub fn invalid_setup_code() -> ApiError {
@@ -1143,37 +1481,83 @@ pub mod ops {
         )
     }
 
-    /// First-boot setup through the API.
-    pub async fn init(
-        state: &AppState,
-        setup_code: &str,
-        mode: SealMode,
-        passphrase: Option<Zeroizing<String>>,
-        unlock_policy: UnlockPolicy,
-    ) -> ApiResult<()> {
+    /// What `sys/init` asked for.
+    pub struct InitRequest {
+        pub setup_code: Zeroizing<String>,
+        pub mode: SealMode,
+        pub passphrase: Option<Zeroizing<String>>,
+        pub unlock_policy: UnlockPolicy,
+    }
+
+    /// First-boot setup through the API, audited either way. Returns a break-glass admin token
+    /// and when it expires. Call it through [`detached`].
+    pub async fn init(state: &AppState, ip: IpAddr, request: InitRequest) -> ApiResult<(String, i64)> {
+        let principal = Principal::system("setup");
+        let mode = request.mode;
+        match init_inner(state, request).await {
+            Ok(()) => {}
+            Err(error) => {
+                // Refusals that cost nothing and say nothing, such as setup being off, are not news.
+                if error.code != "conflict" && error.code != "setup_disabled" {
+                    audit(
+                        state,
+                        &principal,
+                        ip,
+                        "sys.init.failed",
+                        AuditTarget::default(),
+                        json!({"error": error.code}),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        }
+        audit(
+            state,
+            &principal,
+            ip,
+            "sys.init",
+            AuditTarget::default(),
+            json!({"mode": mode.as_str()}),
+        )
+        .await;
+        let token = crate::admin::bootstrap_admin_token(state, INIT_TOKEN_TTL).await?;
+        let _gate = state.keyring.lock().await;
+        if let Ok(root) = state.keyring.root() {
+            after_unlock_locked(state, &root, None, false).await;
+        }
+        Ok(token)
+    }
+
+    const INIT_TOKEN_TTL: i64 = 3600;
+
+    async fn init_inner(state: &AppState, request: InitRequest) -> ApiResult<()> {
         let settings = &state.config.seal;
         if !settings.web_setup {
             return Err(ApiError::new(
                 axum::http::StatusCode::FORBIDDEN,
                 "setup_disabled",
-                "setup through the API is turned off; run `sekret admin init` on the host",
+                "setup through the API is turned off; stop the server and run `sekret admin init` on the host",
             ));
         }
+        let InitRequest {
+            setup_code,
+            mode,
+            passphrase,
+            unlock_policy,
+        } = request;
         if setup_code.len() > sekret_core::seal::MAX_SETUP_CODE_BYTES {
             return Err(ApiError::bad_request("the setup code is too long"));
         }
         if let Some(passphrase) = &passphrase {
             check_length(passphrase)?;
         }
-        let permit = match mode {
-            SealMode::Passphrase => Some(state.keyring.kdf_permit()?),
-            SealMode::KeyFile => None,
-        };
-        let _gate = state.keyring.lock().await;
+        // Everything that costs nothing is checked before a derivation permit is taken, so
+        // wrong codes cannot keep the permit busy.
         if state.keyring.state() != SealState::Uninitialised {
             return Err(ApiError::conflict("the server is already initialised"));
         }
-        if !state.keyring.setup_code_matches(setup_code) {
+        if !state.keyring.setup_code_matches(&setup_code) {
             return Err(invalid_setup_code());
         }
         if let Some(configured) = settings.mode
@@ -1190,12 +1574,21 @@ pub mod ops {
                 "the remember policy needs seal.remember_file in the server configuration",
             ));
         }
+        let permit = match mode {
+            SealMode::Passphrase => Some(state.keyring.kdf_permit()?),
+            SealMode::KeyFile => None,
+        };
+        let _gate = state.keyring.lock().await;
+        if state.keyring.state() != SealState::Uninitialised {
+            return Err(ApiError::conflict("the server is already initialised"));
+        }
         let plan = InitPlan {
             mode,
             passphrase,
-            unlock_policy,
+            unlock_policy: policy,
             key_file: settings.root_key_file.clone(),
             reuse_key_file: false,
+            epoch_files: settings.epoch_files.clone(),
         };
         let (root, config) = initialise(state.store.as_ref(), state.clock.now(), plan, permit).await?;
         let by = match mode {
@@ -1203,10 +1596,10 @@ pub mod ops {
             SealMode::KeyFile => UnsealedBy::KeyFile,
         };
         state.keyring.install(root, &config, by)?;
-        if let Some(path) = &settings.setup_code_file
-            && let Err(error) = crate::files::remove_if_present(path)
+        if let Some(written) = &settings.setup_code_file
+            && let Err(error) = crate::files::remove_if_unchanged(written)
         {
-            tracing::warn!(%error, path = %path.display(), "could not remove the setup code file");
+            tracing::warn!(%error, "could not remove the setup code file");
         }
         Ok(())
     }

@@ -32,23 +32,6 @@ export const POLICY_NAMES: Record<UnlockPolicy, string> = {
   "passphrase-file": "Passphrase file",
 };
 
-/** One line on how this server gets unlocked, for the unlock page. */
-export function unlockPolicyLine(status: Pick<SysStatus, "unlock_policy" | "remembered" | "configured">): string | null {
-  const origin = status.configured ? " This is set in the server configuration." : "";
-  switch (status.unlock_policy) {
-    case "manual":
-      return `Unlock policy: manual. The server needs its passphrase after every start.${origin}`;
-    case "remember":
-      return status.remembered
-        ? `Unlock policy: remember. It unlocks itself after a restart, but after locking by hand someone has to type the passphrase.${origin}`
-        : `Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.${origin}`;
-    case "passphrase-file":
-      return `Unlock policy: passphrase file. It unlocks itself at start unless the passphrase could not be read or it was locked by hand.${origin}`;
-    default:
-      return null;
-  }
-}
-
 export const UNSEALED_BY_NAMES: Record<UnsealedBy, string> = {
   passphrase: "Passphrase, typed by a person",
   remember: "Remembered unlock",

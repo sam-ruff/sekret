@@ -8,8 +8,10 @@ use sekret_api::{
 };
 use sekret_core::crypto::{RootKey, hash_token, open_credential, seal_credential};
 use sekret_core::glob::glob_match;
-use sekret_store::{Identity, PrincipalKind};
+use sekret_store::{Identity, PrincipalKind, Store};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::api::{AuditTarget, audit};
 use crate::auth::{ClientIp, Principal, TokenKind, TokenRequest, ip_allowed, mint_token};
@@ -89,7 +91,24 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
     }
 }
 
-fn credential_context(identity_id: &str) -> String {
+/// Binds a sealed reviewer token to its identity and to the cluster it was entered for, so
+/// someone who can write the database cannot send it to another host, trust another CA or
+/// switch the mode.
+fn credential_context(identity_id: &str, k8s: &KubernetesAuthConfig) -> String {
+    let digest = |value: Option<&str>| hex::encode(&Sha256::digest(value.unwrap_or_default().as_bytes())[..16]);
+    let mode = match k8s.mode {
+        KubernetesMode::TokenReview => "token-review",
+        KubernetesMode::Jwks => "jwks",
+    };
+    format!(
+        "identity:{identity_id}:kubernetes:v2:{mode}:{}:{}",
+        digest(k8s.host.as_deref()),
+        digest(k8s.ca_cert.as_deref())
+    )
+}
+
+/// What reviewer tokens were sealed under before they were bound to their cluster.
+fn legacy_context(identity_id: &str) -> String {
     format!("identity:{identity_id}:kubernetes")
 }
 
@@ -117,7 +136,14 @@ pub fn seal_for_storage(
             }
             _ => return Err(ApiError::bad_request("there is no stored reviewer token to keep")),
         },
-        Some(value) => Some(seal_credential(root, value.trim(), &credential_context(identity_id))?),
+        Some(value) => {
+            let value = Zeroizing::new(value);
+            Some(seal_credential(
+                root,
+                value.trim(),
+                &credential_context(identity_id, &k8s),
+            )?)
+        }
     };
     Ok(AuthMethodConfig::Kubernetes(k8s))
 }
@@ -132,14 +158,18 @@ pub fn redact(config: AuthMethodConfig) -> AuthMethodConfig {
     AuthMethodConfig::Kubernetes(k8s)
 }
 
-pub fn unseal_reviewer(root: &RootKey, identity_id: &str, k8s: &mut KubernetesAuthConfig) -> ApiResult<()> {
+/// The reviewer token in plain text, opened only for the cluster it was sealed for.
+pub fn unseal_reviewer(
+    root: &RootKey,
+    identity_id: &str,
+    k8s: &KubernetesAuthConfig,
+) -> ApiResult<Option<Zeroizing<String>>> {
     let Some(sealed) = &k8s.reviewer_jwt else {
-        return Ok(());
+        return Ok(None);
     };
-    let plain = open_credential(root, sealed, &credential_context(identity_id))
-        .map_err(|e| ApiError::internal("opening reviewer token", e))?;
-    k8s.reviewer_jwt = Some(plain.to_string());
-    Ok(())
+    open_credential(root, sealed, &credential_context(identity_id, k8s))
+        .map(Some)
+        .map_err(|e| ApiError::internal("opening reviewer token", e))
 }
 
 /// Re-seals stored credentials under a new root key; `None` when the config holds none.
@@ -152,12 +182,53 @@ pub fn reseal(
     let AuthMethodConfig::Kubernetes(k8s) = config else {
         return Ok(None);
     };
-    if k8s.reviewer_jwt.is_none() {
+    let Some(plain) = unseal_reviewer(old_root, identity_id, k8s)? else {
         return Ok(None);
-    }
+    };
     let mut k8s = k8s.clone();
-    unseal_reviewer(old_root, identity_id, &mut k8s)?;
-    seal_for_storage(new_root, identity_id, AuthMethodConfig::Kubernetes(k8s), None).map(Some)
+    k8s.reviewer_jwt = Some(seal_credential(
+        new_root,
+        &plain,
+        &credential_context(identity_id, &k8s),
+    )?);
+    Ok(Some(AuthMethodConfig::Kubernetes(k8s)))
+}
+
+/// Re-seals reviewer tokens stored before they were bound to their cluster. Runs once the root
+/// key is in memory; best effort, since a token that cannot be moved only stops its own logins.
+pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) {
+    let result: ApiResult<usize> = async {
+        let mut moved = 0;
+        for identity in store.list_identities().await? {
+            for mut method in store.list_auth_methods(&identity.id).await? {
+                let Ok(AuthMethodConfig::Kubernetes(mut k8s)) = serde_json::from_value(method.config.clone()) else {
+                    continue;
+                };
+                let Some(sealed) = k8s.reviewer_jwt.clone() else {
+                    continue;
+                };
+                if open_credential(root, &sealed, &credential_context(&identity.id, &k8s)).is_ok() {
+                    continue;
+                }
+                let Ok(plain) = open_credential(root, &sealed, &legacy_context(&identity.id)) else {
+                    tracing::warn!(identity = %identity.name, "a stored reviewer token cannot be opened; enter it again");
+                    continue;
+                };
+                k8s.reviewer_jwt = Some(seal_credential(root, &plain, &credential_context(&identity.id, &k8s))?);
+                method.config = serde_json::to_value(AuthMethodConfig::Kubernetes(k8s))
+                    .map_err(|e| ApiError::internal("auth method config", e))?;
+                store.put_auth_method(method).await?;
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+    .await;
+    match result {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!(moved, "bound stored reviewer tokens to their clusters"),
+        Err(error) => tracing::warn!(error = %error.message, "could not re-seal stored reviewer tokens"),
+    }
 }
 
 pub async fn verify_oidc(jwt: &JwtVerifier, config: &OidcAuthConfig, token: &str) -> Result<Value, LoginError> {
@@ -214,10 +285,12 @@ fn unverified_claims(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// `reviewer_token` is the opened reviewer token, when the method has one.
 pub async fn verify_kubernetes(
     jwt: &JwtVerifier,
     reviewer: &dyn TokenReviewer,
     config: &KubernetesAuthConfig,
+    reviewer_token: Option<Zeroizing<String>>,
     token: &str,
 ) -> Result<Value, LoginError> {
     let username = match config.mode {
@@ -230,7 +303,7 @@ pub async fn verify_kubernetes(
                 .review(TokenReviewRequest {
                     host: host.to_string(),
                     ca_pem: config.ca_cert.clone(),
-                    reviewer: config.reviewer_jwt.clone(),
+                    reviewer: reviewer_token,
                     token: token.to_string(),
                     audiences: config.audiences.clone(),
                 })
@@ -292,24 +365,52 @@ async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAdd
     if !state.login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
-    let identity = state
-        .store
-        .get_identity(identity_id)
-        .await?
-        .ok_or_else(ApiError::login_failed)?;
-    if identity.disabled || !ip_allowed(&identity.trusted_cidrs, ip) {
+    let Some(identity) = state.store.get_identity(identity_id).await? else {
+        audit_failure(state, ip, identity_id, "unknown identity").await;
+        return Err(ApiError::login_failed());
+    };
+    if identity.disabled {
+        audit_failure(state, ip, identity_id, "identity disabled").await;
+        return Err(ApiError::login_failed());
+    }
+    if !ip_allowed(&identity.trusted_cidrs, ip) {
+        audit_failure(state, ip, identity_id, "address not in trusted_cidrs").await;
         return Err(ApiError::login_failed());
     }
     Ok(identity)
 }
 
-async fn method_config(state: &AppState, identity: &Identity, kind: AuthMethodKind) -> ApiResult<AuthMethodConfig> {
-    let method = state
-        .store
-        .get_auth_method(&identity.id, kind.as_str())
-        .await?
-        .ok_or_else(ApiError::login_failed)?;
-    serde_json::from_value(method.config).map_err(|e| ApiError::internal("auth method config", e))
+/// Records a refused machine login. The caller only ever sees `login_failed`.
+async fn audit_failure(state: &AppState, ip: std::net::IpAddr, identity_id: &str, reason: &str) {
+    // Bounded, since the id comes from the request.
+    let identity: String = identity_id.chars().take(64).collect();
+    crate::seal::audit_system(
+        state.store.as_ref(),
+        state.clock.now(),
+        &ip.to_string(),
+        "auth.machine-login.failed",
+        json!({"identity_id": identity, "reason": reason}),
+    )
+    .await;
+}
+
+/// [`login_identity`]'s later checks, audited the same way when they refuse.
+async fn refused<T>(state: &AppState, ip: std::net::IpAddr, identity: &Identity, reason: &str) -> ApiResult<T> {
+    audit_failure(state, ip, &identity.id, reason).await;
+    Err(ApiError::login_failed())
+}
+
+async fn method_config(
+    state: &AppState,
+    identity: &Identity,
+    kind: AuthMethodKind,
+) -> ApiResult<Option<AuthMethodConfig>> {
+    let Some(method) = state.store.get_auth_method(&identity.id, kind.as_str()).await? else {
+        return Ok(None);
+    };
+    serde_json::from_value(method.config)
+        .map(Some)
+        .map_err(|e| ApiError::internal("auth method config", e))
 }
 
 /// Token source for logins through an auth method, revoked when the method is removed.
@@ -370,9 +471,15 @@ async fn issue(
     }))
 }
 
-fn rejected(identity: &Identity, error: LoginError) -> ApiError {
+async fn rejected<T>(state: &AppState, ip: std::net::IpAddr, identity: &Identity, error: LoginError) -> ApiResult<T> {
     tracing::warn!(identity = %identity.name, %error, "machine login rejected");
-    ApiError::login_failed()
+    let reason = match error {
+        LoginError::Token(_) => "token rejected",
+        LoginError::Binding(_) => "claims not bound",
+        LoginError::NotAuthenticated => "kubernetes rejected the token",
+        LoginError::Upstream(_) => "upstream failure",
+    };
+    refused(state, ip, identity, reason).await
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/oidc/login", tag = "auth", request_body = JwtLoginRequest,
@@ -383,12 +490,13 @@ pub async fn oidc_login(
     Json(request): Json<JwtLoginRequest>,
 ) -> ApiResult<Json<TokenResponse>> {
     let identity = login_identity(&state, &request.identity_id, ip).await?;
-    let AuthMethodConfig::Oidc(config) = method_config(&state, &identity, AuthMethodKind::Oidc).await? else {
-        return Err(ApiError::login_failed());
+    let Some(AuthMethodConfig::Oidc(config)) = method_config(&state, &identity, AuthMethodKind::Oidc).await? else {
+        return refused(&state, ip, &identity, "no oidc auth method").await;
     };
-    let claims = verify_oidc(&state.jwt, &config, &request.token)
-        .await
-        .map_err(|e| rejected(&identity, e))?;
+    let claims = match verify_oidc(&state.jwt, &config, &request.token).await {
+        Ok(claims) => claims,
+        Err(error) => return rejected(&state, ip, &identity, error).await,
+    };
     let detail = json!({"iss": claims["iss"], "sub": claims["sub"]});
     let source = auth_method_source(&identity.id, AuthMethodKind::Oidc.as_str());
     issue(&state, &identity, AuthMethodKind::Oidc, source, detail, ip).await
@@ -402,14 +510,24 @@ pub async fn kubernetes_login(
     Json(request): Json<JwtLoginRequest>,
 ) -> ApiResult<Json<TokenResponse>> {
     let identity = login_identity(&state, &request.identity_id, ip).await?;
-    let AuthMethodConfig::Kubernetes(mut config) = method_config(&state, &identity, AuthMethodKind::Kubernetes).await?
+    let Some(AuthMethodConfig::Kubernetes(config)) =
+        method_config(&state, &identity, AuthMethodKind::Kubernetes).await?
     else {
-        return Err(ApiError::login_failed());
+        return refused(&state, ip, &identity, "no kubernetes auth method").await;
     };
-    unseal_reviewer(state.keyring.root()?.as_ref(), &identity.id, &mut config)?;
-    let detail = verify_kubernetes(&state.jwt, state.token_reviewer.as_ref(), &config, &request.token)
-        .await
-        .map_err(|e| rejected(&identity, e))?;
+    let reviewer_token = unseal_reviewer(state.keyring.root()?.as_ref(), &identity.id, &config)?;
+    let detail = match verify_kubernetes(
+        &state.jwt,
+        state.token_reviewer.as_ref(),
+        &config,
+        reviewer_token,
+        &request.token,
+    )
+    .await
+    {
+        Ok(detail) => detail,
+        Err(error) => return rejected(&state, ip, &identity, error).await,
+    };
     let source = auth_method_source(&identity.id, AuthMethodKind::Kubernetes.as_str());
     issue(&state, &identity, AuthMethodKind::Kubernetes, source, detail, ip).await
 }
@@ -428,17 +546,19 @@ pub async fn universal_login(
         .await?
         .is_none()
     {
-        return Err(ApiError::login_failed());
+        return refused(&state, ip, &identity, "no universal auth method").await;
     }
     let now = state.clock.now();
-    let secret = state
+    let Some(secret) = state
         .store
         .find_client_secret(&hash_token(&request.client_secret))
         .await?
         .filter(|s| s.identity_id == identity.id && !s.revoked && s.expires_at.is_none_or(|at| at > now))
-        .ok_or_else(ApiError::login_failed)?;
+    else {
+        return refused(&state, ip, &identity, "client secret wrong, revoked or expired").await;
+    };
     if !state.store.consume_client_secret(&secret.id, now).await? {
-        return Err(ApiError::login_failed());
+        return refused(&state, ip, &identity, "client secret has no uses left").await;
     }
     issue(
         &state,
@@ -523,6 +643,16 @@ mod tests {
     use anyhow::{Context, bail};
     use sekret_api::ClaimBindings;
     use std::sync::Arc;
+
+    /// Most tests need no reviewer token.
+    async fn verify_kubernetes(
+        jwt: &JwtVerifier,
+        reviewer: &dyn TokenReviewer,
+        config: &KubernetesAuthConfig,
+        token: &str,
+    ) -> Result<Value, LoginError> {
+        super::verify_kubernetes(jwt, reviewer, config, None, token).await
+    }
 
     fn k8s_config(mode: KubernetesMode) -> KubernetesAuthConfig {
         KubernetesAuthConfig {
@@ -651,7 +781,7 @@ mod tests {
         let mut reviewer = MockTokenReviewer::new();
         reviewer
             .expect_review()
-            .withf(|request| request.reviewer.as_deref() == Some("reviewer-jwt"))
+            .withf(|request| request.reviewer.as_deref().map(String::as_str) == Some("reviewer-jwt"))
             .returning(|request| {
                 Ok(TokenReviewResult {
                     authenticated: request.token != "bad",
@@ -659,22 +789,27 @@ mod tests {
                     audiences: vec!["sekret".into()],
                 })
             });
-        let mut config = k8s_config(KubernetesMode::TokenReview);
-        config.reviewer_jwt = Some("reviewer-jwt".into());
+        let config = k8s_config(KubernetesMode::TokenReview);
         let jwt = verifier(0);
-        assert!(verify_kubernetes(&jwt, &reviewer, &config, "apps:web-1").await.is_ok());
+        let reviewer_token = Some(Zeroizing::new("reviewer-jwt".to_string()));
+        assert!(
+            super::verify_kubernetes(&jwt, &reviewer, &config, reviewer_token, "apps:web-1")
+                .await
+                .is_ok()
+        );
+        let reviewer_token = Some(Zeroizing::new("reviewer-jwt".to_string()));
+        let verify =
+            |token: &'static str| super::verify_kubernetes(&jwt, &reviewer, &config, reviewer_token.clone(), token);
+        assert!(verify("apps:web-1").await.is_ok());
         assert_eq!(
-            verify_kubernetes(&jwt, &reviewer, &config, "kube-system:web-1").await,
+            verify("kube-system:web-1").await,
             Err(LoginError::Binding("namespace".into()))
         );
         assert_eq!(
-            verify_kubernetes(&jwt, &reviewer, &config, "apps:worker").await,
+            verify("apps:worker").await,
             Err(LoginError::Binding("service account".into()))
         );
-        assert_eq!(
-            verify_kubernetes(&jwt, &reviewer, &config, "bad").await,
-            Err(LoginError::NotAuthenticated)
-        );
+        assert_eq!(verify("bad").await, Err(LoginError::NotAuthenticated));
     }
 
     fn with_reviewer(token: &str) -> AuthMethodConfig {
@@ -718,13 +853,80 @@ mod tests {
             None
         );
 
-        let AuthMethodConfig::Kubernetes(mut k8s) = kept else {
+        let AuthMethodConfig::Kubernetes(k8s) = kept else {
             bail!("kubernetes config expected");
         };
-        let mut other_identity = k8s.clone();
-        unseal_reviewer(&root, "i1", &mut k8s).map_err(api("unseal"))?;
-        assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-jwt"));
-        assert!(unseal_reviewer(&root, "i2", &mut other_identity).is_err());
+        let opened = unseal_reviewer(&root, "i1", &k8s).map_err(api("unseal"))?;
+        assert_eq!(opened.as_deref().map(String::as_str), Some("reviewer-jwt"));
+        assert!(unseal_reviewer(&root, "i2", &k8s).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_sealed_reviewer_token_only_opens_for_its_own_cluster() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let AuthMethodConfig::Kubernetes(sealed) =
+            seal_for_storage(&root, "i1", with_reviewer("reviewer-jwt"), None).map_err(api("seal"))?
+        else {
+            bail!("kubernetes config expected");
+        };
+        // A database writer copies the sealed token but points it elsewhere.
+        let mut other_host = sealed.clone();
+        other_host.host = Some("https://attacker.example".into());
+        let mut other_ca = sealed.clone();
+        other_ca.ca_cert = Some("-----BEGIN CERTIFICATE-----\nattacker\n-----END CERTIFICATE-----".into());
+        let mut other_mode = sealed.clone();
+        other_mode.mode = KubernetesMode::Jwks;
+        for tampered in [other_host, other_ca, other_mode] {
+            assert!(unseal_reviewer(&root, "i1", &tampered).is_err(), "{:?}", tampered.host);
+        }
+        assert!(unseal_reviewer(&root, "i1", &sealed).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewer_tokens_sealed_before_binding_are_moved_on_unlock() -> anyhow::Result<()> {
+        use sekret_store::{AuthMethod, MockStore};
+        let root = RootKey::generate().context("root")?;
+        let mut k8s = k8s_config(KubernetesMode::TokenReview);
+        k8s.reviewer_jwt = Some(seal_credential(&root, "reviewer-jwt", &legacy_context("i1")).context("seal")?);
+        let method = AuthMethod {
+            identity_id: "i1".into(),
+            kind: "kubernetes".into(),
+            config: serde_json::to_value(AuthMethodConfig::Kubernetes(k8s))?,
+            created_at: 0,
+        };
+        let mut store = MockStore::new();
+        store.expect_list_identities().returning(|| {
+            Ok(vec![Identity {
+                id: "i1".into(),
+                name: "web".into(),
+                description: String::new(),
+                token_ttl: 3600,
+                token_max_ttl: 3600,
+                trusted_cidrs: Vec::new(),
+                disabled: false,
+                created_at: 0,
+            }])
+        });
+        store
+            .expect_list_auth_methods()
+            .returning(move |_| Ok(vec![method.clone()]));
+        let saved = Arc::new(std::sync::Mutex::new(None));
+        let sink = saved.clone();
+        store.expect_put_auth_method().times(1).returning(move |m| {
+            if let Ok(mut slot) = sink.lock() {
+                *slot = Some(m);
+            }
+            Ok(())
+        });
+        migrate_reviewer_tokens(&store, &root).await;
+        let moved = saved.lock().ok().and_then(|m| m.clone()).context("saved")?;
+        let AuthMethodConfig::Kubernetes(moved) = serde_json::from_value(moved.config)? else {
+            bail!("kubernetes config expected");
+        };
+        let opened = unseal_reviewer(&root, "i1", &moved).map_err(api("unseal"))?;
+        assert_eq!(opened.as_deref().map(String::as_str), Some("reviewer-jwt"));
         Ok(())
     }
 
@@ -733,14 +935,14 @@ mod tests {
         let old_root = RootKey::generate().context("root")?;
         let new_root = RootKey::generate().context("root")?;
         let sealed = seal_for_storage(&old_root, "i1", with_reviewer("reviewer-jwt"), None).map_err(api("seal"))?;
-        let AuthMethodConfig::Kubernetes(mut k8s) = reseal(&old_root, &new_root, "i1", &sealed)
+        let AuthMethodConfig::Kubernetes(k8s) = reseal(&old_root, &new_root, "i1", &sealed)
             .map_err(api("reseal"))?
             .context("changed")?
         else {
             bail!("kubernetes config expected");
         };
-        unseal_reviewer(&new_root, "i1", &mut k8s).map_err(api("unseal"))?;
-        assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-jwt"));
+        let opened = unseal_reviewer(&new_root, "i1", &k8s).map_err(api("unseal"))?;
+        assert_eq!(opened.as_deref().map(String::as_str), Some("reviewer-jwt"));
         let plain = AuthMethodConfig::Kubernetes(k8s_config(KubernetesMode::Jwks));
         assert_eq!(reseal(&old_root, &new_root, "i1", &plain).map_err(api("reseal"))?, None);
         assert_eq!(

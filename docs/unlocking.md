@@ -10,7 +10,9 @@ There are three policies. Choose one at setup, change it later on the Server pag
 
 ## Manual
 
-Someone unlocks the server by hand after every start, on the unlock page or with `sekret sys unseal`. The passphrase is typed, used and wiped; the unwrapped root key exists only in the server's memory and nowhere else. Anyone who opens the web interface while the server is sealed lands on the unlock page, and goes back to where they were heading once it is unlocked. A tab that was already open moves there too, and drops every secret it had loaded or revealed on the way. After several wrong passphrases the server makes everyone wait before the next try, and the unlock page counts down until then.
+Someone unlocks the server by hand after every start, on the unlock page or with `sekret sys unseal`. The passphrase is typed, used and wiped; the unwrapped root key exists only in the server's memory and nowhere else. Anyone who opens the web interface while the server is sealed lands on the unlock page, and goes back to where they were heading once it is unlocked. A tab that was already open moves there too, and drops every secret it had loaded or revealed on the way. After several wrong passphrases from one address the server makes that address wait before its next try; it says to try again shortly, without the exact wait. Others are not held back, so someone guessing from elsewhere cannot keep you out.
+
+On the server itself, `sekret sys unseal --socket /run/sekret/sekret.sock` unlocks through the Unix socket set with `server.unix_socket`, which the network's rate limits and back-off do not apply to. File permissions on the socket decide who may use it.
 
 ![The unlock page](assets/screenshots/unlock-dark.png)
 
@@ -24,7 +26,7 @@ Someone unlocks the server by hand once, and from then on it unlocks itself on e
 
 On the first manual unlock under this policy, the server generates a random 32-byte device key and writes it to the remember file with mode 0600. It refuses to write through a symlink or over an existing file it did not just remove. It then stores a second copy of the root key in the database, wrapped under that device key. On each start it reads the file, unwraps that copy and is unlocked. Neither half is any use alone: the database copy needs the file, and the file is only a random key.
 
-There is no default location for the remember file. Set `seal.remember_file` (or `--remember-file`, `SEKRET_REMEMBER_FILE`) before choosing this policy; setup and the API refuse `remember` without it. It may not be the database, the root key file or a passphrase file, and the server warns at start when it sits in the database's directory or any folder beneath it, because then one copy of that directory unlocks the server. Keep it on a different disk from the database if you can, and keep it out of backups; `.skb` backups never include the database copy.
+There is no default location for the remember file. Set `seal.remember_file` (or `--remember-file`, `SEKRET_REMEMBER_FILE`) before choosing this policy; setup and the API refuse `remember` without it. It may not be the database or any file beside it that sekret uses, the root key file, a passphrase file or another file the server writes. The server warns at start when it sits in the database's directory or any folder beneath it, or on the same filesystem as the database, because then one copy of that directory or disk unlocks the server. Relative paths, files that do not exist yet and symlinked folders are all resolved before comparing. Keep it on a different disk from the database if you can, and keep it out of backups; `.skb` backups never include the database copy.
 
 The file is opened without following symlinks and without blocking, and anything that is not a regular file is refused. When the server replaces or forgets it, it only deletes a regular file the size of a device key (or a symlink, never its target), so a mistyped path cannot delete something else.
 
@@ -36,19 +38,19 @@ The trade-off is the threat model. Someone with the server's disk, both the file
 
 A remember secret closes the stolen-disk gap. Set `seal.remember_secret_file` (or `--remember-secret-file`, `SEKRET_REMEMBER_SECRET_FILE`) to a file holding at least 32 random characters, or pass the value itself in `SEKRET_REMEMBER_SECRET`. The server then wraps the remembered root key under a key derived from the device key and the secret together (HKDF-SHA256), so the database and the remember file alone cannot unlock it. Deliver the secret from somewhere that is not the data disk, such as a systemd credential or a secret mounted from elsewhere.
 
-One trailing line ending is dropped, the same as for passphrases, and the environment variable is removed from the process as soon as it is read. If the secret is missing or wrong, the server stays sealed and says so in its log. Unlocking by hand then writes a fresh remember file under the secret now configured.
+A leading byte order mark and one trailing line ending are dropped, the same as for passphrases, and the environment variable's value is wiped from the process as soon as it is read. If the secret is missing or wrong, the server stays sealed and says so in its log. Unlocking by hand then writes a fresh remember file under the secret now configured.
 
 ### Locking by hand
 
-"Lock now" on the Server page and `sekret sys seal` drop the root key from memory but keep the remembered unlock, so the next restart unlocks itself again. The status endpoint keeps reporting `remembered: true` while that is so. To make the next start need the passphrase, forget the unlock as well.
+"Lock now" on the Server page and `sekret sys seal` drop the root key from memory but keep the remembered unlock, so the next restart unlocks itself again. The admin status (`sekret sys status` as an admin, or the Server page) keeps reporting `remembered: true` while that is so. To make the next start need the passphrase, forget the unlock as well.
 
 To stop remembering, choose another policy or run `sekret sys forget-unlock` (or "Forget remembered unlock" on the Server page, which asks you to confirm). Both delete the file and the database copy, and the next start needs the passphrase.
 
 ## Passphrase file
 
-The server unlocks itself at start with a passphrase read from `seal.passphrase_file` or the `SEKRET_UNLOCK_PASSPHRASE` environment variable. It reads either one only when this policy is in force (or automatic setup is running), once, at start, and drops one trailing line ending.
+The server unlocks itself at start with a passphrase read from `seal.passphrase_file` or the `SEKRET_UNLOCK_PASSPHRASE` environment variable. It reads either one only when this policy is in force, once, at start, and drops a leading byte order mark and one trailing line ending. Automatic setup under this policy also takes the first passphrase from it; under `manual` or `remember` automatic setup needs `setup.passphrase_file`, so the passphrase does not have to sit in an unlock source the policy never uses.
 
-Prefer the file. The server removes `SEKRET_UNLOCK_PASSPHRASE` from its environment as soon as it starts, so nothing it runs inherits it, but Linux keeps the original bytes in `/proc/<pid>/environ` for the life of the process, readable by the same user and by root. The server also logs a warning when this policy itself comes from the environment rather than the configuration file.
+Prefer the file. The server overwrites the value of `SEKRET_UNLOCK_PASSPHRASE` in its own environment block and removes the variable as soon as it starts, so it no longer shows in `/proc/<pid>/environ` and nothing the server runs inherits it. Whatever started the server, such as the unit file or container definition, still holds it. The server also logs a warning when this policy itself comes from the environment rather than the configuration file.
 
 This keeps the passphrase on disk or in the process environment, which is about as strong as key-file mode: anyone who can read that file or the service's environment can unlock the server. It exists for setups that already deliver secrets from somewhere else, such as a vault agent or a systemd credential, and want one way of doing things. If the passphrase is wrong or missing, the server stays sealed and logs why.
 
@@ -84,9 +86,11 @@ sekret sys unlock-policy manual
 
 The stored policy, mode, root key fingerprint, the passphrase wrap and the remembered wrap are signed together with an HMAC under a key derived from the root key, along with a counter that goes up with every change. The server checks the signature each time it recovers the root key. Someone who can write to the database but does not hold the root key cannot switch `manual` to `remember` and wait for your next unlock: the signature fails, the server falls back to `manual`, writes no remember file, logs an error and records `sys.seal_config.tampered` in the audit log. A server that would have unlocked itself stays sealed instead.
 
-Databases from before signing are signed on their first unlock. If such a database asks for `remember` with nothing remembered yet, which nothing can vouch for, it is treated as `manual` until an admin chooses the policy again.
+A configuration with no signature at all is only accepted if it grants nothing: the `manual` policy with nothing remembered, as a database from before signing has. That one is signed on its first unlock. An unsigned configuration that asks for `remember` or `passphrase-file`, or holds a remembered wrap, is treated exactly like a bad signature, because otherwise clearing the signature would be a way round it.
 
-What the signature cannot catch is a full rollback of the seal configuration to an earlier state that was genuinely signed, for example by restoring an old database file. Changing the passphrase replaces the root key, so an older configuration no longer matches the data.
+Every save also raises a mark outside the database: a small `<file>.epoch` file, mode 0600, beside the SQLite database, the remember file and the root key file, whichever there are. When the server recovers the root key it refuses a configuration whose counter is lower than the mark, even with a good signature: someone has put back an older copy, perhaps one from before you switched `passphrase-file` back to `manual`. It falls back to `manual` the same way, logs an error and records `sys.seal_config.rolled_back`. A Postgres server with no remember file and no key file has nowhere to keep the mark, so there only the signature protects it. Someone who can also delete the mark files can still roll back, and restoring an older backup over the same database path counts as a rollback: delete `<db>.epoch` first if that is what you mean to do, or expect the policy to go back to `manual`.
+
+Changing the passphrase replaces the root key, so a configuration from before the change no longer matches the data at all.
 
 ## Forgetting the passphrase
 

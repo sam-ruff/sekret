@@ -33,7 +33,7 @@ sekret-env off        # unload
 
 The project comes from `-p`, `SEKRET_PROJECT` or `.sekret.toml`, so `sekret-env` in a repository with a `.sekret.toml` loads that repository's project.
 
-Some names are never loaded, because a shell or the dynamic linker would act on them: `PATH`, `LD_*`, `BASH_ENV`, `PROMPT_COMMAND`, the prompt variables `PS*`, names ending in `_OPTIONS` and a few more. Anyone who can write a secret could otherwise run code on your machine when you load the environment. `sekret run` leaves out the same names. Keys that are not valid variable names, such as `my.key`, are skipped too.
+Some names are never loaded, because a shell, the dynamic linker or a program would act on them: `PATH`, `LD_*`, `BASH_ENV`, `PROMPT_COMMAND`, the prompt variables `PS*`, names ending in `_OPTIONS`, helper commands such as `GIT_ASKPASS` and `LESSOPEN`, proxy settings such as `HTTPS_PROXY`, and a few more. Anyone who can write a secret could otherwise run code on your machine, or see your traffic, when you load the environment. `sekret run` and `sekret export --format dotenv` or `shell` leave out the same names, as well as keys starting with `SEKRET_`. Keys that are not valid variable names, such as `my.key`, are skipped too. Each of them names what it skipped on standard error.
 
 `sekret env use` refuses to print to a terminal, since its output contains every value. Run it inside `eval`, or through `sekret-env`.
 

@@ -13,6 +13,11 @@ server:
   trusted_proxies: []
   # Allow http:// OIDC issuers and Kubernetes hosts. Development only.
   allow_insecure_http: false
+  # Unix socket on the host for `sekret sys unseal --socket`, which skips the network's
+  # rate limits; file permissions decide who may use it.
+  unix_socket: null
+  # "0600" for the server's user only, or "0660" to let the socket's group in too.
+  unix_socket_mode: "0600"
 
 database:
   # sqlite://path?mode=rwc or postgres://user:pass@host/db.
@@ -86,8 +91,9 @@ setup:
   web: true
   # Initialise an empty database at start, in seal.mode, without a person.
   auto_init: false
-  # First passphrase for auto_init in passphrase mode, read once. Falls back to
-  # seal.passphrase_file. Delete it afterwards: a passphrase on disk defeats sealing.
+  # First passphrase for auto_init in passphrase mode, read once. Required unless the
+  # unlock policy is passphrase-file, which falls back to seal.passphrase_file. Delete it
+  # afterwards: a passphrase on disk defeats sealing.
   passphrase_file: null
   # Where auto_init writes a break-glass admin token, mode 0600. Unset, no token is
   # issued and admins sign in through the OIDC admin groups.

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { SecretTextarea } from "@/components/secret-field";
 import { isValidSecretKey } from "@/lib/dotenv";
 import { slugify } from "@/lib/format";
 import { DEFAULT_DRAFT, describeGenerator, generatorFromDraft, lengthProblem } from "@/lib/generation";
@@ -113,7 +113,7 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
                 />
               </div>
             ) : (
-              <Textarea
+              <SecretTextarea
                 id={`value-${id}`}
                 value={draft.value}
                 autoFocus={!isNew}

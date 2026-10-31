@@ -27,6 +27,29 @@ test("asks for a backup with POST, and the server refuses GET and a POST without
   expect(made.headers()["x-sekret-csrf"]).toBe("1");
 });
 
+test("pages are isolated from the window that opened them", async ({ page }) => {
+  for (const path of ["/", "/projects", "/login"]) {
+    const response = await page.request.get(path);
+    expect(response.headers()["cross-origin-opener-policy"], path).toBe("same-origin");
+  }
+});
+
+test("the server page reads how it was unlocked from the admin detail, which the public status leaves out", async ({ page }) => {
+  await page.goto("/org/server");
+  await expect(page.getByTestId("server-state")).toHaveText("Unlocked");
+  await expect(page.getByTestId("server-unsealed-by")).not.toBeEmpty();
+  await expect(page.getByTestId("server-mode")).not.toBeEmpty();
+
+  const anonymous = await page.context().browser()?.newContext();
+  const status = anonymous ? await anonymous.request.get(page.url().replace(/\/org\/server$/, "/api/v1/sys/status")) : null;
+  expect(status?.status()).toBe(200);
+  const body = (await status?.json()) as { state: string; unsealed_by: unknown; remembered: unknown };
+  expect(body.state).toBe("unsealed");
+  expect(body.unsealed_by).toBeNull();
+  expect(body.remembered).toBe(false);
+  await anonymous?.close();
+});
+
 test("confirms a weaker unlock policy with the current passphrase", async ({ page }) => {
   test.skip(!passphrase, "only a passphrase-mode server has an unlock policy");
   await page.goto("/org/server");

@@ -126,6 +126,11 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
         Command::Operator(_) => anyhow::bail!("--server-url or SEKRET_URL is required"),
         Command::Server(args) => server::run_server(*args, env_secrets).await?,
         Command::Admin(command) => server::run_admin(command).await?,
+        Command::Sys(command) if command.socket().is_some() => {
+            let path = command.socket().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let api = cli::host_socket_client(&path)?;
+            return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
+        }
         Command::Sys(command) => {
             let resolved = cli::resolve(&cli.client)?;
             let api = cli::client(&cli.client, &resolved, resolved.token.clone())?;
@@ -194,11 +199,11 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
         }
         Command::Export(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            cli::export(&api, cli::location(&resolved)?, &args, &mut out).await?;
+            cli::export(&api, cli::location(&resolved)?, &args, &mut out, &mut std::io::stderr()).await?;
         }
         Command::Run(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            return cli::run_command(&api, cli::location(&resolved)?, &args).await;
+            return cli::run_command(&api, cli::location(&resolved)?, &args, &mut std::io::stderr()).await;
         }
         Command::ShellInit { shell } => print!("{}", cli::shell::init_script(shell)),
         Command::Policy(flags) => {
@@ -266,7 +271,7 @@ fn main() -> anyhow::Result<()> {
     // Taken while the process still has one thread, so removing them from the environment is
     // safe and nothing the server starts inherits them.
     let env_secrets = match cli.command {
-        Command::Server(_) => settings::EnvSecrets::take(),
+        Command::Server(_) => settings::EnvSecrets::take()?,
         _ => settings::EnvSecrets::default(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

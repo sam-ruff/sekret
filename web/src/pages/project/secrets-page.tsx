@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { Link, Navigate } from "react-router";
@@ -101,7 +101,16 @@ function NewFolderDialog({
   );
 }
 
+/**
+ * Each project, environment and folder gets fresh state, so values revealed, an editor open or the
+ * history drawer in one place never carry over to the same key somewhere else.
+ */
 export function SecretsPage() {
+  const { project, envParam, path } = useProjectEnv();
+  return <SecretsView key={`${project}/${envParam ?? ""}/${path}`} />;
+}
+
+function SecretsView() {
   const { project, envParam, env, envs, path, environments } = useProjectEnv();
   const projectQuery = useProject(project);
   const perms = useProjectPermissions(project);
@@ -110,6 +119,8 @@ export function SecretsPage() {
   const [filter, setFilter] = useState("");
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const [revealAll, setRevealAll] = useState(false);
+  /** Keys hidden again by hand while everything else is revealed. */
+  const [hiddenFromAll, setHiddenFromAll] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
@@ -128,17 +139,31 @@ export function SecretsPage() {
     queryFn: () => api.secrets(at, false),
     enabled: !!env,
   });
-  const wantValues = revealAll || revealed.size > 0 || editing !== null;
-  const values = useQuery({
+  // Reveal all fetches the folder's values in one go; anything else fetches only the secret it is for.
+  const allValues = useQuery({
     queryKey: keys.secretValues(project, envSlug, path),
     queryFn: async () => {
       const result = await api.secrets(at, true);
       return new Map(result.secrets.map((s) => [s.key, s.value ?? null]));
     },
-    enabled: !!env && wantValues,
+    enabled: !!env && revealAll,
     staleTime: 15_000,
     gcTime: SECRET_VALUE_GC_TIME,
   });
+  const singleValue = (key: string) => ({
+    queryKey: keys.secretValue(project, envSlug, path, key),
+    queryFn: async () => (await api.secret(at, key)).value ?? null,
+    staleTime: 15_000,
+    gcTime: SECRET_VALUE_GC_TIME,
+  });
+  const singleKeys = [...new Set([...(revealAll ? [] : revealed), ...(editing === null ? [] : [editing])])];
+  const singles = useQueries({
+    queries: singleKeys.map((key) => ({ ...singleValue(key), enabled: !!env })),
+  });
+  const singleQuery = (key: string) => singles[singleKeys.indexOf(key)];
+  /** Undefined while loading or not asked for. */
+  const valueOf = (key: string): string | null | undefined =>
+    revealAll && editing !== key ? allValues.data?.get(key) : singleQuery(key)?.data;
   useSealWatch(revealAll || revealed.size > 0);
 
   const invalidate = [
@@ -211,30 +236,20 @@ export function SecretsPage() {
   const canCreateSecret = perms.canSomewhere("secrets", "create");
   const canCreateFolder = perms.canSomewhere("folders", "create");
   const canRollback = perms.canSomewhere("secrets", "edit");
-  const isRevealed = (key: string) => revealAll || revealed.has(key);
+  const isRevealed = (key: string) => (revealAll ? !hiddenFromAll.has(key) : revealed.has(key));
 
+  const toggle = (set: Set<string>, key: string) => {
+    const next = new Set(set);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  };
   const toggleReveal = (key: string) => {
-    setRevealAll(false);
-    setRevealed((current) => {
-      const next = new Set(revealAll ? secrets.map((s) => s.key) : current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    if (revealAll) setHiddenFromAll((current) => toggle(current, key));
+    else setRevealed((current) => toggle(current, key));
   };
 
-  const fetchValue = async (key: string) => {
-    const map = await queryClient.fetchQuery({
-      queryKey: keys.secretValues(project, envSlug, path),
-      queryFn: async () => {
-        const result = await api.secrets(at, true);
-        return new Map(result.secrets.map((s) => [s.key, s.value ?? null]));
-      },
-      staleTime: 15_000,
-      gcTime: SECRET_VALUE_GC_TIME,
-    });
-    return map.get(key);
-  };
+  const fetchValue = (key: string) => queryClient.fetchQuery(singleValue(key));
 
   return (
     <div className="space-y-6">
@@ -285,6 +300,7 @@ export function SecretsPage() {
                 onClick={() => {
                   setRevealAll(!revealAll);
                   setRevealed(new Set());
+                  setHiddenFromAll(new Set());
                 }}
                 aria-label={revealAll ? "Hide all values" : "Reveal all values"}
                 data-testid="reveal-all"
@@ -398,7 +414,7 @@ export function SecretsPage() {
               {visibleSecrets.map((secret) =>
                 editing === secret.key ? (
                   <div key={secret.key} className="border-b p-3 last:border-b-0">
-                    {values.isPending && !secret.value_hidden ? (
+                    {singleQuery(secret.key)?.isPending !== false && !secret.value_hidden ? (
                       <ListSkeleton rows={1} />
                     ) : (
                       <SecretEditor
@@ -407,7 +423,7 @@ export function SecretsPage() {
                         generated={secret.generated}
                         initial={{
                           key: secret.key,
-                          value: values.data?.get(secret.key) ?? "",
+                          value: valueOf(secret.key) ?? "",
                           comment: secret.comment,
                           tags: secret.tags,
                         }}
@@ -416,7 +432,7 @@ export function SecretsPage() {
                         onSave={(draft) => {
                           const unchanged =
                             !draft.generator &&
-                            draft.value === (values.data?.get(secret.key) ?? "") &&
+                            draft.value === (valueOf(secret.key) ?? "") &&
                             draft.comment === secret.comment &&
                             draft.tags.join() === secret.tags.join() &&
                             !secret.value_hidden;
@@ -434,7 +450,7 @@ export function SecretsPage() {
                     key={secret.key}
                     secret={secret}
                     revealed={isRevealed(secret.key)}
-                    value={values.data?.get(secret.key)}
+                    value={valueOf(secret.key)}
                     abilities={{
                       edit: perms.can("secrets", "edit", resourceFor(secret)),
                       remove: perms.can("secrets", "delete", resourceFor(secret)),

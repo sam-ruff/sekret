@@ -147,6 +147,7 @@
         "tags": [
           "auth"
         ],
+        "description": "`code` must be typed by the person from the terminal that started the login.",
         "operationId": "cli_approve",
         "requestBody": {
           "content": {
@@ -160,6 +161,15 @@
         },
         "responses": {
           "204": {},
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -168,8 +178,85 @@
                 }
               }
             }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/cli/pending": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Where and when a CLI login was started, so the person can check it was them before approving.",
+        "operationId": "cli_pending",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The code from the terminal, or from the link the CLI printed.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingCliLogin"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/api/v1/auth/cli/poll": {
@@ -3295,6 +3382,15 @@
                 }
               }
             }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3415,6 +3511,7 @@
         "tags": [
           "system"
         ],
+        "description": "Unauthenticated. After setup only `state`, `web_setup` and `version` are filled in; organisation admins get the rest from `/api/v1/sys/status/detail`.",
         "operationId": "status",
         "responses": {
           "200": {
@@ -3427,6 +3524,49 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/sys/status/detail": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "description": "Every status field, including how the server was unlocked and whether an unlock is remembered.",
+        "operationId": "status_detail",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/api/v1/sys/unlock-policy": {
@@ -3514,6 +3654,7 @@
         "tags": [
           "system"
         ],
+        "description": "Answers with the public status. Also served on the host socket, where the network's rate limits do not apply.",
         "operationId": "unseal",
         "requestBody": {
           "content": {
@@ -4060,11 +4201,12 @@
       },
       "CliApproveRequest": {
         "type": "object",
+        "description": "The code the person typed from their own terminal; a code carried in a link is not enough.",
         "required": [
-          "user_code"
+          "code"
         ],
         "properties": {
-          "user_code": {
+          "code": {
             "type": "string"
           }
         }
@@ -4905,6 +5047,42 @@
           }
         }
       },
+      "PendingCliLogin": {
+        "type": "object",
+        "description": "A CLI login waiting for approval, so the person can tell whether they started it.",
+        "required": [
+          "requested_from_ip",
+          "user_agent",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "code_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Never set by this server: the person must type the whole code from their terminal."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds."
+          },
+          "requested_from_ip": {
+            "type": "string",
+            "description": "The client address that started the login, as the server saw it."
+          },
+          "user_agent": {
+            "type": "string"
+          }
+        }
+      },
       "PolicyOverride": {
         "oneOf": [
           {
@@ -5541,7 +5719,7 @@
       },
       "SysStatus": {
         "type": "object",
-        "description": "Always answered without authentication, so monitoring can alert on a sealed server.",
+        "description": "`GET /sys/status` answers without authentication, so monitoring can alert on a sealed server,\nand then fills in only `state`, `web_setup` and `version`, plus what configuration has decided\nwhile uninitialised. `GET /sys/status/detail` fills in every field for organisation admins.",
         "required": [
           "state",
           "configured",

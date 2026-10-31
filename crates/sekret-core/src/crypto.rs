@@ -52,6 +52,18 @@ fn key_from_material(material: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
     Ok(key)
 }
 
+/// Base64 of a 32-byte key plus `\n`, in a buffer sized up front so no copy is ever left behind
+/// by a reallocation.
+pub(crate) fn key_text(key: &[u8; KEY_LEN]) -> Zeroizing<String> {
+    let mut text = Zeroizing::new(String::with_capacity(KEY_TEXT_LEN));
+    STANDARD.encode_string(key, &mut text);
+    text.push('\n');
+    text
+}
+
+/// 44 base64 characters and a newline.
+const KEY_TEXT_LEN: usize = 45;
+
 impl RootKey {
     /// Accepts 32 raw bytes, or base64 / hex text with surrounding whitespace.
     pub fn parse(material: &[u8]) -> Result<Self, CryptoError> {
@@ -71,7 +83,14 @@ impl RootKey {
     }
 
     pub fn to_base64(&self) -> Zeroizing<String> {
-        Zeroizing::new(STANDARD.encode(self.0))
+        let mut text = key_text(&self.0);
+        text.pop();
+        text
+    }
+
+    /// The key as written to a key file: base64 and a newline.
+    pub fn to_key_file_text(&self) -> Zeroizing<String> {
+        key_text(&self.0)
     }
 
     pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {

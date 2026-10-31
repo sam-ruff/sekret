@@ -164,9 +164,11 @@ test("users, identities, auth methods and access render as text", async ({ page 
   await expectNoXss(page);
 });
 
-test("the CLI login code from the URL renders as text", async ({ page }) => {
+test("markup in the CLI login link is never rendered or prefilled", async ({ page }) => {
   await page.goto(`/cli-login?code=${encodeURIComponent(X.img)}`);
-  await expect(page.getByTestId("cli-code")).toHaveText(X.img.toUpperCase());
+  await expect(page.getByTestId("cli-unknown")).toBeVisible();
+  await expect(page.getByTestId("cli-code-input")).toHaveValue("");
+  await expect(page.getByTestId("cli-login")).not.toContainText("ONERROR", { ignoreCase: true });
   await expectNoXss(page);
 });
 

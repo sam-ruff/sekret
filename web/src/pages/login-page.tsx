@@ -10,10 +10,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/hooks/queries";
 import { DOCS_URL } from "@/lib/links";
+import { loginErrorText } from "@/lib/login-errors";
 
 export function LoginPage() {
   const [params] = useSearchParams();
-  const error = params.get("error");
+  const error = loginErrorText(params.get("error"));
   const returnTo = params.get("return_to") ?? "/";
   const { data: config, isPending } = useAuthConfig();
   const [leaving, setLeaving] = useState(false);

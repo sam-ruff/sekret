@@ -16,10 +16,13 @@ use crate::prompt::{Prompter, read_new_passphrase, read_passphrase, read_stdin_l
 #[derive(Debug, Subcommand)]
 pub enum SysCommand {
     /// Show whether the server is set up and unlocked. Exits 0 when unsealed, 2 when sealed and
-    /// 3 when not set up yet.
+    /// 3 when not set up yet. Org admins also see how it was unlocked and its unlock policy.
     Status {
         #[arg(long)]
         json: bool,
+        /// Ask the server's Unix socket on this host instead of its URL.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Set up a new server through its API with the code from its log, and print a one-time admin
     /// token. With web setup turned off, run `sekret admin init` on the host instead.
@@ -45,6 +48,10 @@ pub enum SysCommand {
         /// Read the passphrase from this file, or `-` for stdin, instead of asking.
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
+        /// Unseal through the server's Unix socket on this host (server.unix_socket), which the
+        /// network's rate limits and back-off do not apply to.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Drop the root key from the server's memory until someone unseals it. Org admins only.
     Seal,
@@ -74,6 +81,25 @@ pub enum SysCommand {
         #[arg(long, short = 'o')]
         output: PathBuf,
     },
+}
+
+impl SysCommand {
+    /// The host socket the command should use instead of the server's URL, if any.
+    pub fn socket(&self) -> Option<&std::path::Path> {
+        match self {
+            SysCommand::Status { socket, .. } | SysCommand::Unseal { socket, .. } => socket.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// The full status for organisation admins, else what anyone may see.
+async fn best_status(api: &dyn SekretApi) -> anyhow::Result<SysStatus> {
+    match api.sys_status_detail().await {
+        Ok(status) => Ok(status),
+        Err(error) if matches!(error.status(), Some(401 | 403 | 404)) => Ok(api.sys_status().await?),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn parse_unlock(raw: &str) -> Result<UnlockPolicy, String> {
@@ -173,8 +199,8 @@ pub async fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<i32> {
     match command {
-        SysCommand::Status { json } => {
-            let status = api.sys_status().await?;
+        SysCommand::Status { json, .. } => {
+            let status = best_status(api).await?;
             if json {
                 writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
             } else {
@@ -219,7 +245,7 @@ pub async fn run(
                 eprintln!("There is no recovery key: if the passphrase is lost, so is everything in sekret.");
             }
         }
-        SysCommand::Unseal { passphrase_file } => {
+        SysCommand::Unseal { passphrase_file, .. } => {
             let passphrase = read_passphrase(passphrase_file.as_deref(), "Passphrase: ", prompter)?;
             let status = api.sys_unseal(UnsealRequest { passphrase }).await?;
             write!(out, "{}", describe(&status))?;
@@ -319,20 +345,58 @@ mod tests {
             (SealState::Uninitialised, 3),
         ] {
             let mut api = MockSekretApi::new();
-            api.expect_sys_status().returning(move || Ok(status(state)));
+            api.expect_sys_status_detail().returning(move || Ok(status(state)));
             let mut out = Vec::new();
-            let exit = run(&api, SysCommand::Status { json: false }, &Scripted::new(&[]), &mut out).await?;
+            let exit = run(&api, plain_status(false), &Scripted::new(&[]), &mut out).await?;
             assert_eq!(exit, code);
             let text = String::from_utf8(out)?;
             assert!(text.contains(state_name(state)));
             assert!(text.contains("unlock: manual (set in configuration)"));
         }
         let mut api = MockSekretApi::new();
-        api.expect_sys_status().returning(|| Ok(status(SealState::Sealed)));
+        api.expect_sys_status_detail()
+            .returning(|| Ok(status(SealState::Sealed)));
         let mut out = Vec::new();
-        run(&api, SysCommand::Status { json: true }, &Scripted::new(&[]), &mut out).await?;
+        run(&api, plain_status(true), &Scripted::new(&[]), &mut out).await?;
         let parsed: serde_json::Value = serde_json::from_slice(&out)?;
         assert_eq!(parsed["state"], "sealed");
+        Ok(())
+    }
+
+    fn plain_status(json: bool) -> SysCommand {
+        SysCommand::Status { json, socket: None }
+    }
+
+    #[tokio::test]
+    async fn without_admin_rights_status_shows_what_anyone_may_see() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_sys_status_detail().returning(|| {
+            Err(sekret_client::ClientError::Api {
+                status: 401,
+                code: "unauthorised".into(),
+                message: String::new(),
+            })
+        });
+        api.expect_sys_status().times(1).returning(|| {
+            Ok(SysStatus {
+                seal_mode: None,
+                unlock_policy: None,
+                configured: false,
+                ..status(SealState::Sealed)
+            })
+        });
+        let mut out = Vec::new();
+        assert_eq!(run(&api, plain_status(false), &Scripted::new(&[]), &mut out).await?, 2);
+        assert!(String::from_utf8(out)?.contains("sealed"));
+        let mut failing = MockSekretApi::new();
+        failing
+            .expect_sys_status_detail()
+            .returning(|| Err(sekret_client::ClientError::Network("down".into())));
+        assert!(
+            run(&failing, plain_status(false), &Scripted::new(&[]), &mut Vec::new())
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -485,8 +549,12 @@ mod tests {
         let mut out = Vec::new();
         run(
             &api,
-            SysCommand::Unseal { passphrase_file: None },
-            &Scripted::new(&["violet tractor sings beneath"]),
+            SysCommand::Unseal {
+                passphrase_file: None,
+                socket: None,
+            },
+            // A pasted byte order mark and line ending are not part of the passphrase.
+            &Scripted::new(&["\u{feff}violet tractor sings beneath\r\n"]),
             &mut out,
         )
         .await?;

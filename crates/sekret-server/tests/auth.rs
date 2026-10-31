@@ -215,9 +215,17 @@ async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
     let (status, _) = h.get("/api/v1/me", &session).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "session tokens are not bearer tokens");
 
-    // CLI device login.
-    let (status, start_body) = h.call(Method::POST, "/api/v1/auth/cli/start", None, None).await?;
-    assert_eq!(status, StatusCode::OK);
+    // CLI device login, started by a client the person can recognise.
+    let response = h
+        .client
+        .post(format!("{}/api/v1/auth/cli/start", h.base))
+        .header("user-agent", "sekret-cli/9.9 (test)")
+        .send()
+        .await
+        .context("start")?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let start_body: Value = response.json().await.context("start body")?;
+    assert!(start_body["expires_in"].as_i64().is_some_and(|ttl| ttl <= 600));
     let poll = json!({"device_code": start_body["device_code"]});
     let (status, pending) = h
         .call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll.clone()))
@@ -226,13 +234,49 @@ async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
         (status, pending["error"].as_str()),
         (StatusCode::BAD_REQUEST, Some("authorization_pending"))
     );
-    let approve = json!({"user_code": start_body["user_code"]});
+    let code = start_body["user_code"].as_str().context("user code")?;
+    let pending_path = format!("/api/v1/auth/cli/pending?code={code}");
+    let (status, shown) = with_cookie(&h, Method::GET, &pending_path, &session, false, None).await?;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown["requested_from_ip"], "127.0.0.1");
+    assert_eq!(shown["user_agent"], "sekret-cli/9.9 (test)");
+    assert!(shown["created_at"].as_i64().is_some() && shown["expires_at"].as_i64().is_some());
+    assert!(shown.get("code_hint").is_none(), "the code is never handed back");
+    let (status, _) = h.get(&pending_path, &h.admin).await?;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "only browser sessions see pending logins"
+    );
+
+    let approve = json!({"code": code.to_lowercase().replace('-', " ")});
     let (status, _) = h.post("/api/v1/auth/cli/approve", &h.admin, approve.clone()).await?;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
         "only browser sessions may approve CLI logins"
     );
+    // A link carrying the code is not approval; the body must hold a code typed by the person.
+    let (status, _) = with_cookie(
+        &h,
+        Method::POST,
+        "/api/v1/auth/cli/approve",
+        &session,
+        true,
+        Some(json!({"user_code": code})),
+    )
+    .await?;
+    assert!(status.is_client_error() && status != StatusCode::NO_CONTENT);
+    let (status, _) = with_cookie(
+        &h,
+        Method::POST,
+        "/api/v1/auth/cli/approve",
+        &session,
+        true,
+        Some(json!({"code": "BCDF-GHJK"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a wrong code approves nothing");
     let (status, _) = with_cookie(
         &h,
         Method::POST,
@@ -250,6 +294,17 @@ async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
     let cli_token = token["access_token"].as_str().context("token")?;
     let (_, me) = h.get("/api/v1/me", cli_token).await?;
     assert_eq!(me["email"], "alice@example.com");
+    let record = h
+        .state
+        .store
+        .find_token(&sekret_core::crypto::hash_token(cli_token))
+        .await?
+        .context("cli token")?;
+    assert_eq!(
+        record.max_expires_at - record.created_at,
+        h.state.config.cli_token_ttl,
+        "access from groups cannot be renewed past the first TTL"
+    );
     let (_, gone) = h.call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll)).await?;
     assert_eq!(gone["error"], "expired_token");
 
@@ -262,6 +317,90 @@ async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
     );
     let (status, _) = with_cookie(&h, Method::GET, "/api/v1/me", &session, false, None).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, audit) = h.get("/api/v1/audit?action=auth.logout", &h.admin).await?;
+    assert_eq!(audit["entries"].as_array().map(Vec::len), Some(1), "{audit}");
+    Ok(())
+}
+
+/// A session for a user stored with `subject` and `groups`, as a sign-in would leave it.
+async fn stored_session(h: &Harness, subject: &str, groups: &[&str]) -> anyhow::Result<(String, String)> {
+    let now = h.state.clock.now();
+    let user = h
+        .state
+        .store
+        .upsert_user(sekret_store::UserLogin {
+            subject: subject.into(),
+            email: format!("{}@example.com", uuid::Uuid::new_v4()),
+            name: subject.into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            now,
+        })
+        .await?;
+    let token = format!("skt_{}", uuid::Uuid::new_v4().simple());
+    h.state
+        .store
+        .create_token(sekret_store::AccessToken {
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: sekret_core::crypto::hash_token(&token),
+            kind: "session".into(),
+            principal_kind: sekret_store::PrincipalKind::User,
+            principal_id: user.id.clone(),
+            description: "browser session".into(),
+            source: String::new(),
+            created_at: now,
+            expires_at: now + 3600,
+            max_expires_at: now + 3600,
+            revoked: false,
+            last_used_at: None,
+            auth_time: Some(now),
+        })
+        .await?;
+    Ok((user.id, token))
+}
+
+/// Narrowing the sign-in lists takes effect at once, not at each person's next sign-in.
+#[tokio::test]
+async fn sessions_from_before_the_sign_in_lists_narrowed_stop_working() -> anyhow::Result<()> {
+    let (_server, issuer) = issuer().await;
+    let mut config = oidc_config(&issuer);
+    config.required_groups = vec!["sekret-users".into()];
+    config.allowed_subjects = vec!["alice".into(), "bob".into()];
+    let h = start(Options {
+        oidc: Some(config),
+        ..Default::default()
+    })
+    .await?;
+    let stored = |sub: &str| format!("{}|{sub}", issuer.url);
+    let (_, allowed) = stored_session(&h, &stored("alice"), &["sekret-users"]).await?;
+    let (_, outsider) = stored_session(&h, &stored("mallory"), &["sekret-users"]).await?;
+    let (_, ungrouped) = stored_session(&h, &stored("bob"), &["guests"]).await?;
+    let me = |session: &str| {
+        let session = session.to_string();
+        let h = &h;
+        async move { with_cookie(h, Method::GET, "/api/v1/me", &session, false, None).await }
+    };
+    assert_eq!(me(&allowed).await?.0, StatusCode::OK);
+    assert_eq!(me(&outsider).await?.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(&ungrouped).await?.0, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.get("/api/v1/me", &h.admin).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the local break-glass admin is not an OIDC user"
+    );
+
+    let revoked = sekret_server::auth::revoke_disallowed_users(&h.state)
+        .await
+        .map_err(common::api_error("revoke"))?;
+    assert_eq!(revoked, 2);
+    let record = h
+        .state
+        .store
+        .find_token(&sekret_core::crypto::hash_token(&outsider))
+        .await?
+        .context("token")?;
+    assert!(record.revoked, "revoked at start, not just refused");
+    assert_eq!(me(&allowed).await?.0, StatusCode::OK);
     Ok(())
 }
 

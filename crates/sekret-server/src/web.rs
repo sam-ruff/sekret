@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
@@ -36,7 +36,16 @@ fn asset(path: &str) -> Option<Response> {
         headers.insert(header::CONTENT_TYPE, value);
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    isolate_window(headers);
     Some(response)
+}
+
+/// A page that opened this one, or that this one opens, gets no handle on its window.
+fn isolate_window(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
 }
 
 /// Serves the embedded frontend, falling back to `index.html` for client-side routes.
@@ -86,7 +95,22 @@ mod tests {
                 .get(header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok());
             assert_eq!(cache, Some("no-store"), "{path}");
+            let opener = response
+                .headers()
+                .get("cross-origin-opener-policy")
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(opener, Some("same-origin"), "{path}");
         }
+    }
+
+    #[test]
+    fn pages_are_isolated_from_their_opener() {
+        let mut headers = axum::http::HeaderMap::new();
+        super::isolate_window(&mut headers);
+        assert_eq!(
+            headers.get("cross-origin-opener-policy").and_then(|v| v.to_str().ok()),
+            Some("same-origin")
+        );
     }
 
     #[test]

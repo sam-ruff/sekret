@@ -1684,11 +1684,11 @@ async fn kubernetes_reviewer_tokens_are_write_only_and_survive_rotation(db: Stri
         .await
         .map_err(api_error("rotate"))?;
     let rotated: sekret_api::AuthMethodConfig = serde_json::from_value(stored_config().await?).context("config")?;
-    let sekret_api::AuthMethodConfig::Kubernetes(mut k8s) = rotated else {
+    let sekret_api::AuthMethodConfig::Kubernetes(k8s) = rotated else {
         anyhow::bail!("kubernetes config expected");
     };
-    assert!(sekret_server::machine::unseal_reviewer(&old_root, id, &mut k8s.clone()).is_err());
-    sekret_server::machine::unseal_reviewer(&new_root, id, &mut k8s).map_err(api_error("unseal"))?;
-    assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-plaintext"));
+    assert!(sekret_server::machine::unseal_reviewer(&old_root, id, &k8s).is_err());
+    let opened = sekret_server::machine::unseal_reviewer(&new_root, id, &k8s).map_err(api_error("unseal"))?;
+    assert_eq!(opened.as_deref().map(String::as_str), Some("reviewer-plaintext"));
     Ok(())
 }

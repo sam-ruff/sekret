@@ -84,6 +84,8 @@ pub trait SekretApi: Send + Sync {
     async fn snapshots(&self, project: String, environment: String) -> ClientResult<Vec<Snapshot>>;
     async fn restore(&self, at: Location, snapshot: String) -> ClientResult<BatchResult>;
     async fn sys_status(&self) -> ClientResult<SysStatus>;
+    /// Every status field; organisation admins only.
+    async fn sys_status_detail(&self) -> ClientResult<SysStatus>;
     async fn sys_init(&self, request: InitRequest) -> ClientResult<InitResponse>;
     async fn sys_unseal(&self, request: UnsealRequest) -> ClientResult<SysStatus>;
     async fn sys_seal(&self) -> ClientResult<SysStatus>;
@@ -108,10 +110,54 @@ pub struct ClientOptions {
     /// PEM client certificate chain followed by its private key, for servers that require mTLS.
     pub identity_pem: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
+    /// Talk to the server's host socket instead of over the network.
+    pub unix_socket: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+fn unix_socket(builder: reqwest::ClientBuilder, path: std::path::PathBuf) -> ClientResult<reqwest::ClientBuilder> {
+    Ok(builder.unix_socket(path))
+}
+
+#[cfg(not(unix))]
+fn unix_socket(_builder: reqwest::ClientBuilder, _path: std::path::PathBuf) -> ClientResult<reqwest::ClientBuilder> {
+    Err(ClientError::Config("Unix sockets need a Unix host".into()))
 }
 
 /// Joins a PEM certificate chain and a PEM private key into the form `identity_pem` expects.
 /// Both or neither must be given.
+/// The most a PEM file may hold.
+const PEM_LIMIT: u64 = 1024 * 1024;
+
+/// Reads a regular file of at most [`PEM_LIMIT`] bytes, so a device or FIFO cannot hang or
+/// exhaust the CLI.
+fn read_pem(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut contents = Vec::new();
+    file.take(PEM_LIMIT + 1).read_to_end(&mut contents)?;
+    if contents.len() as u64 > PEM_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("larger than {PEM_LIMIT} bytes"),
+        ));
+    }
+    Ok(contents)
+}
+
 pub fn identity_from_files(
     cert: Option<&std::path::Path>,
     key: Option<&std::path::Path>,
@@ -126,7 +172,7 @@ pub fn identity_from_files(
         }
     };
     let read = |path: &std::path::Path| {
-        std::fs::read(path).map_err(|e| ClientError::Config(format!("reading {}: {e}", path.display())))
+        read_pem(path).map_err(|e| ClientError::Config(format!("reading {}: {e}", path.display())))
     };
     let mut pem = read(cert)?;
     pem.push(b'\n');
@@ -153,6 +199,9 @@ impl HttpClient {
             let identity = reqwest::Identity::from_pem(&pem)
                 .map_err(|e| ClientError::Config(format!("client certificate: {e}")))?;
             builder = builder.identity(identity);
+        }
+        if let Some(path) = options.unix_socket {
+            builder = unix_socket(builder, path)?;
         }
         let http = builder.build().map_err(|e| ClientError::Config(e.to_string()))?;
         Ok(Self { http, base, token })
@@ -444,6 +493,15 @@ impl SekretApi for HttpClient {
         self.send(Method::GET, self.sys_url("status")?, None).await
     }
 
+    async fn sys_status_detail(&self) -> ClientResult<SysStatus> {
+        self.send(
+            Method::GET,
+            self.url(&["api", "v1", "sys", "status", "detail"], &[])?,
+            None,
+        )
+        .await
+    }
+
     async fn sys_init(&self, request: InitRequest) -> ClientResult<InitResponse> {
         self.send(Method::POST, self.sys_url("init")?, Some(&request)).await
     }
@@ -483,6 +541,26 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[cfg(unix)]
+    #[test]
+    fn client_certificate_files_are_bounded_and_regular() {
+        let devices = identity_from_files(
+            Some(std::path::Path::new("/dev/zero")),
+            Some(std::path::Path::new("/dev/zero")),
+        );
+        assert!(devices.is_err(), "a device is not read");
+    }
+
+    #[test]
+    fn oversized_client_certificate_files_are_refused() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("sekret-client-big-{}.pem", std::process::id()));
+        std::fs::write(&path, vec![b'a'; (PEM_LIMIT + 1) as usize]).context("write")?;
+        let result = identity_from_files(Some(&path), Some(&path));
+        std::fs::remove_file(&path).context("remove")?;
+        assert!(result.is_err());
+        Ok(())
+    }
 
     fn client(server: &MockServer, token: Option<&str>) -> anyhow::Result<HttpClient> {
         let _ = rustls::crypto::ring::default_provider().install_default();

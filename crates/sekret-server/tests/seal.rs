@@ -37,6 +37,12 @@ async fn status(h: &Harness) -> anyhow::Result<Value> {
     Ok(body)
 }
 
+/// Every status field, as organisation admins see them; read in process, as some tests have no
+/// admin token.
+fn detail(h: &Harness) -> anyhow::Result<Value> {
+    serde_json::to_value(sekret_server::seal::status(&h.state.config.seal, &h.state.keyring)).context("status")
+}
+
 /// Runs first-boot setup in passphrase mode and returns the admin token.
 async fn init(h: &Harness, policy: UnlockPolicy) -> anyhow::Result<String> {
     let code = h.state.keyring.setup_code().context("setup code")?;
@@ -63,6 +69,23 @@ async fn unseal(h: &Harness, passphrase: &str) -> anyhow::Result<(StatusCode, Va
         Some(json!({"passphrase": passphrase})),
     )
     .await
+}
+
+/// Entries with exactly `action`.
+async fn audit_entries(h: &Harness, token: &str, action: &str) -> anyhow::Result<Vec<Value>> {
+    let (code, audit) = h.get("/api/v1/audit?limit=200", token).await?;
+    assert_eq!(code, StatusCode::OK, "{audit}");
+    Ok(audit["entries"]
+        .as_array()
+        .context("entries")?
+        .iter()
+        .filter(|e| e["action"] == action)
+        .cloned()
+        .collect())
+}
+
+async fn audit_count(h: &Harness, token: &str, action: &str) -> anyhow::Result<usize> {
+    Ok(audit_entries(h, token, action).await?.len())
 }
 
 async fn read_secret(h: &Harness, token: &str) -> anyhow::Result<(StatusCode, Value)> {
@@ -217,7 +240,12 @@ async fn restart_is_sealed_until_unsealed(db: String) -> anyhow::Result<()> {
     let h = fresh(&db.url, SealSettings::default()).await?;
     let body = status(&h).await?;
     assert_eq!(body["state"], "sealed");
-    assert_eq!(body["seal_mode"], "passphrase");
+    assert_eq!(
+        body["seal_mode"],
+        Value::Null,
+        "the public status says only that it is sealed"
+    );
+    assert_eq!(detail(&h)?["seal_mode"], "passphrase");
     let (code, body) = read_secret(&h, &admin).await?;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "sealed");
@@ -260,6 +288,13 @@ async fn seal_and_unseal(db: String) -> anyhow::Result<()> {
     let member = h.machine_as("reader", "app", "viewer", &admin).await?.1;
     let (code, _) = h.post("/api/v1/sys/seal", &member, json!({})).await?;
     assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, _) = h.get("/api/v1/sys/status/detail", &member).await?;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        audit_count(&h, &admin, "sys.forbidden").await?,
+        2,
+        "refusals are audited"
+    );
     let (code, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["state"], "sealed");
@@ -313,6 +348,8 @@ async fn sealed_server_answers_nothing(db: String) -> anyhow::Result<()> {
     assert_eq!(code, StatusCode::OK);
     let open = [
         "/api/v1/sys/status",
+        // Organisation admins can see the full status while sealed; it needs no root key.
+        "/api/v1/sys/status/detail",
         "/api/v1/sys/init",
         "/api/v1/sys/unseal",
         "/api/v1/sys/passphrase-strength",
@@ -348,6 +385,10 @@ async fn sealed_server_answers_nothing(db: String) -> anyhow::Result<()> {
         let (code, _) = h.call(Method::GET, path, None, None).await?;
         assert_ne!(code, StatusCode::SERVICE_UNAVAILABLE, "{path}");
     }
+    let (code, full) = h.get("/api/v1/sys/status/detail", &admin).await?;
+    assert_eq!((code, full["seal_mode"].clone()), (StatusCode::OK, json!("passphrase")));
+    let (code, _) = h.call(Method::GET, "/api/v1/sys/status/detail", None, None).await?;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
     let (code, _) = h
         .call(
             Method::POST,
@@ -448,17 +489,23 @@ async fn remember_policy(db: String) -> anyhow::Result<()> {
     let first = fresh(&db.url, settings.clone()).await?;
     let admin = init(&first, UnlockPolicy::Remember).await?;
     assert!(file.exists());
-    assert_eq!(status(&first).await?["remembered"], true);
+    assert_eq!(detail(&first)?["remembered"], true);
 
     let h = fresh(&db.url, settings.clone()).await?;
     let body = status(&h).await?;
     assert_eq!(body["state"], "unsealed", "{body}");
-    assert_eq!(body["unlock_policy"], "remember");
+    assert_eq!(body["unlock_policy"], Value::Null);
+    assert_eq!(body["unsealed_by"], Value::Null);
+    let (code, full) = h.get("/api/v1/sys/status/detail", &admin).await?;
+    assert_eq!(code, StatusCode::OK, "{full}");
+    assert_eq!(full["unlock_policy"], "remember");
+    assert_eq!(full["unsealed_by"], "remember");
+    assert_eq!(full["remembered"], true);
 
     std::fs::remove_file(&file).context("lose the file")?;
     let h = fresh(&db.url, settings.clone()).await?;
     assert_eq!(status(&h).await?["state"], "sealed");
-    assert_eq!(status(&h).await?["remembered"], false);
+    assert_eq!(detail(&h)?["remembered"], false);
     let (code, _) = unseal(&h, PASSPHRASE).await?;
     assert_eq!(code, StatusCode::OK);
     assert!(file.exists(), "the next manual unlock writes a fresh file");
@@ -526,6 +573,7 @@ async fn unlock_policy_changes(db: String) -> anyhow::Result<()> {
     let h = start(opened(&db.url, configured.clone(), secrets)).await?;
     let body = status(&h).await?;
     assert_eq!(body["state"], "unsealed", "{body}");
+    let body = detail(&h)?;
     assert_eq!(body["unlock_policy"], "passphrase-file");
     assert_eq!(body["configured"], true);
     let (code, _) = h
@@ -560,9 +608,8 @@ async fn auto_init_key_file(db: String) -> anyhow::Result<()> {
     assert_eq!(status(&h).await?["state"], "unsealed");
     assert!(key_file.exists());
     let h = fresh(&key_db.url, key_settings.clone()).await?;
-    let body = status(&h).await?;
-    assert_eq!(body["state"], "unsealed");
-    assert_eq!(body["seal_mode"], "key-file");
+    assert_eq!(status(&h).await?["state"], "unsealed");
+    assert_eq!(detail(&h)?["seal_mode"], "key-file");
 
     // A configured mode that disagrees with the database is refused.
     let conflicting = SealSettings {
@@ -594,9 +641,8 @@ async fn auto_init_passphrase(db: String) -> anyhow::Result<()> {
         }),
     };
     let h = start(opened(&pass_db.url, SealSettings::default(), strong)).await?;
-    let body = status(&h).await?;
-    assert_eq!(body["state"], "unsealed");
-    assert_eq!(body["seal_mode"], "passphrase");
+    assert_eq!(status(&h).await?["state"], "unsealed");
+    assert_eq!(detail(&h)?["seal_mode"], "passphrase");
     let h = fresh(&pass_db.url, SealSettings::default()).await?;
     assert_eq!(status(&h).await?["state"], "sealed");
     let (code, _) = unseal(&h, PASSPHRASE).await?;
@@ -648,6 +694,26 @@ async fn web_setup_can_be_turned_off(db: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A start refused for the configured mode leaves an empty database as it was, rather than
+/// recording key-file mode in it first.
+async fn a_refused_mode_leaves_an_empty_database_alone(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let key_file = db.dir.path().join("root.key");
+    let root = sekret_core::crypto::RootKey::generate().context("root")?;
+    std::fs::write(&key_file, root.to_base64().as_bytes()).context("write")?;
+    let conflicting = SealSettings {
+        mode: Some(SealMode::Passphrase),
+        root_key_file: Some(key_file),
+        ..SealSettings::default()
+    };
+    assert!(fresh(&db.url, conflicting).await.is_err());
+    let store = sekret_store::SqlStore::connect(&db.url).await.context("store")?;
+    assert!(sekret_store::Store::get_seal_config(&store).await?.is_none());
+    let h = fresh(&db.url, SealSettings::default()).await?;
+    assert_eq!(status(&h).await?["state"], "uninitialised", "setup is still offered");
+    Ok(())
+}
+
 async fn existing_data_needs_its_key(db: String) -> anyhow::Result<()> {
     let db = persistent(&db)?;
     let key_file = db.dir.path().join("root.key");
@@ -658,7 +724,7 @@ async fn existing_data_needs_its_key(db: String) -> anyhow::Result<()> {
         ..SealSettings::default()
     };
     let h = fresh(&db.url, with_key.clone()).await?;
-    assert_eq!(status(&h).await?["seal_mode"], "key-file");
+    assert_eq!(detail(&h)?["seal_mode"], "key-file");
     // Forgetting the key file must not offer setup over existing data.
     assert!(fresh(&db.url, SealSettings::default()).await.is_err());
     let other = sekret_core::crypto::RootKey::generate().context("root")?;
@@ -681,5 +747,6 @@ on_both_backends!(
     auto_init_passphrase,
     auto_init_reuses_an_existing_key_file,
     web_setup_can_be_turned_off,
+    a_refused_mode_leaves_an_empty_database_alone,
     existing_data_needs_its_key,
 );

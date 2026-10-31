@@ -4,7 +4,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use sekret_api::{AuthConfig, CliApproveRequest, CliPollRequest, CliStartResponse, LogoutResponse, TokenResponse};
+use sekret_api::{
+    AuthConfig, CliApproveRequest, CliPollRequest, CliStartResponse, LogoutResponse, PendingCliLogin, TokenResponse,
+};
 use sekret_core::crypto::{constant_time_eq, fill_random, generate_token, hash_token};
 use sekret_store::{CliLogin, CliPoll, LoginState, PrincipalKind, UserLogin};
 use serde::Deserialize;
@@ -19,7 +21,9 @@ use crate::jwt::{Expectations, KeySource};
 use crate::state::AppState;
 
 const LOGIN_STATE_TTL: i64 = 600;
-const CLI_CODE_TTL: i64 = 600;
+/// Short, so a code sent to someone else goes stale quickly.
+const CLI_CODE_TTL: i64 = 300;
+const MAX_USER_AGENT_CHARS: usize = 200;
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ23456789";
 
 /// Only same-site relative paths are allowed as post-login destinations.
@@ -205,12 +209,34 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
-fn login_error(message: &str) -> Response {
-    let target = format!(
-        "/login?error={}",
-        url::form_urlencoded::byte_serialize(message.as_bytes()).collect::<String>()
-    );
-    Redirect::to(&target).into_response()
+/// Why a browser sign-in failed. Only the fixed code reaches the URL; the login page owns the wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginError {
+    ProviderRefused,
+    IncompleteResponse,
+    OtherBrowser,
+    Expired,
+    ReauthNotPerformed,
+    NotAllowed,
+    AccountDisabled,
+}
+
+impl LoginError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ProviderRefused => "provider_refused",
+            Self::IncompleteResponse => "incomplete_response",
+            Self::OtherBrowser => "other_browser",
+            Self::Expired => "expired",
+            Self::ReauthNotPerformed => "reauth_not_performed",
+            Self::NotAllowed => "not_allowed",
+            Self::AccountDisabled => "account_disabled",
+        }
+    }
+}
+
+fn login_error(error: LoginError) -> Response {
+    Redirect::to(&format!("/login?error={}", error.code())).into_response()
 }
 
 pub async fn callback(
@@ -249,7 +275,7 @@ async fn audit_refused(state: &AppState, ip: std::net::IpAddr, subject: &str, re
 }
 
 /// Whether the user stored as `issuer|sub` is still in `oidc.allowed_subjects`.
-fn subject_allowed(config: &HumanOidcConfig, stored_subject: &str) -> bool {
+pub(crate) fn subject_allowed(config: &HumanOidcConfig, stored_subject: &str) -> bool {
     if config.allowed_subjects.is_empty() {
         return true;
     }
@@ -268,17 +294,15 @@ async fn finish_login(
     let config = oidc(state)?;
     if let Some(error) = query.error {
         tracing::warn!(%error, "identity provider returned an error");
-        return Ok(login_error("The identity provider refused the sign-in."));
+        return Ok(login_error(LoginError::ProviderRefused));
     }
     let (Some(code), Some(state_param)) = (query.code, query.state) else {
-        return Ok(login_error("The sign-in response was incomplete."));
+        return Ok(login_error(LoginError::IncompleteResponse));
     };
     let same_browser = cookie_value(headers, LOGIN_STATE_COOKIE)
         .is_some_and(|cookie| constant_time_eq(cookie.as_bytes(), state_param.as_bytes()));
     if !same_browser {
-        return Ok(login_error(
-            "The sign-in was started in another browser. Please try again.",
-        ));
+        return Ok(login_error(LoginError::OtherBrowser));
     }
     let now = state.clock.now();
     let Some(saved) = state
@@ -287,7 +311,7 @@ async fn finish_login(
         .await?
         .filter(|s| now - s.created_at < LOGIN_STATE_TTL)
     else {
-        return Ok(login_error("The sign-in attempt expired. Please try again."));
+        return Ok(login_error(LoginError::Expired));
     };
     let discovery = state
         .jwt
@@ -330,9 +354,7 @@ async fn finish_login(
         && !fresh_enough(auth_time, max_age, now)
     {
         tracing::warn!("the identity provider did not authenticate the person again as asked");
-        return Ok(login_error(
-            "The identity provider did not ask you to sign in again. Please try again.",
-        ));
+        return Ok(login_error(LoginError::ReauthNotPerformed));
     }
     let subject = claims["sub"]
         .as_str()
@@ -341,7 +363,7 @@ async fn finish_login(
     let groups = extract_groups(&claims, &config.group_claims);
     if let Some(reason) = login_refusal(config, subject, &groups) {
         audit_refused(state, ip, subject, reason).await;
-        return Ok(login_error("Your account is not allowed to use sekret."));
+        return Ok(login_error(LoginError::NotAllowed));
     }
     let email = claims["email"].as_str().unwrap_or_default().to_string();
     let name = ["name", "preferred_username", "email"]
@@ -360,7 +382,7 @@ async fn finish_login(
         })
         .await?;
     if user.disabled {
-        return Ok(login_error("Your sekret account has been disabled."));
+        return Ok(login_error(LoginError::AccountDisabled));
     }
     let minted = mint_token(
         state,
@@ -397,10 +419,16 @@ async fn finish_login(
 /// Ends the browser session and clears its cookie.
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 200, body = LogoutResponse)),
     security(("bearer" = [])))]
-pub async fn logout(State(state): State<AppState>, principal: Principal, headers: HeaderMap) -> ApiResult<Response> {
+pub async fn logout(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    principal: Principal,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     if cookie_value(&headers, SESSION_COOKIE).is_some() {
         state.store.revoke_token(&principal.token_id).await?;
     }
+    audit(&state, &principal, ip, "auth.logout", AuditTarget::default(), json!({})).await;
     let logout_url = match &state.config.oidc {
         Some(config) => state
             .jwt
@@ -424,8 +452,37 @@ pub async fn logout(State(state): State<AppState>, principal: Principal, headers
     Ok(response)
 }
 
+/// The first line of a user agent, cut to a length the approval page can show.
+fn shown_user_agent(headers: &HeaderMap) -> String {
+    let raw = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_USER_AGENT_CHARS)
+        .collect()
+}
+
+/// Codes are shown grouped and read back by people, so case, spaces and dashes are ignored.
+fn normalise_user_code(code: &str) -> String {
+    let plain: String = code
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    match plain.len() {
+        8 => format!("{}-{}", &plain[..4], &plain[4..]),
+        _ => plain,
+    }
+}
+
 #[utoipa::path(post, path = "/api/v1/auth/cli/start", tag = "auth", responses((status = 200, body = CliStartResponse)))]
-pub async fn cli_start(State(state): State<AppState>, ClientIp(ip): ClientIp) -> ApiResult<Json<CliStartResponse>> {
+pub async fn cli_start(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
+) -> ApiResult<Json<CliStartResponse>> {
     if !state.login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
@@ -441,6 +498,8 @@ pub async fn cli_start(State(state): State<AppState>, ClientIp(ip): ClientIp) ->
             expires_at: now + CLI_CODE_TTL,
             approved_user_id: None,
             consumed: false,
+            requested_from_ip: ip.to_string(),
+            user_agent: shown_user_agent(&headers),
         })
         .await?;
     Ok(Json(CliStartResponse {
@@ -455,18 +514,66 @@ pub async fn cli_start(State(state): State<AppState>, ClientIp(ip): ClientIp) ->
     }))
 }
 
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct PendingQuery {
+    /// The code from the terminal, or from the link the CLI printed.
+    code: String,
+}
+
+/// Only a browser session may look at or approve CLI logins.
+fn require_browser_session(principal: &Principal) -> ApiResult<()> {
+    if principal.kind != PrincipalKind::User || principal.token_kind != TokenKind::Session.as_str() {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
+}
+
+#[utoipa::path(get, path = "/api/v1/auth/cli/pending", tag = "auth", params(PendingQuery),
+    description = "Where and when a CLI login was started, so the person can check it was them before approving.",
+    responses((status = 200, body = PendingCliLogin), (status = 403, body = sekret_api::ErrorBody),
+        (status = 404, body = sekret_api::ErrorBody), (status = 429, body = sekret_api::ErrorBody)),
+    security(("bearer" = [])))]
+pub async fn cli_pending(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    principal: Principal,
+    Query(query): Query<PendingQuery>,
+) -> ApiResult<Json<PendingCliLogin>> {
+    require_browser_session(&principal)?;
+    if !state.login_limiter.allow_ip(ip) {
+        return Err(ApiError::too_many_requests());
+    }
+    let login = state
+        .store
+        .get_cli_login(&normalise_user_code(&query.code), state.clock.now())
+        .await?
+        .filter(|login| login.approved_user_id.is_none())
+        .ok_or_else(|| ApiError::not_found("login code"))?;
+    Ok(Json(PendingCliLogin {
+        code_hint: None,
+        requested_from_ip: login.requested_from_ip,
+        user_agent: login.user_agent,
+        created_at: login.created_at,
+        expires_at: login.expires_at,
+    }))
+}
+
 #[utoipa::path(post, path = "/api/v1/auth/cli/approve", tag = "auth", request_body = CliApproveRequest,
-    responses((status = 204), (status = 404, body = sekret_api::ErrorBody)))]
+    description = "`code` must be typed by the person from the terminal that started the login.",
+    responses((status = 204), (status = 403, body = sekret_api::ErrorBody), (status = 404, body = sekret_api::ErrorBody),
+        (status = 429, body = sekret_api::ErrorBody)),
+    security(("bearer" = [])))]
 pub async fn cli_approve(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     principal: Principal,
     Json(request): Json<CliApproveRequest>,
 ) -> ApiResult<StatusCode> {
-    if principal.kind != PrincipalKind::User || principal.token_kind != TokenKind::Session.as_str() {
-        return Err(ApiError::forbidden());
+    require_browser_session(&principal)?;
+    if !state.login_limiter.allow_ip(ip) {
+        return Err(ApiError::too_many_requests());
     }
-    let code = request.user_code.trim().to_ascii_uppercase();
+    let code = normalise_user_code(&request.code);
     // A session from before the subject list changed must not mint a CLI token.
     if let Some(config) = &state.config.oidc
         && !config.allowed_subjects.is_empty()
@@ -512,6 +619,17 @@ pub async fn cli_approve(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// How long a CLI token may be renewed to. With re-authentication on, or when the user's access
+/// may come from identity provider groups, which only refresh at the next browser sign-in, it
+/// cannot be renewed past its first TTL.
+fn cli_max_ttl(state: &AppState, groups: &[String]) -> i64 {
+    let ttl = state.config.cli_token_ttl;
+    if state.config.cli_login_max_auth_age.is_some() || !groups.is_empty() {
+        return ttl;
+    }
+    ttl * 7
+}
+
 #[utoipa::path(post, path = "/api/v1/auth/cli/poll", tag = "auth", request_body = CliPollRequest,
     responses((status = 200, body = TokenResponse), (status = 400, body = sekret_api::ErrorBody)))]
 pub async fn cli_poll(
@@ -549,12 +667,7 @@ pub async fn cli_poll(
                     principal_kind: PrincipalKind::User,
                     principal_id: &user.id,
                     ttl: state.config.cli_token_ttl,
-                    // With re-authentication on, renewing must not outlive the TTL; a new
-                    // browser sign-in is the only way to extend access.
-                    max_ttl: match state.config.cli_login_max_auth_age {
-                        Some(_) => state.config.cli_token_ttl,
-                        None => state.config.cli_token_ttl * 7,
-                    },
+                    max_ttl: cli_max_ttl(&state, &user.groups),
                     description: "CLI login".into(),
                     source: String::new(),
                     auth_time: None,
@@ -659,6 +772,31 @@ mod tests {
             reauth_url("/cli-login?code=AB-CD"),
             "/auth/login?reauth=1&return_to=%2Fcli-login%3Fcode%3DAB-CD"
         );
+    }
+
+    #[test]
+    fn login_errors_redirect_with_fixed_codes_only() {
+        let all = [
+            (LoginError::ProviderRefused, "provider_refused"),
+            (LoginError::IncompleteResponse, "incomplete_response"),
+            (LoginError::OtherBrowser, "other_browser"),
+            (LoginError::Expired, "expired"),
+            (LoginError::ReauthNotPerformed, "reauth_not_performed"),
+            (LoginError::NotAllowed, "not_allowed"),
+            (LoginError::AccountDisabled, "account_disabled"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (error, code) in all {
+            assert_eq!(error.code(), code);
+            assert!(seen.insert(code), "{code} is used twice");
+            assert!(
+                code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{code} needs no escaping and carries no prose"
+            );
+            let response = login_error(error);
+            let location = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok());
+            assert_eq!(location, Some(format!("/login?error={code}").as_str()));
+        }
     }
 
     #[test]

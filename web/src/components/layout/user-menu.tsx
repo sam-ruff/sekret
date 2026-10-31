@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { LogOut, Monitor, Moon, Sun } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -36,6 +37,7 @@ export function ThemeToggle() {
 export function UserMenu() {
   const { data: me, isPending } = useMe();
   const { theme, setTheme } = useTheme();
+  const queryClient = useQueryClient();
 
   if (isPending) return <Skeleton className="size-8 rounded-full" />;
   const label = me?.name || me?.email || "Signed in";
@@ -68,7 +70,7 @@ export function UserMenu() {
           </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void signOut()} data-testid="logout">
+        <DropdownMenuItem onSelect={() => void signOut(queryClient)} data-testid="logout">
           <LogOut />
           Sign out
         </DropdownMenuItem>

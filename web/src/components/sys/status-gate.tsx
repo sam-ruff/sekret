@@ -1,11 +1,12 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import { useLocation, useNavigate } from "react-router";
-import { onSealResponse } from "@/api/client";
+import { onSealResponse, redirectToLogin } from "@/api/client";
 import { ErrorState } from "@/components/states";
 import { Spinner } from "@/components/ui/spinner";
 import { forgetAllButStatus, keys, useSysStatus } from "@/hooks/queries";
 import { gateRedirect } from "@/lib/sys-gate";
+import { listen } from "@/lib/tab-sync";
 import { StandalonePage } from "./standalone-page";
 
 /**
@@ -27,6 +28,19 @@ export function StatusGate({ children }: { children: ReactNode }) {
         setRechecking(true);
         forgetAllButStatus(queryClient);
         void queryClient.invalidateQueries({ queryKey: keys.sysStatus }).finally(() => setRechecking(false));
+      }),
+    [queryClient],
+  );
+
+  useEffect(
+    () =>
+      listen((message) => {
+        forgetAllButStatus(queryClient);
+        if (message === "signed-out") {
+          redirectToLogin();
+          return;
+        }
+        void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
       }),
     [queryClient],
   );

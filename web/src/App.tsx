@@ -1,7 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { ApiError, isSealError } from "@/api/client";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { AppLayout } from "@/components/layout/app-layout";
+import { forgetAllButStatus } from "@/hooks/queries";
 import { StatusGate } from "@/components/sys/status-gate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -35,6 +37,8 @@ function createQueryClient() {
         },
         refetchOnWindowFocus: false,
       },
+      // A finished mutation can hold a passphrase, a value or a client secret; drop it once unused.
+      mutations: { gcTime: 0 },
     },
   });
 }
@@ -75,11 +79,13 @@ export function App() {
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <TooltipProvider delayDuration={300}>
-          <BrowserRouter>
-            <StatusGate>
-              <AppRoutes />
-            </StatusGate>
-          </BrowserRouter>
+          <ErrorBoundary onError={() => forgetAllButStatus(queryClient)}>
+            <BrowserRouter>
+              <StatusGate>
+                <AppRoutes />
+              </StatusGate>
+            </BrowserRouter>
+          </ErrorBoundary>
           <Toaster richColors closeButton position="bottom-right" />
         </TooltipProvider>
       </QueryClientProvider>

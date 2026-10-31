@@ -3,20 +3,18 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use axum::Json;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use sekret_api::{
     ChangePassphrase, ErrorBody, InitRequest, InitResponse, PassphraseCheck, PassphraseStrength, SetUnlockPolicy,
     SysStatus, UnsealRequest,
 };
 use sekret_core::permissions::{Action, BuiltinRole, Subject};
-use sekret_core::seal::{
-    BackupHeader, MAX_BACKUP_LEN, SealState, encrypt_backup, passphrase_strength, strip_line_ending,
-};
-use sekret_store::{PrincipalKind, sqlite_file};
+use sekret_core::seal::{BackupHeader, MAX_BACKUP_LEN, SealState, encrypt_backup, passphrase_strength, trim_input};
+use sekret_store::sqlite_file;
 use serde_json::json;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -24,22 +22,24 @@ use zeroize::Zeroizing;
 
 use super::logo::LogoFile;
 use super::{AuditTarget, audit};
-use crate::admin::bootstrap_admin_token;
 use crate::auth::authenticate;
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{org_role_slugs, org_rules, require_any};
 use crate::error::{ApiError, ApiResult};
 use crate::files::{create_private_dir, read_limited};
-use crate::seal::{self, ops};
+use crate::seal;
+use crate::seal::ops::{self, Source, detached};
 use crate::state::AppState;
 
-const INIT_TOKEN_TTL: i64 = 3600;
 /// Every system request body is small; backups have none.
 const SYS_BODY_LIMIT: usize = 16 * 1024;
+/// Staging directories for backups start with this, so ones left by a crash can be found.
+pub const BACKUP_STAGING_PREFIX: &str = ".sekret-backup-";
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(status))
+        .routes(routes!(status_detail))
         .routes(routes!(init))
         .routes(routes!(unseal))
         .routes(routes!(seal_now))
@@ -51,9 +51,23 @@ pub fn router() -> OpenApiRouter<AppState> {
         .layer(DefaultBodyLimit::max(SYS_BODY_LIMIT))
 }
 
-/// Every passphrase source drops one trailing line ending the same way.
+/// Marks requests that came in over the host's Unix socket.
+#[derive(Debug, Clone, Copy)]
+pub struct HostSocket;
+
+/// The status and unseal routes alone, for the host socket. Nothing else is reachable through it.
+pub fn host_router(state: AppState) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/sys/status", axum::routing::get(status))
+        .route("/api/v1/sys/unseal", axum::routing::post(unseal))
+        .layer(Extension(HostSocket))
+        .layer(DefaultBodyLimit::max(SYS_BODY_LIMIT))
+        .with_state(state)
+}
+
+/// Every passphrase source drops a leading byte order mark and one trailing line ending the same way.
 fn normalised(passphrase: Zeroizing<String>) -> Zeroizing<String> {
-    let trimmed = strip_line_ending(&passphrase);
+    let trimmed = trim_input(&passphrase);
     if trimmed.len() == passphrase.len() {
         return passphrase;
     }
@@ -78,32 +92,25 @@ async fn check_passphrase(
         SealState::Sealed => return Err(ApiError::sealed()),
         SealState::Unsealed => {
             let principal = authenticate(&state, &method, &headers, ip).await?;
-            require_org_admin(&state, &principal).await?;
+            require_org_admin(&state, &principal, ip).await?;
         }
     }
     let passphrase = normalised(request.passphrase);
     Ok(Json(passphrase_strength(&passphrase)))
 }
 
-/// Recorded as the actor for setup and unlock attempts, which have no signed-in caller.
-fn system_principal(name: &str) -> Principal {
-    Principal {
-        kind: PrincipalKind::Identity,
-        id: name.into(),
-        name: name.into(),
-        email: String::new(),
-        groups: Vec::new(),
-        token_id: String::new(),
-        token_kind: "system".into(),
-    }
-}
-
-async fn require_org_admin(state: &AppState, principal: &Principal) -> ApiResult<()> {
+/// Organisation admins only; a refusal is audited.
+async fn require_org_admin(state: &AppState, principal: &Principal, ip: IpAddr) -> ApiResult<()> {
     let slugs = org_role_slugs(state, principal).await?;
     if slugs.iter().any(|s| s == BuiltinRole::OrgAdmin.slug()) {
         return Ok(());
     }
+    audit_forbidden(state, principal, ip).await;
     Err(ApiError::forbidden())
+}
+
+async fn audit_forbidden(state: &AppState, principal: &Principal, ip: IpAddr) {
+    audit(state, principal, ip, "sys.forbidden", AuditTarget::default(), json!({})).await;
 }
 
 fn rate_limit(state: &AppState, ip: IpAddr) -> ApiResult<()> {
@@ -117,23 +124,29 @@ fn current(state: &AppState) -> SysStatus {
     seal::status(&state.config.seal, &state.keyring)
 }
 
-async fn audit_tampered(state: &AppState, principal: &Principal, ip: IpAddr, tampered: bool) {
-    if tampered {
-        audit(
-            state,
-            principal,
-            ip,
-            "sys.seal_config.tampered",
-            AuditTarget::default(),
-            json!({}),
-        )
-        .await;
-    }
+fn public(state: &AppState) -> SysStatus {
+    seal::public_status(&state.config.seal, &state.keyring)
 }
 
-#[utoipa::path(get, path = "/api/v1/sys/status", tag = "system", responses((status = 200, body = SysStatus)))]
+#[utoipa::path(get, path = "/api/v1/sys/status", tag = "system",
+    description = "Unauthenticated. After setup only `state`, `web_setup` and `version` are filled in; \
+                   organisation admins get the rest from `/api/v1/sys/status/detail`.",
+    responses((status = 200, body = SysStatus)))]
 async fn status(State(state): State<AppState>) -> Json<SysStatus> {
-    Json(current(&state))
+    Json(public(&state))
+}
+
+#[utoipa::path(get, path = "/api/v1/sys/status/detail", tag = "system",
+    description = "Every status field, including how the server was unlocked and whether an unlock is remembered.",
+    responses((status = 200, body = SysStatus), (status = 401, body = ErrorBody), (status = 403, body = ErrorBody)),
+    security(("bearer" = [])))]
+async fn status_detail(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    principal: Principal,
+) -> ApiResult<Json<SysStatus>> {
+    require_org_admin(&state, &principal, ip).await?;
+    Ok(Json(current(&state)))
 }
 
 #[utoipa::path(post, path = "/api/v1/sys/init", tag = "system", request_body = InitRequest,
@@ -145,39 +158,14 @@ async fn init(
     Json(request): Json<InitRequest>,
 ) -> ApiResult<Json<InitResponse>> {
     rate_limit(&state, ip)?;
-    let InitRequest {
-        setup_code,
-        mode,
-        passphrase,
-        unlock_policy,
-    } = request;
-    let passphrase = passphrase.map(normalised);
-    let outcome = ops::init(&state, &setup_code, mode, passphrase, unlock_policy.unwrap_or_default()).await;
-    if let Err(error) = &outcome
-        && error.code == "invalid_setup_code"
-    {
-        audit(
-            &state,
-            &system_principal("setup"),
-            ip,
-            "sys.init.failed",
-            AuditTarget::default(),
-            json!({}),
-        )
-        .await;
-    }
-    outcome?;
-    audit(
-        &state,
-        &system_principal("setup"),
-        ip,
-        "sys.init",
-        AuditTarget::default(),
-        json!({"mode": mode.as_str()}),
-    )
-    .await;
-    let (admin_token, admin_token_expires_at) = bootstrap_admin_token(&state, INIT_TOKEN_TTL).await?;
-    ops::after_unlock(&state, None, false).await;
+    let request = ops::InitRequest {
+        setup_code: request.setup_code,
+        mode: request.mode,
+        passphrase: request.passphrase.map(normalised),
+        unlock_policy: request.unlock_policy.unwrap_or_default(),
+    };
+    let task = state.clone();
+    let (admin_token, admin_token_expires_at) = detached(async move { ops::init(&task, ip, request).await }).await?;
     Ok(Json(InitResponse {
         status: current(&state),
         admin_token,
@@ -186,39 +174,27 @@ async fn init(
 }
 
 #[utoipa::path(post, path = "/api/v1/sys/unseal", tag = "system", request_body = UnsealRequest,
+    description = "Answers with the public status. Also served on the host socket, where the network's \
+                   rate limits do not apply.",
     responses((status = 200, body = SysStatus), (status = 400, body = ErrorBody), (status = 401, body = ErrorBody),
         (status = 429, body = ErrorBody), (status = 503, body = ErrorBody)))]
 async fn unseal(
     State(state): State<AppState>,
+    host: Option<Extension<HostSocket>>,
     ClientIp(ip): ClientIp,
     Json(request): Json<UnsealRequest>,
 ) -> ApiResult<Json<SysStatus>> {
-    rate_limit(&state, ip)?;
+    let source = match host {
+        Some(_) => Source::HostSocket,
+        None => {
+            rate_limit(&state, ip)?;
+            Source::Network(ip)
+        }
+    };
     let passphrase = normalised(request.passphrase);
-    let principal = system_principal("unseal");
-    match ops::unseal(&state, &ip.to_string(), passphrase.clone()).await {
-        Ok(ops::Unsealed::Already) => Ok(Json(current(&state))),
-        Ok(ops::Unsealed::Now { tampered }) => {
-            audit(&state, &principal, ip, "sys.unseal", AuditTarget::default(), json!({})).await;
-            audit_tampered(&state, &principal, ip, tampered).await;
-            ops::after_unlock(&state, Some(passphrase), tampered).await;
-            Ok(Json(current(&state)))
-        }
-        Err(error) if error.code == "invalid_passphrase" => {
-            let failures = state.passphrase_backoff.failures();
-            audit(
-                &state,
-                &principal,
-                ip,
-                "sys.unseal.failed",
-                AuditTarget::default(),
-                json!({"consecutive_failures": failures}),
-            )
-            .await;
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
+    let task = state.clone();
+    detached(async move { ops::unseal(&task, source, passphrase).await }).await?;
+    Ok(Json(public(&state)))
 }
 
 #[utoipa::path(post, path = "/api/v1/sys/seal", tag = "system",
@@ -231,8 +207,8 @@ async fn seal_now(
     ClientIp(ip): ClientIp,
     principal: Principal,
 ) -> ApiResult<Json<SysStatus>> {
-    require_org_admin(&state, &principal).await?;
-    ops::seal(&state)?;
+    require_org_admin(&state, &principal, ip).await?;
+    ops::seal(&state).await?;
     audit(&state, &principal, ip, "sys.seal", AuditTarget::default(), json!({})).await;
     Ok(Json(current(&state)))
 }
@@ -241,7 +217,8 @@ async fn seal_now(
     description = "Replaces the root key and re-encrypts every value under it, so the old passphrase opens \
                    nothing in the live database. Backups taken earlier still open with the old passphrase.",
     responses((status = 204), (status = 400, body = ErrorBody), (status = 401, body = ErrorBody),
-        (status = 403, body = ErrorBody), (status = 409, body = ErrorBody), (status = 429, body = ErrorBody)),
+        (status = 403, body = ErrorBody), (status = 409, body = ErrorBody), (status = 429, body = ErrorBody),
+        (status = 503, body = ErrorBody)),
     security(("bearer" = [])))]
 async fn change_passphrase(
     State(state): State<AppState>,
@@ -249,44 +226,13 @@ async fn change_passphrase(
     principal: Principal,
     Json(request): Json<ChangePassphrase>,
 ) -> ApiResult<StatusCode> {
-    require_org_admin(&state, &principal).await?;
+    require_org_admin(&state, &principal, ip).await?;
     rate_limit(&state, ip)?;
     let current = normalised(request.current);
     let new = normalised(request.new);
-    match ops::change_passphrase(&state, current, new).await {
-        Ok(tampered) => {
-            audit(
-                &state,
-                &principal,
-                ip,
-                "sys.passphrase",
-                AuditTarget::default(),
-                json!({"root_key_rotated": true}),
-            )
-            .await;
-            audit_tampered(&state, &principal, ip, tampered).await;
-            ops::after_unlock(&state, None, tampered).await;
-            Ok(StatusCode::NO_CONTENT)
-        }
-        Err(error) => {
-            if error.code == "invalid_passphrase" {
-                audit_passphrase_failure(&state, &principal, ip).await;
-            }
-            Err(error)
-        }
-    }
-}
-
-async fn audit_passphrase_failure(state: &AppState, principal: &Principal, ip: IpAddr) {
-    audit(
-        state,
-        principal,
-        ip,
-        "sys.passphrase.failed",
-        AuditTarget::default(),
-        json!({"consecutive_failures": state.passphrase_backoff.failures()}),
-    )
-    .await;
+    let task = state.clone();
+    detached(async move { ops::change_passphrase(&task, Source::Network(ip), &principal, current, new).await }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(put, path = "/api/v1/sys/unlock-policy", tag = "system", request_body = SetUnlockPolicy,
@@ -300,25 +246,13 @@ async fn set_unlock_policy(
     principal: Principal,
     Json(request): Json<SetUnlockPolicy>,
 ) -> ApiResult<Json<SysStatus>> {
-    require_org_admin(&state, &principal).await?;
+    require_org_admin(&state, &principal, ip).await?;
     rate_limit(&state, ip)?;
     let policy = request.policy;
-    if let Err(error) = ops::set_unlock_policy(&state, policy, request.passphrase.map(normalised)).await {
-        if error.code == "invalid_passphrase" {
-            audit_passphrase_failure(&state, &principal, ip).await;
-        }
-        return Err(error);
-    }
-    audit(
-        &state,
-        &principal,
-        ip,
-        "sys.unlock_policy",
-        AuditTarget::default(),
-        json!({"policy": policy.as_str()}),
-    )
-    .await;
-    ops::after_unlock(&state, None, false).await;
+    let passphrase = request.passphrase.map(normalised);
+    let task = state.clone();
+    detached(async move { ops::set_unlock_policy(&task, Source::Network(ip), &principal, policy, passphrase).await })
+        .await?;
     Ok(Json(current(&state)))
 }
 
@@ -330,17 +264,9 @@ async fn forget_unlock(
     ClientIp(ip): ClientIp,
     principal: Principal,
 ) -> ApiResult<Json<SysStatus>> {
-    require_org_admin(&state, &principal).await?;
-    ops::forget_unlock(&state).await?;
-    audit(
-        &state,
-        &principal,
-        ip,
-        "sys.forget_unlock",
-        AuditTarget::default(),
-        json!({}),
-    )
-    .await;
+    require_org_admin(&state, &principal, ip).await?;
+    let task = state.clone();
+    detached(async move { ops::forget_unlock(&task, &principal, ip).await }).await?;
     Ok(Json(current(&state)))
 }
 
@@ -374,21 +300,46 @@ fn too_large() -> ApiError {
     )
 }
 
-/// Where the snapshot is staged: the configured directory, or beside the database, never `/tmp`,
+/// Where snapshots are staged: the configured directory, or beside the database, never `/tmp`,
 /// which a scratch container does not have.
-fn staging_dir(state: &AppState) -> ApiResult<tempfile::TempDir> {
-    let base = match (&state.config.backup_temp_dir, sqlite_file(&state.config.database_url)) {
-        (Some(dir), _) => dir.clone(),
+pub fn staging_base(backup_temp_dir: Option<&std::path::Path>, database_url: &str) -> PathBuf {
+    match (backup_temp_dir, sqlite_file(database_url)) {
+        (Some(dir), _) => dir.to_path_buf(),
         (None, Some(db)) => db
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf),
         // Only an in-memory database, which exists in tests.
         (None, None) => std::env::temp_dir(),
+    }
+}
+
+/// Removes staging directories a crash left behind, which may hold a complete copy of the database.
+pub fn clean_stale_staging(base: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
     };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let stale = name.to_string_lossy().starts_with(BACKUP_STAGING_PREFIX);
+        let directory = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !stale || !directory {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(path = %entry.path().display(), "removed a backup staging directory left behind"),
+            Err(error) => {
+                tracing::warn!(%error, path = %entry.path().display(), "could not remove a stale backup staging directory")
+            }
+        }
+    }
+}
+
+fn staging_dir(state: &AppState) -> ApiResult<tempfile::TempDir> {
+    let base = staging_base(state.config.backup_temp_dir.as_deref(), &state.config.database_url);
     create_private_dir(&base).map_err(|e| ApiError::internal("backup directory", e))?;
     tempfile::Builder::new()
-        .prefix(".sekret-backup-")
+        .prefix(BACKUP_STAGING_PREFIX)
         .tempdir_in(&base)
         .map_err(|e| ApiError::internal("backup directory", e))
 }
@@ -416,8 +367,10 @@ fn database_size(state: &AppState) -> u64 {
         (status = 507, body = ErrorBody, description = "Too large to back up through the API")),
     security(("bearer" = [])))]
 async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal: Principal) -> ApiResult<Response> {
-    require_any(&org_rules(&state, &principal).await?, Subject::Backups, Action::Read)?;
-    let root = state.keyring.root()?;
+    if let Err(error) = require_any(&org_rules(&state, &principal).await?, Subject::Backups, Action::Read) {
+        audit_forbidden(&state, &principal, ip).await;
+        return Err(error);
+    }
     if state.config.database_url.starts_with("postgres") {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -431,25 +384,32 @@ async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal
     if usize::try_from(database_size(&state)).map_or(true, |size| size > MAX_BACKUP_LEN) {
         return Err(too_large());
     }
-    let config = state
-        .store
-        .get_seal_config()
-        .await?
-        .ok_or_else(ApiError::uninitialised)?;
-    // The copy never carries the remembered wrap, and is signed again without it.
-    let copy_config = seal::signed(
-        &root,
-        sekret_store::SealConfig {
-            remembered: None,
-            ..config.clone()
-        },
-    )?;
-    let dir = staging_dir(&state)?;
-    let path = dir.path().join("snapshot.db");
-    state
-        .store
-        .snapshot_to(&path.display().to_string(), copy_config)
-        .await?;
+    // Held from reading the root key until the snapshot is taken, so a rotation cannot slip in
+    // between and leave a backup whose header and contents belong to different keys.
+    let (root, config, dir, path) = {
+        let _writing = state.keyring.writing().await;
+        let root = state.keyring.root()?;
+        let config = state
+            .store
+            .get_seal_config()
+            .await?
+            .ok_or_else(ApiError::uninitialised)?;
+        // The copy never carries the remembered wrap, and is signed again without it.
+        let copy_config = seal::signed(
+            &root,
+            sekret_store::SealConfig {
+                remembered: None,
+                ..config.clone()
+            },
+        )?;
+        let dir = staging_dir(&state)?;
+        let path = dir.path().join("snapshot.db");
+        state
+            .store
+            .snapshot_to(&path.display().to_string(), copy_config)
+            .await?;
+        (root, config, dir, path)
+    };
     let now = state.clock.now();
     let header = BackupHeader::new(config.mode, config.wrapped.as_ref(), &root, now, sekret_core::VERSION);
     let file = tokio::task::spawn_blocking(move || {
@@ -485,7 +445,8 @@ async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_utc, normalised};
+    use super::{BACKUP_STAGING_PREFIX, clean_stale_staging, compact_utc, normalised};
+    use anyhow::Context;
     use zeroize::Zeroizing;
 
     #[test]
@@ -496,11 +457,28 @@ mod tests {
     }
 
     #[test]
-    fn json_passphrases_lose_one_line_ending() {
+    fn json_passphrases_lose_one_line_ending_and_a_byte_order_mark() {
         let n = |s: &str| normalised(Zeroizing::new(s.to_string())).to_string();
         assert_eq!(n("pass\n"), "pass");
         assert_eq!(n("pass\r\n"), "pass");
         assert_eq!(n("pass\n\n"), "pass\n");
         assert_eq!(n("pass"), "pass");
+        assert_eq!(n("\u{feff}pass\n"), "pass");
+    }
+
+    #[test]
+    fn staging_left_by_a_crash_is_removed_and_nothing_else() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let stale = dir.path().join(format!("{BACKUP_STAGING_PREFIX}abc123"));
+        std::fs::create_dir(&stale).context("stale")?;
+        std::fs::write(stale.join("snapshot.db"), b"copy").context("snapshot")?;
+        let database = dir.path().join("sekret.db");
+        std::fs::write(&database, b"db").context("db")?;
+        let lookalike = dir.path().join(format!("{BACKUP_STAGING_PREFIX}file"));
+        std::fs::write(&lookalike, b"not a directory").context("file")?;
+        clean_stale_staging(dir.path());
+        assert!(!stale.exists());
+        assert!(database.exists() && lookalike.exists());
+        Ok(())
     }
 }

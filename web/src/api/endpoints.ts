@@ -41,7 +41,10 @@ function secretParams(at: SecretLocation, key: string) {
 }
 
 export const api = {
+  /** Public: after setup, only the state, whether web setup is on, and the version. */
   sysStatus: () => unwrap(client.GET("/api/v1/sys/status")),
+  /** Every status field; organisation admins only. */
+  sysStatusDetail: () => unwrap(client.GET("/api/v1/sys/status/detail")),
   init: (body: InitRequest) => unwrap(client.POST("/api/v1/sys/init", { body })),
   unseal: (passphrase: string) => unwrap(client.POST("/api/v1/sys/unseal", { body: { passphrase } })),
   seal: () => unwrap(client.POST("/api/v1/sys/seal")),
@@ -54,8 +57,9 @@ export const api = {
   authConfig: () => unwrap(client.GET("/api/v1/auth/config")),
   me: () => unwrap(client.GET("/api/v1/me")),
   logout: () => unwrap(client.POST("/auth/logout")),
-  approveCli: (userCode: string) =>
-    unwrap(client.POST("/api/v1/auth/cli/approve", { body: { user_code: userCode } })),
+  pendingCli: (code: string) => unwrap(client.GET("/api/v1/auth/cli/pending", { params: { query: { code } } })),
+  /** `code` must be the one the person typed from their terminal. */
+  approveCli: (code: string) => unwrap(client.POST("/api/v1/auth/cli/approve", { body: { code } })),
 
   projects: () => unwrap(client.GET("/api/v1/projects")),
   project: (project: string) => unwrap(client.GET("/api/v1/projects/{project}", { params: { path: { project } } })),
@@ -100,6 +104,9 @@ export const api = {
         params: { path: { project: at.project, env: at.env }, query: { path: at.path, values } },
       }),
     ),
+  /** One secret with its value, when the caller may read it. */
+  secret: (at: SecretLocation, key: string) =>
+    unwrap(client.GET("/api/v1/projects/{project}/environments/{env}/secrets/{key}", { params: secretParams(at, key) })),
   setSecret: (at: SecretLocation, key: string, body: SetSecret) =>
     unwrap(client.PUT("/api/v1/projects/{project}/environments/{env}/secrets/{key}", { params: secretParams(at, key), body })),
   deleteSecret: (at: SecretLocation, key: string) =>

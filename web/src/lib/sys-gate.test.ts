@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { gateRedirect, keyFileOverride, unlockPath, unlockPolicyLine } from "./sys-gate";
+import { gateRedirect, keyFileOverride, unlockPath } from "./sys-gate";
 
 const ORIGIN = "https://sekret.example";
 const at = (pathname: string, search = "") => ({ pathname, search });
@@ -35,30 +35,6 @@ describe("unlockPath", () => {
   it("omits a return to the root", () => {
     expect(unlockPath("/")).toBe("/unlock");
     expect(unlockPath("/projects/app/secrets")).toBe("/unlock?return_to=%2Fprojects%2Fapp%2Fsecrets");
-  });
-});
-
-describe("unlockPolicyLine", () => {
-  it("explains a remember policy with nothing remembered", () => {
-    expect(unlockPolicyLine({ unlock_policy: "remember", remembered: false, configured: false })).toBe(
-      "Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.",
-    );
-  });
-
-  it("does not claim a restart happened or that locking forgot the unlock", () => {
-    const line = unlockPolicyLine({ unlock_policy: "remember", remembered: true, configured: false }) ?? "";
-    expect(line).toContain("after locking by hand someone has to type the passphrase");
-    expect(line).not.toMatch(/sealed|restarted/);
-  });
-
-  it("notes a policy set in configuration", () => {
-    expect(unlockPolicyLine({ unlock_policy: "manual", remembered: false, configured: true })).toContain(
-      "set in the server configuration",
-    );
-  });
-
-  it("says nothing without a policy", () => {
-    expect(unlockPolicyLine({ unlock_policy: null, remembered: false, configured: false })).toBeNull();
   });
 });
 

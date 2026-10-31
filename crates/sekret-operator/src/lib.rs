@@ -70,6 +70,7 @@ pub async fn run(args: OperatorArgs) -> anyhow::Result<()> {
         ca_pem,
         identity_pem,
         timeout: Some(Duration::from_secs(args.request_timeout)),
+        unix_socket: None,
     };
     let sekret = HttpSekretFactory::new(args.server_url.clone(), options).context("configuring the sekret client")?;
     let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;

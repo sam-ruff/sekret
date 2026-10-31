@@ -14,7 +14,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { SecretInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
 import { keys, useSysStatus } from "@/hooks/queries";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
@@ -110,11 +110,9 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
             <FieldGroup>
               <Field data-invalid={!!codeError}>
                 <FieldLabel htmlFor="setup-code">Setup code</FieldLabel>
-                <Input
+                <SecretInput
                   ref={codeInput}
                   id="setup-code"
-                  autoComplete="off"
-                  spellCheck={false}
                   className="font-mono"
                   placeholder="XXXX-XXXX-XXXX"
                   value={setupCode}

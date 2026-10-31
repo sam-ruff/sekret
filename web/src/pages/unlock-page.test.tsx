@@ -112,10 +112,23 @@ describe("UnlockPage", () => {
     expect(screen.getByTestId("unlock-limited")).toHaveTextContent("Too many attempts");
   });
 
-  it("explains a remember policy that is not remembered", () => {
-    renderUnlock({ ...sealed, unlock_policy: "remember" });
-    expect(screen.getByTestId("unlock-policy")).toHaveTextContent(
-      "Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.",
-    );
+  it("keeps no copy of the passphrase once unlocked", async () => {
+    unseal.mockResolvedValue({ ...sealed, state: "unsealed" });
+    const { client } = renderUnlock();
+    await attempt("plum orbit gravel lantern");
+    expect(unseal).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unlock-passphrase")).toHaveValue("");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(client.getMutationCache().getAll()).toHaveLength(0);
+  });
+
+  it("marks the passphrase field as a secret but keeps the password manager hint", () => {
+    renderUnlock();
+    const field = screen.getByTestId("unlock-passphrase");
+    expect(field).toHaveAttribute("spellcheck", "false");
+    expect(field).toHaveAttribute("data-gramm", "false");
+    expect(field).toHaveAttribute("autocomplete", "current-password");
   });
 });

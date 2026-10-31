@@ -69,7 +69,9 @@ const fn list(key: &'static str, flag: &'static str, env: &'static str, separato
     }
 }
 
-const OPTIONS: [Opt; 35] = [
+const OPTIONS: [Opt; 37] = [
+    scalar("server.unix_socket", "unix-socket", "SEKRET_UNIX_SOCKET"),
+    scalar("server.unix_socket_mode", "unix-socket-mode", "SEKRET_UNIX_SOCKET_MODE"),
     scalar("server.public_url", "public-url", "SEKRET_PUBLIC_URL"),
     scalar("server.listen", "listen", "SEKRET_LISTEN"),
     list(
@@ -227,6 +229,24 @@ fn mode_of(path: &Path) -> anyhow::Result<u32> {
         & 0o777)
 }
 
+/// An org admin token for the passphrase-mode `sekret.db` in `dir`, made on the host while any
+/// server keeps running.
+fn admin_token_for(dir: &Path) -> anyhow::Result<String> {
+    let pass = dir.join("admin-pass");
+    std::fs::write(&pass, format!("{PASSPHRASE}\n")).context("passphrase file")?;
+    let db = format!("sqlite://{}?mode=rwc", dir.join("sekret.db").display());
+    let output = Command::new(BIN)
+        .args(["admin", "bootstrap", "--database-url", &db, "--passphrase-file"])
+        .arg(&pass)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", dir)
+        .current_dir(dir)
+        .output()
+        .context("bootstrap")?;
+    Ok(ok(output)?.trim().to_string())
+}
+
 /// A temporary directory holding one server's database, keys and logs.
 struct Sandbox {
     dir: tempfile::TempDir,
@@ -300,6 +320,11 @@ impl Sandbox {
     /// An org admin token for a key-file database.
     fn bootstrap(&self, key: &str) -> anyhow::Result<String> {
         self.bootstrap_on(&self.db(), key)
+    }
+
+    /// An org admin token for the default database in passphrase mode.
+    fn bootstrap_passphrase(&self) -> anyhow::Result<String> {
+        admin_token_for(self.dir.path())
     }
 
     fn bootstrap_on(&self, db: &str, key: &str) -> anyhow::Result<String> {
@@ -686,6 +711,13 @@ impl Running {
     async fn status(&self) -> anyhow::Result<Value> {
         let (code, body) = self.get("/api/v1/sys/status", Auth::None).await?;
         ensure!(code == StatusCode::OK, "status answered {code}: {body}");
+        Ok(body)
+    }
+
+    /// Every status field, which only organisation admins see.
+    async fn detail(&self, admin: &str) -> anyhow::Result<Value> {
+        let (code, body) = self.get("/api/v1/sys/status/detail", Auth::Bearer(admin)).await?;
+        ensure!(code == StatusCode::OK, "detail answered {code}: {body}");
         Ok(body)
     }
 
@@ -1377,7 +1409,7 @@ async fn cli_token_lifetime(server: &Running, issuer: &Issuer) -> anyhow::Result
             Method::POST,
             "/api/v1/auth/cli/approve",
             Auth::Session(&session),
-            Some(json!({"user_code": started["user_code"]})),
+            Some(json!({"code": started["user_code"]})),
         )
         .await?;
     ensure!(code == StatusCode::NO_CONTENT, "approve: {code} {body}");
@@ -1604,10 +1636,21 @@ async fn oidc_allowed_subjects_stop_older_sessions_approving_cli_logins() -> any
             Method::POST,
             "/api/v1/auth/cli/approve",
             Auth::Session(&session),
-            Some(json!({"user_code": started["user_code"]})),
+            Some(json!({"code": started["user_code"]})),
         )
         .await?;
-    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        code,
+        StatusCode::UNAUTHORIZED,
+        "the session itself stops working once its subject is no longer allowed: {body}"
+    );
+    let (code, _) = pinned.get("/api/v1/me", Auth::Session(&session)).await?;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert!(
+        pinned.log().contains("revoked the sessions and tokens of a user"),
+        "revoked at start: {}",
+        pinned.log()
+    );
     Ok(())
 }
 
@@ -1775,7 +1818,7 @@ async fn seal_mode_picks_the_mode_and_refuses_the_other() -> anyhow::Result<()> 
             .arg("--auto-init")
             .start()
             .await?;
-        let status = server.status().await?;
+        let status = server.detail(&sb.bootstrap(&key)?).await?;
         assert_eq!(
             (status["state"].as_str(), status["seal_mode"].as_str()),
             (Some("unsealed"), Some("key-file")),
@@ -1798,7 +1841,8 @@ async fn seal_mode_picks_the_mode_and_refuses_the_other() -> anyhow::Result<()> 
             .arg(&format!("--setup-passphrase-file={pass}"))
             .start()
             .await?;
-        assert_eq!(server.status().await?["seal_mode"], "passphrase", "{way:?}");
+        let admin = sb.bootstrap_passphrase()?;
+        assert_eq!(server.detail(&admin).await?["seal_mode"], "passphrase", "{way:?}");
         drop(server);
         let log = sb.launch().set(way, "seal.mode", "key-file").refused().await?;
         assert!(
@@ -1878,7 +1922,7 @@ async fn root_key_file_is_an_emergency_way_into_passphrase_mode() -> anyhow::Res
         drop(server);
 
         let server = sb.launch().set(way, "seal.root_key_file", &key).start().await?;
-        let status = server.status().await?;
+        let status = server.detail(&admin).await?;
         assert_eq!(
             (status["state"].as_str(), status["seal_mode"].as_str()),
             (Some("unsealed"), Some("passphrase")),
@@ -1910,7 +1954,7 @@ async fn root_key_file_is_an_emergency_way_into_passphrase_mode() -> anyhow::Res
 async fn unlock_manual_stays_sealed_across_restarts() -> anyhow::Result<()> {
     for way in WAYS {
         let sb = Sandbox::new()?;
-        sb.passphrase_db("passphrase-file")?;
+        let admin = sb.passphrase_db("passphrase-file")?;
         for _ in 0..2 {
             let server = sb
                 .launch()
@@ -1918,7 +1962,7 @@ async fn unlock_manual_stays_sealed_across_restarts() -> anyhow::Result<()> {
                 .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
                 .start()
                 .await?;
-            let status = server.status().await?;
+            let status = server.detail(&admin).await?;
             assert_eq!(
                 (status["state"].as_str(), status["unlock_policy"].as_str()),
                 (Some("sealed"), Some("manual")),
@@ -1936,7 +1980,7 @@ async fn unlock_manual_stays_sealed_across_restarts() -> anyhow::Result<()> {
 async fn unlock_passphrase_file_unlocks_at_every_start() -> anyhow::Result<()> {
     for way in WAYS {
         let sb = Sandbox::new()?;
-        sb.passphrase_db("manual")?;
+        let admin = sb.passphrase_db("manual")?;
         for _ in 0..2 {
             let server = sb
                 .launch()
@@ -1944,7 +1988,7 @@ async fn unlock_passphrase_file_unlocks_at_every_start() -> anyhow::Result<()> {
                 .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
                 .start()
                 .await?;
-            let status = server.status().await?;
+            let status = server.detail(&admin).await?;
             assert_eq!(
                 (status["state"].as_str(), status["unlock_policy"].as_str()),
                 (Some("unsealed"), Some("passphrase-file")),
@@ -1960,7 +2004,7 @@ async fn unlock_passphrase_file_unlocks_at_every_start() -> anyhow::Result<()> {
 async fn unlock_remember_needs_one_manual_unlock() -> anyhow::Result<()> {
     for way in WAYS {
         let sb = Sandbox::new()?;
-        sb.passphrase_db("manual")?;
+        let admin = sb.passphrase_db("manual")?;
         let server = sb.remembering().set(way, "seal.unlock", "remember").start().await?;
         assert_eq!(server.state().await?, "sealed", "{way:?}");
         assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK);
@@ -1971,7 +2015,7 @@ async fn unlock_remember_needs_one_manual_unlock() -> anyhow::Result<()> {
         );
         #[cfg(unix)]
         assert_eq!(mode_of(&file)?, 0o600);
-        assert_eq!(server.status().await?["remembered"], true);
+        assert_eq!(server.detail(&admin).await?["remembered"], true);
         drop(server);
         for _ in 0..2 {
             let server = sb.remembering().set(way, "seal.unlock", "remember").start().await?;
@@ -2007,7 +2051,7 @@ async fn remember_file_sets_where_the_device_key_goes() -> anyhow::Result<()> {
 #[tokio::test]
 async fn remember_file_problems_leave_the_server_sealed() -> anyhow::Result<()> {
     let sb = Sandbox::new()?;
-    sb.passphrase_db("remember")?;
+    let admin = sb.passphrase_db("remember")?;
     let file = sb.path("sekret.unlock-key");
     let server = sb.remembering().start().await?;
     assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK);
@@ -2018,7 +2062,7 @@ async fn remember_file_problems_leave_the_server_sealed() -> anyhow::Result<()> 
     std::fs::remove_file(&file).context("remove")?;
     let server = sb.remembering().start().await?;
     assert_eq!(server.state().await?, "sealed");
-    assert_eq!(server.status().await?["remembered"], false);
+    assert_eq!(server.detail(&admin).await?["remembered"], false);
     assert!(
         server.log().contains("not unlocking from the remember file"),
         "{}",
@@ -2165,7 +2209,7 @@ async fn unlock_policy_in_configuration_overrides_the_database() -> anyhow::Resu
         .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
         .start()
         .await?;
-    let status = server.status().await?;
+    let status = server.detail(&admin).await?;
     assert_eq!(status["state"], "unsealed");
     assert_eq!(status["configured"], true);
     let (code, body) = server
@@ -2181,7 +2225,7 @@ async fn unlock_policy_in_configuration_overrides_the_database() -> anyhow::Resu
 
     // Unset in configuration, the stored policy applies and an admin may change it.
     let server = sb.launch().env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE).start().await?;
-    let status = server.status().await?;
+    let status = server.detail(&admin).await?;
     assert_eq!(
         (status["state"].as_str(), status["configured"].as_bool()),
         (Some("sealed"), Some(false))
@@ -2318,14 +2362,21 @@ async fn auto_init_in_passphrase_mode_follows_each_unlock_policy() -> anyhow::Re
         ("remember", "unsealed"),
     ] {
         let sb = Sandbox::new()?;
+        // Only the passphrase-file policy takes the first passphrase from the unlock passphrase.
+        let pass = sb.passphrase_file()?;
         let launch = || {
-            sb.remembering()
+            let launch = sb
+                .remembering()
                 .set(Way::Flag, "setup.auto_init", "true")
                 .set(Way::Flag, "seal.unlock", policy)
-                .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
+                .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE);
+            match policy {
+                "passphrase-file" => launch,
+                _ => launch.set(Way::Flag, "setup.passphrase_file", &pass),
+            }
         };
         let server = launch().start().await?;
-        let status = server.status().await?;
+        let status = server.detail(&sb.bootstrap_passphrase()?).await?;
         assert_eq!(
             (status["state"].as_str(), status["seal_mode"].as_str()),
             (Some("unsealed"), Some("passphrase")),
@@ -2339,7 +2390,19 @@ async fn auto_init_in_passphrase_mode_follows_each_unlock_policy() -> anyhow::Re
     }
     let sb = Sandbox::new()?;
     let log = sb.launch().set(Way::Env, "setup.auto_init", "true").refused().await?;
-    assert!(log.contains("needs a passphrase"), "{log}");
+    assert!(log.contains("needs setup.passphrase_file"), "{log}");
+    // The unlock passphrase is not a setup passphrase under a policy that would not keep it.
+    for policy in ["manual", "remember"] {
+        let sb = Sandbox::new()?;
+        let log = sb
+            .remembering()
+            .set(Way::Flag, "setup.auto_init", "true")
+            .set(Way::Flag, "seal.unlock", policy)
+            .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
+            .refused()
+            .await?;
+        assert!(log.contains("needs setup.passphrase_file"), "{policy}: {log}");
+    }
     Ok(())
 }
 
@@ -2350,7 +2413,8 @@ async fn setup_passphrase_file_is_the_first_passphrase() -> anyhow::Result<()> {
         let pass = sb.passphrase_file()?;
         let launch = || sb.launch().default("setup.auto_init", "true");
         let server = launch().set(way, "setup.passphrase_file", &pass).start().await?;
-        assert_eq!(server.status().await?["seal_mode"], "passphrase", "{way:?}");
+        let admin = sb.bootstrap_passphrase()?;
+        assert_eq!(server.detail(&admin).await?["seal_mode"], "passphrase", "{way:?}");
         drop(server);
         std::fs::remove_file(&pass).context("delete the bootstrap file")?;
         let server = launch().start().await?;
@@ -2633,7 +2697,7 @@ fn probe_rate(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Result<St
 
 fn probe_unlock(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>> {
     Box::pin(async move {
-        let status = server.status().await?;
+        let status = server.detail(&admin_token_for(&server.dir)?).await?;
         Ok(format!(
             "{} {} {}",
             status["unlock_policy"].as_str().unwrap_or_default(),
@@ -2934,7 +2998,8 @@ async fn root_keys_written_on_the_host_are_owner_only() -> anyhow::Result<()> {
     )?)?;
     assert_eq!(mode_of(&sb.path("written.key"))?, 0o600);
     let server = sb.keyed(&sb.p("written.key")).start().await?;
-    assert_eq!(server.status().await?["seal_mode"], "key-file");
+    let admin = sb.bootstrap(&sb.p("written.key"))?;
+    assert_eq!(server.detail(&admin).await?["seal_mode"], "key-file");
     Ok(())
 }
 
@@ -3021,6 +3086,14 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
         .execute(&pool)
         .await
         .context("drop column")?;
+    for column in ["requested_from_ip", "user_agent"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE cli_logins DROP COLUMN {column}"
+        )))
+        .execute(&pool)
+        .await
+        .context("drop column")?;
+    }
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 5")
         .execute(&pool)
         .await
@@ -3051,7 +3124,7 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
 
     // With the key it upgrades in key-file mode and the data is readable.
     let server = sb.keyed(&key).start().await?;
-    let status = server.status().await?;
+    let status = server.detail(&admin).await?;
     assert_eq!(
         (status["state"].as_str(), status["seal_mode"].as_str()),
         (Some("unsealed"), Some("key-file"))
@@ -3069,7 +3142,7 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
     migrate_up_to(&empty.path("sekret.db"), 4).await?;
     let key = empty.root_key("root.key")?;
     let server = empty.keyed(&key).start().await?;
-    assert_eq!(server.status().await?["seal_mode"], "key-file");
+    assert_eq!(server.detail(&empty.bootstrap(&key)?).await?["seal_mode"], "key-file");
     Ok(())
 }
 
@@ -3171,7 +3244,7 @@ async fn data_written_by_the_previous_release_stays_readable() -> anyhow::Result
     old.wait().ok();
 
     let server = sb.keyed(&key).start().await?;
-    assert_eq!(server.status().await?["seal_mode"], "key-file");
+    assert_eq!(server.detail(&admin).await?["seal_mode"], "key-file");
     let (code, secret) = server.read_secret(&admin, "OLD").await?;
     assert_eq!((code, secret["value"].as_str()), (StatusCode::OK, Some("from-v1")));
     Ok(())
@@ -3266,5 +3339,249 @@ async fn auth_cli_login_max_auth_age_must_be_positive() -> anyhow::Result<()> {
             "{way:?}: the startup log reports it"
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The second security audit
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_unix_socket_unseals_on_the_host() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        let pass = sb.passphrase_file()?;
+        let socket = sb.p("sekret.sock");
+        for _ in 0..2 {
+            let server = sb.launch().set(way, "server.unix_socket", &socket).start().await?;
+            assert_eq!(server.state().await?, "sealed", "{way:?}");
+            #[cfg(unix)]
+            assert_eq!(mode_of(&sb.path("sekret.sock"))?, 0o600, "{way:?}");
+            let unsealed = sb.cli(
+                &["sys", "unseal", "--socket", &socket, "--passphrase-file", &pass],
+                &[],
+                None,
+            )?;
+            assert!(ok(unsealed)?.contains("unsealed"), "{way:?}");
+            assert_eq!(server.state().await?, "unsealed", "{way:?}");
+            // A restart finds the old socket file and replaces it.
+        }
+    }
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        let socket = sb.p("group.sock");
+        let server = sb
+            .launch()
+            .set(Way::Flag, "server.unix_socket", &socket)
+            .set(way, "server.unix_socket_mode", "0660")
+            .start()
+            .await?;
+        #[cfg(unix)]
+        assert_eq!(mode_of(&sb.path("group.sock"))?, 0o660, "{way:?}");
+        drop(server);
+        let log = sb
+            .launch()
+            .set(Way::Flag, "server.unix_socket", &socket)
+            .set(way, "server.unix_socket_mode", "0777")
+            .refused()
+            .await?;
+        assert!(log.contains("0600 or 0660"), "{way:?}: {log}");
+    }
+    Ok(())
+}
+
+/// Removing a variable from the environment leaves its value in `/proc/<pid>/environ`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn secrets_from_the_environment_are_wiped_from_the_process() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    sb.passphrase_db("passphrase-file")?;
+    let remember = "q".repeat(40);
+    let server = sb
+        .remembering()
+        .env("SEKRET_UNLOCK_PASSPHRASE", PASSPHRASE)
+        .env("SEKRET_REMEMBER_SECRET", &remember)
+        .start()
+        .await?;
+    assert_eq!(server.state().await?, "unsealed", "the values were still read");
+    let environ = std::fs::read(format!("/proc/{}/environ", server.child.id())).context("environ")?;
+    let has = |needle: &[u8]| environ.windows(needle.len()).any(|w| w == needle);
+    assert!(!has(PASSPHRASE.as_bytes()), "the unlock passphrase is gone");
+    assert!(!has(remember.as_bytes()), "the remember secret is gone");
+    assert!(has(b"SEKRET_LOG=info"), "the rest of the environment is untouched");
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_code_file_never_truncates_another_file() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let log = sb
+        .launch()
+        .set(Way::Flag, "setup.code_file", &sb.p("sekret.db"))
+        .refused()
+        .await?;
+    assert!(log.contains("same file as the database"), "{log}");
+    let precious = sb.write("precious", "keep me\n")?;
+    std::fs::hard_link(&precious, sb.path("code")).context("link")?;
+    for way in WAYS {
+        let log = sb.launch().set(way, "setup.code_file", &sb.p("code")).refused().await?;
+        assert!(log.contains("not a file sekret wrote"), "{way:?}: {log}");
+    }
+    assert_eq!(std::fs::read_to_string(&precious).context("read")?, "keep me\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_commands_that_rewrite_keys_refuse_while_a_server_runs() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let new = sb.root_key("new.key")?;
+    let server = sb.keyed(&key).start().await?;
+    let admin = sb.bootstrap(&key)?;
+    server.create_project(&admin, "app").await?;
+    server.write_secret(&admin, "A", "kept").await?;
+    let db = sb.db();
+    let rotate = || {
+        sb.cli(
+            &[
+                "admin",
+                "rotate-root-key",
+                "--database-url",
+                &db,
+                "--root-key-file",
+                &key,
+                "--new-root-key-file",
+                &new,
+            ],
+            &[],
+            None,
+        )
+    };
+    let refused = rotate()?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another sekret server"));
+    let refused = sb.cli(
+        &[
+            "admin",
+            "set-seal-mode",
+            "passphrase",
+            "--database-url",
+            &db,
+            "--root-key-file",
+            &key,
+            "--passphrase-file",
+            &sb.passphrase_file()?,
+        ],
+        &[],
+        None,
+    )?;
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another sekret server"));
+    let (code, secret) = server.read_secret(&admin, "A").await?;
+    assert_eq!((code, secret["value"].as_str()), (StatusCode::OK, Some("kept")));
+    drop(server);
+
+    ok(rotate()?)?;
+    let server = sb.keyed(&new).start().await?;
+    let (code, secret) = server.read_secret(&admin, "A").await?;
+    assert_eq!((code, secret["value"].as_str()), (StatusCode::OK, Some("kept")));
+    let (_, audit) = server.get("/api/v1/audit?limit=200", Auth::Bearer(&admin)).await?;
+    let entries = audit["entries"].as_array().context("entries")?;
+    for action in ["admin.bootstrap", "admin.rotate_root_key"] {
+        assert!(
+            entries.iter().any(|e| e["action"] == action && e["ip"] == "local"),
+            "{action} is audited from the host"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overriding_security_settings_from_the_environment_is_warned_about() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = sb
+        .keyed(&key)
+        .set(Way::File, "auth.default_org_role", "org-member")
+        .env("SEKRET_DEFAULT_ORG_ROLE", "org-admin")
+        .set_list(Way::File, "server.trusted_proxies", &["10.0.0.1/32"])
+        .env("SEKRET_TRUSTED_PROXIES", "10.0.0.0/8")
+        .start()
+        .await?;
+    let log = server.log();
+    for expected in [
+        "auth.default_org_role in the configuration file is overridden by an environment variable",
+        "server.trusted_proxies in the configuration file is overridden by an environment variable",
+        "makes everyone who can sign in an organisation admin",
+        "setting=\"auth.default_org_role\"",
+    ] {
+        assert!(log.contains(expected), "{expected} missing from {log}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn key_files_others_can_read_are_warned_about() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+    let server = sb.keyed(&key).start().await?;
+    assert!(server.log().contains("other users can read it"), "{}", server.log());
+    drop(server);
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let server = sb.keyed(&key).start().await?;
+    assert!(!server.log().contains("other users can read it"), "{}", server.log());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_clears_what_an_interrupted_restore_left() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = sb.keyed(&key).start().await?;
+    let admin = sb.bootstrap(&key)?;
+    server.create_project(&admin, "app").await?;
+    let backup = server
+        .client
+        .post(format!("{}/api/v1/sys/backup", server.url))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .context("backup")?
+        .bytes()
+        .await
+        .context("bytes")?;
+    std::fs::write(sb.path("backup.skb"), &backup).context("save")?;
+    drop(server);
+    std::fs::create_dir(sb.path(".restored.db.restore-abc")).context("stale dir")?;
+    std::fs::write(sb.path(".restored.db.restore-abc/restored.db"), b"half").context("stale")?;
+    std::fs::write(sb.path(".restored.db.restore-123"), b"half").context("stale file")?;
+    ok(sb.cli(
+        &[
+            "admin",
+            "restore",
+            "--backup",
+            &sb.p("backup.skb"),
+            "--database-url",
+            &sb.db_named("restored.db"),
+            "--root-key-file",
+            &key,
+        ],
+        &[],
+        None,
+    )?)?;
+    assert!(!sb.path(".restored.db.restore-abc").exists());
+    assert!(!sb.path(".restored.db.restore-123").exists());
+    assert!(sb.path("restored.db").is_file());
+    let leftovers: Vec<String> = std::fs::read_dir(sb.dir.path())
+        .context("list")?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".restore-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
@@ -8,7 +8,10 @@ use sekret_core::crypto::{generate_token, hash_token};
 use sekret_store::{AccessToken, PrincipalKind};
 use zeroize::Zeroizing;
 
+use crate::admin::BOOTSTRAP_SUBJECT;
+use crate::config::HumanOidcConfig;
 use crate::error::{ApiError, ApiResult};
+use crate::human::subject_allowed;
 use crate::state::AppState;
 
 pub const SESSION_COOKIE: &str = "sekret_session";
@@ -48,6 +51,19 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// Recorded as the actor for things with no signed-in caller, such as setup and unlocking.
+    pub fn system(name: &str) -> Self {
+        Self {
+            kind: PrincipalKind::Identity,
+            id: name.into(),
+            name: name.into(),
+            email: String::new(),
+            groups: Vec::new(),
+            token_id: String::new(),
+            token_kind: "system".into(),
+        }
+    }
+
     /// How the caller is shown in history and the audit log.
     pub fn actor(&self) -> String {
         let label = if self.email.is_empty() { &self.name } else { &self.email };
@@ -57,40 +73,100 @@ impl Principal {
 
 pub struct ClientIp(pub IpAddr);
 
+/// Stands in for a client whose forwarded address could not be read. No identity's trusted
+/// CIDRs match it, and every such client shares one rate-limit bucket.
+pub const UNKNOWN_CLIENT: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+
+fn forwarded_entry(bytes: &[u8]) -> Option<IpAddr> {
+    if !bytes.is_ascii() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.trim().parse().ok()
+}
+
 /// Resolves the client address, trusting `X-Forwarded-For` only from configured proxies.
 ///
 /// Every header line counts, read right to left. Trusted proxies are skipped; the first
-/// untrusted address is the client. An entry that does not parse stops the walk at the peer,
-/// so a garbled value cannot be used to reach further left.
+/// untrusted address is the client. Any entry, on any line, that is not a plain ASCII address
+/// makes the client [`UNKNOWN_CLIENT`], never the trusted peer, so a garbled value can neither
+/// borrow the proxy's address nor hide a spoofed one.
 pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
     let peer = peer.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|net| net.contains(ip));
     if !is_trusted(&peer) {
         return peer;
     }
-    let mut lines = Vec::new();
-    for value in headers.get_all("x-forwarded-for") {
-        let Ok(text) = value.to_str() else {
-            return peer;
-        };
-        lines.push(text);
-    }
-    let joined = lines.join(",");
-    for part in joined.split(',').rev() {
-        let Ok(ip) = part.trim().parse::<IpAddr>() else {
-            return peer;
-        };
-        let ip = ip.to_canonical();
-        if !is_trusted(&ip) {
-            return ip;
-        }
-    }
-    peer
+    let entries: Option<Vec<IpAddr>> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+        .map(|entry| forwarded_entry(entry).map(|ip| ip.to_canonical()))
+        .collect();
+    let Some(entries) = entries else {
+        return UNKNOWN_CLIENT;
+    };
+    entries.into_iter().rev().find(|ip| !is_trusted(ip)).unwrap_or(peer)
 }
 
-/// Proxy ranges wide enough to let most of the internet set its own client address.
-pub fn broad_proxy_ranges(trusted: &[IpNet]) -> Vec<IpNet> {
-    trusted.iter().copied().filter(|net| net.prefix_len() < 8).collect()
+/// Addresses in this range are private, loopback or link-local.
+fn private_range(net: &IpNet) -> bool {
+    let private: &[&str] = match net {
+        IpNet::V4(_) => &[
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "100.64.0.0/10",
+        ],
+        IpNet::V6(_) => &["fc00::/7", "fe80::/10", "::1/128"],
+    };
+    private
+        .iter()
+        .filter_map(|p| p.parse::<IpNet>().ok())
+        .any(|p| p.contains(net))
+}
+
+/// Warnings about proxy ranges that let too many hosts set their own client address: wider than
+/// /16 for IPv4 or /32 for IPv6, outside private ranges, or more than a /8's worth in total.
+pub fn proxy_range_warnings(trusted: &[IpNet]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut total_v4: u128 = 0;
+    let mut total_v6: u128 = 0;
+    for net in trusted {
+        let (threshold, bits) = match net {
+            IpNet::V4(_) => (16, 32),
+            IpNet::V6(_) => (32, 128),
+        };
+        let size = 1u128
+            .checked_shl(bits - u32::from(net.prefix_len()))
+            .unwrap_or(u128::MAX);
+        match net {
+            IpNet::V4(_) => total_v4 = total_v4.saturating_add(size),
+            IpNet::V6(_) => total_v6 = total_v6.saturating_add(size),
+        }
+        if net.prefix_len() == 0 {
+            warnings.push(format!(
+                "trusted proxy range {net} is the whole internet; any client can set its own address with X-Forwarded-For"
+            ));
+        } else if net.prefix_len() < threshold {
+            warnings.push(format!(
+                "trusted proxy range {net} is wider than /{threshold}; any host in it can set its own address with \
+                 X-Forwarded-For"
+            ));
+        } else if !private_range(net) {
+            warnings.push(format!(
+                "trusted proxy range {net} is not a private range; only list your own reverse proxies"
+            ));
+        }
+    }
+    if total_v4 > 1 << 24 || total_v6 > 1 << 120 {
+        warnings.push(
+            "the trusted proxy ranges together cover more than a /8; list only the addresses of your reverse proxies"
+                .into(),
+        );
+    }
+    warnings
 }
 
 impl FromRequestParts<AppState> for ClientIp {
@@ -126,6 +202,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 pub fn ip_allowed(cidrs: &[String], ip: IpAddr) -> bool {
     if cidrs.is_empty() {
         return true;
+    }
+    // An address that could not be read is never inside a restriction, even `::/0`.
+    if ip == UNKNOWN_CLIENT {
+        return false;
     }
     cidrs
         .iter()
@@ -164,7 +244,7 @@ pub async fn authenticate(state: &AppState, method: &Method, headers: &HeaderMap
                 .get_user(&record.principal_id)
                 .await?
                 .ok_or_else(ApiError::unauthorised)?;
-            if user.disabled {
+            if user.disabled || !user_still_allowed(state.config.oidc.as_ref(), &user.subject, &user.groups) {
                 return Err(ApiError::unauthorised());
             }
             Principal {
@@ -204,10 +284,53 @@ pub async fn authenticate(state: &AppState, method: &Method, headers: &HeaderMap
     Ok(principal)
 }
 
+/// Whether a user still passes `oidc.allowed_subjects` and `oidc.required_groups`, judged from the
+/// subject and groups stored at their last browser sign-in. The local break-glass admin is not an
+/// OIDC user, so neither list applies to it.
+pub fn user_still_allowed(config: Option<&HumanOidcConfig>, subject: &str, groups: &[String]) -> bool {
+    let Some(config) = config else {
+        return true;
+    };
+    if subject == BOOTSTRAP_SUBJECT {
+        return true;
+    }
+    let groups_ok = config.required_groups.is_empty() || groups.iter().any(|g| config.required_groups.contains(g));
+    groups_ok && subject_allowed(config, subject)
+}
+
+/// Revokes every session and token of users who no longer pass the sign-in lists, as after the
+/// lists were narrowed. Returns how many users lost access.
+pub async fn revoke_disallowed_users(state: &AppState) -> ApiResult<usize> {
+    let Some(config) = state.config.oidc.as_ref() else {
+        return Ok(0);
+    };
+    let mut revoked = 0;
+    for user in state.store.list_users().await? {
+        if user_still_allowed(Some(config), &user.subject, &user.groups) {
+            continue;
+        }
+        let tokens = state.store.list_principal_tokens(PrincipalKind::User, &user.id).await?;
+        if tokens.iter().all(|t| t.revoked) {
+            continue;
+        }
+        state
+            .store
+            .revoke_principal_tokens(PrincipalKind::User, &user.id)
+            .await?;
+        tracing::warn!(user = %user.subject, "revoked the sessions and tokens of a user the sign-in lists no longer allow");
+        revoked += 1;
+    }
+    Ok(revoked)
+}
+
 impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        // The write gate authenticates before taking its lock; reuse that rather than repeat it.
+        if let Some(principal) = parts.extensions.get::<Principal>() {
+            return Ok(principal.clone());
+        }
         let ClientIp(ip) = ClientIp::from_request_parts(parts, state).await?;
         authenticate(state, &parts.method, &parts.headers, ip).await
     }
@@ -258,6 +381,7 @@ pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResul
 mod tests {
     use super::*;
     use anyhow::Context;
+    use axum::http::HeaderValue;
 
     fn headers(pairs: &[(&'static str, &str)]) -> anyhow::Result<HeaderMap> {
         let mut map = HeaderMap::new();
@@ -292,9 +416,32 @@ mod tests {
         assert_eq!(client_ip(peer, &two_lines, &[proxy]), ip("203.0.113.9")?);
         // A spoofed address hiding behind a value that does not parse is never reached.
         let garbled = headers(&[("x-forwarded-for", "1.2.3.4, not-an-ip, 10.0.0.5")])?;
-        assert_eq!(client_ip(peer, &garbled, &[proxy]), peer);
+        assert_eq!(client_ip(peer, &garbled, &[proxy]), UNKNOWN_CLIENT);
         let all_trusted = headers(&[("x-forwarded-for", "10.0.0.7, 10.0.0.5")])?;
         assert_eq!(client_ip(peer, &all_trusted, &[proxy]), peer);
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_utf8_forwarded_for_never_becomes_the_proxy_address() -> anyhow::Result<()> {
+        let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
+        let peer: IpAddr = "10.0.0.2".parse().context("ip")?;
+        let raw = |bytes: &[u8]| HeaderValue::from_bytes(bytes).context("header");
+        let mut one_line = HeaderMap::new();
+        one_line.append("x-forwarded-for", raw(b"\x80, 203.0.113.9")?);
+        assert_eq!(client_ip(peer, &one_line, &[proxy]), UNKNOWN_CLIENT);
+        let mut leading = HeaderMap::new();
+        leading.append("x-forwarded-for", raw(b"203.0.113.9, \x80")?);
+        assert_eq!(client_ip(peer, &leading, &[proxy]), UNKNOWN_CLIENT);
+        let mut two_lines = HeaderMap::new();
+        two_lines.append("x-forwarded-for", raw(b"203.0.113.9")?);
+        two_lines.append("x-forwarded-for", raw(b"\x80")?);
+        assert_eq!(client_ip(peer, &two_lines, &[proxy]), UNKNOWN_CLIENT);
+        // An identity limited to the proxy's network must not be reachable through it.
+        let cidrs = ["10.0.0.0/24".to_string()];
+        assert!(!ip_allowed(&cidrs, client_ip(peer, &two_lines, &[proxy])));
+        assert!(!ip_allowed(&["::/0".into(), "0.0.0.0/0".into()], UNKNOWN_CLIENT));
+        assert!(ip_allowed(&[], UNKNOWN_CLIENT), "no restriction means everyone");
         Ok(())
     }
 
@@ -315,14 +462,24 @@ mod tests {
         Ok(())
     }
 
+    fn nets(list: &[&str]) -> anyhow::Result<Vec<IpNet>> {
+        list.iter().map(|n| n.parse().context("net")).collect()
+    }
+
     #[test]
-    fn broad_proxy_ranges_are_flagged() -> anyhow::Result<()> {
-        let nets: Vec<IpNet> = ["0.0.0.0/0", "10.0.0.0/8", "4.0.0.0/7", "::/0", "fd00::/8"]
-            .iter()
-            .map(|n| n.parse().context("net"))
-            .collect::<anyhow::Result<_>>()?;
-        let broad: Vec<String> = broad_proxy_ranges(&nets).iter().map(ToString::to_string).collect();
-        assert_eq!(broad, vec!["0.0.0.0/0", "4.0.0.0/7", "::/0"]);
+    fn broad_and_public_proxy_ranges_are_flagged_per_family() -> anyhow::Result<()> {
+        let quiet = nets(&["10.0.0.0/24", "192.168.1.10/32", "fd00:1::/48", "172.18.0.0/16"])?;
+        assert_eq!(proxy_range_warnings(&quiet), Vec::<String>::new());
+        let warned = |list: &[&str]| -> anyhow::Result<String> { Ok(proxy_range_warnings(&nets(list)?).join("\n")) };
+        assert!(warned(&["0.0.0.0/0"])?.contains("whole internet"));
+        assert!(warned(&["::/0"])?.contains("whole internet"));
+        assert!(warned(&["10.0.0.0/15"])?.contains("wider than /16"));
+        assert!(warned(&["fd00::/31"])?.contains("wider than /32"));
+        assert!(warned(&["203.0.113.0/24"])?.contains("not a private range"));
+        assert!(warned(&["2001:db8::/48"])?.contains("not a private range"));
+        let many: Vec<String> = (0..300).map(|i| format!("10.{}.0.0/16", i % 256)).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(warned(&many)?.contains("more than a /8"));
         Ok(())
     }
 

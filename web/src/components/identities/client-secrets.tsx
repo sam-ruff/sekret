@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { SecretTextarea } from "@/components/secret-field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
@@ -57,12 +58,15 @@ function CreateSecretDialog({
         max_uses: usesValue === "invalid" ? null : usesValue,
       }),
     invalidate: [keys.clientSecrets(identityId)],
+    gcTime: 0,
     onSuccess: (created) => {
       setDescription("");
       setTtl("");
       setMaxUses("");
       onOpenChange(false);
       onCreated(created);
+      // The new secret lives only in the dialog that shows it once, not in the mutation cache.
+      create.reset();
     },
   });
 
@@ -72,7 +76,13 @@ function CreateSecretDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) create.reset();
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="sm:max-w-md" data-testid="create-client-secret-dialog">
         <form onSubmit={submit} className="space-y-6">
           <DialogHeader>
@@ -160,9 +170,15 @@ function CreatedSecretDialog({ created, onClose }: { created: CreatedClientSecre
             <div className="space-y-1.5">
               <Label>Client secret</Label>
               <div className="flex items-center gap-1 rounded-md border bg-muted/50 py-1 pr-1 pl-3">
-                <code className="min-w-0 flex-1 font-mono text-sm break-all" data-testid="client-secret-value">
-                  {created.client_secret}
-                </code>
+                <SecretTextarea
+                  readOnly
+                  rows={1}
+                  aria-label="Client secret"
+                  value={created.client_secret}
+                  className="min-h-0 min-w-0 flex-1 resize-none border-0 bg-transparent p-0 font-mono text-sm break-all shadow-none focus-visible:ring-0 dark:bg-transparent"
+                  onFocus={(e) => e.currentTarget.select()}
+                  data-testid="client-secret-value"
+                />
                 <CopyButton
                   value={created.client_secret}
                   label="Copy client secret"

@@ -43,6 +43,10 @@ pub struct ClientArgs {
     /// PEM private key for --client-cert.
     #[arg(long, global = true, env = "SEKRET_CLIENT_KEY", requires = "client_cert")]
     pub client_key: Option<PathBuf>,
+    /// Allow a plain http:// server that is not on this machine. Tokens then travel unencrypted.
+    #[arg(long, global = true, env = "SEKRET_CLIENT_ALLOW_INSECURE_HTTP", num_args = 0..=1,
+        default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub allow_insecure_http: Option<bool>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -274,7 +278,11 @@ pub fn now() -> i64 {
 
 pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
     let cwd = std::env::current_dir()?;
-    let file = config::load_project_file(&cwd)?;
+    let mut warnings = Vec::new();
+    let (file, _) = config::load_project_file(&cwd, &mut warnings)?;
+    for warning in warnings {
+        eprintln!("sekret: {warning}");
+    }
     let credentials = config::load_credentials(&config::credentials_path()?)?;
     config::resolve(
         Overrides {
@@ -291,12 +299,14 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
 }
 
 pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> anyhow::Result<HttpClient> {
+    config::check_transport(&resolved.server, args.allow_insecure_http.unwrap_or(false))?;
     let ca_pem = args
         .ca_file
-        .as_ref()
-        .map(std::fs::read)
+        .as_deref()
+        .map(config::read_text)
         .transpose()
-        .context("reading CA file")?;
+        .context("reading CA file")?
+        .map(String::into_bytes);
     let identity_pem = sekret_client::identity_from_files(args.client_cert.as_deref(), args.client_key.as_deref())?;
     Ok(HttpClient::new(
         &resolved.server,
@@ -305,6 +315,21 @@ pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> 
             ca_pem,
             identity_pem,
             timeout: None,
+            unix_socket: None,
+        },
+    )?)
+}
+
+/// A client for the server's host socket, which needs no server URL or token.
+pub fn host_socket_client(path: &std::path::Path) -> anyhow::Result<HttpClient> {
+    Ok(HttpClient::new(
+        "http://localhost",
+        None,
+        ClientOptions {
+            ca_pem: None,
+            identity_pem: None,
+            timeout: None,
+            unix_socket: Some(path.to_path_buf()),
         },
     )?)
 }
@@ -319,10 +344,7 @@ pub fn location(resolved: &Resolved) -> anyhow::Result<Location> {
 }
 
 fn read_trimmed(path: &std::path::Path) -> anyhow::Result<String> {
-    Ok(std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .trim()
-        .to_string())
+    Ok(config::read_text(path)?.trim().to_string())
 }
 
 /// Works out which machine credential the flags describe, or `None` for an interactive login.
@@ -371,16 +393,32 @@ pub async fn machine_credential(
     }))
 }
 
+/// Machine credentials only go to a server named by a flag, `SEKRET_URL` or an earlier login,
+/// never to one that only a project file names.
+pub fn require_confirmed_server(resolved: &Resolved) -> anyhow::Result<()> {
+    if resolved.server_confirmed {
+        return Ok(());
+    }
+    bail!(
+        "{} comes only from {}, so no credential is sent to it; pass --server or set SEKRET_URL to confirm the server",
+        resolved.server,
+        config::PROJECT_FILE
+    )
+}
+
 pub async fn run_login(client_args: &ClientArgs, args: LoginArgs) -> anyhow::Result<()> {
     let resolved = resolve(client_args)?;
     let api = client(client_args, &resolved, None)?;
     let github = || -> anyhow::Result<Box<dyn IdTokenSource>> { Ok(Box::new(GithubActionsTokenSource::from_env()?)) };
     let mut stderr = std::io::stderr();
     let token = match machine_credential(&args, &github).await? {
-        Some(credential) => login::machine_login(&api, credential).await?,
+        Some(credential) => {
+            require_confirmed_server(&resolved)?;
+            login::machine_login(&api, credential).await?
+        }
         None => {
             let opener = |url: &str| !args.no_browser && login::open_in_browser(url);
-            login::device_login(&api, &mut stderr, &opener, Duration::from_secs(10)).await?
+            login::device_login(&api, &resolved.server, &mut stderr, &opener, Duration::from_secs(10)).await?
         }
     };
     if args.print_token {
@@ -435,6 +473,28 @@ fn summarise(result: &BatchResult) -> String {
     } else {
         parts.join("; ")
     }
+}
+
+/// A reminder, for someone typing at a terminal, that values on the command line end up in the
+/// shell's history and the process list.
+pub fn shell_history_warning(pairs: &[String], interactive: bool) -> Option<String> {
+    if !interactive {
+        return None;
+    }
+    let keys: Vec<&str> = pairs
+        .iter()
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(_, value)| *value != "-")
+        .map(|(key, _)| key)
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "sekret: the value of {} is now in your shell history; next time use `{}=-` and type it on standard input",
+        keys.join(", "),
+        keys[0]
+    ))
 }
 
 /// Turns `KEY=value` arguments (and an optional .env file) into upserts.
@@ -543,8 +603,12 @@ pub async fn secrets(
             from_dotenv,
             comment,
         } => {
+            if let Some(warning) = shell_history_warning(&pairs, std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+                eprintln!("{warning}");
+            }
             let dotenv = from_dotenv
-                .map(std::fs::read_to_string)
+                .as_deref()
+                .map(config::read_text)
                 .transpose()
                 .context("reading .env file")?;
             let upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
@@ -709,9 +773,25 @@ pub async fn snapshots(
     Ok(())
 }
 
-pub async fn export(api: &dyn SekretApi, at: Location, args: &ExportArgs, out: &mut dyn Write) -> anyhow::Result<()> {
+/// Formats that get sourced into a shell leave out keys that are unsafe as variables, like `run`.
+pub async fn export(
+    api: &dyn SekretApi,
+    at: Location,
+    args: &ExportArgs,
+    out: &mut dyn Write,
+    notes: &mut dyn Write,
+) -> anyhow::Result<()> {
     let raw = api.raw(at, args.recursive).await?;
-    write!(out, "{}", render(&flatten(&raw.secrets)?, args.format)?)?;
+    let vars = flatten(&raw.secrets)?;
+    let vars = match args.format {
+        ExportFormat::Dotenv | ExportFormat::Shell => {
+            let (kept, skipped) = shell::split_loadable(vars);
+            note_skipped(notes, &skipped)?;
+            kept
+        }
+        ExportFormat::Json | ExportFormat::Yaml => vars,
+    };
+    write!(out, "{}", render(&vars, args.format)?)?;
     Ok(())
 }
 
@@ -778,27 +858,43 @@ pub fn env_status(project: Option<&str>, environment: Option<&str>, loaded: &[St
 }
 
 /// Fetches secrets and runs the command with them in its environment, returning its exit code.
-pub async fn run_command(api: &dyn SekretApi, at: Location, args: &RunArgs) -> anyhow::Result<i32> {
-    let raw = api.raw(at, args.recursive).await?;
-    let mut vars = flatten(&raw.secrets)?;
-    let unsafe_names: Vec<String> = vars.keys().filter(|k| shell::is_unsafe_name(k)).cloned().collect();
-    if !unsafe_names.is_empty() {
-        eprintln!(
-            "sekret: not passing {} because they change how programs are loaded or run",
-            unsafe_names.join(", ")
-        );
-        vars.retain(|k, _| !shell::is_unsafe_name(k));
-    }
+pub async fn run_command(
+    api: &dyn SekretApi,
+    at: Location,
+    args: &RunArgs,
+    notes: &mut dyn Write,
+) -> anyhow::Result<i32> {
     let Some((program, rest)) = args.command.split_first() else {
         bail!("no command given");
     };
-    let status = tokio::process::Command::new(program)
-        .args(rest)
+    let raw = api.raw(at, args.recursive).await?;
+    let (vars, skipped) = shell::split_loadable(flatten(&raw.secrets)?);
+    note_skipped(notes, &skipped)?;
+    let mut command = tokio::process::Command::new(program);
+    command.args(rest);
+    // The child gets the secrets, never the credentials that fetched them.
+    for name in shell::CREDENTIAL_VARS {
+        command.env_remove(name);
+    }
+    let status = command
         .envs(&vars)
         .status()
         .await
         .with_context(|| format!("running {program}"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn note_skipped(notes: &mut dyn Write, skipped: &[String]) -> anyhow::Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        notes,
+        "sekret: skipped {} because they are not valid variable names, start with SEKRET_ or change how programs \
+         are loaded or run",
+        skipped.join(", ")
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -994,6 +1090,7 @@ mod tests {
                 recursive: false,
             },
             &mut out,
+            &mut Vec::new(),
         )
         .await
         .context("export")?;
@@ -1007,8 +1104,106 @@ mod tests {
                 "test \"$GREETING\" = 'hello world' && exit 7".into(),
             ],
         };
-        assert_eq!(run_command(&api, at(), &args).await.context("run")?, 7);
+        assert_eq!(run_command(&api, at(), &args, &mut Vec::new()).await.context("run")?, 7);
         Ok(())
+    }
+
+    fn hostile_raw() -> RawSecrets {
+        let secret = |key: &str, value: &str| RawSecret {
+            path: "/".into(),
+            key: key.into(),
+            value: value.into(),
+        };
+        RawSecrets {
+            project: "app".into(),
+            environment: "dev".into(),
+            secrets: vec![
+                secret("GREETING", "hi"),
+                secret("SEKRET_URL", "https://evil.test"),
+                secret("HTTPS_PROXY", "http://evil.test:3128"),
+                secret("GIT_ASKPASS", "/tmp/evil"),
+                secret("bad.key", "x"),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn run_and_dotenv_export_leave_out_unsafe_and_sekret_keys() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_raw().returning(|_, _| Ok(hostile_raw()));
+        let args = RunArgs {
+            recursive: false,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "test \"$GREETING\" = hi && test -z \"${HTTPS_PROXY-}\" && test -z \"${GIT_ASKPASS-}\" \
+                 && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7"
+                    .into(),
+            ],
+        };
+        let mut notes = Vec::new();
+        assert_eq!(run_command(&api, at(), &args, &mut notes).await.context("run")?, 7);
+        let notes = String::from_utf8(notes).context("utf8")?;
+        assert!(notes.contains("HTTPS_PROXY") && notes.contains("SEKRET_URL") && notes.contains("bad.key"));
+
+        for format in [ExportFormat::Dotenv, ExportFormat::Shell] {
+            let (mut out, mut notes) = (Vec::new(), Vec::new());
+            let args = ExportArgs {
+                format,
+                recursive: false,
+            };
+            export(&api, at(), &args, &mut out, &mut notes)
+                .await
+                .context("export")?;
+            let out = String::from_utf8(out).context("utf8")?;
+            assert!(out.contains("GREETING"), "{format:?}");
+            for hidden in ["SEKRET_URL", "HTTPS_PROXY", "GIT_ASKPASS", "bad.key"] {
+                assert!(!out.contains(hidden), "{format:?}: {hidden} in {out}");
+            }
+            assert!(String::from_utf8(notes).context("utf8")?.contains("HTTPS_PROXY"));
+        }
+        let mut json = Vec::new();
+        let args = ExportArgs {
+            format: ExportFormat::Json,
+            recursive: false,
+        };
+        export(&api, at(), &args, &mut json, &mut Vec::new())
+            .await
+            .context("json")?;
+        assert!(
+            String::from_utf8(json).context("utf8")?.contains("HTTPS_PROXY"),
+            "JSON is data, not sourced, so it keeps every key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_values_on_a_terminal_warn_about_shell_history() {
+        let pairs = vec!["DB_PASSWORD=hunter2".to_string(), "TOKEN=-".to_string()];
+        let warning = shell_history_warning(&pairs, true).unwrap_or_default();
+        assert!(
+            warning.contains("DB_PASSWORD") && warning.contains("DB_PASSWORD=-"),
+            "{warning}"
+        );
+        assert!(!warning.contains("TOKEN,"), "values from stdin are not in the history");
+        assert!(!warning.contains("hunter2"), "the warning never repeats the value");
+        assert_eq!(shell_history_warning(&pairs, false), None, "scripts are not nagged");
+        assert_eq!(shell_history_warning(&["A=-".into()], true), None);
+    }
+
+    #[test]
+    fn machine_credentials_need_a_confirmed_server() {
+        let mut resolved = Resolved {
+            server: "https://evil.test".into(),
+            token: None,
+            project: None,
+            environment: None,
+            path: "/".into(),
+            server_confirmed: false,
+        };
+        assert!(require_confirmed_server(&resolved).is_err());
+        resolved.server_confirmed = true;
+        assert!(require_confirmed_server(&resolved).is_ok());
     }
 
     #[tokio::test]

@@ -383,7 +383,7 @@ async fn cli_device_login_is_approved_in_the_browser() -> anyhow::Result<()> {
         &alice,
         reqwest::Method::POST,
         "/api/v1/auth/cli/approve",
-        Some(json!({"user_code": code})),
+        Some(json!({"code": code})),
     )
     .await?;
     assert_eq!(status, 204);

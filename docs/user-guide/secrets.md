@@ -14,7 +14,7 @@ sekret secrets get DATABASE_URL
 sekret secrets delete OLD_KEY
 ```
 
-In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. A copied value is cleared from the clipboard after 45 seconds if it is still there. Pasting a `.env` file into the import dialog creates or updates every key in it in one write.
+In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. Switching to another environment or folder masks everything again. A copied value is cleared from the clipboard after 45 seconds if it is still there. Browsers only allow that while the tab has focus, so if you have moved to another window by then, sekret clears it when you come back, or tells you to clear it yourself when it cannot check what the clipboard holds. Pasting a `.env` file into the import dialog creates or updates every key in it in one write; closing the dialog throws the pasted text away.
 
 Reading a key name and reading its value are separate permissions, so a role can let someone see which keys exist without seeing any values.
 

@@ -7,10 +7,13 @@ import type { MockState } from "./state";
 import {
   MAX_FAILED_UNSEALS,
   MOCK_BACKOFF_SECONDS,
+  MOCK_CLI_ADDRESS,
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_PASSPHRASE,
   MOCK_SETUP_CODE,
+  MOCK_VERSION,
   mockSys,
+  publicStatusOf,
   statusOf,
   sysFromControls,
 } from "./sys";
@@ -196,5 +199,39 @@ describe("parseControls", () => {
       sealMode: undefined,
       unsealedBy: undefined,
     });
+  });
+});
+
+describe("mock public status", () => {
+  it("shows anyone only the state, web setup and version once set up", () => {
+    const sys = { ...mockSys(), unlockPolicy: "remember" as const, remembered: true };
+    expect(publicStatusOf(sys)).toEqual({
+      state: "unsealed",
+      seal_mode: null,
+      unlock_policy: null,
+      configured: false,
+      remembered: false,
+      unsealed_by: null,
+      web_setup: true,
+      version: MOCK_VERSION,
+    });
+    expect(statusOf(sys)).toMatchObject({ remembered: true, unsealed_by: "passphrase", unlock_policy: "remember" });
+  });
+
+  it("keeps what configuration decided before setup, for the wizard", () => {
+    const sys = { ...mockSys("uninitialised"), mode: "key-file" as const };
+    expect(publicStatusOf(sys)).toEqual(statusOf(sys));
+  });
+});
+
+describe("mock CLI login", () => {
+  it("describes a waiting login and refuses unknown codes", () => {
+    const { b } = backend();
+    const pending = b.pendingCli("bcdf 2345");
+    expect(pending.requested_from_ip).toBe(MOCK_CLI_ADDRESS);
+    expect(pending.code_hint).toBeNull();
+    expect(pending.expires_at).toBeGreaterThan(pending.created_at);
+    expect(failure(() => b.pendingCli("XXXX-0000")).status).toBe(404);
+    expect(failure(() => b.approveCli("BCDF")).status).toBe(404);
   });
 });

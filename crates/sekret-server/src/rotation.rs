@@ -105,6 +105,7 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
         return Ok(Vec::new());
     }
     let _writing = state.keyring.writing().await;
+    state.keyring.check_fingerprint(state.store.as_ref()).await?;
     let principal = rotation_principal();
     let now = state.clock.now();
     let rules = BuiltinRole::ProjectAdmin.rules();

@@ -29,7 +29,25 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /** @description `code` must be typed by the person from the terminal that started the login. */
         post: operations["cli_approve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/cli/pending": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Where and when a CLI login was started, so the person can check it was them before approving. */
+        get: operations["cli_pending"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -865,7 +883,25 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /** @description Unauthenticated. After setup only `state`, `web_setup` and `version` are filled in; organisation admins get the rest from `/api/v1/sys/status/detail`. */
         get: operations["status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/status/detail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Every status field, including how the server was unlocked and whether an unlock is remembered. */
+        get: operations["status_detail"];
         put?: never;
         post?: never;
         delete?: never;
@@ -900,6 +936,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /** @description Answers with the public status. Also served on the host socket, where the network's rate limits do not apply. */
         post: operations["unseal"];
         delete?: never;
         options?: never;
@@ -1051,8 +1088,9 @@ export interface components {
              */
             subjects: string[];
         };
+        /** @description The code the person typed from their own terminal; a code carried in a link is not enough. */
         CliApproveRequest: {
-            user_code: string;
+            code: string;
         };
         CliPollRequest: {
             device_code: string;
@@ -1310,6 +1348,24 @@ export interface components {
             suggestions: string[];
             warning?: string | null;
         };
+        /** @description A CLI login waiting for approval, so the person can tell whether they started it. */
+        PendingCliLogin: {
+            /** @description Never set by this server: the person must type the whole code from their terminal. */
+            code_hint?: string | null;
+            /**
+             * Format: int64
+             * @description Unix seconds.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description Unix seconds.
+             */
+            expires_at: number;
+            /** @description The client address that started the login, as the server saw it. */
+            requested_from_ip: string;
+            user_agent: string;
+        };
         /** @description A secret's own setting: follow the project, or use `policy` (which may switch everything off). */
         PolicyOverride: {
             /** @enum {string} */
@@ -1485,7 +1541,11 @@ export interface components {
         Status: "active" | "disabled";
         /** @enum {string} */
         Subject: "secrets" | "secret-versions" | "snapshots" | "folders" | "environments" | "members" | "roles" | "audit-log" | "settings" | "projects" | "identities" | "org-members" | "org-roles" | "org-audit-log" | "backups";
-        /** @description Always answered without authentication, so monitoring can alert on a sealed server. */
+        /**
+         * @description `GET /sys/status` answers without authentication, so monitoring can alert on a sealed server,
+         *     and then fills in only `state`, `web_setup` and `version`, plus what configuration has decided
+         *     while uninitialised. `GET /sys/status/detail` fills in every field for organisation admins.
+         */
         SysStatus: {
             /** @description The unlock policy comes from server configuration and cannot be changed through the API. */
             configured: boolean;
@@ -1636,7 +1696,69 @@ export interface operations {
                 };
                 content?: never;
             };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cli_pending: {
+        parameters: {
+            query: {
+                /** @description The code from the terminal, or from the link the CLI printed. */
+                code: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingCliLogin"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3464,6 +3586,14 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     check_passphrase: {
@@ -3563,6 +3693,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+        };
+    };
+    status_detail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
         };

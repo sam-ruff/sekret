@@ -39,6 +39,16 @@ async function backupStatuses(page: Page): Promise<number[]> {
   });
 }
 
+/** What the fake server tells a caller with no session. */
+async function publicStatus(page: Page): Promise<unknown> {
+  return page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as { mockFetch: (request: Request) => Promise<Response> };
+    const response = await mock.mockFetch(new Request(`${location.origin}/api/v1/sys/status`));
+    return response.json() as Promise<unknown>;
+  });
+}
+
 /** A clipboard the test can read, and that reports reading as already allowed. */
 async function fakeClipboard(page: Page): Promise<void> {
   await page.addInitScript(() => {
@@ -202,7 +212,6 @@ test.describe("unlocking", () => {
     await expect(page.getByTestId("sidebar")).toHaveCount(0);
     await expect(page.getByTestId("unlock-card")).toContainText("sekret is locked. Enter the passphrase to decrypt secrets.");
     await expect(page.getByTestId("unlock-card")).not.toContainText("restarted");
-    await expect(page.getByTestId("unlock-policy")).toContainText("Unlock policy: manual");
 
     await page.getByTestId("unlock-submit").click();
     await expect(page.getByTestId("unlock-empty")).toHaveText("Enter the passphrase to unlock.");
@@ -218,11 +227,17 @@ test.describe("unlocking", () => {
     await expect(page).toHaveTitle("Users · sekret");
   });
 
-  test("explains a remember policy with nothing remembered", async ({ page }) => {
+  test("shows nothing the public status holds back about how the server unlocks", async ({ page }) => {
     await page.goto("/?mock-state=sealed&mock-unlock=remember");
-    await expect(page.getByTestId("unlock-policy")).toContainText(
-      "Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.",
-    );
+    await expect(page.getByTestId("unlock-card")).toBeVisible();
+    await expect(page.getByTestId("unlock-card")).not.toContainText(/remember|policy/i);
+    expect(await publicStatus(page)).toMatchObject({
+      state: "sealed",
+      seal_mode: null,
+      unlock_policy: null,
+      remembered: false,
+      unsealed_by: null,
+    });
   });
 
   test("counts down after too many wrong passphrases and keeps the button disabled", async ({ page }) => {
@@ -403,7 +418,7 @@ test.describe("server page", () => {
 
     await page.getByTestId("seal-now").click();
     await page.getByTestId("seal-dialog").getByTestId("confirm-action").click();
-    await expect(page.getByTestId("unlock-policy")).toContainText("after locking by hand someone has to type the passphrase");
+    await expect(page.getByTestId("unlock-card")).toBeVisible();
     await unlock(page, PASSPHRASE);
     await expect(page.getByTestId("server-remembered")).toContainText("yes");
   });
@@ -444,6 +459,19 @@ test.describe("server page", () => {
     await expect(page.getByTestId("seal-now")).toHaveCount(0);
     await expect(page.getByTestId("server-passphrase")).toHaveCount(0);
     await expect(page.getByTestId("server-unlock-policy")).toHaveCount(0);
+    // Only the public status: how it was unlocked and how it is protected stay with admins.
+    await expect(page.getByTestId("server-state")).toHaveText("Unlocked");
+    await expect(page.getByTestId("server-unsealed-by")).toHaveCount(0);
+    await expect(page.getByTestId("server-mode")).toHaveCount(0);
+    await expect(page.getByTestId("server-backup")).toContainText("the passphrase or root key file");
+  });
+
+  test("reads how the server was unlocked from the admin detail", async ({ page }) => {
+    await page.goto("/org/server?mock-unsealed-by=remember");
+    await expect(page.getByTestId("server-unsealed-by")).toHaveText("Remembered unlock");
+    await expect(page.getByTestId("server-mode")).toHaveText("Passphrase");
+    const status = (await publicStatus(page)) as { unsealed_by: unknown };
+    expect(status.unsealed_by).toBeNull();
   });
 });
 

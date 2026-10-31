@@ -21,7 +21,7 @@ test("creates an identity with universal auth and a client secret", async ({ pag
   await page.getByTestId("client-secret-create").click();
   const once = page.getByTestId("client-secret-once-dialog");
   await expect(once).toContainText("You will not see this secret again");
-  await expect(once.getByTestId("client-secret-value")).not.toBeEmpty();
+  await expect(once.getByTestId("client-secret-value")).toHaveValue(/^sks_/);
   await once.getByTestId("client-secret-done").click();
   await expect(universal.getByTestId("client-secrets")).toContainText("live test");
 

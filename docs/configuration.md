@@ -34,11 +34,13 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `server.listen` | `--listen` | `SEKRET_LISTEN` | `0.0.0.0:8080` | Address and port to listen on. |
 | `server.trusted_proxies` | `--trusted-proxies` | `SEKRET_TRUSTED_PROXIES` | none | CIDRs of reverse proxies whose `X-Forwarded-For` header is believed. |
 | `server.allow_insecure_http` | `--allow-insecure-http` | `SEKRET_ALLOW_INSECURE_HTTP` | `false` | Allows `http://` OIDC issuers and Kubernetes API servers. For local testing only. |
+| `server.unix_socket` | `--unix-socket` | `SEKRET_UNIX_SOCKET` | none | A Unix socket on the host serving only status and unseal, for `sekret sys unseal --socket`. The network's rate limits and back-off do not apply to it. |
+| `server.unix_socket_mode` | `--unix-socket-mode` | `SEKRET_UNIX_SOCKET_MODE` | `0600` | `0600` for the server's user only, or `0660` to let the socket's group unseal too. Quote it in the file. |
 | `database.url` | `--database-url` | `SEKRET_DATABASE_URL` | `sqlite://sekret.db?mode=rwc` | `sqlite://path?mode=rwc` or `postgres://user:pass@host/db`. |
 | `database.snapshots_to_keep` | `--snapshots-to-keep` | `SEKRET_SNAPSHOTS_TO_KEEP` | `200` | Snapshots kept per environment. |
-| `auth.default_org_role` | `--default-org-role` | `SEKRET_DEFAULT_ORG_ROLE` | `org-member` | Organisation role everyone who signs in receives. Empty for none. |
+| `auth.default_org_role` | `--default-org-role` | `SEKRET_DEFAULT_ORG_ROLE` | `org-member` | Organisation role everyone who signs in receives. Empty for none. The server warns at every start when it is `org-admin` or `backup-reader`. |
 | `auth.session_ttl` | `--session-ttl` | `SEKRET_SESSION_TTL` | `43200` | Browser session length in seconds. |
-| `auth.cli_token_ttl` | `--cli-token-ttl` | `SEKRET_CLI_TOKEN_TTL` | `86400` | Lifetime of a `sekret login` token in seconds. It can be renewed up to seven times its lifetime, or not past it at all when `cli_login_max_auth_age` is set. |
+| `auth.cli_token_ttl` | `--cli-token-ttl` | `SEKRET_CLI_TOKEN_TTL` | `86400` | Lifetime of a `sekret login` token in seconds. It can be renewed up to seven times its lifetime, or not past it at all when `cli_login_max_auth_age` is set or the person has groups from the identity provider. |
 | `auth.cli_login_max_auth_age` | `--cli-login-max-auth-age` | `SEKRET_CLI_LOGIN_MAX_AUTH_AGE` | unset | Seconds. Approving a `sekret login` needs a browser sign-in with the identity provider at most this old. See [CLI login re-authentication](#cli-login-re-authentication). |
 | `auth.login_rate_per_minute` | `--login-rate-per-minute` | `SEKRET_LOGIN_RATE_PER_MINUTE` | `30` | Attempts allowed per client address (per /64 for IPv6) per minute. Sign-in has one allowance and setup, unlocking and passphrase changes have another, so using up one never blocks the other. |
 | `oidc.issuer` | `--oidc-issuer` | `SEKRET_OIDC_ISSUER` | none | Issuer URL of your OIDC provider. Turns on browser sign-in. |
@@ -47,8 +49,8 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `oidc.scopes` | `--oidc-scopes` | `SEKRET_OIDC_SCOPES` | `openid profile email` | Scopes to request. |
 | `oidc.group_claims` | `--oidc-group-claims` | `SEKRET_OIDC_GROUP_CLAIMS` | `roles,groups` | Claims whose values become the user's groups. A name starting with `/` is a JSON pointer, such as `/realm_access/roles`. |
 | `oidc.admin_groups` | `--oidc-admin-groups` | `SEKRET_OIDC_ADMIN_GROUPS` | `sekret-admin` | Groups that make someone an organisation admin. |
-| `oidc.required_groups` | `--oidc-required-groups` | `SEKRET_OIDC_REQUIRED_GROUPS` | none | When set, only members of one of these groups may sign in. |
-| `oidc.allowed_subjects` | `--oidc-allowed-subjects` | `SEKRET_OIDC_ALLOWED_SUBJECTS` | none | When set, only ID tokens whose `sub` is listed may sign in or approve a `sekret login`, whatever their groups. Anyone else is sent back to the sign-in page and the attempt is audited as `auth.login.refused`. Pin the owner's subject here so that a role granted inside the identity provider is not enough on its own. |
+| `oidc.required_groups` | `--oidc-required-groups` | `SEKRET_OIDC_REQUIRED_GROUPS` | none | When set, only members of one of these groups may sign in, and existing sessions and tokens of anyone else stop working. |
+| `oidc.allowed_subjects` | `--oidc-allowed-subjects` | `SEKRET_OIDC_ALLOWED_SUBJECTS` | none | When set, only ID tokens whose `sub` is listed may sign in or approve a `sekret login`, whatever their groups, and existing sessions and tokens of anyone else stop working and are revoked at the next start. Refused sign-ins are sent back to the sign-in page and audited as `auth.login.refused`. Pin the owner's subject here so that a role granted inside the identity provider is not enough on its own. |
 | `tls.cert_file` | `--tls-cert-file` | `SEKRET_TLS_CERT_FILE` | none | PEM certificate chain. With a key file, the server speaks HTTPS itself. |
 | `tls.key_file` | `--tls-key-file` | `SEKRET_TLS_KEY_FILE` | none | PEM private key for the certificate. |
 | `tls.client_ca_file` | `--tls-client-ca-file` | `SEKRET_TLS_CLIENT_CA_FILE` | none | PEM CA certificates that client certificates must chain to. Turns on mutual TLS. |
@@ -56,22 +58,30 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `seal.mode` | `--seal-mode` | `SEKRET_SEAL_MODE` | unset | `passphrase` or `key-file`. Unset, setup offers passphrase mode and either kind of database starts. Set, a database in the other mode is refused. |
 | `seal.root_key_file` | `--root-key-file` | `SEKRET_ROOT_KEY_FILE` | none | The root key file in key-file mode, raw, base64 or hex. |
 | `seal.unlock` | `--unlock` | `SEKRET_UNLOCK` | unset | `manual`, `remember` or `passphrase-file`. Unset, the choice made at setup applies. See [Unlocking](unlocking.md). |
-| `seal.remember_file` | `--remember-file` | `SEKRET_REMEMBER_FILE` | none | Device key file for the `remember` policy, which needs it set. It may not be the database, root key or a passphrase file. |
+| `seal.remember_file` | `--remember-file` | `SEKRET_REMEMBER_FILE` | none | Device key file for the `remember` policy, which needs it set. It may not be the database, root key, a passphrase file or another file sekret uses. |
 | `seal.remember_secret_file` | `--remember-secret-file` | `SEKRET_REMEMBER_SECRET_FILE` | none | File holding a secret of at least 32 characters mixed into the remember key, so the disk alone cannot unlock. `SEKRET_REMEMBER_SECRET` holding the value itself also works. See [Unlocking](unlocking.md#remember-secret). |
-| `seal.passphrase_file` | `--unlock-passphrase-file` | `SEKRET_UNLOCK_PASSPHRASE_FILE` | none | Passphrase for the `passphrase-file` policy, read only under that policy. `SEKRET_UNLOCK_PASSPHRASE` holding the passphrase itself also works, but leaves a copy in `/proc/<pid>/environ`. |
+| `seal.passphrase_file` | `--unlock-passphrase-file` | `SEKRET_UNLOCK_PASSPHRASE_FILE` | none | Passphrase for the `passphrase-file` policy, read only under that policy. `SEKRET_UNLOCK_PASSPHRASE` holding the passphrase itself also works; the server wipes it from its own environment, but whatever started the server still holds it. |
 | `setup.web` | `--web-setup` | `SEKRET_WEB_SETUP` | `true` | Offer first-boot setup through the API and web interface. When false, no setup code is made; set up with `auto_init` or `sekret admin init`. |
 | `setup.auto_init` | `--auto-init` | `SEKRET_AUTO_INIT` | `false` | Set up an empty database at start, without a person. Skipped when the database already has a root key; refused when it holds projects or identities. |
-| `setup.passphrase_file` | `--setup-passphrase-file` | `SEKRET_SETUP_PASSPHRASE_FILE` | none | First passphrase for `auto_init`, read only when the database is not set up yet. The server warns while the file still exists afterwards. |
+| `setup.passphrase_file` | `--setup-passphrase-file` | `SEKRET_SETUP_PASSPHRASE_FILE` | none | First passphrase for `auto_init`, read only when the database is not set up yet. Required for `auto_init` in passphrase mode unless the unlock policy is `passphrase-file`, which uses the unlock passphrase. The server warns while the file still exists afterwards. |
 | `setup.admin_token_file` | `--setup-admin-token-file` | `SEKRET_SETUP_ADMIN_TOKEN_FILE` | none | Where `auto_init` writes a one-hour admin token, mode 0600. It must not exist yet and its directory must be writable, checked before anything is set up. |
-| `setup.code_file` | `--setup-code-file` | `SEKRET_SETUP_CODE_FILE` | none | Where to write the one-time setup code, mode 0600, as well as the log and standard error. Deleted once setup succeeds. |
+| `setup.code_file` | `--setup-code-file` | `SEKRET_SETUP_CODE_FILE` | none | Where to write the one-time setup code, mode 0600, as well as the log and standard error. Anything already there that sekret did not write, such as a link to another file, stops the server instead of being overwritten. Deleted once setup succeeds, if it is unchanged. |
 | `backup.temp_dir` | `--backup-temp-dir` | `SEKRET_BACKUP_TEMP_DIR` | beside the SQLite database | Where API backups are staged, in a private 0700 directory. |
 | | `--config` | `SEKRET_CONFIG` | none | The YAML file itself. |
 
 Lists such as `--oidc-admin-groups` take comma-separated values on the command line and YAML lists in the file. Switches such as `--auto-init` can be given bare or as `--auto-init=false`; in the file they must be `true` or `false`, and `yes`, `no`, `on` and `off` are refused. Configuration errors give the line and column but never echo the value, so a password in a database URL does not end up in a log.
 
-Every file the server reads (configuration, keys, passphrases, secrets) must be a regular file and is read with a size limit, 4 KiB for keys, passphrases and secrets, so pointing a setting at `/dev/zero` or a FIFO fails straight away. Key files may be symlinks, because Kubernetes mounts secrets that way; the remember file may not.
+Every file the server reads (configuration, keys, passphrases, secrets) must be a regular file and is read with a size limit, 4 KiB for keys, passphrases and secrets, so pointing a setting at `/dev/zero` or a FIFO fails straight away. Key files may be symlinks, because Kubernetes mounts secrets that way; the remember file may not. The files the server writes (the remember file, setup code file, admin token file and Unix socket) must each be a file of their own: the server refuses to start when one is the same file as the database, its `-wal`, `-shm`, `.lock` or `.epoch` files, a key, passphrase or secret file, the configuration file, the TLS key or each other.
 
-At start the server logs, at `info`, each seal, unlock and setup setting with its value (never a secret) and where it came from: flag, environment, file or default. It warns about settings that weaken it: `allow_insecure_http`, an `http://` public URL with a non-loopback listen address, trusted proxy ranges shorter than /8, the `passphrase-file` policy coming from the environment, and environment variables overriding unlock or setup settings in the file. Set `SEKRET_LOG` to a [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) such as `info` or `sekret_server=debug` to change logging; logs go to standard error.
+At start the server logs, at `info`, each seal, unlock and setup setting, `auth.default_org_role`, the trusted proxies and `allow_insecure_http`, with its value (never a secret) and where it came from: flag, environment, file or default. It warns about settings that weaken it:
+
+- `allow_insecure_http`, and an `http://` public URL with a non-loopback listen address;
+- trusted proxy ranges wider than /16 for IPv4 or /32 for IPv6, outside private address space, or covering more than a /8 between them;
+- `auth.default_org_role` set to `org-admin` or `backup-reader`;
+- the `passphrase-file` policy coming from the environment;
+- an environment variable overriding the file for any unlock, setup or seal setting, `auth.default_org_role`, `server.trusted_proxies`, `server.allow_insecure_http` or the OIDC group and subject lists;
+- a root key, passphrase, secret, remember, OIDC client secret or TLS key file that the group or other users can read, or that another user owns (symlinks are followed, so the mounted target is what counts);
+- a remember file on the same filesystem as the database, or anywhere under its directory. Set `SEKRET_LOG` to a [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) such as `info` or `sekret_server=debug` to change logging; logs go to standard error.
 
 The `admin` commands also accept `--config`, and take the database URL and root key file from it.
 
@@ -184,11 +194,11 @@ sekret server \
 
 In Keycloak, create a client called `sekret` with client authentication on, the standard flow enabled and the redirect URIs above. Add two mappers to the client's dedicated scope: an *Audience* mapper that adds `sekret` to the ID token, and a *User Realm Role* mapper with claim name `roles`, multivalued, added to the ID token. Realm roles then arrive in the `roles` claim, which is one of the defaults for `--oidc-group-claims`.
 
-Group membership is copied from the token at each sign-in. Removing someone from a group in your provider takes effect at their next sign-in, or when their session expires, whichever comes first.
+Group membership is copied from the token at each sign-in. Removing someone from a group in your provider takes effect for their roles at their next sign-in, or when their session expires, whichever comes first; their CLI tokens cannot be renewed past their first lifetime for that reason. Changes to `oidc.required_groups` and `oidc.allowed_subjects` in sekret's own configuration take effect at once, judged against the groups and subject stored at the last sign-in.
 
 ## Reverse proxies
 
-sekret speaks plain HTTP and expects TLS to end at a reverse proxy in front of it. Set `--trusted-proxies` to the proxy's address so that rate limiting and machine identities' trusted CIDRs see the real client address; without it, every request appears to come from the proxy. Only the rightmost address in `X-Forwarded-For` that is not a trusted proxy is used, across all of the header's lines; an entry that is not an address stops the search at the proxy's own address. Keep the trusted ranges narrow: the server warns about anything shorter than /8.
+sekret speaks plain HTTP and expects TLS to end at a reverse proxy in front of it. Set `--trusted-proxies` to the proxy's address so that rate limiting and machine identities' trusted CIDRs see the real client address; without it, every request appears to come from the proxy. Only the rightmost address in `X-Forwarded-For` that is not a trusted proxy is used, across all of the header's lines. If any entry is not a plain address, the client is treated as unknown, which no identity's trusted CIDRs match, rather than as the proxy. Keep the trusted ranges narrow: the server warns about IPv4 ranges wider than /16, IPv6 ranges wider than /32, and public ranges.
 
 ## TLS and mutual TLS
 
@@ -224,7 +234,7 @@ sekret whoami \
 
 ## CLI configuration
 
-The CLI reads its server, project, environment and folder from, in order of priority: command-line flags, `SEKRET_URL`, `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT` and `SEKRET_PATH`, then the nearest `.sekret.toml` in the current directory or a parent, then the server saved by `sekret login`.
+The CLI reads its server, project, environment and folder from, in order of priority: command-line flags, `SEKRET_URL`, `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT` and `SEKRET_PATH`, then the nearest `.sekret.toml` in the current directory or a parent. There is no fallback to the last server you logged in to: with none of these, the command asks for `--server`.
 
 ```toml
 # .sekret.toml

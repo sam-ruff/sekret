@@ -13,6 +13,8 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub strength: Option<PassphraseStrength>,
+    /// Seconds for a `Retry-After` header.
+    pub retry_after: Option<u64>,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -24,6 +26,7 @@ impl ApiError {
             code,
             message: message.into(),
             strength: None,
+            retry_after: None,
         }
     }
 
@@ -105,15 +108,36 @@ impl ApiError {
         )
     }
 
-    /// Too many wrong passphrases recently, from anywhere.
+    /// Too many wrong passphrases recently. The wait is only given rounded, in `Retry-After`.
     pub fn passphrase_backoff(wait: std::time::Duration) -> Self {
+        Self {
+            retry_after: Some(crate::ratelimit::rounded_wait(wait)),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "passphrase_backoff",
+                "too many wrong passphrases; try again shortly",
+            )
+        }
+    }
+
+    /// Replacing the root key waited too long for in-flight changes to finish.
+    pub fn rekey_busy() -> Self {
         Self::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "passphrase_backoff",
-            format!(
-                "too many wrong passphrases; try again in {} seconds",
-                wait.as_secs().max(1)
-            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "other changes are still being written; try again in a moment",
+        )
+    }
+
+    /// The database's root key is not the one in memory, as after rotating it with the server running.
+    pub fn root_key_changed() -> Self {
+        tracing::error!(
+            "the database's root key fingerprint no longer matches the key in memory; refusing writes until restarted"
+        );
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "root_key_changed",
+            "the database's root key was changed outside this server; restart it",
         )
     }
 
@@ -154,7 +178,13 @@ impl IntoResponse for ApiError {
             message: self.message,
             strength: self.strength,
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(seconds));
+        }
+        response
     }
 }
 

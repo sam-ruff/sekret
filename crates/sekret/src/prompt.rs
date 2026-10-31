@@ -4,7 +4,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use sekret_core::seal::{strip_line_ending, validate_passphrase};
+use sekret_core::seal::{trim_input, validate_passphrase};
 use sekret_server::files::{SECRET_FILE_LIMIT, read_limited};
 use zeroize::Zeroizing;
 
@@ -59,7 +59,7 @@ pub fn read_text_file(path: &Path) -> anyhow::Result<Zeroizing<String>> {
 }
 
 /// Reads a passphrase from a file, `-` for the first line of stdin, or asks. Every source drops
-/// one trailing line ending, and nothing else.
+/// a leading byte order mark and one trailing line ending, and nothing else.
 pub fn read_passphrase(
     file: Option<&Path>,
     prompt: &str,
@@ -70,7 +70,7 @@ pub fn read_passphrase(
         Some(path) if path == Path::new("-") => read_stdin_line()?,
         Some(path) => read_text_file(path)?,
     };
-    let passphrase = Zeroizing::new(strip_line_ending(&text).to_string());
+    let passphrase = Zeroizing::new(trim_input(&text).to_string());
     if passphrase.is_empty() {
         bail!("the passphrase is empty");
     }
@@ -147,6 +147,11 @@ pub mod tests {
         );
         let prompted = read_passphrase(None, "", &Scripted::new(&["typed\n"]))?;
         assert_eq!(prompted.as_str(), "typed");
+        std::fs::write(&path, "\u{feff}saved by notepad\r\n").context("write")?;
+        assert_eq!(
+            read_passphrase(Some(&path), "", &Scripted::new(&[]))?.as_str(),
+            "saved by notepad"
+        );
         Ok(())
     }
 

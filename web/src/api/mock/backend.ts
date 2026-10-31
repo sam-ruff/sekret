@@ -1,4 +1,5 @@
 import { authorise, type Resource } from "@/lib/permissions";
+import { isCompleteCode, normaliseUserCode } from "@/lib/cli-code";
 import { isValidSecretKey } from "@/lib/dotenv";
 import { DEFAULT_GENERATOR, MAX_LENGTH, MAX_ROTATION_DAYS, MIN_LENGTH } from "@/lib/generation";
 import { MAX_LOGO_BYTES, validateImage } from "@/lib/images";
@@ -32,6 +33,7 @@ import type {
   OrgBinding,
   Overview,
   PassphraseStrength,
+  PendingCliLogin,
   PolicyOverride,
   PrincipalKind,
   Project,
@@ -68,9 +70,12 @@ import {
   MAX_FAILED_UNSEALS,
   MOCK_BACKOFF_SECONDS,
   MOCK_KDF_BUSY_PASSPHRASE,
+  MOCK_CLI_ADDRESS,
+  MOCK_CLI_USER_AGENT,
   MOCK_REAUTH_CODE_PREFIX,
   MOCK_SETUP_CODE,
   MOCK_VERSION,
+  publicStatusOf,
   statusOf,
   sysFromControls,
 } from "./sys";
@@ -1532,6 +1537,17 @@ export class MockBackend {
 
   // Setup, sealing and backups
 
+  /** The unauthenticated status: after setup only the state, whether web setup is on, and the version. */
+  publicStatus(): SysStatus {
+    return publicStatusOf(this.state.sys);
+  }
+
+  /** Every field, for organisation admins. */
+  statusDetail(): SysStatus {
+    this.requireOrgAdmin();
+    return this.sysStatus();
+  }
+
   sysStatus(): SysStatus {
     return statusOf(this.state.sys);
   }
@@ -1730,11 +1746,29 @@ export class MockBackend {
 
   // CLI device login
 
-  approveCli(code: string): void {
-    const normalised = code.trim().toUpperCase();
-    if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(normalised) || normalised.startsWith("XXXX")) {
+  /** Any well-formed code but `XXXX-...` stands for a waiting login started a minute ago from the CLI. */
+  private knownCliCode(code: string): string {
+    const normalised = normaliseUserCode(code);
+    if (!isCompleteCode(normalised) || normalised.startsWith("XXXX")) {
       throw new MockError(404, "not_found", "that code is unknown or has expired");
     }
+    return normalised;
+  }
+
+  pendingCli(code: string): PendingCliLogin {
+    this.knownCliCode(code);
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      code_hint: null,
+      requested_from_ip: MOCK_CLI_ADDRESS,
+      user_agent: MOCK_CLI_USER_AGENT,
+      created_at: now - 60,
+      expires_at: now + 540,
+    };
+  }
+
+  approveCli(code: string): void {
+    const normalised = this.knownCliCode(code);
     if (normalised.startsWith(MOCK_REAUTH_CODE_PREFIX) && !this.state.freshSignIn) {
       const back = encodeURIComponent(`/cli-login?code=${encodeURIComponent(normalised)}`);
       throw new MockError(

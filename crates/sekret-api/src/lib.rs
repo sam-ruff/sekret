@@ -92,9 +92,25 @@ pub struct CliPollRequest {
     pub device_code: String,
 }
 
+/// The code the person typed from their own terminal; a code carried in a link is not enough.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CliApproveRequest {
-    pub user_code: String,
+    pub code: String,
+}
+
+/// A CLI login waiting for approval, so the person can tell whether they started it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PendingCliLogin {
+    /// Never set by this server: the person must type the whole code from their terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_hint: Option<String>,
+    /// The client address that started the login, as the server saw it.
+    pub requested_from_ip: String,
+    pub user_agent: String,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// Unix seconds.
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -633,7 +649,9 @@ pub struct AuditEntry {
     pub ip: String,
 }
 
-/// Always answered without authentication, so monitoring can alert on a sealed server.
+/// `GET /sys/status` answers without authentication, so monitoring can alert on a sealed server,
+/// and then fills in only `state`, `web_setup` and `version`, plus what configuration has decided
+/// while uninitialised. `GET /sys/status/detail` fills in every field for organisation admins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SysStatus {
     pub state: SealState,

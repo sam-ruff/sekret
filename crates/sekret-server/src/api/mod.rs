@@ -5,6 +5,8 @@ mod projects;
 mod secrets;
 mod sys;
 
+pub use sys::{HostSocket, clean_stale_staging, host_router, staging_base};
+
 use std::net::IpAddr;
 
 use sekret_core::permissions::Rule;
@@ -170,6 +172,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(human::auth_config))
         .routes(routes!(human::logout))
         .routes(routes!(human::cli_start))
+        .routes(routes!(human::cli_pending))
         .routes(routes!(human::cli_approve))
         .routes(routes!(human::cli_poll))
         .routes(routes!(machine::oidc_login))

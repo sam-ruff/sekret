@@ -67,15 +67,23 @@ sekret sys unseal --server https://sekret.example.com
 
 No sign-in is needed: the passphrase is the credential. Applications get 503 until then and should retry.
 
+On the server host you can also unlock through a Unix socket, which is not subject to the network's rate limits, so nobody guessing over the network can hold you up. Set `server.unix_socket` (and `server.unix_socket_mode: "0660"` if a group should be able to use it), then:
+
+```sh
+sekret sys unseal --socket /run/sekret/sekret.sock
+```
+
+The server serves only status and unseal on the socket. It holds a lock on its database for as long as it runs (`<db>.lock` beside a SQLite file, an advisory lock on Postgres), so `sekret admin init`, `rotate-root-key`, `set-seal-mode` and `restore` refuse to run until it stops. `sekret admin bootstrap` still works alongside it.
+
 ## Alerting when sealed
 
 `GET /api/v1/sys/status` needs no authentication and always answers 200:
 
 ```json
-{"state": "sealed", "seal_mode": "passphrase", "unlock_policy": "manual", "configured": false, "remembered": false, "unsealed_by": null, "web_setup": true, "version": "1.2.0"}
+{"state": "sealed", "seal_mode": null, "unlock_policy": null, "configured": false, "remembered": false, "unsealed_by": null, "web_setup": true, "version": "1.2.0"}
 ```
 
-`state` is `uninitialised`, `sealed` or `unsealed`. While unsealed, `unsealed_by` says how: `passphrase`, `remember`, `passphrase-file` or `key-file`; `key-file` with a `seal_mode` of `passphrase` means a root key file overrode the passphrase. Every wrong passphrase is in the audit log as `sys.unseal.failed`, with a count of consecutive failures, which is the simplest thing to alert on if someone may be guessing. `sekret sys status` exits 0 when unsealed, 2 when sealed and 3 when not set up, which suits shell checks. In Home Assistant, a REST sensor and an automation send a notification when the server is sealed:
+`state` is `uninitialised`, `sealed` or `unsealed`, which is all monitoring needs. The other fields are only filled in for organisation admins, at `GET /api/v1/sys/status/detail` (or `sekret sys status` when signed in as one), so the public endpoint does not tell anyone how the server unlocks. There, while unsealed, `unsealed_by` says how: `passphrase`, `remember`, `passphrase-file` or `key-file`; `key-file` with a `seal_mode` of `passphrase` means a root key file overrode the passphrase. Before setup the public endpoint also shows what configuration has already decided. Every wrong passphrase is in the audit log as `sys.unseal.failed`, with a count of consecutive failures from that address, which is the simplest thing to alert on if someone may be guessing. `sekret sys status` exits 0 when unsealed, 2 when sealed and 3 when not set up, which suits shell checks. In Home Assistant, a REST sensor and an automation send a notification when the server is sealed:
 
 ```yaml
 sensor:
@@ -171,7 +179,7 @@ Restore offline, on any host, into a new SQLite file:
 sekret admin restore --backup sekret-2026-10-30.skb --database-url 'sqlite:///var/lib/sekret/sekret.db?mode=rwc'
 ```
 
-It prints when the backup was taken and its root key fingerprint, asks for the passphrase (or reads `--passphrase-file`; `--root-key-file` for key-file backups) and checks it matches the backup. It refuses to overwrite an existing file, or to write where a `-wal`, `-shm` or `-journal` file from another database is waiting beside the target. It writes to a temporary file in the same directory, checks the copy is intact and belongs to the backup's root key, and only then moves it into place. Start the server on the restored database and unlock it with the same passphrase. Tokens, users and identities come back as they were. A remembered unlock does not, so the first start needs the passphrase.
+It prints when the backup was taken and its root key fingerprint, asks for the passphrase (or reads `--passphrase-file`; `--root-key-file` for key-file backups) and checks it matches the backup. It refuses to overwrite an existing file, or to write where a `-wal`, `-shm` or `-journal` file from another database is waiting beside the target. It writes into a new private directory in the same folder, checks the copy is intact and belongs to the backup's root key, makes sure the file it checked is still the one it wrote, and only then links it into place; anything an interrupted restore left behind is removed first. The restore is recorded in the restored database's audit log as `admin.restore`. Start the server on the restored database and unlock it with the same passphrase. If you restore over the path of a database that had a newer seal configuration, delete its `<db>.epoch` file first, or the server takes the older configuration for a rollback and falls back to the manual unlock policy. Tokens, users and identities come back as they were. A remembered unlock does not, so the first start needs the passphrase.
 
 ## Health checks
 

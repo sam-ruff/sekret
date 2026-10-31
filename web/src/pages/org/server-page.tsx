@@ -1,10 +1,10 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, Download, Lock } from "lucide-react";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
-import type { SysStatus, UnlockPolicy } from "@/api/types";
+import type { SealMode, SysStatus, UnlockPolicy } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { ErrorState } from "@/components/states";
@@ -16,7 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { SecretInput } from "@/components/secret-field";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { keys, useApiMutation, useSysStatus } from "@/hooks/queries";
@@ -24,15 +24,24 @@ import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
 import { errorMessage } from "@/lib/errors";
 import { passphraseProblem, problemText } from "@/lib/passphrase";
+import { broadcast } from "@/lib/tab-sync";
 import { keyFileOverride, POLICY_NAMES, UNSEALED_BY_NAMES } from "@/lib/sys-gate";
 
 const NO_ACCESS = new ApiError("Only organisation admins and backup readers can see this page.", 403, "forbidden");
 
 export function ServerPage() {
-  const status = useSysStatus(true);
   const org = useOrgPermissions();
   const admin = useIsOrgAdmin();
   const canBackup = org.can("backups", "read");
+  // The public status says only whether the server is locked; admins read the rest from the detail.
+  const publicStatus = useSysStatus(true);
+  const detail = useQuery({
+    queryKey: keys.sysStatusDetail,
+    queryFn: api.sysStatusDetail,
+    enabled: org.ready && admin,
+    staleTime: 0,
+  });
+  const status = admin ? detail : publicStatus;
 
   const header = admin ? (
     <PageHeader title="Server" description="Locking, unlocking and backups for this sekret server." />
@@ -44,6 +53,14 @@ export function ServerPage() {
       <div className="space-y-6">
         {header}
         <ErrorState error={NO_ACCESS} />
+      </div>
+    );
+  }
+  if (org.ready && status.error && !status.data) {
+    return (
+      <div className="space-y-6">
+        {header}
+        <ErrorState error={status.error} onRetry={() => void status.refetch()} />
       </div>
     );
   }
@@ -64,7 +81,7 @@ export function ServerPage() {
         <StatusCard status={status.data} canLock={admin && passphraseMode} />
         {admin && passphraseMode && <UnlockPolicyCard key={status.data.unlock_policy ?? ""} status={status.data} />}
         {admin && passphraseMode && <ChangePassphraseCard />}
-        {canBackup && <BackupCard passphraseMode={passphraseMode} />}
+        {canBackup && <BackupCard mode={status.data.seal_mode ?? null} />}
       </div>
     </div>
   );
@@ -85,8 +102,11 @@ function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }
 
   const seal = useApiMutation({
     mutationFn: api.seal,
-    // The status gate sees the locked state, clears the cache and moves to the unlock page.
-    onSuccess: (next) => queryClient.setQueryData(keys.sysStatus, next),
+    // The status gate sees the locked state, clears the cache and moves to the unlock page, here and in other tabs.
+    onSuccess: (next) => {
+      queryClient.setQueryData(keys.sysStatus, next);
+      broadcast("sealed");
+    },
   });
 
   const policy = status.unlock_policy;
@@ -103,9 +123,11 @@ function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }
               {status.state === "unsealed" ? "Unlocked" : "Locked"}
             </Badge>
           </Row>
-          <Row label="Protected by">
-            <span data-testid="server-mode">{status.seal_mode === "key-file" ? "Key file" : "Passphrase"}</span>
-          </Row>
+          {status.seal_mode && (
+            <Row label="Protected by">
+              <span data-testid="server-mode">{status.seal_mode === "key-file" ? "Key file" : "Passphrase"}</span>
+            </Row>
+          )}
           {status.unsealed_by && (
             <Row label="Unlocked by">
               <span data-testid="server-unsealed-by">{UNSEALED_BY_NAMES[status.unsealed_by]}</span>
@@ -185,16 +207,19 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
 
   const save = useApiMutation({
     mutationFn: (confirmWith: string | undefined) => api.setUnlockPolicy(policy, confirmWith),
+    // The passphrase is the mutation's variable, so it must not linger in the mutation cache.
+    gcTime: 0,
     onSuccess: (next) => {
       setPassphrase("");
-      queryClient.setQueryData(keys.sysStatus, next);
+      queryClient.setQueryData(keys.sysStatusDetail, next);
+      save.reset();
     },
     onError: (error) => isPassphraseError(error),
     success: "Unlock policy saved",
   });
   const forget = useApiMutation({
     mutationFn: api.forgetUnlock,
-    onSuccess: (next) => queryClient.setQueryData(keys.sysStatus, next),
+    onSuccess: (next) => queryClient.setQueryData(keys.sysStatusDetail, next),
     success: "Remembered unlock forgotten",
   });
 
@@ -280,7 +305,9 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
         open={confirming}
         onOpenChange={(open) => {
           setConfirming(open);
-          if (!open) setPassphrase("");
+          if (open) return;
+          setPassphrase("");
+          if (!save.isPending) save.reset();
         }}
         title={`Switch to ${POLICY_NAMES[policy]}?`}
         description="Confirm with the current passphrase. This lets the server unlock without a person."
@@ -301,7 +328,7 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
           <PassphraseAccountField />
           <Field data-invalid={!!fieldError}>
             <FieldLabel htmlFor="policy-passphrase">Current passphrase</FieldLabel>
-            <Input
+            <SecretInput
               id="policy-passphrase"
               type="password"
               autoComplete="current-password"
@@ -349,11 +376,13 @@ function ChangePassphraseCard() {
 
   const change = useMutation({
     mutationFn: () => api.changePassphrase({ current, new: passphrase }),
+    gcTime: 0,
     onSuccess: () => {
       toast.success("Passphrase changed");
       setCurrent("");
       setPassphrase("");
       setConfirm("");
+      change.reset();
     },
   });
 
@@ -387,7 +416,7 @@ function ChangePassphraseCard() {
             <PassphraseAccountField />
             <Field data-invalid={!!wrong}>
               <FieldLabel htmlFor="current-passphrase">Current passphrase</FieldLabel>
-              <Input
+              <SecretInput
                 id="current-passphrase"
                 type="password"
                 autoComplete="current-password"
@@ -462,7 +491,14 @@ function saveFile(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function BackupCard({ passphraseMode }: { passphraseMode: boolean }) {
+const BACKUP_RESTORE_NEEDS: Record<SealMode | "unknown", string> = {
+  passphrase: "Restoring it needs the passphrase that was in use when it was made.",
+  "key-file": "Restoring it needs the server's root key file.",
+  unknown: "Restoring it needs the passphrase or root key file that was in use when it was made.",
+};
+
+/** `mode` is null when the caller may not see how the server is protected. */
+function BackupCard({ mode }: { mode: SealMode | null }) {
   const download = useApiMutation({
     mutationFn: api.backup,
     onSuccess: ({ blob, filename }) => saveFile(blob, filename),
@@ -473,9 +509,7 @@ function BackupCard({ passphraseMode }: { passphraseMode: boolean }) {
       <CardHeader>
         <CardTitle>Backup</CardTitle>
         <CardDescription>
-          {passphraseMode
-            ? "An encrypted copy of the database. Restoring it needs the passphrase that was in use when it was made."
-            : "An encrypted copy of the database. Restoring it needs the server's root key file."}
+          An encrypted copy of the database. {BACKUP_RESTORE_NEEDS[mode ?? "unknown"]}
         </CardDescription>
       </CardHeader>
       <CardFooter className="justify-end">

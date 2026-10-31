@@ -49,7 +49,7 @@ pub fn is_variable_name(key: &str) -> bool {
 /// Names that change how a shell, the dynamic linker or a runtime behaves. Anyone who can write a
 /// secret could otherwise run code on the machine of whoever loads the environment.
 pub fn is_unsafe_name(key: &str) -> bool {
-    const EXACT: [&str; 14] = [
+    const EXACT: [&str; 27] = [
         "PATH",
         "BASH_ENV",
         "ENV",
@@ -62,8 +62,21 @@ pub fn is_unsafe_name(key: &str) -> bool {
         "SHELL",
         "CDPATH",
         "PYTHONSTARTUP",
+        "PYTHONHOME",
         "PERL5OPT",
         "RUBYOPT",
+        "RUBYLIB",
+        "NODE_PATH",
+        "NODE_OPTIONS",
+        "GIT_PROXY_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
     ];
     const PREFIXES: [&str; 7] = ["LD_", "DYLD_", "PS", "BASH_FUNC_", "fish_", "PYTHONPATH", "PERL5LIB"];
     let upper = key.to_ascii_uppercase();
@@ -75,6 +88,26 @@ pub fn is_unsafe_name(key: &str) -> bool {
         || upper == "GIT_SSH_COMMAND"
         || upper.starts_with("GIT_CONFIG")
 }
+
+/// Whether a key may become an environment variable: a valid name, not one of sekret's own
+/// `SEKRET_*` settings and not one that changes how programs are loaded or run.
+pub fn is_loadable(key: &str) -> bool {
+    is_variable_name(key) && !key.starts_with("SEKRET_") && !is_unsafe_name(key)
+}
+
+/// Splits secrets into those that may be loaded and the names of those left out.
+pub fn split_loadable(vars: BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
+    let (kept, skipped): (BTreeMap<_, _>, BTreeMap<_, _>) = vars.into_iter().partition(|(k, _)| is_loadable(k));
+    (kept, skipped.into_keys().collect())
+}
+
+/// Credentials of the CLI and server that a child process never needs.
+pub const CREDENTIAL_VARS: [&str; 4] = [
+    "SEKRET_TOKEN",
+    "SEKRET_CLIENT_SECRET",
+    "SEKRET_UNLOCK_PASSPHRASE",
+    "SEKRET_REMEMBER_SECRET",
+];
 
 fn fish_value(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
@@ -115,7 +148,7 @@ pub fn switch_script(shell: Shell, previous: &[String], vars: &BTreeMap<String, 
     let mut loaded = Vec::new();
     let mut skipped = Vec::new();
     for (key, value) in vars {
-        if !is_variable_name(key) || key.starts_with("SEKRET_") || is_unsafe_name(key) {
+        if !is_loadable(key) {
             skipped.push(key.clone());
             continue;
         }
@@ -264,6 +297,42 @@ mod tests {
             switch.skipped.contains(&"PSQL_HOST".to_string()),
             "PS* is treated as a prompt variable"
         );
+    }
+
+    #[test]
+    fn helper_programs_proxies_and_runtime_paths_are_unsafe() {
+        for name in [
+            "GIT_PROXY_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "NODE_PATH",
+            "NODE_OPTIONS",
+            "RUBYLIB",
+            "RUBYOPT",
+            "PERL5OPT",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "BASH_ENV",
+            "ENV",
+            "PROMPT_COMMAND",
+        ] {
+            assert!(is_unsafe_name(name), "{name}");
+            assert!(!is_loadable(name), "{name}");
+        }
+        assert!(!is_loadable("SEKRET_URL"));
+        assert!(!is_loadable("bad.key"));
+        assert!(is_loadable("DATABASE_URL"));
+        let (kept, skipped) = split_loadable(vars(&[("A", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["A"]);
+        assert_eq!(skipped, ["HTTPS_PROXY", "SEKRET_TOKEN"]);
     }
 
     #[test]

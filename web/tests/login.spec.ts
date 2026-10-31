@@ -20,9 +20,19 @@ test("login page offers a generic sign-in on the shared standalone layout", asyn
   }
 });
 
-test("login page shows the error from a failed sign-in", async ({ page }) => {
-  await page.goto("/login?error=state%20mismatch");
-  await expect(page.getByTestId("login-error")).toContainText("state mismatch");
+test("login page explains a failed sign-in from its fixed code", async ({ page }) => {
+  await page.goto("/login?error=not_allowed");
+  await expect(page.getByTestId("login-error")).toContainText("Your account is not allowed to use sekret.");
+  await page.goto("/login?error=other_browser");
+  await expect(page.getByTestId("login-error")).toContainText("started in another browser");
+});
+
+test("login page never shows text an attacker put in the error parameter", async ({ page }) => {
+  const lure = "Your account is locked. Call +44 20 7946 0000 to restore access.";
+  await page.goto(`/login?error=${encodeURIComponent(lure)}`);
+  await expect(page.getByTestId("login-error")).toContainText("Signing in did not work. Please try again.");
+  await expect(page.getByTestId("login-card")).not.toContainText("7946");
+  await expect(page.getByTestId("login-card")).not.toContainText("locked");
 });
 
 test("signing in returns to the requested page", async ({ page }) => {

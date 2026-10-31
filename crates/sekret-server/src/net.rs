@@ -39,14 +39,14 @@ pub struct TokenReviewRequest {
     pub host: String,
     pub ca_pem: Option<String>,
     /// Bearer for the review call; the reviewed token itself when absent.
-    pub reviewer: Option<String>,
+    pub reviewer: Option<zeroize::Zeroizing<String>>,
     pub token: String,
     pub audiences: Vec<String>,
 }
 
 impl TokenReviewRequest {
     pub fn bearer(&self) -> &str {
-        self.reviewer.as_deref().unwrap_or(&self.token)
+        self.reviewer.as_ref().map_or(&self.token, |r| r.as_str())
     }
 }
 
@@ -211,7 +211,7 @@ mod tests {
         TokenReviewRequest {
             host: server.uri(),
             ca_pem: None,
-            reviewer: reviewer.map(String::from),
+            reviewer: reviewer.map(|r| zeroize::Zeroizing::new(r.to_string())),
             token: "workload-token".into(),
             audiences: vec!["sekret".into()],
         }

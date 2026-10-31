@@ -1,9 +1,11 @@
 //! Persistence for sekret behind the [`Store`] trait, with a sqlx implementation for SQLite and Postgres.
 
+mod lock;
 pub mod models;
 mod sql;
 
 use async_trait::async_trait;
+pub use lock::{InstanceLock, lock_file};
 pub use models::*;
 pub use sql::{SqlStore, sqlite_file};
 

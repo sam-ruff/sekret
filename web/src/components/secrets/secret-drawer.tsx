@@ -175,14 +175,17 @@ function VersionItem({
 export function SecretDrawer({ project, env, envName, path, secretKey, canRollback, canEditPolicy, onRotate, onClose }: SecretDrawerProps) {
   const at = { project, env, path };
   const [target, setTarget] = useState<number | null>(null);
-  // Values are shown only for the secret they were asked for, and hidden again on close or a switch.
+  // Values are shown only for the secret they were asked for, and hidden again on close or a switch
+  // to another key, folder or environment, even one holding a key of the same name.
+  const location = secretKey === null ? null : JSON.stringify([project, env, path, secretKey]);
   const [valuesFor, setValuesFor] = useState<string | null>(null);
-  const [openKey, setOpenKey] = useState(secretKey);
-  if (openKey !== secretKey) {
-    setOpenKey(secretKey);
+  const [openAt, setOpenAt] = useState(location);
+  if (openAt !== location) {
+    setOpenAt(location);
     setValuesFor(null);
+    setTarget(null);
   }
-  const showValues = secretKey !== null && valuesFor === secretKey;
+  const showValues = location !== null && valuesFor === location;
 
   const historyKey = keys.versions(project, env, path, secretKey ?? "");
   const loadVersions = async (values: boolean) => {
@@ -245,7 +248,7 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => setValuesFor(showValues ? null : secretKey)}
+                      onClick={() => setValuesFor(showValues ? null : location)}
                       aria-pressed={showValues}
                       data-testid="history-values-toggle"
                     >

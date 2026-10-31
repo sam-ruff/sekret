@@ -12,7 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { SecretTextarea } from "@/components/secret-field";
 import { useApiMutation } from "@/hooks/queries";
 import { parseDotenv } from "@/lib/dotenv";
 
@@ -42,6 +42,8 @@ export function ImportEnvDialog({
   invalidate,
 }: ImportEnvDialogProps) {
   const [text, setText] = useState("");
+  // Pasted values never outlive the dialog, however it was closed.
+  if (!open && text !== "") setText("");
   const parsed = useMemo(() => parseDotenv(text), [text]);
   const existing = new Set(existingKeys);
   const updates = parsed.entries.filter((e) => existing.has(e.key)).length;
@@ -72,7 +74,7 @@ export function ImportEnvDialog({
             are updated.
           </DialogDescription>
         </DialogHeader>
-        <Textarea
+        <SecretTextarea
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder={EXAMPLE}

@@ -77,11 +77,19 @@ pub async fn machine_login(api: &dyn SekretApi, credential: MachineCredential) -
 /// Browser-approved login: show a code, wait for approval in the web interface.
 pub async fn device_login(
     api: &dyn SekretApi,
+    server: &str,
     out: &mut dyn Write,
     open_browser: &dyn Fn(&str) -> bool,
     max_interval: Duration,
 ) -> anyhow::Result<TokenResponse> {
     let start = api.cli_start().await.context("starting login")?;
+    // A link elsewhere would send the person to approve on a site the server does not control.
+    if !super::config::same_origin(server, &start.verification_url) {
+        bail!(
+            "the server sent an approval link for another site ({}); not opening it",
+            start.verification_url
+        );
+    }
     writeln!(out, "Confirm this code in your browser: {}", start.user_code)?;
     if !open_browser(&start.verification_url) {
         writeln!(out, "Open {} to continue.", start.verification_url)?;
@@ -117,6 +125,8 @@ mod tests {
     use anyhow::Context;
     use sekret_api::CliStartResponse;
     use sekret_client::{ClientError, MockSekretApi};
+
+    const SERVER: &str = "https://sekret.example.com";
 
     fn start() -> CliStartResponse {
         CliStartResponse {
@@ -158,7 +168,7 @@ mod tests {
             .in_sequence(&mut seq)
             .returning(|_| Ok(token()));
         let mut out = Vec::new();
-        let result = device_login(&api, &mut out, &|_| false, Duration::ZERO)
+        let result = device_login(&api, SERVER, &mut out, &|_| false, Duration::ZERO)
             .await
             .context("login")?;
         assert_eq!(result.access_token, "skt_t");
@@ -178,7 +188,7 @@ mod tests {
                 message: String::new(),
             })
         });
-        let Err(err) = device_login(&api, &mut Vec::new(), &|_| true, Duration::ZERO).await else {
+        let Err(err) = device_login(&api, SERVER, &mut Vec::new(), &|_| true, Duration::ZERO).await else {
             anyhow::bail!("expired device code should fail the login");
         };
         assert!(err.to_string().contains("expired"));
@@ -187,10 +197,35 @@ mod tests {
         api.expect_cli_start()
             .returning(|| Err(ClientError::Network("down".into())));
         assert!(
-            device_login(&api, &mut Vec::new(), &|_| true, Duration::ZERO)
+            device_login(&api, SERVER, &mut Vec::new(), &|_| true, Duration::ZERO)
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_approval_link_on_another_site_is_refused() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| {
+            Ok(CliStartResponse {
+                verification_url: "https://evil.test/cli-login?code=ABCD-EFGH".into(),
+                ..start()
+            })
+        });
+        api.expect_cli_poll().times(0);
+        let opened = std::cell::Cell::new(false);
+        let opener = |_: &str| {
+            opened.set(true);
+            true
+        };
+        let mut out = Vec::new();
+        let Err(error) = device_login(&api, SERVER, &mut out, &opener, Duration::ZERO).await else {
+            anyhow::bail!("a foreign approval link must fail the login");
+        };
+        assert!(error.to_string().contains("another site"), "{error}");
+        assert!(!opened.get(), "the browser is never opened on the foreign link");
+        assert!(out.is_empty(), "no code is shown for a foreign link");
         Ok(())
     }
 

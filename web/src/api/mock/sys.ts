@@ -13,6 +13,9 @@ export const MOCK_BACKOFF_SECONDS = 3;
 export const MOCK_KDF_BUSY_PASSPHRASE = "mock kdf busy";
 /** CLI login codes starting with this need a fresh sign-in before they can be approved. */
 export const MOCK_REAUTH_CODE_PREFIX = "AUTH";
+/** Where every pending CLI login in the fake says it came from. */
+export const MOCK_CLI_ADDRESS = "203.0.113.24";
+export const MOCK_CLI_USER_AGENT = "sekret/0.0.0-mock (linux; x86_64)";
 
 export function mockSys(state: SealState = "unsealed"): MockSys {
   const initialised = state !== "uninitialised";
@@ -53,6 +56,21 @@ export function statusOf(sys: MockSys): SysStatus {
     configured: sys.configured,
     remembered: passphrase && sys.remembered,
     unsealed_by: sys.state === "unsealed" ? sys.unsealedBy : null,
+    web_setup: sys.webSetup,
+    version: MOCK_VERSION,
+  };
+}
+
+/** What anyone may see once set up: the state and little else, as the server's public status. */
+export function publicStatusOf(sys: MockSys): SysStatus {
+  if (sys.state === "uninitialised") return statusOf(sys);
+  return {
+    state: sys.state,
+    seal_mode: null,
+    unlock_policy: null,
+    configured: false,
+    remembered: false,
+    unsealed_by: null,
     web_setup: sys.webSetup,
     version: MOCK_VERSION,
   };

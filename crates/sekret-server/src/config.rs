@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use ipnet::IpNet;
 use sekret_core::seal::{RememberSecret, SealMode, UnlockPolicy};
 
+use crate::files::WrittenFile;
+
 /// Human sign-in through an OIDC provider such as Keycloak.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HumanOidcConfig {
     pub issuer: String,
     pub client_id: String,
@@ -20,6 +22,29 @@ pub struct HumanOidcConfig {
     /// When non-empty, only these ID token subjects may sign in, whatever their groups, so a
     /// role granted inside the provider is not enough on its own.
     pub allowed_subjects: Vec<String>,
+}
+
+impl std::fmt::Debug for HumanOidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HumanOidcConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"(redacted)")
+            .field("scopes", &self.scopes)
+            .field("group_claims", &self.group_claims)
+            .field("admin_groups", &self.admin_groups)
+            .field("required_groups", &self.required_groups)
+            .field("allowed_subjects", &self.allowed_subjects)
+            .finish()
+    }
+}
+
+/// A Unix socket on the host for unsealing without the network's rate limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnixSocketSettings {
+    pub path: PathBuf,
+    /// 0o600, or 0o660 to let the socket's group in too.
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +72,7 @@ pub struct ServerConfig {
     /// Serve HTTPS directly; plain HTTP behind a TLS-terminating proxy when absent.
     pub tls: Option<TlsSettings>,
     pub seal: SealSettings,
+    pub unix_socket: Option<UnixSocketSettings>,
 }
 
 /// How the root key is protected and how first-boot setup is offered.
@@ -63,8 +89,11 @@ pub struct SealSettings {
     pub remember_secret: Option<RememberSecret>,
     /// Offer first-boot setup through the API and web interface.
     pub web_setup: bool,
-    /// Where the one-time setup code was written; removed once setup succeeds.
-    pub setup_code_file: Option<PathBuf>,
+    /// The one-time setup code file this start wrote; removed once setup succeeds, if unchanged.
+    pub setup_code_file: Option<WrittenFile>,
+    /// Files outside the database that remember the highest seal configuration epoch seen, so
+    /// an older signed configuration put back into the database is noticed.
+    pub epoch_files: Vec<PathBuf>,
 }
 
 impl Default for SealSettings {
@@ -77,8 +106,31 @@ impl Default for SealSettings {
             remember_secret: None,
             web_setup: true,
             setup_code_file: None,
+            epoch_files: Vec::new(),
         }
     }
+}
+
+fn sidecar(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Where the epoch high-water mark is kept: beside the SQLite database, the remember file and the
+/// root key file, whichever there are. A Postgres server with none of the files has nowhere.
+pub fn epoch_files(
+    database_url: &str,
+    remember_file: Option<&std::path::Path>,
+    root_key_file: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    sekret_store::sqlite_file(database_url)
+        .as_deref()
+        .into_iter()
+        .chain(remember_file)
+        .chain(root_key_file)
+        .map(|path| sidecar(path, ".epoch"))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -128,6 +180,46 @@ impl ServerConfig {
             login_rate_per_minute: 1000,
             tls: None,
             seal: SealSettings::default(),
+            unix_socket: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_oidc_client_secret_never_reaches_debug_output() {
+        let config = HumanOidcConfig {
+            issuer: "https://id.example".into(),
+            client_id: "sekret".into(),
+            client_secret: "hunter2-client-secret".into(),
+            scopes: vec![],
+            group_claims: vec![],
+            admin_groups: vec![],
+            required_groups: vec![],
+            allowed_subjects: vec![],
+        };
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("https://id.example"));
+    }
+
+    #[test]
+    fn epoch_marks_sit_beside_each_file() {
+        let files = epoch_files(
+            "sqlite:///var/lib/sekret/sekret.db?mode=rwc",
+            Some(std::path::Path::new("/run/sekret/unlock.key")),
+            None,
+        );
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/var/lib/sekret/sekret.db.epoch"),
+                PathBuf::from("/run/sekret/unlock.key.epoch")
+            ]
+        );
+        assert!(epoch_files("postgres://db/sekret", None, None).is_empty());
     }
 }
