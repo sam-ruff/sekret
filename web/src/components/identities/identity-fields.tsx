@@ -2,14 +2,14 @@ import { ListInput } from "@/components/list-input";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { formatDuration } from "@/lib/format";
+import { formatDurationWords } from "@/lib/format";
 import { ttlProblem, type IdentityDraft } from "./identity-model";
 
 const CIDR = /^[0-9a-fA-F:.]+\/\d{1,3}$/;
 
 function hint(seconds: string): string {
   const n = Number(seconds);
-  return Number.isInteger(n) && n > 0 ? formatDuration(n) : "seconds";
+  return Number.isInteger(n) && n > 0 ? formatDurationWords(n) : "a whole number of seconds";
 }
 
 export function IdentityFields({
@@ -44,7 +44,7 @@ export function IdentityFields({
         />
       </Field>
       <Field>
-        <FieldLabel htmlFor={`${idPrefix}-ttl`}>Token TTL (seconds)</FieldLabel>
+        <FieldLabel htmlFor={`${idPrefix}-ttl`}>Token lifetime (seconds)</FieldLabel>
         <Input
           id={`${idPrefix}-ttl`}
           inputMode="numeric"
@@ -53,10 +53,10 @@ export function IdentityFields({
           onChange={(e) => onChange({ ...draft, tokenTtl: e.target.value.trim() })}
           data-testid="identity-ttl"
         />
-        <FieldDescription>How long each token lasts: {hint(draft.tokenTtl)}</FieldDescription>
+        <FieldDescription data-testid="identity-ttl-hint">How long each token lasts: {hint(draft.tokenTtl)}.</FieldDescription>
       </Field>
       <Field>
-        <FieldLabel htmlFor={`${idPrefix}-max-ttl`}>Max TTL (seconds)</FieldLabel>
+        <FieldLabel htmlFor={`${idPrefix}-max-ttl`}>Longest renewed lifetime (seconds)</FieldLabel>
         <Input
           id={`${idPrefix}-max-ttl`}
           inputMode="numeric"
@@ -65,7 +65,9 @@ export function IdentityFields({
           onChange={(e) => onChange({ ...draft, tokenMaxTtl: e.target.value.trim() })}
           data-testid="identity-max-ttl"
         />
-        <FieldDescription>Longest a token can be renewed to: {hint(draft.tokenMaxTtl)}</FieldDescription>
+        <FieldDescription data-testid="identity-max-ttl-hint">
+          How long renewals can keep a token going: {hint(draft.tokenMaxTtl)}.
+        </FieldDescription>
       </Field>
       {problem && <p className="text-sm text-destructive md:col-span-2">{problem}</p>}
       <Field className="md:col-span-2">

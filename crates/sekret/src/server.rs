@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use sekret_core::crypto::RootKey;
 use sekret_core::seal::{
-    MAX_BACKUP_LEN, SealMode, UnlockPolicy, decrypt_backup, parse_backup, trim_input, unwrap_root_key,
+    MAX_BACKUP_LEN, SealFlags, SealMode, UnlockPolicy, decrypt_backup, parse_backup, trim_input, unwrap_root_key,
     unwrap_root_key_checked, validate_passphrase, wrap_root_key,
 };
+use sekret_server::admin::Rotation;
 use sekret_server::clock::{Clock, SystemClock};
 use sekret_server::config::{SealSettings, ServerConfig};
 use sekret_server::files::{
@@ -15,16 +17,22 @@ use sekret_server::files::{
 };
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
 use sekret_server::seal::{
-    AutoInit, InitPlan, Keyring, Signature, StartupSecrets, audit_as, check_signature, initialise, open_keyring,
-    record_epoch, signed,
+    AutoInit, Distrust, HighWater, InitPlan, Keyring, Signature, StartupSecrets, audit_as, cautious_flags,
+    check_signature, high_water, initialise, open_keyring, record_epoch, reset_epoch, signed, verify_config,
 };
 use sekret_server::state::{AppState, Dependencies, build_state};
-use sekret_store::{InstanceLock, SealConfig, SqlStore, Store};
+use sekret_store::{InstanceLock, Open, SealConfig, SqlStore, Store};
 use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::prompt::{Prompter, Terminal, read_new_passphrase, read_passphrase};
 use crate::settings::{self, EnvSecrets, Report, ServerArgs, Setup, Sources, StoreArgs, StoreLocation, sqlite_path};
+
+const MAX_ADMIN_TOKEN_TTL: i64 = sekret_server::admin::MAX_BOOTSTRAP_TTL;
+/// How long a starting server waits for the database lock, for restarts that overlap.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How often a running server checks it still holds the database lock.
+const LOCK_CHECK_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
@@ -32,7 +40,8 @@ pub enum AdminCommand {
     Bootstrap {
         #[command(flatten)]
         store: StoreArgs,
-        #[arg(long, default_value_t = 3600)]
+        /// Seconds the token lasts, at most 86400.
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(1..=MAX_ADMIN_TOKEN_TTL))]
         ttl: i64,
         /// Passphrase mode: read the passphrase from this file, or `-` for stdin, instead of asking.
         #[arg(long)]
@@ -52,7 +61,8 @@ pub enum AdminCommand {
         /// manual, remember or passphrase-file. remember also needs seal.remember_file on the server.
         #[arg(long, value_parser = parse_unlock, default_value = "manual")]
         unlock: UnlockPolicy,
-        #[arg(long, default_value_t = 3600)]
+        /// Seconds the admin token lasts, at most 86400.
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(1..=MAX_ADMIN_TOKEN_TTL))]
         ttl: i64,
     },
     /// Print a new random root key, base64 encoded.
@@ -65,6 +75,20 @@ pub enum AdminCommand {
         #[arg(long)]
         new_root_key_file: Option<PathBuf>,
         /// Passphrase mode: the current passphrase, from this file or `-` for stdin. Always checked.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Leave values, project keys and stored credentials that no longer decrypt as they are,
+        /// and audit them, instead of refusing to rotate.
+        #[arg(long)]
+        skip_unreadable: bool,
+    },
+    /// Re-sign the seal configuration and set every epoch mark to its epoch, lowering them if need
+    /// be. For after restoring an older database in place, or when a mark is damaged. Stop the
+    /// server first. A configuration that fails its signature is reset to the manual unlock policy.
+    ResetEpoch {
+        #[command(flatten)]
+        store: StoreArgs,
+        /// Passphrase mode: the passphrase, from this file or `-` for stdin, instead of asking.
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
     },
@@ -223,18 +247,46 @@ fn log_report(report: &Report) {
     }
 }
 
-/// Takes the database's instance lock, or explains that something else has it.
-async fn lock(database_url: &str) -> anyhow::Result<InstanceLock> {
-    InstanceLock::acquire(database_url).await.map_err(|error| {
-        if InstanceLock::is_held_error(&error) {
-            anyhow::anyhow!("{error}")
-        } else {
-            anyhow::anyhow!("taking the database lock: {error}")
-        }
-    })
+fn lock_error(error: sekret_store::StoreError) -> anyhow::Error {
+    if InstanceLock::is_held_error(&error) {
+        anyhow::anyhow!("{error}")
+    } else {
+        anyhow::anyhow!("taking the database lock: {error}")
+    }
 }
 
-pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Result<()> {
+/// Takes the database's instance lock, or explains that something else has it.
+async fn lock(database_url: &str) -> anyhow::Result<InstanceLock> {
+    InstanceLock::acquire(database_url).await.map_err(lock_error)
+}
+
+/// The URL of a database that must already exist, so an admin command never leaves an empty
+/// database or lock file behind a mistyped path.
+fn existing_database(database_url: &str) -> anyhow::Result<String> {
+    if let Some(path) = sqlite_path(database_url)
+        && path.symlink_metadata().is_err()
+    {
+        bail!(
+            "there is no database at {}; check --database-url or database.url",
+            path.display()
+        );
+    }
+    Ok(sekret_store::without_create(database_url))
+}
+
+/// Returns only when the lock is lost: the Postgres session dropped or the database file at the
+/// path was replaced. Serving on without it could let a second writer in.
+async fn watch_lock(lock: &mut InstanceLock) -> anyhow::Error {
+    loop {
+        tokio::time::sleep(LOCK_CHECK_EVERY).await;
+        if let Err(error) = lock.check().await {
+            tracing::error!(%error, "stopping: this server no longer holds the database lock");
+            return anyhow::anyhow!("{error}");
+        }
+    }
+}
+
+pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets, sources: &Sources) -> anyhow::Result<()> {
     if args.print_config {
         print!("{}", settings::EXAMPLE);
         return Ok(());
@@ -244,10 +296,12 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Re
         mut config,
         setup,
         report,
-    } = settings::resolve_with(&args, file, &env_secrets, &Sources::process())?;
+    } = settings::resolve_with(&args, file, &env_secrets, sources)?;
     log_report(&report);
     // Held for the life of the server, so admin commands cannot write underneath it.
-    let _lock = lock(&config.database_url).await?;
+    let mut lock = InstanceLock::acquire_within(&config.database_url, LOCK_WAIT)
+        .await
+        .map_err(lock_error)?;
     let store: Arc<dyn Store> = Arc::new(
         SqlStore::connect(&config.database_url)
             .await
@@ -279,7 +333,10 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets) -> anyhow::Re
             tracing::warn!(path = %path.display(), "setup is done; delete the setup passphrase file");
         }
     }
-    sekret_server::serve(state).await?;
+    tokio::select! {
+        served = sekret_server::serve(state) => served?,
+        lost = watch_lock(&mut lock) => return Err(lost),
+    }
     Ok(())
 }
 
@@ -312,14 +369,20 @@ async fn audit_admin(store: &dyn Store, action: &str, detail: serde_json::Value)
     audit_as(store, SystemClock.now(), "local", "admin-cli", action, detail).await;
 }
 
-/// Warns, without changing anything, when the stored configuration fails its signature.
-fn warn_if_tampered(root: &RootKey, config: Option<&SealConfig>) {
-    if config.is_some_and(|c| check_signature(root, c) == Signature::Invalid) {
-        eprintln!(
-            "warning: the seal configuration was changed without the root key; the server will reset it to the \
-             manual unlock policy when it next unlocks"
-        );
-    }
+/// Warns, without changing anything, when the stored configuration fails its signature or is
+/// older than the recorded epoch marks.
+fn warn_if_tampered(root: &RootKey, config: Option<&SealConfig>, marks: HighWater) {
+    let Some(Err(distrust)) = config.map(|c| verify_config(root, c, marks)) else {
+        return;
+    };
+    let what = match distrust {
+        Distrust::Tampered => "was changed without the root key",
+        Distrust::RolledBack => "is older than the one last seen",
+    };
+    eprintln!(
+        "warning: the seal configuration {what}; the server falls back to the manual unlock policy when it next \
+         unlocks. `sekret admin reset-epoch` re-signs it if this was expected, such as after restoring in place"
+    );
 }
 
 /// The root key on the host, offline: from the key file, or by unwrapping it with the passphrase.
@@ -342,7 +405,7 @@ async fn obtain_root(
         _ => bail!("this database is in key-file mode; pass --root-key-file"),
     };
     sekret_server::check_root_key(store, &root.fingerprint()).await?;
-    warn_if_tampered(&root, config.as_ref());
+    warn_if_tampered(&root, config.as_ref(), high_water(&location.epoch_files()));
     Ok((root, config, passphrase))
 }
 
@@ -366,7 +429,17 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlStore> {
     SqlStore::connect(database_url).await.context("opening database")
 }
 
-pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
+/// An existing database, locked against the server and other admin commands, with any
+/// migrations applied: nothing else can be using it.
+async fn open_locked(store: &StoreArgs, sources: &Sources) -> anyhow::Result<(StoreLocation, InstanceLock, SqlStore)> {
+    let location = store.locate(sources)?;
+    let url = existing_database(&location.database_url)?;
+    let lock = lock(&url).await?;
+    let sql = SqlStore::open(&url, Open::Migrate).await.context("opening database")?;
+    Ok((location, lock, sql))
+}
+
+pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Result<()> {
     let prompter = Terminal;
     match command {
         AdminCommand::GenerateRootKey => {
@@ -385,8 +458,10 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
         } => {
             // No instance lock: this writes nothing under the root key, and it is how admin
             // access is recovered on a server that is running.
-            let location = store.locate()?;
-            let sql: Arc<dyn Store> = Arc::new(connect(&location.database_url).await?);
+            let location = store.locate(sources)?;
+            // Never migrates: a running server of another version would break under it.
+            let url = existing_database(&location.database_url)?;
+            let sql: Arc<dyn Store> = Arc::new(SqlStore::open(&url, Open::Exact).await.context("opening database")?);
             let (root, config, _) = obtain_root(sql.as_ref(), &location, passphrase_file.as_deref(), &prompter).await?;
             let mode = config.map_or(SealMode::KeyFile, |c| c.mode);
             let state = state(
@@ -407,7 +482,7 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             unlock,
             ttl,
         } => {
-            let location = store.locate()?;
+            let location = store.locate(sources)?;
             let _lock = lock(&location.database_url).await?;
             let sql: Arc<dyn Store> = Arc::new(connect(&location.database_url).await?);
             let mode = if key_file_mode {
@@ -455,27 +530,31 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             store,
             new_root_key_file,
             passphrase_file,
+            skip_unreadable,
         } => {
-            let location = store.locate()?;
-            let _lock = lock(&location.database_url).await?;
-            let sql = connect(&location.database_url).await?;
+            let (location, _lock, sql) = open_locked(&store, sources).await?;
             rotate(
                 &sql,
                 &location,
-                new_root_key_file.as_deref(),
-                passphrase_file.as_deref(),
+                RotateInputs {
+                    new_root_key_file: new_root_key_file.as_deref(),
+                    passphrase_file: passphrase_file.as_deref(),
+                    skip_unreadable,
+                },
                 &prompter,
             )
             .await?;
+        }
+        AdminCommand::ResetEpoch { store, passphrase_file } => {
+            let (location, _lock, sql) = open_locked(&store, sources).await?;
+            reset_epoch_marks(&sql, &location, passphrase_file.as_deref(), &prompter).await?;
         }
         AdminCommand::SetSealMode {
             store,
             mode,
             passphrase_file,
         } => {
-            let location = store.locate()?;
-            let _lock = lock(&location.database_url).await?;
-            let sql = connect(&location.database_url).await?;
+            let (location, _lock, sql) = open_locked(&store, sources).await?;
             set_seal_mode(&sql, &location, mode, passphrase_file.as_deref(), &prompter).await?;
         }
         AdminCommand::Restore {
@@ -484,7 +563,8 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
             passphrase_file,
             root_key_file,
         } => {
-            let _lock = lock(&database_url).await?;
+            // Locks the target's name without creating the file, which must not exist yet.
+            let _lock = lock(&sekret_store::without_create(&database_url)).await?;
             restore(
                 &backup,
                 &database_url,
@@ -501,17 +581,23 @@ pub async fn run_admin(command: AdminCommand) -> anyhow::Result<()> {
 /// Replaces the root key offline and re-encrypts everything. In passphrase mode the passphrase is
 /// always checked against the stored wrap, even when a key file is present, because the new wrap
 /// is made with it and a typo would lock the owner out.
+struct RotateInputs<'a> {
+    new_root_key_file: Option<&'a Path>,
+    passphrase_file: Option<&'a Path>,
+    skip_unreadable: bool,
+}
+
 async fn rotate(
     sql: &SqlStore,
     location: &StoreLocation,
-    new_root_key_file: Option<&Path>,
-    passphrase_file: Option<&Path>,
+    inputs: RotateInputs<'_>,
     prompter: &dyn Prompter,
 ) -> anyhow::Result<()> {
+    let marks = high_water(&location.epoch_files());
     let config = sql.get_seal_config().await?;
     let (old, seal) = match config.filter(|c| c.mode == SealMode::Passphrase) {
         Some(config) => {
-            let (old, passphrase) = unwrap_with_passphrase(&config, passphrase_file, prompter)?;
+            let (old, passphrase) = unwrap_with_passphrase(&config, inputs.passphrase_file, prompter)?;
             if let Some(path) = location.root_key_file.as_deref().filter(|p| p.exists())
                 && read_root_key(path)?.fingerprint() != old.fingerprint()
             {
@@ -522,9 +608,10 @@ async fn rotate(
             }
             validate_passphrase(&passphrase)?;
             sekret_server::check_root_key(sql, &old.fingerprint()).await?;
-            // Only a configuration signed by the server keeps what it grants.
-            let tampered = check_signature(&old, &config) != Signature::Valid;
-            warn_if_tampered(&old, Some(&config));
+            // Only a configuration signed by the server, and not older than the marks, keeps
+            // what it grants.
+            let tampered = verify_config(&old, &config, marks).is_err();
+            warn_if_tampered(&old, Some(&config), marks);
             (old, Some((config, passphrase, tampered)))
         }
         None => {
@@ -538,7 +625,7 @@ async fn rotate(
             (old, None)
         }
     };
-    let new = match (new_root_key_file, &seal) {
+    let new = match (inputs.new_root_key_file, &seal) {
         (Some(path), _) => read_root_key(path)?,
         (None, Some(_)) => RootKey::generate()?,
         (None, None) => bail!("key-file mode needs --new-root-key-file"),
@@ -554,22 +641,35 @@ async fn rotate(
             } else {
                 config.unlock_policy
             },
+            flags: if *tampered {
+                cautious_flags(config.flags, false)
+            } else {
+                config.flags
+            },
             updated_at: SystemClock.now(),
             ..config.clone()
         }),
     };
-    let count = sekret_server::admin::rotate_root_key(sql, &old, &new, seal_config)
+    let rotation = Rotation {
+        marks,
+        skip_unreadable: inputs.skip_unreadable,
+    };
+    let report = sekret_server::admin::rotate_root_key(sql, &old, &new, seal_config, rotation)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
+    let count = report.projects;
     if let Some(stored) = sql.get_seal_config().await? {
-        record_epoch(&location.epoch_files(), stored.epoch, false);
+        record_epoch(&location.epoch_files(), stored.epoch);
     }
     audit_admin(
         sql,
         "admin.rotate_root_key",
-        json!({"projects": count, "fingerprint": new.fingerprint()}),
+        json!({"projects": count, "fingerprint": new.fingerprint(), "skipped": report.skipped}),
     )
     .await;
+    for row in &report.skipped {
+        eprintln!("warning: left unreadable {row} as it was");
+    }
     match seal {
         Some(_) => eprintln!(
             "replaced the root key and re-encrypted the secrets of {count} projects; it is wrapped under the \
@@ -596,6 +696,7 @@ async fn set_seal_mode(
         bail!("the database is already in {} mode", mode.as_str());
     }
     let now = SystemClock.now();
+    let marks = high_water(&location.epoch_files());
     let config = match mode {
         SealMode::KeyFile => {
             let path = location
@@ -611,15 +712,20 @@ async fn set_seal_mode(
             write_new_private(path, root.to_key_file_text().as_bytes())
                 .with_context(|| format!("writing {}", path.display()))?;
             let config = config.context("no seal configuration")?;
+            let flags = match verify_config(&root, &config, marks) {
+                Ok(_) => config.flags,
+                Err(_) => cautious_flags(config.flags, false),
+            };
             let config = SealConfig {
                 mode: SealMode::KeyFile,
                 wrapped: None,
                 unlock_policy: UnlockPolicy::Manual,
                 remembered: None,
+                flags,
                 updated_at: now,
                 ..config
             };
-            let config = signed(&root, config)?;
+            let config = signed(&root, config, marks.floor())?;
             sql.update_seal_config(config.clone()).await?;
             eprintln!(
                 "now in key-file mode; start the server with --root-key-file {}",
@@ -635,6 +741,12 @@ async fn set_seal_mode(
             let root = read_root_key(path)?;
             sekret_server::check_root_key(sql, &root.fingerprint()).await?;
             let passphrase = read_new_passphrase(passphrase_file, prompter)?;
+            let flags = match current.as_ref().map(|c| (c, verify_config(&root, c, marks))) {
+                Some((c, Ok(_))) => c.flags,
+                Some((c, Err(_))) => cautious_flags(c.flags, false),
+                None if marks.highest.is_some() || marks.broken => cautious_flags(SealFlags::default(), false),
+                None => SealFlags::default(),
+            };
             let config = SealConfig {
                 mode: SealMode::Passphrase,
                 wrapped: Some(wrap_root_key(&root, &passphrase)?),
@@ -642,10 +754,11 @@ async fn set_seal_mode(
                 remembered: None,
                 epoch: current.as_ref().map_or(0, |c| c.epoch),
                 mac: None,
+                flags,
                 created_at: current.as_ref().map_or(now, |c| c.created_at),
                 updated_at: now,
             };
-            let config = signed(&root, config)?;
+            let config = signed(&root, config, marks.floor())?;
             match current {
                 Some(_) => sql.update_seal_config(config.clone()).await?,
                 None => sql.init_seal_config(config.clone(), &root.fingerprint()).await?,
@@ -657,8 +770,64 @@ async fn set_seal_mode(
             config
         }
     };
-    record_epoch(&location.epoch_files(), config.epoch, false);
+    record_epoch(&location.epoch_files(), config.epoch);
     audit_admin(sql, "admin.set_seal_mode", json!({"mode": mode.as_str()})).await;
+    Ok(())
+}
+
+/// The explicit operator command that may lower epoch marks. The configuration is checked with
+/// the root key: a sound one is signed again as it is, at its own epoch plus one; one that fails
+/// its signature only keeps what the operator has just proved (the passphrase wrap, or key-file
+/// mode) and falls back to the manual policy. Every mark is then set to the new epoch.
+async fn reset_epoch_marks(
+    sql: &SqlStore,
+    location: &StoreLocation,
+    passphrase_file: Option<&Path>,
+    prompter: &dyn Prompter,
+) -> anyhow::Result<()> {
+    let (root, config, _) = obtain_root(sql, location, passphrase_file, prompter).await?;
+    let config = config.context("the database has no seal configuration yet")?;
+    let sound = check_signature(&root, &config) == Signature::Valid;
+    let config = match sound {
+        true => config,
+        false => SealConfig {
+            mode: match config.wrapped {
+                Some(_) if config.mode == SealMode::Passphrase => SealMode::Passphrase,
+                _ => SealMode::KeyFile,
+            },
+            wrapped: config.wrapped.filter(|_| config.mode == SealMode::Passphrase),
+            unlock_policy: UnlockPolicy::Manual,
+            remembered: None,
+            flags: cautious_flags(config.flags, false),
+            ..config
+        },
+    };
+    // A configuration at the last epoch starts again from the bottom.
+    let base = SealConfig {
+        epoch: if config.epoch == i64::MAX { 0 } else { config.epoch },
+        updated_at: SystemClock.now(),
+        ..config
+    };
+    let config = signed(&root, base, 0)?;
+    sql.update_seal_config(config.clone()).await?;
+    let paths = location.epoch_files();
+    reset_epoch(&paths, config.epoch).context("writing the epoch marks")?;
+    audit_admin(
+        sql,
+        "admin.reset_epoch",
+        json!({"epoch": config.epoch, "was_sound": sound}),
+    )
+    .await;
+    eprintln!(
+        "signed the seal configuration at epoch {} and set {} epoch mark(s) to it{}",
+        config.epoch,
+        paths.len(),
+        if sound {
+            ""
+        } else {
+            "; it had failed its signature, so the unlock policy is now manual"
+        }
+    );
     Ok(())
 }
 
@@ -868,7 +1037,9 @@ async fn restore(
     }
     let snapshot = decrypt_backup(&root, &parsed).context("the backup is damaged or was changed")?;
     place_restored(&target, &snapshot, &root.fingerprint()).await?;
-    let restored = connect(database_url).await?;
+    let restored = SqlStore::open(database_url, Open::Migrate)
+        .await
+        .context("opening the restored database")?;
     audit_admin(
         &restored,
         "admin.restore",

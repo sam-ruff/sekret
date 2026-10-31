@@ -37,6 +37,24 @@ test("the sidebar links to the documentation in a new tab", async ({ page }) => 
   await expect(docs).toHaveAttribute("rel", /noopener/);
 });
 
+test("tells the two audit logs apart and has one main region with a skip link to it", async ({ page }) => {
+  await page.goto("/projects/storefront/secrets/dev");
+  await expect(page.locator("main")).toHaveCount(1);
+  await expect(page.getByRole("main")).toHaveAttribute("id", "main-content");
+
+  await page.keyboard.press("Tab");
+  const skip = page.getByTestId("skip-link");
+  await expect(skip).toBeFocused();
+  await expect(skip).toHaveText("Skip to content");
+  await expect(skip).toBeInViewport();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("main")).toBeFocused();
+
+  if (isMobile(page)) await page.getByTestId("sidebar-trigger").click();
+  await expect(page.getByTestId("nav-project-audit")).toHaveText("Project audit log");
+  await expect(page.getByTestId("nav-org-audit")).toHaveText("Organisation audit log");
+});
+
 test("the sidebar collapses to icons on desktop", async ({ page }) => {
   test.skip(isMobile(page), "Desktop layout only");
   await page.goto("/projects");

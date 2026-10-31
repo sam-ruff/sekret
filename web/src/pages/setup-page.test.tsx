@@ -64,7 +64,7 @@ describe("SetupPage", () => {
   });
 
   it("sends the chosen policy, shows the admin token with its expiry and keeps no copy in the query cache", async () => {
-    const expires = 1_900_000_000;
+    const expires = Math.floor(Date.now() / 1000) + 3600;
     init.mockResolvedValue({
       status: { ...uninitialised, state: "unsealed" },
       admin_token: "skt_abc",
@@ -79,7 +79,9 @@ describe("SetupPage", () => {
       passphrase: "plum orbit gravel lantern",
       unlock_policy: "remember",
     });
-    expect(screen.getByTestId("admin-token-help")).toHaveTextContent("It is shown once and lasts until");
+    expect(screen.getByTestId("admin-token-help")).toHaveTextContent(/It is shown once and expires in 1 hour \(/);
+    expect(screen.queryByTestId("admin-token-expiry")).toBeNull();
+    expect(screen.getByTestId("admin-token-cli-copy")).toBeInTheDocument();
     expect(screen.getByTestId("admin-token-help")).toHaveTextContent("The web interface signs you in through your identity provider.");
     expect(screen.getByTestId("admin-token-cli")).toHaveTextContent("export SEKRET_TOKEN=<token>");
     expect(screen.getByTestId("setup-continue")).toHaveTextContent("I have saved it, continue");

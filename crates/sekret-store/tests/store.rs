@@ -593,6 +593,10 @@ fn seal_config(remembered: Option<Vec<u8>>) -> SealConfig {
         remembered,
         epoch: 4,
         mac: Some(vec![6; 32]),
+        flags: sekret_core::seal::SealFlags {
+            reviewer_tokens_migrated: true,
+            remember_secret: true,
+        },
         created_at: 10,
         updated_at: 10,
     }
@@ -627,6 +631,7 @@ async fn exercise_seal_config(store: &SqlStore) -> anyhow::Result<()> {
         remembered: None,
         epoch: 5,
         mac: None,
+        flags: sekret_core::seal::SealFlags::default(),
         created_at: 10,
         updated_at: 20,
     };
@@ -753,7 +758,8 @@ async fn postgres_store() -> anyhow::Result<()> {
         Err(StoreError::Unsupported(_))
     ));
     // One server or admin command per database, through an advisory lock.
-    let held = InstanceLock::acquire(&url).await.context("lock")?;
+    let mut held = InstanceLock::acquire(&url).await.context("lock")?;
+    held.check().await.context("the advisory lock is seen as held")?;
     assert!(
         InstanceLock::acquire(&url)
             .await

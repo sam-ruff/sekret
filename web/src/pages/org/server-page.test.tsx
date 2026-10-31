@@ -91,7 +91,33 @@ describe("ServerPage", () => {
     await userEvent.click(screen.getByTestId("seal-now"));
     const dialog = await screen.findByTestId("seal-dialog");
     expect(dialog).toHaveTextContent("Lock the server now?");
-    expect(dialog).toHaveTextContent("A remembered unlock still unlocks it after a restart.");
+    // Nothing is remembered here, so the dialog does not claim it unlocks after a restart.
+    expect(dialog).not.toHaveTextContent("remembered unlock");
+  });
+
+  it("mentions the remembered unlock in the lock dialog only when one is remembered", async () => {
+    renderServer({ ...unlocked, unlock_policy: "remember", remembered: true });
+    await userEvent.click(await screen.findByTestId("seal-now"));
+    expect(await screen.findByTestId("seal-dialog")).toHaveTextContent("A remembered unlock still unlocks it after a restart.");
+  });
+
+  it("asks before changing the passphrase, leading with what it means", async () => {
+    mocked.changePassphrase.mockResolvedValue(undefined);
+    renderServer();
+    const card = await screen.findByTestId("server-passphrase");
+    expect(screen.getByTestId("change-passphrase-help").firstElementChild).toHaveTextContent(
+      "Every secret is re-encrypted. Backups made before this still need the old passphrase.",
+    );
+    await userEvent.type(screen.getByTestId("current-passphrase"), "correct horse battery staple");
+    await userEvent.type(screen.getByTestId("change-passphrase"), "plum orbit gravel lantern");
+    await userEvent.type(screen.getByTestId("change-confirm"), "plum orbit gravel lantern");
+    await waitFor(() => expect(screen.getByTestId("change-submit")).toBeEnabled());
+    await userEvent.click(screen.getByTestId("change-submit"));
+    const dialog = await screen.findByTestId("change-passphrase-dialog");
+    expect(mocked.changePassphrase).not.toHaveBeenCalled();
+    await userEvent.click(within(dialog).getByTestId("confirm-action"));
+    await waitFor(() => expect(mocked.changePassphrase).toHaveBeenCalledTimes(1));
+    expect(card).toBeInTheDocument();
   });
 
   it("warns when a key file unlocked a passphrase server", async () => {
@@ -113,6 +139,14 @@ describe("ServerPage", () => {
     expect(screen.getByTestId("server-backup")).toHaveTextContent(
       "Restoring it needs the passphrase or root key file that was in use when it was made.",
     );
+    expect(screen.getByTestId("server-status-help")).toHaveTextContent("Whether the server is unlocked.");
+  });
+
+  it("shows people with no access a plain header and the refusal", async () => {
+    renderServer(unlocked, { ...admin, org_roles: [], is_org_admin: false, org_rules: [] });
+    expect(await screen.findByText("Only organisation admins and backup readers can see this page.")).toBeInTheDocument();
+    expect(screen.getByTestId("page-title")).toHaveTextContent("Server");
+    expect(screen.queryByText(/download encrypted backups/)).toBeNull();
   });
 
   it("reads how the server was unlocked from the admin detail, not the public status", async () => {

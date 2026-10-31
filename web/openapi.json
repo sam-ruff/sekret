@@ -196,6 +196,60 @@
         ]
       }
     },
+    "/api/v1/auth/cli/deny": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Refuses a pending CLI login. The terminal that started it is told the login has ended.",
+        "operationId": "cli_deny",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CliDenyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {},
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/auth/cli/pending": {
       "get": {
         "tags": [
@@ -3165,6 +3219,16 @@
               }
             }
           },
+          "409": {
+            "description": "`seal_config_tampered`: the seal configuration failed its integrity check, so it is not backed up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Another backup is running",
             "content": {
@@ -3324,7 +3388,7 @@
         "tags": [
           "system"
         ],
-        "description": "Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase.",
+        "description": "Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase. Stored data that no longer decrypts is refused with `unreadable_data`, naming it by id, unless `skip_unreadable` is set.",
         "operationId": "change_passphrase",
         "requestBody": {
           "content": {
@@ -3366,6 +3430,7 @@
             }
           },
           "409": {
+            "description": "`unreadable_data`, `seal_config_tampered` or not in passphrase mode",
             "content": {
               "application/json": {
                 "schema": {
@@ -4150,6 +4215,10 @@
           },
           "new": {
             "type": "string"
+          },
+          "skip_unreadable": {
+            "type": "boolean",
+            "description": "Re-encrypt what can be read and leave values, project keys or stored credentials that no\nlonger decrypt as they are, auditing each. Without it, the change is refused and the error\nlists them."
           }
         }
       },
@@ -4202,6 +4271,18 @@
       "CliApproveRequest": {
         "type": "object",
         "description": "The code the person typed from their own terminal; a code carried in a link is not enough.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "CliDenyRequest": {
+        "type": "object",
+        "description": "A CLI login to refuse; the code is typed or carried from the approval page.",
         "required": [
           "code"
         ],
@@ -5053,6 +5134,7 @@
         "required": [
           "requested_from_ip",
           "user_agent",
+          "same_address",
           "created_at",
           "expires_at"
         ],
@@ -5078,8 +5160,13 @@
             "type": "string",
             "description": "The client address that started the login, as the server saw it."
           },
+          "same_address": {
+            "type": "boolean",
+            "description": "Whether the requester's address matches the address of the browser asking. Behind shared\nNAT this can be true for someone else, and a VPN can make it false for the same person."
+          },
           "user_agent": {
-            "type": "string"
+            "type": "string",
+            "description": "Reported by the requester, so it can be faked."
           }
         }
       },

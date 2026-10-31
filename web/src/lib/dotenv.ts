@@ -8,9 +8,29 @@ export interface EnvParseIssue {
   message: string;
 }
 
+/** A key set on more than one line; the last line wins. */
+export interface EnvDuplicate {
+  key: string;
+  /** The line whose value is used. */
+  line: number;
+  /** The earlier lines that set it too. */
+  earlier: number[];
+}
+
+function lineList(lines: number[]): string {
+  if (lines.length === 1) return `line ${lines[0]}`;
+  return `lines ${lines.slice(0, -1).join(", ")} and ${lines[lines.length - 1]}`;
+}
+
+/** Such as "Line 6: API_URL is also on line 1. The value from line 6 is used." */
+export function duplicateText(duplicate: EnvDuplicate): string {
+  return `Line ${duplicate.line}: ${duplicate.key} is also on ${lineList(duplicate.earlier)}. The value from line ${duplicate.line} is used.`;
+}
+
 export interface EnvParseResult {
   entries: EnvEntry[];
   issues: EnvParseIssue[];
+  duplicates: EnvDuplicate[];
 }
 
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
@@ -47,7 +67,12 @@ function closingQuote(text: string, quote: string, from: number): number {
 export function parseDotenv(text: string): EnvParseResult {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const found = new Map<string, string>();
+  const seenOn = new Map<string, number[]>();
   const issues: EnvParseIssue[] = [];
+  const set = (key: string, value: string, line: number) => {
+    found.set(key, value);
+    seenOn.set(key, [...(seenOn.get(key) ?? []), line]);
+  };
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1;
@@ -69,7 +94,7 @@ export function parseDotenv(text: string): EnvParseResult {
     let rest = body.slice(eq + 1).trimStart();
     const quote = rest[0];
     if (quote !== '"' && quote !== "'" && quote !== "`") {
-      found.set(key, rest.replace(/\s+#.*$/, "").trim());
+      set(key, rest.replace(/\s+#.*$/, "").trim(), lineNumber);
       continue;
     }
 
@@ -84,8 +109,12 @@ export function parseDotenv(text: string): EnvParseResult {
       continue;
     }
     const inner = rest.slice(1, end);
-    found.set(key, quote === '"' ? unescapeDouble(inner) : inner);
+    set(key, quote === '"' ? unescapeDouble(inner) : inner, lineNumber);
   }
 
-  return { entries: Array.from(found, ([key, value]) => ({ key, value })), issues };
+  const duplicates = Array.from(seenOn)
+    .filter(([, lines]) => lines.length > 1)
+    .map(([key, lines]) => ({ key, line: lines[lines.length - 1], earlier: lines.slice(0, -1) }))
+    .sort((a, b) => a.line - b.line);
+  return { entries: Array.from(found, ([key, value]) => ({ key, value })), issues, duplicates };
 }

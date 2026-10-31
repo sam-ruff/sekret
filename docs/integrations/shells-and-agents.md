@@ -33,7 +33,14 @@ sekret-env off        # unload
 
 The project comes from `-p`, `SEKRET_PROJECT` or `.sekret.toml`, so `sekret-env` in a repository with a `.sekret.toml` loads that repository's project.
 
-Some names are never loaded, because a shell, the dynamic linker or a program would act on them: `PATH`, `LD_*`, `BASH_ENV`, `PROMPT_COMMAND`, the prompt variables `PS*`, names ending in `_OPTIONS`, helper commands such as `GIT_ASKPASS` and `LESSOPEN`, proxy settings such as `HTTPS_PROXY`, and a few more. Anyone who can write a secret could otherwise run code on your machine, or see your traffic, when you load the environment. `sekret run` and `sekret export --format dotenv` or `shell` leave out the same names, as well as keys starting with `SEKRET_`. Keys that are not valid variable names, such as `my.key`, are skipped too. Each of them names what it skipped on standard error.
+Anyone who can write a secret could run code on your machine, or see your traffic, if a secret's name were one a shell, the dynamic linker or a program acts on. So only names made of letters, digits and underscores, not starting with a digit, are loaded, and of those the following are blocked unless you allow them. Names are compared without regard to case.
+
+- Names ending in `PAGER`, `EDITOR`, `ASKPASS`, `_COMMAND`, `_OPTIONS` or `_PROXY`, and names containing `PROMPT`.
+- The prompt variables `PS1` to `PS4`, `RPS1` and the like.
+- Names starting with `BASH_`, `FISH_`, `TERM`, `LD_`, `DYLD_`, `MALLOC_`, `XDG_`, `GIT_`, `SSH_`, `GPG`, `CARGO_`, `RUSTC`, `RUSTUP_`, `PYTHON`, `PIP_`, `PERL`, `RUBY`, `GEM_`, `BUNDLE_`, `NODE_`, `NPM_`, `YARN_`, `JAVA_`, `_JAVA_`, `JDK_`, `CLASSPATH`, `LUA_`, `DOCKER_`, `KUBE`, `SSL_`, `OPENSSL_`, `CURL_`, `REQUESTS_CA`, `GTK_`, `QT_` or `GST_PLUGIN`.
+- `PATH`, `HOME`, `SHELL`, `ENV`, `IFS`, `SHELLOPTS`, `BASHOPTS`, `ZDOTDIR`, `CDPATH`, `FPATH`, `MANPATH`, `MODULE_PATH`, `HISTFILE`, `TMOUT`, `MAIL`, `MAILPATH`, `BROWSER`, `VISUAL`, `INPUTRC`, `LESSOPEN`, `LESSCLOSE`, `GCONV_PATH`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`, `HOSTALIASES`, `GNUPGHOME`, `GOFLAGS`, `GOROOT`, `GOPATH`, `GOENV`, `GOTOOLCHAIN`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CC`, `CXX`, `CPP`, `LD`, `AR`, `MAKE`, `MAKEFLAGS` and `MFLAGS`.
+
+To load a blocked name, name it exactly with `--allow NAME` on `sekret env use`, `sekret run` or `sekret export`, or add it to `allow = [...]` in `.sekret.toml`. Only allow a name if you trust everyone who can write secrets in that environment, and remember that a `.sekret.toml` comes with the repository: check its `allow` list in a repository you did not write. Keys starting with `SEKRET_` are never loaded, even when allowed. `sekret run` and `sekret export --format dotenv` or `shell` follow the same rules. Each skipped key is named on standard error with the reason, never its value.
 
 `sekret env use` refuses to print to a terminal, since its output contains every value. Run it inside `eval`, or through `sekret-env`.
 

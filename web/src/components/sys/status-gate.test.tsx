@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beginLeaving, browserNavigation, stopLeaving } from "@/lib/leaving";
 import { unwrap } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { SealState, SysStatus } from "@/api/types";
@@ -116,6 +117,52 @@ describe("StatusGate", () => {
     sysStatus.mockResolvedValue(status("sealed"));
     renderGate("/org/users?page=2");
     expect(await screen.findByTestId("where")).toHaveTextContent("/unlock?return_to=%2Forg%2Fusers%3Fpage%3D2");
+  });
+
+  it("shows nothing and drops nothing new while the page is leaving", async () => {
+    sysStatus.mockResolvedValue(status("unsealed"));
+    renderGate("/projects");
+    expect(await screen.findByTestId("where")).toBeInTheDocument();
+    act(() => beginLeaving());
+    expect(screen.queryByTestId("where")).toBeNull();
+    expect(screen.getByTestId("status-gate-loading")).toBeInTheDocument();
+    act(() => stopLeaving());
+    expect(await screen.findByTestId("where")).toBeInTheDocument();
+  });
+
+  describe("another tab signing in", () => {
+    const channels: BroadcastChannel[] = [];
+    afterEach(() => {
+      channels.splice(0).forEach((c) => c.close());
+      vi.restoreAllMocks();
+    });
+
+    async function signInElsewhere(user: string): Promise<void> {
+      const other = new BroadcastChannel("sekret-tabs");
+      channels.push(other);
+      other.postMessage({ kind: "signed-in", user });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+    }
+
+    it("as someone else drops everything and reloads", async () => {
+      const reload = vi.spyOn(browserNavigation, "reload").mockImplementation(() => undefined);
+      sysStatus.mockResolvedValue(status("unsealed"));
+      const client = renderGate("/projects");
+      expect(await screen.findByTestId("where")).toBeInTheDocument();
+      client.setQueryData(keys.me, { id: "u-alice" });
+      client.setQueryData(VALUES_KEY, new Map([["TOKEN", "s3cret"]]));
+
+      await signInElsewhere("u-alice");
+      expect(reload).not.toHaveBeenCalled();
+      expect(client.getQueryData(VALUES_KEY)).toBeDefined();
+
+      await signInElsewhere("u-bob");
+      await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+      expect(client.getQueryData(VALUES_KEY)).toBeUndefined();
+      expect(client.getQueryData(keys.me)).toBeUndefined();
+    });
   });
 
   it("checks again and moves to unlock when a request finds the server sealed", async () => {

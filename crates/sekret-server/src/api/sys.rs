@@ -21,7 +21,7 @@ use utoipa_axum::routes;
 use zeroize::Zeroizing;
 
 use super::logo::LogoFile;
-use super::{AuditTarget, audit};
+use super::{AuditTarget, audit, audit_refusal};
 use crate::auth::authenticate;
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{org_role_slugs, org_rules, require_any};
@@ -110,7 +110,7 @@ async fn require_org_admin(state: &AppState, principal: &Principal, ip: IpAddr) 
 }
 
 async fn audit_forbidden(state: &AppState, principal: &Principal, ip: IpAddr) {
-    audit(state, principal, ip, "sys.forbidden", AuditTarget::default(), json!({})).await;
+    audit_refusal(state, principal, &principal.id, ip, "sys.forbidden", json!({})).await;
 }
 
 fn rate_limit(state: &AppState, ip: IpAddr) -> ApiResult<()> {
@@ -215,9 +215,14 @@ async fn seal_now(
 
 #[utoipa::path(post, path = "/api/v1/sys/passphrase", tag = "system", request_body = ChangePassphrase,
     description = "Replaces the root key and re-encrypts every value under it, so the old passphrase opens \
-                   nothing in the live database. Backups taken earlier still open with the old passphrase.",
+                   nothing in the live database. Backups taken earlier still open with the old passphrase. \
+                   Stored data that no longer decrypts is refused with `unreadable_data`, naming it by id, \
+                   unless `skip_unreadable` is set.",
     responses((status = 204), (status = 400, body = ErrorBody), (status = 401, body = ErrorBody),
-        (status = 403, body = ErrorBody), (status = 409, body = ErrorBody), (status = 429, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 409, body = ErrorBody, description = "`unreadable_data`, `seal_config_tampered` or not in \
+            passphrase mode"),
+        (status = 429, body = ErrorBody),
         (status = 503, body = ErrorBody)),
     security(("bearer" = [])))]
 async fn change_passphrase(
@@ -231,7 +236,9 @@ async fn change_passphrase(
     let current = normalised(request.current);
     let new = normalised(request.new);
     let task = state.clone();
-    detached(async move { ops::change_passphrase(&task, Source::Network(ip), &principal, current, new).await }).await?;
+    let skip = request.skip_unreadable;
+    detached(async move { ops::change_passphrase(&task, Source::Network(ip), &principal, current, new, skip).await })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -362,7 +369,10 @@ fn database_size(state: &AppState) -> u64 {
     description = "POST, so a browser session needs the CSRF header like any other change.",
     responses((status = 200, description = "An encrypted `.skb` backup", body = LogoFile,
         content_type = "application/octet-stream"),
-        (status = 403, body = ErrorBody), (status = 429, body = ErrorBody, description = "Another backup is running"),
+        (status = 403, body = ErrorBody),
+        (status = 409, body = ErrorBody, description = "`seal_config_tampered`: the seal configuration failed its \
+            integrity check, so it is not backed up"),
+        (status = 429, body = ErrorBody, description = "Another backup is running"),
         (status = 501, body = ErrorBody, description = "Postgres; use pg_dump"),
         (status = 507, body = ErrorBody, description = "Too large to back up through the API")),
     security(("bearer" = [])))]
@@ -378,57 +388,17 @@ async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal
             "backups through the API need SQLite; use pg_dump for Postgres, whose secret values are already encrypted",
         ));
     }
-    let Ok(_running) = state.backup_lock.try_lock() else {
+    let Ok(running) = state.backup_lock.clone().try_lock_owned() else {
         return Err(ApiError::backup_in_progress());
     };
-    if usize::try_from(database_size(&state)).map_or(true, |size| size > MAX_BACKUP_LEN) {
-        return Err(too_large());
-    }
-    // Held from reading the root key until the snapshot is taken, so a rotation cannot slip in
-    // between and leave a backup whose header and contents belong to different keys.
-    let (root, config, dir, path) = {
-        let _writing = state.keyring.writing().await;
-        let root = state.keyring.root()?;
-        let config = state
-            .store
-            .get_seal_config()
-            .await?
-            .ok_or_else(ApiError::uninitialised)?;
-        // The copy never carries the remembered wrap, and is signed again without it.
-        let copy_config = seal::signed(
-            &root,
-            sekret_store::SealConfig {
-                remembered: None,
-                ..config.clone()
-            },
-        )?;
-        let dir = staging_dir(&state)?;
-        let path = dir.path().join("snapshot.db");
-        state
-            .store
-            .snapshot_to(&path.display().to_string(), copy_config)
-            .await?;
-        (root, config, dir, path)
-    };
-    let now = state.clock.now();
-    let header = BackupHeader::new(config.mode, config.wrapped.as_ref(), &root, now, sekret_core::VERSION);
-    let file = tokio::task::spawn_blocking(move || {
-        let snapshot = read_limited(&path, MAX_BACKUP_LEN as u64);
-        drop(dir);
-        let snapshot = snapshot.map_err(|_| too_large())?;
-        encrypt_backup(&root, &header, &snapshot).map_err(ApiError::from)
+    // Runs to the end holding the lock even if the client goes away, so cancelling one backup
+    // cannot start a second beside it.
+    let task = state.clone();
+    let (file, now) = detached(async move {
+        let _running = running;
+        take_backup(&task, &principal, ip).await
     })
-    .await
-    .map_err(|e| ApiError::internal("encrypting the backup", e))??;
-    audit(
-        &state,
-        &principal,
-        ip,
-        "sys.backup",
-        AuditTarget::default(),
-        json!({"bytes": file.len()}),
-    )
-    .await;
+    .await?;
     let mut response = file.into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -441,6 +411,51 @@ async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal
         HeaderValue::from_str(&disposition).map_err(|e| ApiError::internal("backup filename", e))?,
     );
     Ok(response)
+}
+
+/// The encrypted backup file, and when it was taken.
+async fn take_backup(state: &AppState, principal: &Principal, ip: IpAddr) -> ApiResult<(Vec<u8>, i64)> {
+    if usize::try_from(database_size(state)).map_or(true, |size| size > MAX_BACKUP_LEN) {
+        return Err(too_large());
+    }
+    let seal::ops::BackupSeal { root, copy: config } = seal::ops::backup_seal(state, principal, ip).await?;
+    // Held while the snapshot is taken, so a rotation cannot slip in and leave a backup whose
+    // header and contents belong to different keys.
+    let (dir, path) = {
+        let _writing = state.keyring.writing().await;
+        if state.keyring.root()?.fingerprint() != root.fingerprint() {
+            return Err(ApiError::conflict(
+                "the root key changed while the backup was being prepared; try again",
+            ));
+        }
+        let dir = staging_dir(state)?;
+        let path = dir.path().join("snapshot.db");
+        state
+            .store
+            .snapshot_to(&path.display().to_string(), config.clone())
+            .await?;
+        (dir, path)
+    };
+    let now = state.clock.now();
+    let header = BackupHeader::new(config.mode, config.wrapped.as_ref(), &root, now, sekret_core::VERSION);
+    let file = tokio::task::spawn_blocking(move || {
+        let snapshot = read_limited(&path, MAX_BACKUP_LEN as u64);
+        drop(dir);
+        let snapshot = snapshot.map_err(|_| too_large())?;
+        encrypt_backup(&root, &header, &snapshot).map_err(ApiError::from)
+    })
+    .await
+    .map_err(|e| ApiError::internal("encrypting the backup", e))??;
+    audit(
+        state,
+        principal,
+        ip,
+        "sys.backup",
+        AuditTarget::default(),
+        json!({"bytes": file.len()}),
+    )
+    .await;
+    Ok((file, now))
 }
 
 #[cfg(test)]

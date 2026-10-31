@@ -69,7 +69,8 @@ const fn list(key: &'static str, flag: &'static str, env: &'static str, separato
     }
 }
 
-const OPTIONS: [Opt; 37] = [
+const OPTIONS: [Opt; 39] = [
+    scalar("server.max_connections", "max-connections", "SEKRET_MAX_CONNECTIONS"),
     scalar("server.unix_socket", "unix-socket", "SEKRET_UNIX_SOCKET"),
     scalar("server.unix_socket_mode", "unix-socket-mode", "SEKRET_UNIX_SOCKET_MODE"),
     scalar("server.public_url", "public-url", "SEKRET_PUBLIC_URL"),
@@ -86,6 +87,7 @@ const OPTIONS: [Opt; 37] = [
         "SEKRET_ALLOW_INSECURE_HTTP",
     ),
     scalar("database.url", "database-url", "SEKRET_DATABASE_URL"),
+    scalar("database.url_file", "database-url-file", "SEKRET_DATABASE_URL_FILE"),
     scalar(
         "database.snapshots_to_keep",
         "snapshots-to-keep",
@@ -1481,6 +1483,56 @@ async fn login_rate_per_minute_limits_attempts() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a fresh connection's request is answered quickly. It asks to close afterwards, so it
+/// gives its slot back.
+async fn answers_promptly(address: &str) -> anyhow::Result<bool> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await.context("connect")?;
+    stream
+        .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .context("write")?;
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_millis(400), stream.read(&mut buf)).await;
+    Ok(matches!(read, Ok(Ok(n)) if buf[..n].starts_with(b"HTTP/1.1 200")))
+}
+
+/// How many connections the server serves at once, up to `cap`, found by holding idle ones open
+/// until a new request has to wait.
+async fn connections_served(server: &Running, cap: usize) -> anyhow::Result<usize> {
+    let address = server.url.trim_start_matches("http://").to_string();
+    let mut held = Vec::new();
+    // The health check at start left one pooled connection open, which takes a slot.
+    while held.len() + 1 < cap {
+        if !answers_promptly(&address).await? {
+            break;
+        }
+        held.push(tokio::net::TcpStream::connect(&address).await.context("connect")?);
+    }
+    Ok(held.len() + 1)
+}
+
+#[tokio::test]
+async fn max_connections_caps_open_connections() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let server = sb.keyed(&key).set(way, "server.max_connections", "3").start().await?;
+        assert_eq!(connections_served(&server, 8).await?, 3, "{way:?}");
+    }
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let server = sb.keyed(&key).start().await?;
+    assert_eq!(connections_served(&server, 8).await?, 8, "the default is far higher");
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let log = sb.keyed(&key).set(way, "server.max_connections", "0").refused().await?;
+        assert!(log.contains("max_connections must be at least 1"), "{way:?}: {log}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn login_rate_also_limits_unlock_attempts() -> anyhow::Result<()> {
     let sb = Sandbox::new()?;
@@ -1574,7 +1626,6 @@ async fn oidc_allowed_subjects_pin_who_may_sign_in() -> anyhow::Result<()> {
     for way in WAYS {
         let sb = Sandbox::new()?;
         let key = sb.root_key("root.key")?;
-        let admin = sb.bootstrap(&key)?;
         let server = sb
             .keyed(&key)
             .oidc(&issuer)?
@@ -1582,6 +1633,7 @@ async fn oidc_allowed_subjects_pin_who_may_sign_in() -> anyhow::Result<()> {
             .set_list(way, "oidc.allowed_subjects", &["owner", "deputy"])
             .start()
             .await?;
+        let admin = sb.bootstrap(&key)?;
         session_of(&server, &issuer, json!({"sub": "owner", "roles": ["sekret-users"]})).await?;
         session_of(&server, &issuer, json!({"sub": "deputy", "roles": ["sekret-users"]})).await?;
 
@@ -1888,8 +1940,21 @@ async fn root_key_file_unlocks_key_file_mode() -> anyhow::Result<()> {
 
 /// A passphrase-mode database whose root key is also in `root.key`, with a secret and a token.
 fn passphrase_db_with_known_key(sb: &Sandbox) -> anyhow::Result<(String, String)> {
-    let key = sb.root_key("root.key")?;
+    let key = sb.p("root.key");
     let pass = sb.passphrase_file()?;
+    ok(sb.cli(
+        &[
+            "admin",
+            "init",
+            "--key-file-mode",
+            "--database-url",
+            &sb.db(),
+            "--root-key-file",
+            &key,
+        ],
+        &[],
+        None,
+    )?)?;
     ok(sb.cli(
         &[
             "admin",
@@ -2862,6 +2927,24 @@ async fn precedence_auth_login_rate_per_minute() -> anyhow::Result<()> {
     .await
 }
 
+fn probe_connections(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>> {
+    Box::pin(async move { Ok(connections_served(server, 6).await?.to_string()) })
+}
+
+#[tokio::test]
+async fn precedence_server_max_connections() -> anyhow::Result<()> {
+    precedence(Chain {
+        key: "server.max_connections",
+        flag: "2",
+        env: "3",
+        file: "4",
+        expect: ["2", "3", "4", "6"],
+        base: keyed_base,
+        probe: probe_connections,
+    })
+    .await
+}
+
 #[tokio::test]
 async fn precedence_tls_client_auth() -> anyhow::Result<()> {
     precedence(Chain {
@@ -3583,5 +3666,439 @@ async fn restore_clears_what_an_interrupted_restore_left() -> anyhow::Result<()>
         .filter(|n| n.contains(".restore-"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The third security audit: admin commands, the database lock and configuration
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn database_url_file_chooses_the_database() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let db = sb.db_named("from-file.db");
+        let url_file = sb.write("db-url", &format!("{db}\n"))?;
+        let server = sb
+            .keyed(&key)
+            .without("database.url")
+            .set(way, "database.url_file", &url_file)
+            .start()
+            .await?;
+        let admin = sb.bootstrap_on(&db, &key)?;
+        server.create_project(&admin, "app").await?;
+        assert!(sb.path("from-file.db").exists(), "{way:?}");
+        assert!(!sb.path("sekret.db").exists(), "{way:?}");
+        assert!(
+            server.log().contains("setting=\"database.url_file\""),
+            "{way:?}: {}",
+            server.log()
+        );
+        assert!(!server.log().contains(&db), "the URL itself is not logged: {way:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_url_and_url_file_follow_the_usual_precedence() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let in_file = sb.write("db-url", &format!("{}\n", sb.db_named("from-file.db")))?;
+    // A URL flag beats a URL file from the environment, and the loser is named.
+    let server = sb
+        .keyed(&key)
+        .without("database.url")
+        .set(Way::Flag, "database.url", &sb.db_named("from-flag.db"))
+        .set(Way::Env, "database.url_file", &in_file)
+        .start()
+        .await?;
+    assert!(sb.path("from-flag.db").exists());
+    assert!(!sb.path("from-file.db").exists());
+    assert!(
+        server
+            .log()
+            .contains("database.url_file from the environment is ignored"),
+        "{}",
+        server.log()
+    );
+    drop(server);
+    // A URL file in the environment beats a URL in the configuration file.
+    let server = sb
+        .keyed(&key)
+        .without("database.url")
+        .set(Way::File, "database.url", &sb.db_named("from-yaml.db"))
+        .set(Way::Env, "database.url_file", &in_file)
+        .start()
+        .await?;
+    assert!(sb.path("from-file.db").exists());
+    assert!(!sb.path("from-yaml.db").exists());
+    drop(server);
+    // Both at the same level is a mistake.
+    let log = sb
+        .keyed(&key)
+        .without("database.url")
+        .set(Way::File, "database.url", &sb.db_named("a.db"))
+        .set(Way::File, "database.url_file", &in_file)
+        .refused()
+        .await?;
+    assert!(log.contains("both set"), "{log}");
+    let empty = sb.write("empty-url", "\n")?;
+    let log = sb
+        .keyed(&key)
+        .without("database.url")
+        .set(Way::Flag, "database.url_file", &empty)
+        .refused()
+        .await?;
+    assert!(log.contains("is empty"), "{log}");
+    // Admin commands read it too.
+    let flags = [
+        "admin",
+        "bootstrap",
+        "--database-url-file",
+        in_file.as_str(),
+        "--root-key-file",
+        key.as_str(),
+    ];
+    assert!(!ok(sb.cli(&flags, &[], None)?)?.trim().is_empty());
+    Ok(())
+}
+
+/// A Postgres URL in the environment carries its password; it must not stay readable there.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_database_url_is_wiped_from_the_environment() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let db = sb.db_named("secret-path.db");
+    let server = sb
+        .keyed(&key)
+        .without("database.url")
+        .env("SEKRET_DATABASE_URL", &db)
+        .start()
+        .await?;
+    assert!(sb.path("secret-path.db").exists(), "the value was still used");
+    let environ = std::fs::read(format!("/proc/{}/environ", server.child.id())).context("environ")?;
+    let has = |needle: &[u8]| environ.windows(needle.len()).any(|w| w == needle);
+    assert!(!has(db.as_bytes()), "the database URL is gone");
+    assert!(
+        server.log().contains("from=\"environment\""),
+        "its origin is still reported: {}",
+        server.log()
+    );
+    Ok(())
+}
+
+/// Rewinds the newest applied migration, as a database last opened by the previous release.
+async fn rewind_schema(path: &Path) -> anyhow::Result<(i64, i64)> {
+    use sqlx::{ConnectOptions, Row};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .connect()
+        .await
+        .context("open")?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)")
+        .execute(&mut conn)
+        .await
+        .context("rewind")?;
+    let row = sqlx::query("SELECT COUNT(*) AS n, MAX(version) AS v FROM _sqlx_migrations")
+        .fetch_one(&mut conn)
+        .await
+        .context("count")?;
+    Ok((row.try_get("n").context("n")?, row.try_get("v").context("v")?))
+}
+
+async fn applied_migrations(path: &Path) -> anyhow::Result<(i64, i64)> {
+    use sqlx::{ConnectOptions, Row};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
+        .await
+        .context("open")?;
+    let row = sqlx::query("SELECT COUNT(*) AS n, MAX(version) AS v FROM _sqlx_migrations")
+        .fetch_one(&mut conn)
+        .await
+        .context("count")?;
+    Ok((row.try_get("n").context("n")?, row.try_get("v").context("v")?))
+}
+
+/// The demonstrated attack: `admin bootstrap`, which runs beside a live server, migrated the
+/// database of an older running server underneath it.
+#[tokio::test]
+async fn bootstrap_never_migrates_a_database_of_another_version() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    drop(sb.keyed(&key).start().await?);
+    let before = rewind_schema(&sb.path("sekret.db")).await?;
+    let output = sb.cli(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &sb.db(),
+            "--root-key-file",
+            &key,
+        ],
+        &[],
+        None,
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("schema"), "{stderr}");
+    assert_eq!(
+        applied_migrations(&sb.path("sekret.db")).await?,
+        before,
+        "nothing was migrated"
+    );
+    // A newer schema than the binary knows is refused the same way.
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    drop(sb.keyed(&key).start().await?);
+    {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(sb.path("sekret.db"))
+            .connect()
+            .await
+            .context("open")?;
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (99999, 'from the future', TRUE, x'00', 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .context("future migration")?;
+    }
+    let output = sb.cli(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &sb.db(),
+            "--root-key-file",
+            &key,
+        ],
+        &[],
+        None,
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("schema"));
+    Ok(())
+}
+
+/// The demonstrated attack: the lock was keyed on the path as given, so an admin command reached
+/// a live database through a symlink and re-keyed it under the running server.
+#[cfg(unix)]
+#[tokio::test]
+async fn admin_commands_cannot_reach_a_live_database_by_another_name() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let new_key = sb.root_key("new.key")?;
+    let server = sb.keyed(&key).start().await?;
+    let admin = sb.bootstrap(&key)?;
+    std::os::unix::fs::symlink(sb.path("sekret.db"), sb.path("link.db")).context("symlink")?;
+    std::fs::hard_link(sb.path("sekret.db"), sb.path("hard.db")).context("hard link")?;
+    for name in ["link.db", "hard.db"] {
+        let output = sb.cli(
+            &[
+                "admin",
+                "rotate-root-key",
+                "--database-url",
+                &sb.db_named(name),
+                "--root-key-file",
+                &key,
+                "--new-root-key-file",
+                &new_key,
+            ],
+            &[],
+            None,
+        )?;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(!output.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("another sekret server"), "{name}: {stderr}");
+    }
+    server.create_project(&admin, "still-writable").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_commands_leave_no_stray_database_behind_a_wrong_path() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let missing = sb.db_named("missing.db");
+    let new_key = sb.root_key("new.key")?;
+    let commands: [&[&str]; 3] = [
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &missing,
+            "--root-key-file",
+            &key,
+        ],
+        &[
+            "admin",
+            "rotate-root-key",
+            "--database-url",
+            &missing,
+            "--root-key-file",
+            &key,
+            "--new-root-key-file",
+            &new_key,
+        ],
+        &[
+            "admin",
+            "set-seal-mode",
+            "passphrase",
+            "--database-url",
+            &missing,
+            "--root-key-file",
+            &key,
+        ],
+    ];
+    for command in commands {
+        let output = sb.cli(command, &[], None)?;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(!output.status.success(), "{command:?}");
+        assert!(stderr.contains("no database"), "{command:?}: {stderr}");
+        assert!(!sb.path("missing.db").exists(), "{command:?}");
+        assert!(!sb.path("missing.db.lock").exists(), "{command:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_token_lifetimes_are_bounded_to_a_day() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    drop(sb.keyed(&key).start().await?);
+    let bootstrap = |ttl: &str| {
+        sb.cli(
+            &[
+                "admin",
+                "bootstrap",
+                "--database-url",
+                &sb.db(),
+                "--root-key-file",
+                &key,
+                "--ttl",
+                ttl,
+            ],
+            &[],
+            None,
+        )
+    };
+    for refused in ["0", "-5", "86401", "31536000"] {
+        assert!(!bootstrap(refused)?.status.success(), "{refused}");
+    }
+    assert!(bootstrap("86400")?.status.success());
+    let output = sb.cli(
+        &[
+            "admin",
+            "init",
+            "--database-url",
+            &sb.db_named("other.db"),
+            "--key-file-mode",
+            "--root-key-file",
+            &sb.p("other.key"),
+            "--ttl",
+            "90000",
+        ],
+        &[],
+        None,
+    )?;
+    assert!(!output.status.success());
+    assert!(!sb.path("other.db").exists(), "refused before anything is created");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_unseal_socket_needs_a_private_directory() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    sb.passphrase_db("manual")?;
+    let shared = sb.path("shared");
+    std::fs::create_dir(&shared).context("dir")?;
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+    let socket = shared.join("sekret.sock").display().to_string();
+    let log = sb
+        .launch()
+        .set(Way::Flag, "server.unix_socket", &socket)
+        .refused()
+        .await?;
+    assert!(log.contains("must not be writable"), "{log}");
+
+    // The CLI refuses a socket someone else could have planted there.
+    let planted = std::os::unix::net::UnixListener::bind(&socket).context("bind")?;
+    let pass = sb.passphrase_file()?;
+    let output = sb.cli(
+        &["sys", "unseal", "--socket", &socket, "--passphrase-file", &pass],
+        &[],
+        None,
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("can be written by other users"), "{stderr}");
+    drop(planted);
+    Ok(())
+}
+
+/// A restart that overlaps the old server waits for its lock rather than failing.
+#[tokio::test]
+async fn a_starting_server_waits_for_the_database_lock() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let first = sb.keyed(&key).start().await?;
+    let release = async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(first);
+    };
+    let (second, ()) = tokio::join!(sb.keyed(&key).start(), release);
+    let second = second?;
+    assert!(second.log().contains("waiting"), "{}", second.log());
+    assert_eq!(second.state().await?, "unsealed");
+    Ok(())
+}
+
+/// When Postgres drops the lock's session, a second server could take over; this one stops.
+#[tokio::test]
+async fn a_server_that_loses_its_postgres_lock_stops() -> anyhow::Result<()> {
+    use sqlx::Connection;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    let container = match Postgres::default().start().await {
+        Ok(container) => container,
+        Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
+            eprintln!("skipping postgres test: {error}");
+            return Ok(());
+        }
+        Err(error) => bail!("postgres container failed: {error}"),
+    };
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let mut server = sb.keyed(&key).set(Way::Flag, "database.url", &url).start().await?;
+    let mut conn = sqlx::PgConnection::connect(&url).await.context("connect")?;
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory'")
+        .execute(&mut conn)
+        .await
+        .context("terminate")?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().context("wait")? {
+            break status;
+        }
+        ensure!(Instant::now() < deadline, "the server kept running:\n{}", server.log());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(!status.success());
+    assert!(
+        server.log().contains("no longer holds the database lock"),
+        "{}",
+        server.log()
+    );
     Ok(())
 }

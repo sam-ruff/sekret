@@ -24,18 +24,119 @@ pub struct StoreArgs {
     #[arg(long, env = "SEKRET_CONFIG")]
     pub config: Option<PathBuf>,
     /// `sqlite://path?mode=rwc` or `postgres://user:pass@host/db` [default: sqlite://sekret.db?mode=rwc].
-    #[arg(long, env = "SEKRET_DATABASE_URL")]
+    #[arg(long, env = DATABASE_URL_ENV)]
     pub database_url: Option<String>,
+    /// File holding the database URL, so a Postgres password stays out of the process list and
+    /// the environment.
+    #[arg(long, env = "SEKRET_DATABASE_URL_FILE")]
+    pub database_url_file: Option<PathBuf>,
     /// File holding the 32-byte root key (raw, base64 or hex), for key-file mode.
     #[arg(long, env = "SEKRET_ROOT_KEY_FILE")]
     pub root_key_file: Option<PathBuf>,
+    /// Device key file for the remember policy; required with it, and best kept off the
+    /// database's disk. Admin commands read it to check and keep the seal epoch mark beside it.
+    #[arg(long, env = "SEKRET_REMEMBER_FILE")]
+    pub remember_file: Option<PathBuf>,
+}
+
+pub const DATABASE_URL_ENV: &str = "SEKRET_DATABASE_URL";
+
+/// The database URL once flag, environment and file have been weighed.
+#[derive(Debug)]
+pub struct DatabaseChoice {
+    pub url: String,
+    pub origin: Origin,
+    /// `database.url` or `database.url_file`, whichever was used.
+    pub key: &'static str,
+    /// Sources that were set but lost.
+    pub ignored: Vec<String>,
+}
+
+fn rank(origin: Origin) -> u8 {
+    match origin {
+        Origin::Flag => 3,
+        Origin::Env => 2,
+        Origin::File => 1,
+        Origin::Default => 0,
+    }
+}
+
+/// Picks the database URL from `--database-url`, `--database-url-file`, their environment
+/// variables and the file, in the usual order. The URL and the URL file set at the same level
+/// is a mistake rather than something to guess about.
+pub fn choose_database(
+    args: &StoreArgs,
+    section: &DatabaseSection,
+    sources: &Sources,
+) -> anyhow::Result<DatabaseChoice> {
+    enum Candidate<'a> {
+        Url(&'a str),
+        File(&'a Path),
+    }
+    let mut candidates: Vec<(&'static str, Origin, Candidate<'_>)> = Vec::new();
+    if let Some(url) = &args.database_url {
+        let origin = sources.origin("database-url", DATABASE_URL_ENV, true, false);
+        candidates.push(("database.url", origin, Candidate::Url(url)));
+    }
+    if let Some(path) = &args.database_url_file {
+        let origin = sources.origin("database-url-file", "SEKRET_DATABASE_URL_FILE", true, false);
+        candidates.push(("database.url_file", origin, Candidate::File(path)));
+    }
+    if let Some(url) = &section.url {
+        candidates.push(("database.url", Origin::File, Candidate::Url(url)));
+    }
+    if let Some(path) = &section.url_file {
+        candidates.push(("database.url_file", Origin::File, Candidate::File(path)));
+    }
+    candidates.sort_by_key(|(_, origin, _)| std::cmp::Reverse(rank(*origin)));
+    let Some((key, origin, winner)) = candidates.first() else {
+        return Ok(DatabaseChoice {
+            url: DEFAULT_DATABASE_URL.into(),
+            origin: Origin::Default,
+            key: "database.url",
+            ignored: Vec::new(),
+        });
+    };
+    if let Some((other, _, _)) = candidates.get(1).filter(|(_, o, _)| rank(*o) == rank(*origin)) {
+        bail!(
+            "{key} and {other} are both set by the {}; set only one",
+            origin.as_str()
+        );
+    }
+    let url = match winner {
+        Candidate::Url(url) => url.to_string(),
+        Candidate::File(path) => {
+            let url = read_secret_file(path)?;
+            if url.is_empty() {
+                bail!("the database URL file {} is empty", path.display());
+            }
+            url
+        }
+    };
+    let ignored = candidates
+        .iter()
+        .skip(1)
+        .map(|(name, lost, _)| {
+            format!(
+                "{name} from the {} is ignored because {key} from the {} wins",
+                lost.as_str(),
+                origin.as_str()
+            )
+        })
+        .collect();
+    Ok(DatabaseChoice {
+        url,
+        origin: *origin,
+        key,
+        ignored,
+    })
 }
 
 /// Where the database and root key are, for the admin commands.
 pub struct StoreLocation {
     pub database_url: String,
     pub root_key_file: Option<PathBuf>,
-    /// From the configuration file only, to keep the epoch mark beside it up to date.
+    /// Found the way the server finds it, so the epoch mark beside it is read and kept up to date.
     pub remember_file: Option<PathBuf>,
 }
 
@@ -50,16 +151,12 @@ impl StoreLocation {
 }
 
 impl StoreArgs {
-    pub fn locate(&self) -> anyhow::Result<StoreLocation> {
+    pub fn locate(&self, sources: &Sources) -> anyhow::Result<StoreLocation> {
         let file = load(self.config.as_deref())?;
         Ok(StoreLocation {
-            database_url: self
-                .database_url
-                .clone()
-                .or(file.database.url)
-                .unwrap_or_else(|| DEFAULT_DATABASE_URL.into()),
+            database_url: choose_database(self, &file.database, sources)?.url,
             root_key_file: self.root_key_file.clone().or(file.seal.root_key_file),
-            remember_file: file.seal.remember_file,
+            remember_file: self.remember_file.clone().or(file.seal.remember_file),
         })
     }
 }
@@ -143,6 +240,9 @@ pub struct ServerArgs {
     /// Also limits setup, unlock and passphrase attempts [default: 30].
     #[arg(long, env = "SEKRET_LOGIN_RATE_PER_MINUTE")]
     pub login_rate_per_minute: Option<u32>,
+    /// Connections served at once; more wait until one closes [default: 512].
+    #[arg(long, env = "SEKRET_MAX_CONNECTIONS")]
+    pub max_connections: Option<usize>,
     /// PEM certificate chain to serve HTTPS directly instead of plain HTTP.
     #[arg(long, env = "SEKRET_TLS_CERT_FILE")]
     pub tls_cert_file: Option<PathBuf>,
@@ -162,10 +262,6 @@ pub struct ServerArgs {
     /// How a passphrase-mode server unlocks after a start: manual, remember or passphrase-file.
     #[arg(long, env = "SEKRET_UNLOCK", value_parser = parse_unlock)]
     pub unlock: Option<UnlockPolicy>,
-    /// Device key file for the remember policy; required with it, and best kept off the
-    /// database's disk.
-    #[arg(long, env = "SEKRET_REMEMBER_FILE")]
-    pub remember_file: Option<PathBuf>,
     /// File holding a secret of 32 or more characters mixed into the remember key, so the disk
     /// alone cannot unlock; SEKRET_REMEMBER_SECRET also works.
     #[arg(long, env = "SEKRET_REMEMBER_SECRET_FILE")]
@@ -226,12 +322,14 @@ pub struct ServerSection {
     pub allow_insecure_http: Option<bool>,
     pub unix_socket: Option<PathBuf>,
     pub unix_socket_mode: Option<String>,
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseSection {
     pub url: Option<String>,
+    pub url_file: Option<PathBuf>,
     pub snapshots_to_keep: Option<i64>,
 }
 
@@ -381,11 +479,28 @@ impl EnvSecrets {
     /// Reads and removes the secret variables, overwriting their values first so they no longer
     /// show in `/proc/<pid>/environ`. Only call this from `main` while the process has one thread.
     pub fn take() -> anyhow::Result<Self> {
+        scrub_database_url()?;
         Ok(Self {
             unlock_passphrase: take_secret(UNLOCK_PASSPHRASE_ENV)?,
             remember_secret: take_secret(REMEMBER_SECRET_ENV)?,
         })
     }
+}
+
+/// Removes the database URL, which can hold a Postgres password, once clap has read it. Only
+/// call this from `main` while the process has one thread.
+pub fn scrub_database_url() -> anyhow::Result<()> {
+    take_secret(DATABASE_URL_ENV).map(drop)
+}
+
+/// Removes and overwrites each named variable once clap has read what it needs, so a program
+/// `sekret run` starts cannot read them from its parent's `/proc/<pid>/environ`. Only call this
+/// from `main` while the process has one thread.
+pub fn scrub_env(names: &[&str]) -> anyhow::Result<()> {
+    for name in names {
+        take_secret(name)?;
+    }
+    Ok(())
 }
 
 fn take_secret(name: &str) -> anyhow::Result<Option<Zeroizing<String>>> {
@@ -437,10 +552,13 @@ fn scrub_environ(name: &str) {
 #[cfg(not(unix))]
 fn scrub_environ(_name: &str) {}
 
-/// The remember secret from its file, else from the environment.
-fn remember_secret(file: Option<&Path>, env: Option<&Zeroizing<String>>) -> anyhow::Result<Option<RememberSecret>> {
-    let text = match (file, env) {
-        (Some(path), _) => {
+/// The remember secret from the source that won.
+fn remember_secret(
+    from: Option<&SecretFrom>,
+    env: Option<&Zeroizing<String>>,
+) -> anyhow::Result<Option<RememberSecret>> {
+    let text = match (from, env) {
+        (Some(SecretFrom::File(path)), _) => {
             let bytes = read_limited(path, SECRET_FILE_LIMIT).with_context(|| format!("reading {}", path.display()))?;
             Zeroizing::new(
                 std::str::from_utf8(&bytes)
@@ -448,11 +566,89 @@ fn remember_secret(file: Option<&Path>, env: Option<&Zeroizing<String>>) -> anyh
                     .to_string(),
             )
         }
-        (None, Some(value)) => value.clone(),
-        (None, None) => return Ok(None),
+        (Some(SecretFrom::Env), Some(value)) => value.clone(),
+        _ => return Ok(None),
     };
     Ok(Some(RememberSecret::new(&text).context("the remember secret")?))
 }
+
+/// Where a secret is read from once flag, environment and file have been weighed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretFrom {
+    File(PathBuf),
+    /// The variable holding the value itself.
+    Env,
+}
+
+/// The names of the ways one secret can be given, for messages.
+struct SecretNames {
+    flag: &'static str,
+    file_env: &'static str,
+    value_env: &'static str,
+    key: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SecretChoice {
+    from: Option<SecretFrom>,
+    origin: Origin,
+    /// Sources that were set but lost.
+    ignored: Vec<String>,
+}
+
+/// Picks a secret's source in the documented order: the flag, then the environment, then the
+/// file. Of the two environment variables, the one naming a file wins over the value itself.
+fn choose_secret(
+    names: &SecretNames,
+    argument: Option<(&Path, Origin)>,
+    in_file: Option<&Path>,
+    env_value: bool,
+) -> SecretChoice {
+    let mut candidates: Vec<(&'static str, Origin, SecretFrom)> = Vec::new();
+    if let Some((path, origin)) = argument {
+        let name = if origin == Origin::Flag {
+            names.flag
+        } else {
+            names.file_env
+        };
+        candidates.push((name, origin, SecretFrom::File(path.to_path_buf())));
+    }
+    if env_value {
+        candidates.push((names.value_env, Origin::Env, SecretFrom::Env));
+    }
+    if let Some(path) = in_file {
+        candidates.push((names.key, Origin::File, SecretFrom::File(path.to_path_buf())));
+    }
+    let mut candidates = candidates.into_iter();
+    let Some((winner, origin, from)) = candidates.next() else {
+        return SecretChoice {
+            from: None,
+            origin: Origin::Default,
+            ignored: Vec::new(),
+        };
+    };
+    SecretChoice {
+        from: Some(from),
+        origin,
+        ignored: candidates
+            .map(|(name, _, _)| format!("{name} is set but ignored, because {winner} wins"))
+            .collect(),
+    }
+}
+
+const REMEMBER_SECRET_NAMES: SecretNames = SecretNames {
+    flag: "--remember-secret-file",
+    file_env: "SEKRET_REMEMBER_SECRET_FILE",
+    value_env: REMEMBER_SECRET_ENV,
+    key: "seal.remember_secret_file",
+};
+
+const UNLOCK_PASSPHRASE_NAMES: SecretNames = SecretNames {
+    flag: "--unlock-passphrase-file",
+    file_env: "SEKRET_UNLOCK_PASSPHRASE_FILE",
+    value_env: UNLOCK_PASSPHRASE_ENV,
+    key: "seal.passphrase_file",
+};
 
 /// Where a setting's value came from, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,10 +677,15 @@ pub struct Sources {
 }
 
 impl Sources {
+    /// The command line and the names in the environment now, before any secret variable is
+    /// removed from it.
     pub fn process() -> Self {
+        let present: std::collections::HashSet<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .collect();
         Self {
             argv: std::env::args().collect(),
-            env: Box::new(|name| std::env::var_os(name).is_some()),
+            env: Box::new(move |name| present.contains(name)),
         }
     }
 
@@ -531,29 +732,34 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// Where `path` really is: relative paths are taken from the working directory and the nearest
-/// existing ancestor is resolved through any symlinks, so a file that does not exist yet still
-/// compares correctly with one that does.
-fn resolved(path: &Path) -> PathBuf {
-    let absolute = match std::env::current_dir() {
-        Ok(cwd) if path.is_relative() => cwd.join(path),
-        _ => path.to_path_buf(),
-    };
-    let mut missing = Vec::new();
-    let mut current = absolute.as_path();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(current) {
-            return missing.iter().rev().fold(real, |acc, part| acc.join(part));
+/// Collects each setting's value and origin, and the settings in the file that an environment
+/// variable overrode.
+struct Notes<'a> {
+    sources: &'a Sources,
+    report: Report,
+    overridden: Vec<&'static str>,
+}
+
+impl Notes<'_> {
+    fn note(&mut self, name: &'static str, flag: &str, env: &str, value: Option<String>, in_file: bool) -> Origin {
+        let origin = self.sources.origin(flag, env, value.is_some(), in_file);
+        self.record(name, value, origin, in_file);
+        origin
+    }
+
+    fn record(&mut self, name: &'static str, value: Option<String>, origin: Origin, in_file: bool) {
+        if origin == Origin::Env && in_file {
+            self.overridden.push(name);
         }
-        match (current.parent(), current.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_os_string());
-                current = parent;
-            }
-            _ => return absolute,
-        }
+        self.report.settings.push(Reported {
+            name,
+            value: value.unwrap_or_else(|| "unset".into()),
+            origin,
+        });
     }
 }
+
+use sekret_store::canonical_path as resolved;
 
 /// The device of the nearest existing ancestor of `path`.
 #[cfg(unix)]
@@ -745,7 +951,7 @@ pub fn resolve_with(
     let public_url = args
         .public_url
         .clone()
-        .or(server.public_url)
+        .or(server.public_url.clone())
         .context("a public URL is required: --public-url, SEKRET_PUBLIC_URL or server.public_url")?;
     if !public_url.starts_with("http://") && !public_url.starts_with("https://") {
         bail!("the public URL must start with http:// or https://");
@@ -759,12 +965,6 @@ pub fn resolve_with(
         .clone()
         .or(auth.default_org_role.clone())
         .unwrap_or_else(|| "org-member".into());
-    let oidc_lists_in_file = [
-        ("oidc.group_claims", oidc_file.group_claims.is_some()),
-        ("oidc.admin_groups", oidc_file.admin_groups.is_some()),
-        ("oidc.required_groups", oidc_file.required_groups.is_some()),
-        ("oidc.allowed_subjects", oidc_file.allowed_subjects.is_some()),
-    ];
     let oidc_secret_file = args
         .oidc_client_secret_file
         .clone()
@@ -790,26 +990,46 @@ pub fn resolve_with(
         Some(listen) => listen,
         None => DEFAULT_LISTEN.parse().context("default listen address")?,
     };
-    let database_url = args
-        .store
-        .database_url
-        .clone()
-        .or(database.url)
-        .unwrap_or_else(|| DEFAULT_DATABASE_URL.into());
-    let mut report = Report::default();
-    let mut note = |name: &'static str, flag: &str, env: &str, value: Option<String>, in_file: bool| {
-        let origin = sources.origin(flag, env, value.is_some(), in_file);
-        report.settings.push(Reported {
-            name,
-            value: value.unwrap_or_else(|| "unset".into()),
-            origin,
-        });
-        origin
+    let database_choice = choose_database(&args.store, &database, sources)?;
+    let database_url = database_choice.url.clone();
+    let mut notes = Notes {
+        sources,
+        report: Report::default(),
+        overridden: Vec::new(),
     };
     let shown = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
-    let remember_file = args.remember_file.clone().or(seal.remember_file.clone());
-    let remember_secret_file = args.remember_secret_file.clone().or(seal.remember_secret_file.clone());
-    let unlock_passphrase_file = args.unlock_passphrase_file.clone().or(seal.passphrase_file.clone());
+    let remember_file = args.store.remember_file.clone().or(seal.remember_file.clone());
+    fn argument<'p>(sources: &Sources, path: &'p Option<PathBuf>, flag: &str, env: &str) -> Option<(&'p Path, Origin)> {
+        path.as_deref().map(|p| (p, sources.origin(flag, env, true, false)))
+    }
+    let remember_choice = choose_secret(
+        &REMEMBER_SECRET_NAMES,
+        argument(
+            sources,
+            &args.remember_secret_file,
+            "remember-secret-file",
+            "SEKRET_REMEMBER_SECRET_FILE",
+        ),
+        seal.remember_secret_file.as_deref(),
+        env_secrets.remember_secret.is_some(),
+    );
+    let unlock_choice = choose_secret(
+        &UNLOCK_PASSPHRASE_NAMES,
+        argument(
+            sources,
+            &args.unlock_passphrase_file,
+            "unlock-passphrase-file",
+            "SEKRET_UNLOCK_PASSPHRASE_FILE",
+        ),
+        seal.passphrase_file.as_deref(),
+        env_secrets.unlock_passphrase.is_some(),
+    );
+    let chosen_file = |choice: &SecretChoice| match &choice.from {
+        Some(SecretFrom::File(path)) => Some(path.clone()),
+        _ => None,
+    };
+    let remember_secret_file = chosen_file(&remember_choice);
+    let unlock_passphrase_file = chosen_file(&unlock_choice);
     let setup_passphrase_file = args.setup_passphrase_file.clone().or(setup.passphrase_file.clone());
     let root_key_file = args.store.root_key_file.clone().or(seal.root_key_file.clone());
     let unlock = args.unlock.or(seal.unlock);
@@ -822,35 +1042,190 @@ pub fn resolve_with(
     if max_auth_age.is_some_and(|age| age <= 0) {
         bail!("cli_login_max_auth_age must be a positive number of seconds");
     }
-    let mode_origin = note(
+    let max_connections = args
+        .max_connections
+        .or(server.max_connections)
+        .unwrap_or(sekret_server::config::DEFAULT_MAX_CONNECTIONS);
+    if max_connections == 0 {
+        bail!("max_connections must be at least 1");
+    }
+    let session_ttl = args.session_ttl.or(auth.session_ttl).unwrap_or(12 * 3600);
+    let cli_token_ttl = args.cli_token_ttl.or(auth.cli_token_ttl).unwrap_or(24 * 3600);
+    let snapshots_to_keep = args
+        .snapshots_to_keep
+        .or(database.snapshots_to_keep)
+        .unwrap_or(200)
+        .max(1);
+    let login_rate_per_minute = args.login_rate_per_minute.or(auth.login_rate_per_minute).unwrap_or(30);
+    let backup_temp_dir = args.backup_temp_dir.clone().or(backup.temp_dir.clone());
+    notes.note(
+        "server.listen",
+        "listen",
+        "SEKRET_LISTEN",
+        Some(listen.to_string()),
+        server.listen.is_some(),
+    );
+    notes.note(
+        "server.public_url",
+        "public-url",
+        "SEKRET_PUBLIC_URL",
+        Some(public_url.clone()),
+        server.public_url.is_some(),
+    );
+    notes.note(
+        "server.unix_socket",
+        "unix-socket",
+        "SEKRET_UNIX_SOCKET",
+        shown(&socket_path),
+        server.unix_socket.is_some(),
+    );
+    notes.note(
+        "server.unix_socket_mode",
+        "unix-socket-mode",
+        "SEKRET_UNIX_SOCKET_MODE",
+        Some(format!("{socket_mode:04o}")),
+        server.unix_socket_mode.is_some(),
+    );
+    let url_file_shown = args
+        .store
+        .database_url_file
+        .clone()
+        .or(database.url_file.clone())
+        .map(|p| p.display().to_string());
+    notes.record(
+        database_choice.key,
+        match database_choice.key {
+            "database.url_file" => url_file_shown,
+            _ => Some(redact_credentials(&database_url)),
+        },
+        database_choice.origin,
+        database.url.is_some() || database.url_file.is_some(),
+    );
+    notes.note(
+        "database.snapshots_to_keep",
+        "snapshots-to-keep",
+        "SEKRET_SNAPSHOTS_TO_KEEP",
+        Some(snapshots_to_keep.to_string()),
+        database.snapshots_to_keep.is_some(),
+    );
+    notes.note(
+        "auth.session_ttl",
+        "session-ttl",
+        "SEKRET_SESSION_TTL",
+        Some(session_ttl.to_string()),
+        auth.session_ttl.is_some(),
+    );
+    notes.note(
+        "auth.cli_token_ttl",
+        "cli-token-ttl",
+        "SEKRET_CLI_TOKEN_TTL",
+        Some(cli_token_ttl.to_string()),
+        auth.cli_token_ttl.is_some(),
+    );
+    notes.note(
+        "auth.login_rate_per_minute",
+        "login-rate-per-minute",
+        "SEKRET_LOGIN_RATE_PER_MINUTE",
+        Some(login_rate_per_minute.to_string()),
+        auth.login_rate_per_minute.is_some(),
+    );
+    notes.note(
+        "oidc.issuer",
+        "oidc-issuer",
+        "SEKRET_OIDC_ISSUER",
+        args.oidc_issuer.clone().or(oidc_file.issuer.clone()),
+        oidc_file.issuer.is_some(),
+    );
+    notes.note(
+        "oidc.client_id",
+        "oidc-client-id",
+        "SEKRET_OIDC_CLIENT_ID",
+        args.oidc_client_id.clone().or(oidc_file.client_id.clone()),
+        oidc_file.client_id.is_some(),
+    );
+    notes.note(
+        "oidc.client_secret_file",
+        "oidc-client-secret-file",
+        "SEKRET_OIDC_CLIENT_SECRET_FILE",
+        shown(&oidc_secret_file),
+        oidc_file.client_secret_file.is_some(),
+    );
+    notes.note(
+        "oidc.scopes",
+        "oidc-scopes",
+        "SEKRET_OIDC_SCOPES",
+        args.oidc_scopes
+            .clone()
+            .or(oidc_file.scopes.clone())
+            .map(|s| s.join(" ")),
+        oidc_file.scopes.is_some(),
+    );
+    notes.note(
+        "tls.cert_file",
+        "tls-cert-file",
+        "SEKRET_TLS_CERT_FILE",
+        shown(&args.tls_cert_file.clone().or(tls_file.cert_file.clone())),
+        tls_file.cert_file.is_some(),
+    );
+    notes.note(
+        "tls.key_file",
+        "tls-key-file",
+        "SEKRET_TLS_KEY_FILE",
+        shown(&tls_key_file),
+        tls_file.key_file.is_some(),
+    );
+    notes.note(
+        "tls.client_ca_file",
+        "tls-client-ca-file",
+        "SEKRET_TLS_CLIENT_CA_FILE",
+        shown(&args.tls_client_ca_file.clone().or(tls_file.client_ca_file.clone())),
+        tls_file.client_ca_file.is_some(),
+    );
+    notes.note(
+        "tls.client_auth",
+        "tls-client-auth",
+        "SEKRET_TLS_CLIENT_AUTH",
+        args.tls_client_auth
+            .or(tls_file.client_auth)
+            .map(|a| format!("{a:?}").to_lowercase()),
+        tls_file.client_auth.is_some(),
+    );
+    notes.note(
+        "backup.temp_dir",
+        "backup-temp-dir",
+        "SEKRET_BACKUP_TEMP_DIR",
+        shown(&backup_temp_dir),
+        backup.temp_dir.is_some(),
+    );
+    notes.note(
         "seal.mode",
         "seal-mode",
         "SEKRET_SEAL_MODE",
         mode.map(|m| m.as_str().into()),
         seal.mode.is_some(),
     );
-    let unlock_origin = note(
+    let unlock_origin = notes.note(
         "seal.unlock",
         "unlock",
         "SEKRET_UNLOCK",
         unlock.map(|u| u.as_str().into()),
         seal.unlock.is_some(),
     );
-    let root_key_origin = note(
+    notes.note(
         "seal.root_key_file",
         "root-key-file",
         "SEKRET_ROOT_KEY_FILE",
         shown(&root_key_file),
         seal.root_key_file.is_some(),
     );
-    let role_origin = note(
+    notes.note(
         "auth.default_org_role",
         "default-org-role",
         "SEKRET_DEFAULT_ORG_ROLE",
         Some(default_org_role.clone()),
         role_in_file,
     );
-    let proxies_origin = note(
+    notes.note(
         "server.trusted_proxies",
         "trusted-proxies",
         "SEKRET_TRUSTED_PROXIES",
@@ -863,137 +1238,138 @@ pub fn resolve_with(
         }),
         proxies_in_file,
     );
-    let insecure_origin = note(
+    notes.note(
         "server.allow_insecure_http",
         "allow-insecure-http",
         "SEKRET_ALLOW_INSECURE_HTTP",
         Some(allow_insecure_http.to_string()),
         insecure_in_file,
     );
-    let oidc_list_origins: Vec<(&str, Origin, bool)> = oidc_lists_in_file
-        .iter()
-        .map(|(name, in_file)| {
-            let (flag, env) = match *name {
-                "oidc.group_claims" => ("oidc-group-claims", "SEKRET_OIDC_GROUP_CLAIMS"),
-                "oidc.admin_groups" => ("oidc-admin-groups", "SEKRET_OIDC_ADMIN_GROUPS"),
-                "oidc.required_groups" => ("oidc-required-groups", "SEKRET_OIDC_REQUIRED_GROUPS"),
-                _ => ("oidc-allowed-subjects", "SEKRET_OIDC_ALLOWED_SUBJECTS"),
-            };
-            let set = match *name {
-                "oidc.group_claims" => args.oidc_group_claims.is_some(),
-                "oidc.admin_groups" => args.oidc_admin_groups.is_some(),
-                "oidc.required_groups" => args.oidc_required_groups.is_some(),
-                _ => args.oidc_allowed_subjects.is_some(),
-            };
-            (*name, sources.origin(flag, env, set || *in_file, *in_file), *in_file)
-        })
-        .collect();
-    note(
+    let oidc_lists = [
+        (
+            "oidc.group_claims",
+            "oidc-group-claims",
+            "SEKRET_OIDC_GROUP_CLAIMS",
+            &args.oidc_group_claims,
+            &oidc_file.group_claims,
+        ),
+        (
+            "oidc.admin_groups",
+            "oidc-admin-groups",
+            "SEKRET_OIDC_ADMIN_GROUPS",
+            &args.oidc_admin_groups,
+            &oidc_file.admin_groups,
+        ),
+        (
+            "oidc.required_groups",
+            "oidc-required-groups",
+            "SEKRET_OIDC_REQUIRED_GROUPS",
+            &args.oidc_required_groups,
+            &oidc_file.required_groups,
+        ),
+        (
+            "oidc.allowed_subjects",
+            "oidc-allowed-subjects",
+            "SEKRET_OIDC_ALLOWED_SUBJECTS",
+            &args.oidc_allowed_subjects,
+            &oidc_file.allowed_subjects,
+        ),
+    ];
+    for (name, flag, env, given, in_file) in oidc_lists {
+        let value = given.as_ref().or(in_file.as_ref()).map(|v| v.join(","));
+        notes.note(name, flag, env, value, in_file.is_some());
+    }
+    notes.note(
         "seal.remember_file",
         "remember-file",
         "SEKRET_REMEMBER_FILE",
         shown(&remember_file),
         seal.remember_file.is_some(),
     );
-    let unlock_file_origin = note(
+    let secret_shown = |choice: &SecretChoice, env: &str| {
+        choice.from.as_ref().map(|from| match from {
+            SecretFrom::File(path) => path.display().to_string(),
+            SecretFrom::Env => env.to_string(),
+        })
+    };
+    notes.record(
+        "seal.remember_secret",
+        secret_shown(&remember_choice, REMEMBER_SECRET_ENV),
+        remember_choice.origin,
+        seal.remember_secret_file.is_some(),
+    );
+    notes.record(
         "seal.passphrase_file",
-        "unlock-passphrase-file",
-        "SEKRET_UNLOCK_PASSPHRASE_FILE",
-        shown(&unlock_passphrase_file),
+        secret_shown(&unlock_choice, UNLOCK_PASSPHRASE_ENV),
+        unlock_choice.origin,
         seal.passphrase_file.is_some(),
     );
-    let web_origin = note(
+    notes.note(
         "setup.web",
         "web-setup",
         "SEKRET_WEB_SETUP",
         web_setup.map(|w| w.to_string()),
         setup.web.is_some(),
     );
-    let auto_origin = note(
+    notes.note(
         "setup.auto_init",
         "auto-init",
         "SEKRET_AUTO_INIT",
         auto_init.map(|a| a.to_string()),
         setup.auto_init.is_some(),
     );
-    let setup_file_origin = note(
+    notes.note(
         "setup.passphrase_file",
         "setup-passphrase-file",
         "SEKRET_SETUP_PASSPHRASE_FILE",
         shown(&setup_passphrase_file),
         setup.passphrase_file.is_some(),
     );
-    note(
+    notes.note(
         "setup.admin_token_file",
         "setup-admin-token-file",
         "SEKRET_SETUP_ADMIN_TOKEN_FILE",
         shown(&admin_token_file),
         setup.admin_token_file.is_some(),
     );
-    note(
+    notes.note(
         "setup.code_file",
         "setup-code-file",
         "SEKRET_SETUP_CODE_FILE",
         shown(&code_file),
         setup.code_file.is_some(),
     );
-    note(
+    notes.note(
         "auth.cli_login_max_auth_age",
         "cli-login-max-auth-age",
         "SEKRET_CLI_LOGIN_MAX_AUTH_AGE",
         max_auth_age.map(|a| a.to_string()),
         auth.cli_login_max_auth_age.is_some(),
     );
-    let remember_secret_set = remember_secret_file.is_some() || env_secrets.remember_secret.is_some();
-    let secret_origin = match (&remember_secret_file, &env_secrets.remember_secret) {
-        (Some(_), _) => sources.origin(
-            "remember-secret-file",
-            "SEKRET_REMEMBER_SECRET_FILE",
-            true,
-            seal.remember_secret_file.is_some(),
-        ),
-        (None, Some(_)) => Origin::Env,
-        (None, None) => Origin::Default,
-    };
-    report.settings.push(Reported {
-        name: "seal.remember_secret",
-        value: if remember_secret_set {
-            "set".into()
-        } else {
-            "unset".into()
-        },
-        origin: secret_origin,
-    });
+    notes.note(
+        "server.max_connections",
+        "max-connections",
+        "SEKRET_MAX_CONNECTIONS",
+        Some(max_connections.to_string()),
+        server.max_connections.is_some(),
+    );
 
+    let Notes {
+        mut report, overridden, ..
+    } = notes;
     let warnings = &mut report.warnings;
-    let overrides_file = [
-        ("seal.unlock", unlock_origin, seal.unlock.is_some()),
-        (
-            "seal.passphrase_file",
-            unlock_file_origin,
-            seal.passphrase_file.is_some(),
-        ),
-        ("setup.auto_init", auto_origin, setup.auto_init.is_some()),
-        (
-            "setup.passphrase_file",
-            setup_file_origin,
-            setup.passphrase_file.is_some(),
-        ),
-        ("setup.web", web_origin, setup.web.is_some()),
-        ("seal.mode", mode_origin, seal.mode.is_some()),
-        ("seal.root_key_file", root_key_origin, seal.root_key_file.is_some()),
-        ("auth.default_org_role", role_origin, role_in_file),
-        ("server.trusted_proxies", proxies_origin, proxies_in_file),
-        ("server.allow_insecure_http", insecure_origin, insecure_in_file),
-    ];
-    for (name, origin, in_file) in overrides_file.into_iter().chain(oidc_list_origins) {
-        if origin == Origin::Env && in_file {
-            warnings.push(format!(
-                "{name} in the configuration file is overridden by an environment variable; check the service's \
-                 environment is meant to set it"
-            ));
-        }
+    for name in overridden {
+        warnings.push(format!(
+            "{name} in the configuration file is overridden by an environment variable; check the service's \
+             environment is meant to set it"
+        ));
     }
+    let ignored = database_choice
+        .ignored
+        .iter()
+        .chain(&remember_choice.ignored)
+        .chain(&unlock_choice.ignored);
+    warnings.extend(ignored.cloned());
     if unlock == Some(UnlockPolicy::PassphraseFile) && unlock_origin == Origin::Env {
         warnings.push(
             "the passphrase-file unlock policy comes from SEKRET_UNLOCK in the environment; the server will unlock \
@@ -1005,28 +1381,29 @@ pub fn resolve_with(
         warnings.push(warning);
     }
     let db_file = sqlite_path(&database_url);
-    let db_parts = db_file.as_deref().map(|db| {
-        [
-            sibling(db, "-wal"),
-            sibling(db, "-shm"),
-            sibling(db, ".lock"),
-            sibling(db, ".epoch"),
-        ]
-    });
+    let db_parts = db_file
+        .as_deref()
+        .map(|db| [sibling(db, "-wal"), sibling(db, "-shm"), sekret_store::lock_file(db)]);
     let db_part = |i: usize| db_parts.as_ref().map(|parts| parts[i].as_path());
+    let epoch_of = |path: &Option<PathBuf>| path.as_deref().map(|p| sibling(&resolved(p), ".epoch"));
+    let db_epoch = epoch_of(&db_file);
+    let remember_epoch = epoch_of(&remember_file);
+    let root_key_epoch = epoch_of(&root_key_file);
     check_distinct(
         &[
             ("remember file", remember_file.as_deref()),
             ("setup code file", code_file.as_deref()),
             ("setup admin token file", admin_token_file.as_deref()),
             ("unix socket", socket_path.as_deref()),
+            ("database's lock file", db_part(2)),
+            ("database's epoch file", db_epoch.as_deref()),
+            ("remember file's epoch file", remember_epoch.as_deref()),
+            ("root key file's epoch file", root_key_epoch.as_deref()),
         ],
         &[
             ("database", db_file.as_deref()),
             ("database's write-ahead log", db_part(0)),
             ("database's shared memory file", db_part(1)),
-            ("database's lock file", db_part(2)),
-            ("database's epoch file", db_part(3)),
             ("root key file", root_key_file.as_deref()),
             ("unlock passphrase file", unlock_passphrase_file.as_deref()),
             ("setup passphrase file", setup_passphrase_file.as_deref()),
@@ -1055,25 +1432,22 @@ pub fn resolve_with(
         public_url: public_url.trim_end_matches('/').to_string(),
         oidc: oidc(args, oidc_file)?,
         default_org_role,
-        session_ttl: args.session_ttl.or(auth.session_ttl).unwrap_or(12 * 3600),
-        cli_token_ttl: args.cli_token_ttl.or(auth.cli_token_ttl).unwrap_or(24 * 3600),
+        session_ttl,
+        cli_token_ttl,
         cli_login_max_auth_age: max_auth_age,
-        backup_temp_dir: args.backup_temp_dir.clone().or(backup.temp_dir),
+        backup_temp_dir,
         trusted_proxies,
         allow_insecure_http,
-        snapshots_to_keep: args
-            .snapshots_to_keep
-            .or(database.snapshots_to_keep)
-            .unwrap_or(200)
-            .max(1),
-        login_rate_per_minute: args.login_rate_per_minute.or(auth.login_rate_per_minute).unwrap_or(30),
+        snapshots_to_keep,
+        login_rate_per_minute,
+        max_connections,
         tls: tls(args, tls_file)?,
         seal: SealSettings {
             mode,
             unlock,
             root_key_file,
             remember_file,
-            remember_secret: remember_secret(remember_secret_file.as_deref(), env_secrets.remember_secret.as_ref())?,
+            remember_secret: remember_secret(remember_choice.from.as_ref(), env_secrets.remember_secret.as_ref())?,
             web_setup: web_setup.unwrap_or(true),
             // Filled in once the code is written.
             setup_code_file: None,
@@ -1472,6 +1846,212 @@ mod tests {
         Ok(())
     }
 
+    /// Sources where every named variable is in the environment and nothing is a flag.
+    fn all_from_env() -> Sources {
+        Sources {
+            argv: vec!["sekret".into(), "server".into()],
+            env: Box::new(|name| name.starts_with("SEKRET_")),
+        }
+    }
+
+    #[test]
+    fn every_setting_overridden_by_the_environment_is_warned_about() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let secret = dir.path().join("oidc-secret");
+        std::fs::write(&secret, "s\n").context("secret")?;
+        let p = |name: &str| dir.path().join(name).display().to_string();
+        let file = parse(&format!(
+            "server:\n  public_url: https://file\n  unix_socket: {}\n  unix_socket_mode: \"0600\"\n\
+             database:\n  url: postgres://u:filepass@db/file\n\
+             oidc:\n  issuer: https://file-issuer\n  client_secret_file: {}\n\
+             seal:\n  remember_file: {}\n\
+             setup:\n  code_file: {}\n  admin_token_file: {}\n",
+            p("file.sock"),
+            secret.display(),
+            p("file-remember"),
+            p("file-code"),
+            p("file-token"),
+        ))?;
+        let mut flags = args(&[])?;
+        flags.public_url = Some("https://env".into());
+        flags.unix_socket = Some(dir.path().join("env.sock"));
+        flags.unix_socket_mode = Some("0660".into());
+        flags.store.database_url = Some("postgres://u:envpass@db/env".into());
+        flags.oidc_issuer = Some("https://env-issuer".into());
+        flags.oidc_client_secret_file = Some(secret.clone());
+        flags.store.remember_file = Some(dir.path().join("env-remember"));
+        flags.setup_code_file = Some(dir.path().join("env-code"));
+        flags.setup_admin_token_file = Some(dir.path().join("env-token"));
+        let resolved = resolve_with(&flags, file, &EnvSecrets::default(), &all_from_env())?;
+        let warnings = resolved.report.warnings.join("\n");
+        for name in [
+            "server.public_url",
+            "server.unix_socket",
+            "server.unix_socket_mode",
+            "database.url",
+            "oidc.issuer",
+            "oidc.client_secret_file",
+            "seal.remember_file",
+            "setup.code_file",
+            "setup.admin_token_file",
+        ] {
+            assert!(
+                warnings.contains(&format!("{name} in the configuration file is overridden")),
+                "{name} missing from {warnings}"
+            );
+            let reported = resolved
+                .report
+                .settings
+                .iter()
+                .find(|s| s.name == name)
+                .with_context(|| format!("{name} not reported"))?;
+            assert_eq!(reported.origin, Origin::Env, "{name}");
+        }
+        let shown = format!("{:?}", resolved.report);
+        assert!(!shown.contains("envpass") && !shown.contains("filepass"), "{shown}");
+        assert!(shown.contains("postgres://u:***@db/env"), "{shown}");
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_follow_flag_then_environment_then_file() {
+        let names = &REMEMBER_SECRET_NAMES;
+        let flag = Path::new("/flag");
+        let yaml = Path::new("/yaml");
+        let chosen = choose_secret(names, Some((flag, Origin::Flag)), Some(yaml), true);
+        assert_eq!(chosen.from, Some(SecretFrom::File(flag.into())));
+        assert_eq!(chosen.origin, Origin::Flag);
+        assert_eq!(chosen.ignored.len(), 2, "{:?}", chosen.ignored);
+        let chosen = choose_secret(names, Some((flag, Origin::Env)), Some(yaml), true);
+        assert_eq!(chosen.from, Some(SecretFrom::File(flag.into())));
+        assert!(chosen.ignored.iter().any(|w| w.starts_with(REMEMBER_SECRET_ENV)));
+        let chosen = choose_secret(names, None, Some(yaml), true);
+        assert_eq!(chosen.from, Some(SecretFrom::Env), "the environment beats the file");
+        assert_eq!(chosen.origin, Origin::Env);
+        assert!(
+            chosen
+                .ignored
+                .iter()
+                .any(|w| w.starts_with("seal.remember_secret_file"))
+        );
+        let chosen = choose_secret(names, None, Some(yaml), false);
+        assert_eq!(
+            (chosen.from, chosen.origin),
+            (Some(SecretFrom::File(yaml.into())), Origin::File)
+        );
+        assert_eq!(choose_secret(names, None, None, false).from, None);
+    }
+
+    #[test]
+    fn the_unlock_passphrase_in_the_environment_beats_the_file_setting() -> anyhow::Result<()> {
+        let file = parse("seal:\n  passphrase_file: /etc/sekret/unlock\n")?;
+        let env = EnvSecrets {
+            unlock_passphrase: Some(Zeroizing::new("from the environment".into())),
+            ..EnvSecrets::default()
+        };
+        let resolved = resolve_with(&args(&["--public-url", "https://x"])?, file, &env, &Sources::none())?;
+        assert_eq!(
+            resolved.setup.unlock_passphrase_file, None,
+            "the environment value is used"
+        );
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("seal.passphrase_file is set but ignored")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        let flagged = Sources {
+            argv: vec!["sekret".into(), "--unlock-passphrase-file=/run/flag".into()],
+            env: Box::new(|_| false),
+        };
+        let mut flags = args(&["--public-url", "https://x"])?;
+        flags.unlock_passphrase_file = Some(PathBuf::from("/run/flag"));
+        let resolved = resolve_with(&flags, FileConfig::default(), &env, &flagged)?;
+        assert_eq!(resolved.setup.unlock_passphrase_file, Some(PathBuf::from("/run/flag")));
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("SEKRET_UNLOCK_PASSPHRASE is set but ignored")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn written_files_may_not_be_an_epoch_mark_or_the_lock_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let db = dir.path().join("sekret.db");
+        let url = format!("sqlite://{}?mode=rwc", db.display());
+        let remember = dir.path().join("remember.key").display().to_string();
+        let key = dir.path().join("root.key").display().to_string();
+        for clash in [
+            format!("{}.epoch", db.display()),
+            format!("{}.lock", db.display()),
+            format!("{remember}.epoch"),
+            format!("{key}.epoch"),
+        ] {
+            let flags = args(&[
+                "--public-url",
+                "https://x",
+                "--database-url",
+                &url,
+                "--remember-file",
+                &remember,
+                "--root-key-file",
+                &key,
+                "--setup-code-file",
+                &clash,
+            ])?;
+            let error = resolve(&flags, FileConfig::default()).err().context(clash.clone())?;
+            assert!(error.to_string().contains("same file"), "{clash}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_database_url_can_come_from_a_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let url_file = dir.path().join("db-url");
+        std::fs::write(&url_file, "postgres://sekret:hunter2@db/sekret\n").context("write")?;
+        let file = parse(&format!("database:\n  url_file: {}\n", url_file.display()))?;
+        let resolved = resolve(&args(&["--public-url", "https://x"])?, file)?;
+        assert_eq!(resolved.config.database_url, "postgres://sekret:hunter2@db/sekret");
+        let reported = format!("{:?}", resolved.report);
+        assert!(!reported.contains("hunter2"), "{reported}");
+        let both = parse(&format!(
+            "database:\n  url: sqlite://x.db\n  url_file: {}\n",
+            url_file.display()
+        ))?;
+        let error = resolve(&args(&["--public-url", "https://x"])?, both)
+            .err()
+            .context("refused")?;
+        assert!(error.to_string().contains("both set"), "{error}");
+        let flags = args(&["--public-url", "https://x", "--database-url", "sqlite://flag.db"])?;
+        let file = parse(&format!("database:\n  url_file: {}\n", url_file.display()))?;
+        let flagged = Sources {
+            argv: vec!["sekret".into(), "--database-url".into(), "sqlite://flag.db".into()],
+            env: Box::new(|_| false),
+        };
+        let resolved = resolve_with(&flags, file, &EnvSecrets::default(), &flagged)?;
+        assert_eq!(resolved.config.database_url, "sqlite://flag.db");
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("database.url_file from the file is ignored")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        Ok(())
+    }
+
     #[test]
     fn new_options_resolve_from_flags_and_the_file() -> anyhow::Result<()> {
         let file = parse("auth:\n  cli_login_max_auth_age: 900\nbackup:\n  temp_dir: /var/lib/sekret/tmp\n")?;
@@ -1537,15 +2117,34 @@ mod tests {
     fn store_args_read_the_file() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("sekret.yaml");
-        std::fs::write(&path, "database:\n  url: sqlite://x.db\nseal:\n  root_key_file: /k\n").context("write")?;
-        let store = StoreArgs {
+        std::fs::write(
+            &path,
+            "database:\n  url: sqlite://x.db\nseal:\n  root_key_file: /k\n  remember_file: /r\n",
+        )
+        .context("write")?;
+        let mut store = StoreArgs {
             config: Some(path),
             database_url: None,
+            database_url_file: None,
             root_key_file: None,
+            remember_file: None,
         };
-        let located = store.locate()?;
+        let located = store.locate(&Sources::none())?;
         assert_eq!(located.database_url, "sqlite://x.db");
         assert_eq!(located.root_key_file, Some(PathBuf::from("/k")));
+        assert_eq!(located.remember_file, Some(PathBuf::from("/r")));
+        // The flag or environment variable wins, as for the server, so its epoch mark is found.
+        store.remember_file = Some(PathBuf::from("/flag"));
+        assert_eq!(
+            store.locate(&Sources::none())?.remember_file,
+            Some(PathBuf::from("/flag"))
+        );
+        assert!(
+            store
+                .locate(&Sources::none())?
+                .epoch_files()
+                .contains(&PathBuf::from("/flag.epoch"))
+        );
         Ok(())
     }
 }

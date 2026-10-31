@@ -358,6 +358,86 @@ async fn stored_session(h: &Harness, subject: &str, groups: &[&str]) -> anyhow::
     Ok((user.id, token))
 }
 
+async fn start_cli_login(h: &Harness) -> anyhow::Result<(String, Value)> {
+    let request = h
+        .client
+        .post(format!("{}/api/v1/auth/cli/start", h.base))
+        .header("user-agent", "sekret-cli/9.9 (test)");
+    let body: Value = request
+        .send()
+        .await
+        .context("start")?
+        .json()
+        .await
+        .context("start body")?;
+    let code = body["user_code"].as_str().context("user code")?.to_string();
+    Ok((code, json!({"device_code": body["device_code"]})))
+}
+
+async fn cli_requests_can_be_denied_and_are_audited_with_their_origin(database_url: String) -> anyhow::Result<()> {
+    let (_server, issuer) = issuer().await;
+    let h = start(Options {
+        oidc: Some(oidc_config(&issuer)),
+        ..common::options(database_url)
+    })
+    .await?;
+    let (_, session) = stored_session(&h, &format!("{}|alice", issuer.url), &["sekret-admin"]).await?;
+
+    let (code, poll) = start_cli_login(&h).await?;
+    let pending_path = format!("/api/v1/auth/cli/pending?code={code}");
+    let (status, shown) = with_cookie(&h, Method::GET, &pending_path, &session, false, None).await?;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown["same_address"], true, "{shown}");
+
+    let deny = |code: &str| Some(json!({"code": code.to_lowercase()}));
+    let (status, _) = h.post("/api/v1/auth/cli/deny", &h.admin, json!({"code": code})).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "only browser sessions may deny");
+    let (status, _) = with_cookie(&h, Method::POST, "/api/v1/auth/cli/deny", &session, false, deny(&code)).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "denying needs the CSRF header");
+    let (status, _) = with_cookie(&h, Method::POST, "/api/v1/auth/cli/deny", &session, true, deny(&code)).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, gone) = h.call(Method::POST, "/api/v1/auth/cli/poll", None, Some(poll)).await?;
+    assert_eq!(gone["error"], "expired_token", "the terminal is told at once");
+    let (status, _) = with_cookie(&h, Method::GET, &pending_path, &session, false, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a denied request is consumed");
+    let (status, _) = with_cookie(
+        &h,
+        Method::POST,
+        "/api/v1/auth/cli/approve",
+        &session,
+        true,
+        Some(json!({"code": code})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a denied request cannot be approved");
+    let (status, _) = with_cookie(&h, Method::POST, "/api/v1/auth/cli/deny", &session, true, deny(&code)).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Approval records where the request came from.
+    let (code, _) = start_cli_login(&h).await?;
+    let (status, _) = with_cookie(
+        &h,
+        Method::POST,
+        "/api/v1/auth/cli/approve",
+        &session,
+        true,
+        Some(json!({"code": code})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, denied) = h.get("/api/v1/audit?action=auth.cli-deny", &h.admin).await?;
+    let (_, approved) = h.get("/api/v1/audit?action=auth.cli-approve", &h.admin).await?;
+    for (audit, label) in [(denied, "deny"), (approved, "approve")] {
+        let entry = audit["entries"].get(0).context("entry")?;
+        assert_eq!(entry["detail"]["requested_from_ip"], "127.0.0.1", "{label}: {entry}");
+        assert_eq!(entry["detail"]["user_agent"], "sekret-cli/9.9 (test)", "{label}");
+        assert!(entry["detail"]["requested_at"].as_i64().is_some(), "{label}");
+    }
+    Ok(())
+}
+
+on_both_backends!(cli_requests_can_be_denied_and_are_audited_with_their_origin);
+
 /// Narrowing the sign-in lists takes effect at once, not at each person's next sign-in.
 #[tokio::test]
 async fn sessions_from_before_the_sign_in_lists_narrowed_stop_working() -> anyhow::Result<()> {
@@ -566,16 +646,24 @@ async fn kubernetes_login_with_jwks_and_token_review() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    let (status, body) = jwt_login(&h, "kubernetes", &review_id, "opaque-sa-token").await?;
+    // The lifetime cap always applies, so a token whose lifetime cannot be read is refused even
+    // though the API server accepts it.
+    let (status, _) = jwt_login(&h, "kubernetes", &review_id, "opaque-sa-token").await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let worker_token = issuer.sign(json!({"sub": "system:serviceaccount:apps:worker"}))?;
+    let (status, body) = jwt_login(&h, "kubernetes", &review_id, &worker_token).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
     let review = server
         .received_requests()
         .await
         .unwrap_or_default()
         .into_iter()
-        .find(|r| r.url.path().ends_with("tokenreviews"))
+        .rfind(|r| r.url.path().ends_with("tokenreviews"))
         .context("token review sent")?;
-    assert_eq!(review.headers["authorization"], "Bearer opaque-sa-token");
+    assert_eq!(
+        review.headers["authorization"],
+        format!("Bearer {worker_token}").as_str()
+    );
     let sent: Value = serde_json::from_slice(&review.body).context("json")?;
     assert_eq!(sent["spec"]["audiences"], json!(["sekret"]));
     Ok(())

@@ -28,7 +28,7 @@ export function PassphraseMeter({ strength, testId = "passphrase-meter", id }: P
 function MeterBody({ strength, testId }: { strength: PassphraseStrength | null; testId: string }) {
   if (!strength) {
     return (
-      <p className="text-xs text-muted-foreground" data-testid={testId}>
+      <p className="text-sm text-muted-foreground" data-testid={testId}>
         At least {MIN_PASSPHRASE_LENGTH} characters. A few unrelated words work well.
       </p>
     );

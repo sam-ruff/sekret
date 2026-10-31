@@ -1,5 +1,6 @@
-import { AlertTriangle, FileUp } from "lucide-react";
-import { useMemo, useState } from "react";
+import { AlertTriangle, FileUp, FolderOpen, Info } from "lucide-react";
+import { useMemo, useRef, useState, type ChangeEvent } from "react";
+import { toast } from "sonner";
 import { api } from "@/api/endpoints";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,7 +15,8 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { SecretTextarea } from "@/components/secret-field";
 import { useApiMutation } from "@/hooks/queries";
-import { parseDotenv } from "@/lib/dotenv";
+import { duplicateText, parseDotenv } from "@/lib/dotenv";
+import { folderLabel } from "@/lib/paths";
 
 interface ImportEnvDialogProps {
   open: boolean;
@@ -31,6 +33,9 @@ const EXAMPLE = `# Paste the contents of a .env file
 DATABASE_URL=postgres://localhost/app
 API_TOKEN="quoted values keep # characters"`;
 
+/** Larger than any sensible .env file, so a wrong file is not read into the page. */
+const MAX_FILE_BYTES = 1024 * 1024;
+
 export function ImportEnvDialog({
   open,
   onOpenChange,
@@ -42,6 +47,7 @@ export function ImportEnvDialog({
   invalidate,
 }: ImportEnvDialogProps) {
   const [text, setText] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
   // Pasted values never outlive the dialog, however it was closed.
   if (!open && text !== "") setText("");
   const parsed = useMemo(() => parseDotenv(text), [text]);
@@ -61,24 +67,51 @@ export function ImportEnvDialog({
     onSuccess: () => {
       setText("");
       onOpenChange(false);
+      write.reset();
     },
   });
+
+  const chooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      toast.error("That file is too large to be a .env file.");
+      return;
+    }
+    setText(await file.text());
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl" data-testid="import-env-dialog">
         <DialogHeader>
           <DialogTitle>Import from .env</DialogTitle>
-          <DialogDescription>
-            Secrets are written to {envName} in <span className="font-mono">{path}</span> in one change. Existing keys
-            are updated.
+          <DialogDescription data-testid="import-env-where">
+            Secrets are written to {envName}, in the <span className="font-mono">{folderLabel(path)}</span> folder, as
+            one change. Existing keys are updated.
           </DialogDescription>
         </DialogHeader>
+        <div className="flex justify-end">
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".env,text/plain"
+            className="hidden"
+            onChange={(event) => void chooseFile(event)}
+            data-testid="import-env-file"
+          />
+          <Button type="button" variant="outline" size="sm" onClick={() => fileInput.current?.click()} data-testid="import-env-choose">
+            <FolderOpen />
+            Choose file…
+          </Button>
+        </div>
         <SecretTextarea
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder={EXAMPLE}
           rows={10}
+          aria-label=".env contents"
           className="max-h-[50vh] font-mono text-sm"
           data-testid="import-env-text"
         />
@@ -91,6 +124,19 @@ export function ImportEnvDialog({
             </>
           )}
         </div>
+        {parsed.duplicates.length > 0 && (
+          <div className="space-y-1 rounded-lg border bg-muted/40 p-3 text-sm" data-testid="import-env-duplicates">
+            <div className="flex items-center gap-2 font-medium">
+              <Info className="size-4 text-muted-foreground" />
+              Some keys are set more than once
+            </div>
+            <ul className="space-y-0.5 text-muted-foreground">
+              {parsed.duplicates.slice(0, 6).map((duplicate) => (
+                <li key={duplicate.key}>{duplicateText(duplicate)}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         {parsed.issues.length > 0 && (
           <div className="space-y-1 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm" data-testid="import-env-issues">
             <div className="flex items-center gap-2 font-medium">

@@ -106,11 +106,21 @@ pub struct PendingCliLogin {
     pub code_hint: Option<String>,
     /// The client address that started the login, as the server saw it.
     pub requested_from_ip: String,
+    /// Reported by the requester, so it can be faked.
     pub user_agent: String,
+    /// Whether the requester's address matches the address of the browser asking. Behind shared
+    /// NAT this can be true for someone else, and a VPN can make it false for the same person.
+    pub same_address: bool,
     /// Unix seconds.
     pub created_at: i64,
     /// Unix seconds.
     pub expires_at: i64,
+}
+
+/// A CLI login to refuse; the code is typed or carried from the approval page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CliDenyRequest {
+    pub code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -733,6 +743,11 @@ pub struct ChangePassphrase {
     pub current: Zeroizing<String>,
     #[schema(value_type = String)]
     pub new: Zeroizing<String>,
+    /// Re-encrypt what can be read and leave values, project keys or stored credentials that no
+    /// longer decrypt as they are, auditing each. Without it, the change is refused and the error
+    /// lists them.
+    #[serde(default)]
+    pub skip_unreadable: bool,
 }
 
 impl std::fmt::Debug for ChangePassphrase {

@@ -11,7 +11,7 @@ use sekret_api::{
 };
 use sekret_client::SekretApi;
 
-use crate::prompt::{Prompter, read_new_passphrase, read_passphrase, read_stdin_line, read_text_file};
+use crate::prompt::{Prompter, read_new_passphrase_for_api, read_passphrase_for_api, read_stdin_line, read_text_file};
 
 #[derive(Debug, Subcommand)]
 pub enum SysCommand {
@@ -63,6 +63,10 @@ pub enum SysCommand {
         /// The new passphrase, from this file.
         #[arg(long)]
         new_passphrase_file: Option<PathBuf>,
+        /// Leave values, project keys and stored credentials that no longer decrypt as they are,
+        /// and audit them, instead of refusing the change.
+        #[arg(long)]
+        skip_unreadable: bool,
     },
     /// Choose how the server unlocks after a restart: manual, remember or passphrase-file.
     /// remember and passphrase-file ask for the current passphrase.
@@ -169,7 +173,7 @@ pub fn describe(status: &SysStatus) -> String {
     if status.state == SealState::Uninitialised && !status.web_setup {
         text.push_str("setup: run `sekret admin init` on the server host\n");
     }
-    text.push_str(&format!("version: {}\n", status.version));
+    text.push_str(&format!("version: {}\n", super::format::one_line(&status.version)));
     text
 }
 
@@ -219,7 +223,7 @@ pub async fn run(
             let (mode, passphrase, unlock_policy) = if key_file_mode {
                 (SealMode::KeyFile, None, None)
             } else {
-                let passphrase = read_new_passphrase(passphrase_file.as_deref(), prompter)?;
+                let passphrase = read_new_passphrase_for_api(passphrase_file.as_deref(), prompter)?;
                 let policy = match (unlock, &passphrase_file) {
                     (Some(policy), _) => policy,
                     (None, Some(_)) => UnlockPolicy::Manual,
@@ -246,7 +250,7 @@ pub async fn run(
             }
         }
         SysCommand::Unseal { passphrase_file, .. } => {
-            let passphrase = read_passphrase(passphrase_file.as_deref(), "Passphrase: ", prompter)?;
+            let passphrase = read_passphrase_for_api(passphrase_file.as_deref(), "Passphrase: ", prompter)?;
             let status = api.sys_unseal(UnsealRequest { passphrase }).await?;
             write!(out, "{}", describe(&status))?;
         }
@@ -257,10 +261,16 @@ pub async fn run(
         SysCommand::ChangePassphrase {
             passphrase_file,
             new_passphrase_file,
+            skip_unreadable,
         } => {
-            let current = read_passphrase(passphrase_file.as_deref(), "Current passphrase: ", prompter)?;
-            let new = read_new_passphrase(new_passphrase_file.as_deref(), prompter)?;
-            api.sys_change_passphrase(ChangePassphrase { current, new }).await?;
+            let current = read_passphrase_for_api(passphrase_file.as_deref(), "Current passphrase: ", prompter)?;
+            let new = read_new_passphrase_for_api(new_passphrase_file.as_deref(), prompter)?;
+            api.sys_change_passphrase(ChangePassphrase {
+                current,
+                new,
+                skip_unreadable,
+            })
+            .await?;
             writeln!(out, "passphrase changed")?;
         }
         SysCommand::UnlockPolicy {
@@ -269,7 +279,7 @@ pub async fn run(
         } => {
             let passphrase = match policy {
                 UnlockPolicy::Manual => None,
-                UnlockPolicy::Remember | UnlockPolicy::PassphraseFile => Some(read_passphrase(
+                UnlockPolicy::Remember | UnlockPolicy::PassphraseFile => Some(read_passphrase_for_api(
                     passphrase_file.as_deref(),
                     "Current passphrase: ",
                     prompter,
@@ -541,8 +551,9 @@ mod tests {
     async fn unseal_sends_the_passphrase() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_sys_unseal()
+            // Sent as read: the server drops the byte order mark and line ending, once.
             .with(function(|r: &UnsealRequest| {
-                r.passphrase.as_str() == "violet tractor sings beneath"
+                r.passphrase.as_str() == "\u{feff}violet tractor sings beneath\r\n"
             }))
             .times(1)
             .returning(|_| Ok(status(SealState::Unsealed)));
@@ -553,7 +564,6 @@ mod tests {
                 passphrase_file: None,
                 socket: None,
             },
-            // A pasted byte order mark and line ending are not part of the passphrase.
             &Scripted::new(&["\u{feff}violet tractor sings beneath\r\n"]),
             &mut out,
         )

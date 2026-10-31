@@ -1,4 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { flushSync } from "react-dom";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { ApiError, isSealError } from "@/api/client";
 import { ErrorBoundary } from "@/components/error-boundary";
@@ -7,6 +9,8 @@ import { forgetAllButStatus } from "@/hooks/queries";
 import { StatusGate } from "@/components/sys/status-gate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { beginLeaving } from "@/lib/leaving";
+import { forgetWhenHidden } from "@/lib/page-lifecycle";
 import { ThemeProvider } from "@/lib/theme";
 import { CliLoginPage } from "@/pages/cli-login-page";
 import { LoginPage } from "@/pages/login-page";
@@ -74,7 +78,14 @@ function AppRoutes() {
   );
 }
 
+/** Empties the screen and the cache in the same task, before the browser stores the page away. */
+function forgetEverything(): void {
+  flushSync(() => beginLeaving());
+  forgetAllButStatus(queryClient);
+}
+
 export function App() {
+  useEffect(() => forgetWhenHidden(forgetEverything), []);
   return (
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>

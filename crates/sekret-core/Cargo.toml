@@ -11,13 +11,13 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+icu_properties = "2.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 subtle = "2.6.1"
 thiserror = "2.0.21"
 unicode-normalization = "0.1.26"
-unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 utoipa = "6.0.0"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }

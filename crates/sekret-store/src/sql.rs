@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use sekret_core::seal::{KdfParams, SealMode, UnlockPolicy, WrappedRootKey};
+use sekret_core::seal::{KdfParams, SealFlags, SealMode, UnlockPolicy, WrappedRootKey};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Connection, Row};
 
@@ -375,7 +375,10 @@ fn seal_config_from(row: &AnyRow) -> StoreResult<SealConfig> {
         (None, None, None) => None,
         _ => return Err(StoreError::Corrupt("partial wrapped root key".into())),
     };
+    let bits: i64 = row.try_get("flags")?;
+    let flags = SealFlags::from_bits(bits).ok_or_else(|| StoreError::Corrupt(format!("unknown seal flags {bits}")))?;
     Ok(SealConfig {
+        flags,
         mode,
         wrapped,
         unlock_policy,
@@ -408,8 +411,8 @@ fn seal_columns(config: &SealConfig) -> StoreResult<SealColumns> {
 }
 
 const UPDATE_SEAL: &str = "UPDATE seal_config SET mode = $1, wrapped_root_key = $2, kdf_salt = $3, kdf_params = $4, \
-                           unlock_policy = $5, remembered_root_key = $6, updated_at = $7, epoch = $8, config_mac = $9 \
-                           WHERE id = 1";
+                           unlock_policy = $5, remembered_root_key = $6, updated_at = $7, epoch = $8, config_mac = $9, \
+                           flags = $10 WHERE id = 1";
 
 fn update_seal(config: &SealConfig) -> StoreResult<sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments>> {
     let columns = seal_columns(config)?;
@@ -422,7 +425,8 @@ fn update_seal(config: &SealConfig) -> StoreResult<sqlx::query::Query<'static, s
         .bind(config.remembered.clone())
         .bind(config.updated_at)
         .bind(config.epoch)
-        .bind(config.mac.clone()))
+        .bind(config.mac.clone())
+        .bind(config.flags.bits()))
 }
 
 fn collect<T>(rows: Vec<AnyRow>, map: fn(&AnyRow) -> StoreResult<T>) -> StoreResult<Vec<T>> {
@@ -506,17 +510,90 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// How [`SqlStore::open`] treats the database it is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Open {
+    /// Creates a SQLite file when the URL says `mode=rwc`, and applies migrations.
+    Create,
+    /// Only an existing database, with migrations applied. For commands that hold the instance lock.
+    Migrate,
+    /// Only an existing database already at this binary's schema, changed in no way. For commands
+    /// that run beside a live server, which a migration could break.
+    Exact,
+}
+
+fn migrator(postgres: bool) -> sqlx::migrate::Migrator {
+    if postgres {
+        sqlx::migrate!("./migrations/postgres")
+    } else {
+        sqlx::migrate!("./migrations/sqlite")
+    }
+}
+
+/// The URL with SQLite's `mode=rwc` turned into `mode=rw`, so opening never creates a file.
+pub fn without_create(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let params: Vec<&str> = query
+        .split('&')
+        .map(|param| if param == "mode=rwc" { "mode=rw" } else { param })
+        .collect();
+    format!("{base}?{}", params.join("&"))
+}
+
+/// Refuses a database whose applied migrations differ from the ones this binary carries.
+async fn check_schema(pool: &AnyPool, postgres: bool) -> StoreResult<()> {
+    let expected: Vec<i64> = migrator(postgres).iter().map(|m| m.version).collect();
+    let rows = sqlx::query("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .map_err(|_| StoreError::Unsupported("this is not a sekret database, or it was never started".into()))?;
+    let applied = rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("version"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if applied == expected {
+        return Ok(());
+    }
+    let shown = |versions: &[i64]| versions.last().map_or_else(|| "none".to_string(), i64::to_string);
+    Err(StoreError::Unsupported(format!(
+        "the database schema is at migration {} but this sekret {} expects {}; run the command with the \
+         sekret version the server runs, or upgrade the server first",
+        shown(&applied),
+        sekret_core::VERSION,
+        shown(&expected)
+    )))
+}
+
 impl SqlStore {
     /// Connects and applies migrations. Accepts `sqlite://...`, `sqlite::memory:` or `postgres://...`.
     pub async fn connect(url: &str) -> StoreResult<Self> {
+        Self::open(url, Open::Create).await
+    }
+
+    pub async fn open(url: &str, how: Open) -> StoreResult<Self> {
         sqlx::any::install_default_drivers();
         let postgres = url.starts_with("postgres");
         let in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let file = if postgres { None } else { sqlite_file(url) };
-        if let Some(path) = &file
-            && url.contains("mode=rwc")
-        {
-            prepare_sqlite_file(path).map_err(|e| StoreError::Database(format!("{}: {e}", path.display())))?;
+        let url = match how {
+            Open::Create => url.to_string(),
+            Open::Migrate | Open::Exact => without_create(url),
+        };
+        let url = url.as_str();
+        if let Some(path) = &file {
+            match how {
+                Open::Create if url.contains("mode=rwc") => {
+                    prepare_sqlite_file(path).map_err(|e| StoreError::Database(format!("{}: {e}", path.display())))?
+                }
+                Open::Create => {}
+                Open::Migrate | Open::Exact => {
+                    if std::fs::symlink_metadata(path).is_err() {
+                        return Err(StoreError::Database(format!("{}: no database there", path.display())));
+                    }
+                }
+            }
         }
         // An in-memory SQLite database exists per connection, so it must not be pooled.
         let max = if in_memory {
@@ -543,15 +620,15 @@ impl SqlStore {
             })
             .connect(url)
             .await?;
-        let before = custom_backup_reader_roles(&pool).await;
-        if postgres {
-            sqlx::migrate!("./migrations/postgres").run(&pool).await?;
-        } else {
-            if !in_memory {
-                sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
-            }
-            sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
+        if how == Open::Exact {
+            check_schema(&pool, postgres).await?;
+            return Ok(Self { pool, postgres });
         }
+        let before = custom_backup_reader_roles(&pool).await;
+        if !postgres && !in_memory {
+            sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+        }
+        migrator(postgres).run(&pool).await?;
         let store = Self { pool, postgres };
         // Migration 0006 renames it when backup-reader-custom is free; this covers the rest.
         if let Some(slug) = store.rename_custom_role("backup-reader").await? {
@@ -675,8 +752,8 @@ impl Store for SqlStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO seal_config (id, mode, wrapped_root_key, kdf_salt, kdf_params, unlock_policy, \
-             remembered_root_key, created_at, updated_at, epoch, config_mac) \
-             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             remembered_root_key, created_at, updated_at, epoch, config_mac, flags) \
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(columns.mode)
         .bind(columns.ciphertext)
@@ -688,6 +765,7 @@ impl Store for SqlStore {
         .bind(config.updated_at)
         .bind(config.epoch)
         .bind(config.mac)
+        .bind(config.flags.bits())
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -1932,6 +2010,18 @@ impl Store for SqlStore {
              AND approved_user_id IS NULL AND consumed = 0",
         )
         .bind(user_id)
+        .bind(user_code)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn deny_cli_login(&self, user_code: &str, now: i64) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE cli_logins SET consumed = 1 WHERE user_code = $1 AND expires_at > $2 \
+             AND approved_user_id IS NULL AND consumed = 0",
+        )
         .bind(user_code)
         .bind(now)
         .execute(&self.pool)

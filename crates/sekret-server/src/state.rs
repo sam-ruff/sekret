@@ -22,13 +22,22 @@ pub struct Inner {
     /// Setup, unlock and passphrase attempts, kept apart from sign-in so exhausting one cannot
     /// lock anyone out of the other.
     pub sys_limiter: RateLimiter<IpAddr>,
-    /// Wrong passphrases from anywhere slow every later attempt down.
+    /// Wrong passphrases slow later attempts from the same source down.
     pub passphrase_backoff: FailureBackoff,
-    /// One backup at a time.
-    pub backup_lock: tokio::sync::Mutex<()>,
+    /// Passphrase attempts, right or wrong, per IPv4 /24 or IPv6 /48.
+    pub passphrase_attempts: RateLimiter<IpAddr>,
+    /// Places in line for a key derivation, for network sources with no recent failures.
+    pub kdf_queue: Arc<tokio::sync::Semaphore>,
+    /// One backup at a time. Owned guards let a backup keep it after its client goes away.
+    pub backup_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Folds repeated refusals into one audit entry a minute per caller and source.
+    pub refusals: crate::ratelimit::AuditThrottle,
 }
 
 pub type AppState = Arc<Inner>;
+
+/// Network unlock attempts that may wait in line for a key derivation at once.
+pub const KDF_QUEUE_DEPTH: usize = 8;
 
 pub struct Dependencies {
     pub store: Arc<dyn Store>,
@@ -43,6 +52,7 @@ pub fn build_state(deps: Dependencies) -> AppState {
     let jwt = JwtVerifier::new(deps.http.clone(), deps.clock.clone());
     let login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let sys_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
+    let passphrase_attempts = RateLimiter::new(deps.config.login_rate_per_minute);
     Arc::new(Inner {
         store: deps.store,
         keyring: deps.keyring,
@@ -54,6 +64,9 @@ pub fn build_state(deps: Dependencies) -> AppState {
         login_limiter,
         sys_limiter,
         passphrase_backoff: FailureBackoff::default(),
-        backup_lock: tokio::sync::Mutex::new(()),
+        passphrase_attempts,
+        kdf_queue: Arc::new(tokio::sync::Semaphore::new(KDF_QUEUE_DEPTH)),
+        backup_lock: Arc::new(tokio::sync::Mutex::new(())),
+        refusals: crate::ratelimit::AuditThrottle::default(),
     })
 }

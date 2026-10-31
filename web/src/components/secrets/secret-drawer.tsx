@@ -12,8 +12,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useSealWatch } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
 import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
+import { folderLabel } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { PolicySection } from "./policy-section";
 
@@ -205,6 +207,7 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
     gcTime: SECRET_VALUE_GC_TIME,
   });
   useSealWatch(showValues);
+  useIdle(showValues, () => setValuesFor(null));
 
   const close = () => {
     setValuesFor(null);
@@ -223,17 +226,17 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
 
   return (
     <Sheet open={secretKey !== null} onOpenChange={(open) => !open && close()}>
-      <SheetContent className="w-full gap-0 sm:max-w-xl" data-testid="secret-drawer">
-        <SheetHeader className="border-b">
-          <SheetTitle className="flex items-center gap-2 font-mono">
+      <SheetContent className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl" data-testid="secret-drawer">
+        <SheetHeader className="border-b pr-12">
+          <SheetTitle className="flex min-w-0 items-center gap-2 font-mono">
             <History className="size-4 shrink-0 text-muted-foreground" />
             <span className="truncate">{secretKey}</span>
           </SheetTitle>
-          <SheetDescription>
-            {envName} · <span className="font-mono">{path}</span>
+          <SheetDescription data-testid="secret-drawer-where">
+            {envName} · <span className="font-mono break-all">{folderLabel(path)}</span>
           </SheetDescription>
         </SheetHeader>
-        <ScrollArea className="min-h-0 flex-1">
+        <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
             {secretKey && (
               <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />

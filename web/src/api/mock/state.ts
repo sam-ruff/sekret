@@ -92,6 +92,10 @@ export interface MockState {
   signedOut: boolean;
   /** Signed in again just now, which approving a CLI login can ask for. */
   freshSignIn?: boolean;
+  /** Where signing out continues, as a server with an identity provider's logout endpoint answers. */
+  idpLogoutUrl?: string;
+  /** CLI login codes already approved or denied. */
+  endedCliCodes?: string[];
   seq: number;
   me: Me;
   users: User[];

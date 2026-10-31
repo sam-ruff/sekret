@@ -16,7 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { SecretInput } from "@/components/secret-field";
+import { PassphraseInput } from "@/components/secret-field";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { keys, useApiMutation, useSysStatus } from "@/hooks/queries";
@@ -43,19 +43,21 @@ export function ServerPage() {
   });
   const status = admin ? detail : publicStatus;
 
+  if (org.ready && !admin && !canBackup) {
+    return (
+      <div className="space-y-6">
+        <PageHeader title="Server" />
+        <div className="max-w-3xl">
+          <ErrorState error={NO_ACCESS} />
+        </div>
+      </div>
+    );
+  }
   const header = admin ? (
     <PageHeader title="Server" description="Locking, unlocking and backups for this sekret server." />
   ) : (
     <PageHeader title="Server" description="See whether this sekret server is unlocked and download encrypted backups." />
   );
-  if (org.ready && !admin && !canBackup) {
-    return (
-      <div className="space-y-6">
-        {header}
-        <ErrorState error={NO_ACCESS} />
-      </div>
-    );
-  }
   if (org.ready && status.error && !status.data) {
     return (
       <div className="space-y-6">
@@ -78,7 +80,7 @@ export function ServerPage() {
     <div className="space-y-6">
       {header}
       <div className="grid max-w-3xl gap-6">
-        <StatusCard status={status.data} canLock={admin && passphraseMode} />
+        <StatusCard status={status.data} admin={admin} canLock={admin && passphraseMode} />
         {admin && passphraseMode && <UnlockPolicyCard key={status.data.unlock_policy ?? ""} status={status.data} />}
         {admin && passphraseMode && <ChangePassphraseCard />}
         {canBackup && <BackupCard mode={status.data.seal_mode ?? null} />}
@@ -96,7 +98,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }) {
+function StatusCard({ status, admin, canLock }: { status: SysStatus; admin: boolean; canLock: boolean }) {
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
 
@@ -114,7 +116,9 @@ function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }
     <Card data-testid="server-status">
       <CardHeader>
         <CardTitle>Status</CardTitle>
-        <CardDescription>How this server keeps its root key.</CardDescription>
+        <CardDescription data-testid="server-status-help">
+          {admin ? "How this server keeps its root key." : "Whether the server is unlocked."}
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <dl className="divide-y">
@@ -178,7 +182,9 @@ function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }
         open={confirming}
         onOpenChange={setConfirming}
         title="Lock the server now?"
-        description="Applications and people get errors until someone unlocks it with the passphrase. You will go to the unlock page. A remembered unlock still unlocks it after a restart."
+        description={`Applications and people get errors until someone unlocks it with the passphrase. You will go to the unlock page.${
+          status.remembered ? " A remembered unlock still unlocks it after a restart." : ""
+        }`}
         confirmLabel="Lock now"
         destructive
         onConfirm={() => seal.mutateAsync()}
@@ -315,37 +321,25 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
         onConfirm={confirmSave}
         testId="policy-dialog"
       >
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void confirmSave().then(
-              () => setConfirming(false),
-              () => undefined,
-            );
-          }}
-          noValidate
-        >
-          <PassphraseAccountField />
-          <Field data-invalid={!!fieldError}>
-            <FieldLabel htmlFor="policy-passphrase">Current passphrase</FieldLabel>
-            <SecretInput
-              id="policy-passphrase"
-              type="password"
-              autoComplete="current-password"
-              autoFocus
-              value={passphrase}
-              aria-invalid={!!fieldError}
-              aria-describedby={fieldError ? "policy-passphrase-error" : undefined}
-              onChange={(e) => setPassphrase(e.target.value)}
-              data-testid="policy-passphrase"
-            />
-            {fieldError && (
-              <FieldError id="policy-passphrase-error" data-testid="policy-passphrase-error">
-                {fieldError}
-              </FieldError>
-            )}
-          </Field>
-        </form>
+        <PassphraseAccountField />
+        <Field data-invalid={!!fieldError}>
+          <FieldLabel htmlFor="policy-passphrase">Current passphrase</FieldLabel>
+          <PassphraseInput
+            id="policy-passphrase"
+            autoComplete="current-password"
+            autoFocus
+            value={passphrase}
+            aria-invalid={!!fieldError}
+            aria-describedby={fieldError ? "policy-passphrase-error" : undefined}
+            onChange={(e) => setPassphrase(e.target.value)}
+            data-testid="policy-passphrase"
+          />
+          {fieldError && (
+            <FieldError id="policy-passphrase-error" data-testid="policy-passphrase-error">
+              {fieldError}
+            </FieldError>
+          )}
+        </Field>
       </ConfirmDialog>
       <ConfirmDialog
         open={forgetting}
@@ -394,20 +388,25 @@ function ChangePassphraseCard() {
   const blocker = current === "" ? "Enter the current passphrase to continue." : problem ? problemText(problem) : null;
   const ready = !blocker && !change.isPending;
 
+  const [confirming, setConfirming] = useState(false);
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (ready) change.mutate();
+    if (ready) setConfirming(true);
   };
 
   return (
     <Card data-testid="server-passphrase">
       <CardHeader>
         <CardTitle>Change passphrase</CardTitle>
-        <CardDescription data-testid="change-passphrase-help">
-          Changing the passphrase also replaces the root key and re-encrypts every secret, so the old passphrase stops
-          working on this server. Backups made before the change still open with the old passphrase and hold the secrets
-          as they were then. A remembered unlock is forgotten, so the next restart needs the new passphrase. If the
-          server reads its passphrase from a file, update that file too.
+        <CardDescription className="space-y-2" data-testid="change-passphrase-help">
+          <p className="font-medium text-foreground">
+            Every secret is re-encrypted. Backups made before this still need the old passphrase.
+          </p>
+          <ul className="list-disc space-y-0.5 pl-5">
+            <li>The old passphrase stops working on this server.</li>
+            <li>A remembered unlock is forgotten, so the next restart needs the new passphrase.</li>
+            <li>If the server reads its passphrase from a file, update that file too.</li>
+          </ul>
         </CardDescription>
       </CardHeader>
       <form onSubmit={submit} noValidate>
@@ -416,9 +415,8 @@ function ChangePassphraseCard() {
             <PassphraseAccountField />
             <Field data-invalid={!!wrong}>
               <FieldLabel htmlFor="current-passphrase">Current passphrase</FieldLabel>
-              <SecretInput
+              <PassphraseInput
                 id="current-passphrase"
-                type="password"
                 autoComplete="current-password"
                 value={current}
                 aria-invalid={!!wrong}
@@ -476,6 +474,17 @@ function ChangePassphraseCard() {
           )}
         </CardFooter>
       </form>
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        title="Change the passphrase now?"
+        description="Every secret is re-encrypted. Backups made before this still need the old passphrase, so keep it with them."
+        confirmLabel="Change passphrase"
+        onConfirm={async () => {
+          if (ready) change.mutate();
+        }}
+        testId="change-passphrase-dialog"
+      />
     </Card>
   );
 }

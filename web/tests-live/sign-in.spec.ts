@@ -16,6 +16,24 @@ test.describe("without a session", () => {
     await page.getByTestId("user-menu").click();
     await expect(page.getByTestId("logout")).toBeVisible();
   });
+
+  test("signing out reaches Keycloak's logout, with no stop at the login page on the way", async ({ page }) => {
+    await signInThroughKeycloak(page, "/projects");
+    await expect(page.getByTestId("page-title")).toHaveText("Projects");
+    await page.getByTestId("user-menu").click();
+    const visited: string[] = [];
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) visited.push(new URL(frame.url()).pathname);
+    });
+    await page.getByTestId("logout").click();
+    await page.waitForURL((url) => url.pathname.endsWith("/protocol/openid-connect/logout"), { timeout: 30_000 });
+    expect(visited.find((path) => path !== "/projects")).toMatch(/\/protocol\/openid-connect\/logout$/);
+    expect(visited).not.toContain("/login");
+
+    // The sekret session is gone too.
+    await page.goto("/org/identities");
+    await expect(page).toHaveURL(/\/login\?return_to=%2Forg%2Fidentities/);
+  });
 });
 
 test("the saved session reaches the API", async ({ page }) => {

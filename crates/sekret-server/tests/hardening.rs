@@ -188,6 +188,24 @@ async fn writes_stop_when_the_database_has_another_root_key(db: String) -> anyho
     );
     let (code, _) = h.get("/api/v1/projects", &h.admin).await?;
     assert_eq!(code, StatusCode::OK, "reading still works");
+    // System changes are refused too; sealing still works.
+    for (path, body) in [
+        ("/api/v1/sys/forget-unlock", json!({})),
+        ("/api/v1/sys/backup", json!({})),
+        (
+            "/api/v1/sys/passphrase",
+            json!({"current": "violet tractor sings beneath", "new": "copper lantern drifts westward"}),
+        ),
+    ] {
+        let (code, body) = h.post(path, &h.admin, body).await?;
+        assert_eq!(
+            (code, body["error"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("root_key_changed")),
+            "{path}"
+        );
+    }
+    let (_, body) = h.post("/api/v1/sys/seal", &h.admin, json!({})).await?;
+    assert_ne!(body["error"], json!("root_key_changed"), "sealing is never held back");
     Ok(())
 }
 

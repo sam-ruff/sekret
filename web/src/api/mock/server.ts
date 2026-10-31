@@ -6,6 +6,7 @@ import type {
   BatchWrite,
   ChangePassphrase,
   CliApproveRequest,
+  CliDenyRequest,
   CreateClientSecret,
   CreateEnvironment,
   CreateIdentity,
@@ -216,6 +217,7 @@ route("GET", "/api/v1/sys/backup", () => {
 route("GET", "/api/v1/auth/config", () => ({ oidc_enabled: true, login_url: "/auth/login" }));
 route("GET", "/api/v1/auth/cli/pending", (b, c) => b.pendingCli(qs(c, "code", "")));
 route("POST", "/api/v1/auth/cli/approve", (b, c) => b.approveCli(body<CliApproveRequest>(c).code), 204);
+route("POST", "/api/v1/auth/cli/deny", (b, c) => b.denyCli(body<CliDenyRequest>(c).code), 204);
 route("POST", "/auth/logout", (b) => b.logout());
 route("GET", "/api/v1/me", (b) => b.me());
 
@@ -313,6 +315,7 @@ const OPEN_WHILE_SEALED = new Set([
   "/api/v1/sys/init",
   "/api/v1/sys/unseal",
   "/api/v1/sys/passphrase-strength",
+  "/auth/logout",
 ]);
 const PUBLIC = new Set(["/api/v1/auth/config", ...OPEN_WHILE_SEALED]);
 

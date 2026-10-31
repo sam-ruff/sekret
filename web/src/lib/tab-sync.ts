@@ -1,8 +1,14 @@
+/** Someone signed in, possibly as a different person than the other tabs show. */
+export interface SignedIn {
+  kind: "signed-in";
+  user: string;
+}
+
 /** What one tab tells the others so they drop secrets they still hold. */
-export type TabMessage = "signed-out" | "sealed";
+export type TabMessage = "signed-out" | "sealed" | SignedIn;
 
 const CHANNEL = "sekret-tabs";
-const MESSAGES: readonly TabMessage[] = ["signed-out", "sealed"];
+const PLAIN_MESSAGES: readonly string[] = ["signed-out", "sealed"];
 
 export interface TabChannel {
   postMessage: (message: unknown) => void;
@@ -11,8 +17,15 @@ export interface TabChannel {
   close: () => void;
 }
 
+function isSignedIn(value: unknown): value is SignedIn {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<SignedIn>;
+  return candidate.kind === "signed-in" && typeof candidate.user === "string" && candidate.user !== "";
+}
+
 function isTabMessage(value: unknown): value is TabMessage {
-  return typeof value === "string" && (MESSAGES as readonly string[]).includes(value);
+  if (typeof value === "string") return PLAIN_MESSAGES.includes(value);
+  return isSignedIn(value);
 }
 
 function openChannel(): TabChannel | null {

@@ -16,6 +16,10 @@ export const MOCK_REAUTH_CODE_PREFIX = "AUTH";
 /** Where every pending CLI login in the fake says it came from. */
 export const MOCK_CLI_ADDRESS = "203.0.113.24";
 export const MOCK_CLI_USER_AGENT = "sekret/0.0.0-mock (linux; x86_64)";
+/** CLI login codes starting with this say they came from the approving browser's own address. */
+export const MOCK_SAME_ADDRESS_CODE_PREFIX = "SAME";
+/** The identity provider's logout page, with `?mock-idp-logout`. */
+export const MOCK_IDP_LOGOUT_URL = "https://idp.example.test/logout";
 
 export function mockSys(state: SealState = "unsealed"): MockSys {
   const initialised = state !== "uninitialised";

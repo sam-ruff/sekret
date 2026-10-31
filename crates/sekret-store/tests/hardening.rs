@@ -173,6 +173,113 @@ async fn only_one_process_holds_a_database_at_a_time() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The demonstrated attack reached a locked database through a symlink, whose `.lock` sidecar
+/// was a different file. Every name for the database now meets the same lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_lock_follows_the_database_through_symlinks_and_hard_links() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let held = InstanceLock::acquire(&url(dir.path())).await.context("first")?;
+    assert!(
+        dir.path().join("sekret.db").exists(),
+        "the lock creates the file it locks"
+    );
+    let other = tempfile::tempdir().context("other")?;
+    std::os::unix::fs::symlink(dir.path().join("sekret.db"), other.path().join("link.db")).context("symlink")?;
+    std::os::unix::fs::symlink(dir.path(), other.path().join("linked-dir")).context("dir symlink")?;
+    std::fs::hard_link(dir.path().join("sekret.db"), dir.path().join("hard.db")).context("hard link")?;
+    for name in [
+        other.path().join("link.db"),
+        other.path().join("linked-dir").join("sekret.db"),
+        dir.path().join("hard.db"),
+    ] {
+        let refused = InstanceLock::acquire(&format!("sqlite://{}?mode=rw", name.display())).await;
+        assert!(
+            refused.as_ref().is_err_and(InstanceLock::is_held_error),
+            "{}: {refused:?}",
+            name.display()
+        );
+    }
+    drop(held);
+    InstanceLock::acquire(&format!("sqlite://{}", other.path().join("link.db").display()))
+        .await
+        .context("free once released")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_waiting_lock_is_taken_once_released_or_refused_after_the_wait() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let database = url(dir.path());
+    let held = InstanceLock::acquire(&database).await.context("first")?;
+    let started = std::time::Instant::now();
+    let refused = InstanceLock::acquire_within(&database, std::time::Duration::from_secs(1)).await;
+    assert!(refused.as_ref().is_err_and(InstanceLock::is_held_error), "{refused:?}");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    let release = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        drop(held);
+    };
+    let (taken, ()) = tokio::join!(
+        InstanceLock::acquire_within(&database, std::time::Duration::from_secs(10)),
+        release
+    );
+    let mut taken = taken.context("taken after release")?;
+    taken.check().await.context("still held")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_replaced_database_file_counts_as_a_lost_lock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let mut held = InstanceLock::acquire(&url(dir.path())).await.context("lock")?;
+    held.check().await.context("held")?;
+    std::fs::rename(dir.path().join("sekret.db"), dir.path().join("moved.db")).context("move")?;
+    std::fs::write(dir.path().join("sekret.db"), b"").context("replace")?;
+    assert!(held.check().await.is_err());
+    Ok(())
+}
+
+/// The demonstrated attack: a newer `admin bootstrap` migrated the database of an older server
+/// still running on it. Opening for commands that run beside a server never migrates.
+#[tokio::test]
+async fn an_exact_open_refuses_another_schema_and_changes_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let store = SqlStore::connect(&url(dir.path())).await.context("create")?;
+    drop(store);
+    SqlStore::open(&url(dir.path()), Open::Exact)
+        .await
+        .context("the current schema opens")?;
+    {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("sekret.db"))
+            .connect()
+            .await
+            .context("raw")?;
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)")
+            .execute(&mut conn)
+            .await
+            .context("rewind")?;
+    }
+    let refused = SqlStore::open(&url(dir.path()), Open::Exact).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Unsupported(message)) if message.contains("schema")),
+        "{:?}",
+        refused.err()
+    );
+    let refused = SqlStore::open(&url(dir.path()), Open::Exact).await;
+    assert!(refused.is_err(), "still behind: nothing was migrated");
+
+    let missing = format!("sqlite://{}?mode=rwc", dir.path().join("missing.db").display());
+    for how in [Open::Exact, Open::Migrate] {
+        assert!(SqlStore::open(&missing, how).await.is_err(), "{how:?}");
+        assert!(!dir.path().join("missing.db").exists(), "{how:?} created nothing");
+    }
+    Ok(())
+}
+
 /// Before the fix, a custom role at the built-in slug stayed there when `backup-reader-custom`
 /// was already taken, silently shadowed by the built-in role.
 #[tokio::test]

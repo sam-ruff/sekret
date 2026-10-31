@@ -11,10 +11,10 @@ export interface IdentityDraft {
 export function ttlProblem(draft: IdentityDraft): string | undefined {
   const ttl = Number(draft.tokenTtl);
   const max = Number(draft.tokenMaxTtl);
-  if (!Number.isInteger(ttl) || !Number.isInteger(max)) return "TTLs are whole numbers of seconds";
-  if (ttl < 60) return "Token TTL must be at least 60 seconds";
-  if (max < ttl) return "Max TTL cannot be shorter than the token TTL";
-  if (max > 365 * 24 * 3600) return "Max TTL can be at most a year";
+  if (!Number.isInteger(ttl) || !Number.isInteger(max)) return "Lifetimes are whole numbers of seconds";
+  if (ttl < 60) return "The token lifetime must be at least 60 seconds";
+  if (max < ttl) return "The longest renewed lifetime cannot be shorter than the token lifetime";
+  if (max > 365 * 24 * 3600) return "The longest renewed lifetime can be at most a year";
   return undefined;
 }
 

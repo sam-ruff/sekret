@@ -77,35 +77,48 @@ pub struct ClientIp(pub IpAddr);
 /// CIDRs match it, and every such client shares one rate-limit bucket.
 pub const UNKNOWN_CLIENT: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 
+/// One `X-Forwarded-For` entry: an address, optionally with a port as `ip:port` or `[v6]:port`.
 fn forwarded_entry(bytes: &[u8]) -> Option<IpAddr> {
     if !bytes.is_ascii() {
         return None;
     }
-    std::str::from_utf8(bytes).ok()?.trim().parse().ok()
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if let Ok(ip) = text.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(socket) = text.parse::<SocketAddr>() {
+        return Some(socket.ip());
+    }
+    text.strip_prefix('[')?.strip_suffix(']')?.parse().ok()
 }
 
 /// Resolves the client address, trusting `X-Forwarded-For` only from configured proxies.
 ///
-/// Every header line counts, read right to left. Trusted proxies are skipped; the first
-/// untrusted address is the client. Any entry, on any line, that is not a plain ASCII address
-/// makes the client [`UNKNOWN_CLIENT`], never the trusted peer, so a garbled value can neither
-/// borrow the proxy's address nor hide a spoofed one.
+/// Every header line counts, read right to left, which is the order the proxies appended them.
+/// Trusted proxies are skipped; the first untrusted address is the client, so whatever the client
+/// wrote further left cannot hide it. Only when an entry that is not an address comes before any
+/// untrusted one is the client [`UNKNOWN_CLIENT`], never the trusted peer, so a garbled value
+/// can neither borrow the proxy's address nor stand for a spoofed one.
 pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
     let peer = peer.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|net| net.contains(ip));
     if !is_trusted(&peer) {
         return peer;
     }
-    let entries: Option<Vec<IpAddr>> = headers
+    let lines: Vec<&[u8]> = headers
         .get_all("x-forwarded-for")
         .iter()
-        .flat_map(|value| value.as_bytes().split(|b| *b == b','))
-        .map(|entry| forwarded_entry(entry).map(|ip| ip.to_canonical()))
+        .map(|value| value.as_bytes())
         .collect();
-    let Some(entries) = entries else {
-        return UNKNOWN_CLIENT;
-    };
-    entries.into_iter().rev().find(|ip| !is_trusted(ip)).unwrap_or(peer)
+    for entry in lines.iter().rev().flat_map(|line| line.split(|b| *b == b',').rev()) {
+        let Some(ip) = forwarded_entry(entry).map(|ip| ip.to_canonical()) else {
+            return UNKNOWN_CLIENT;
+        };
+        if !is_trusted(&ip) {
+            return ip;
+        }
+    }
+    peer
 }
 
 /// Addresses in this range are private, loopback or link-local.
@@ -427,9 +440,13 @@ mod tests {
         let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
         let peer: IpAddr = "10.0.0.2".parse().context("ip")?;
         let raw = |bytes: &[u8]| HeaderValue::from_bytes(bytes).context("header");
+        // Garbage the client wrote to the left of what the proxy appended does not hide the client.
         let mut one_line = HeaderMap::new();
         one_line.append("x-forwarded-for", raw(b"\x80, 203.0.113.9")?);
-        assert_eq!(client_ip(peer, &one_line, &[proxy]), UNKNOWN_CLIENT);
+        assert_eq!(
+            client_ip(peer, &one_line, &[proxy]),
+            "203.0.113.9".parse::<IpAddr>().context("ip")?
+        );
         let mut leading = HeaderMap::new();
         leading.append("x-forwarded-for", raw(b"203.0.113.9, \x80")?);
         assert_eq!(client_ip(peer, &leading, &[proxy]), UNKNOWN_CLIENT);
@@ -442,6 +459,30 @@ mod tests {
         assert!(!ip_allowed(&cidrs, client_ip(peer, &two_lines, &[proxy])));
         assert!(!ip_allowed(&["::/0".into(), "0.0.0.0/0".into()], UNKNOWN_CLIENT));
         assert!(ip_allowed(&[], UNKNOWN_CLIENT), "no restriction means everyone");
+        Ok(())
+    }
+
+    #[test]
+    fn a_client_cannot_erase_its_address_with_garbage_or_ports() -> anyhow::Result<()> {
+        let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
+        let peer: IpAddr = "10.0.0.2".parse().context("ip")?;
+        let ip = |s: &str| s.parse::<IpAddr>().context("ip");
+        // The attack: the client sends garbage, and the proxy appends the real address after it.
+        for sent in ["garbage", "", "1.2.3.4, ???", "unknown"] {
+            let h = headers(&[("x-forwarded-for", &format!("{sent}, 203.0.113.9"))])?;
+            assert_eq!(client_ip(peer, &h, &[proxy]), ip("203.0.113.9")?, "{sent:?}");
+            let lines = headers(&[("x-forwarded-for", sent), ("x-forwarded-for", "203.0.113.9")])?;
+            assert_eq!(client_ip(peer, &lines, &[proxy]), ip("203.0.113.9")?, "{sent:?}");
+        }
+        let ported = headers(&[("x-forwarded-for", "203.0.113.9:51234, 10.0.0.5:443")])?;
+        assert_eq!(client_ip(peer, &ported, &[proxy]), ip("203.0.113.9")?);
+        let v6 = headers(&[("x-forwarded-for", "[2001:db8::7]:443")])?;
+        assert_eq!(client_ip(peer, &v6, &[proxy]), ip("2001:db8::7")?);
+        let bracketed = headers(&[("x-forwarded-for", "[2001:db8::7]")])?;
+        assert_eq!(client_ip(peer, &bracketed, &[proxy]), ip("2001:db8::7")?);
+        // Garbage between the proxies and any client address still means unknown.
+        let hidden = headers(&[("x-forwarded-for", "203.0.113.9, junk, 10.0.0.5")])?;
+        assert_eq!(client_ip(peer, &hidden, &[proxy]), UNKNOWN_CLIENT);
         Ok(())
     }
 

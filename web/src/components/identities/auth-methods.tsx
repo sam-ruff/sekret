@@ -83,6 +83,8 @@ export function AuthMethods({ identityId, canEdit }: { identityId: string; canEd
     success: (_, config) => `${LABELS[config.kind]} saved`,
     onSuccess: (_, config) => {
       if (config.kind === "kubernetes") setKubernetesSaves((n) => n + 1);
+      // The finished mutation still holds the reviewer token as its variables.
+      put.reset();
     },
   });
   const remove = useApiMutation({

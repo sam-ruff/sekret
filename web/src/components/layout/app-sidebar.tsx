@@ -142,7 +142,7 @@ export function AppSidebar() {
         { to: `/projects/${project}/secrets`, label: "Secrets", icon: KeyRound, testId: "nav-secrets" },
         { to: `/projects/${project}/overview`, label: "Overview", icon: Layers, testId: "nav-overview" },
         { to: `/projects/${project}/snapshots`, label: "Snapshots", icon: Camera, testId: "nav-snapshots" },
-        { to: `/projects/${project}/audit`, label: "Audit log", icon: ScrollText, testId: "nav-project-audit" },
+        { to: `/projects/${project}/audit`, label: "Project audit log", icon: ScrollText, testId: "nav-project-audit" },
         { to: `/projects/${project}/settings`, label: "Settings", icon: Settings, testId: "nav-settings" },
       ]
     : [];
@@ -159,7 +159,7 @@ export function AppSidebar() {
         ]
       : []),
     ...(org.can("org-audit-log", "read")
-      ? [{ to: "/org/audit", label: "Audit log", icon: ScrollText, testId: "nav-org-audit" }]
+      ? [{ to: "/org/audit", label: "Organisation audit log", icon: ScrollText, testId: "nav-org-audit" }]
       : []),
     ...(orgAdmin || org.can("backups", "read")
       ? [{ to: "/org/server", label: "Server", icon: Server, testId: "nav-server" }]

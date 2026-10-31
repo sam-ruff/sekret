@@ -47,10 +47,33 @@ describe("UnlockPage", () => {
   it("says the server is locked without claiming a restart", () => {
     renderUnlock();
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Unlock sekret");
-    expect(screen.getByTestId("unlock-card")).toHaveTextContent("sekret is locked. Enter the passphrase to decrypt secrets.");
+    expect(screen.getByTestId("unlock-description")).toHaveTextContent(
+      "The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.",
+    );
+    expect(screen.getByTestId("unlock-description")).not.toHaveTextContent("while you were using it");
     expect(screen.getByTestId("unlock-card")).not.toHaveTextContent(/restart/i);
     expect(document.title).toBe("Unlock · sekret");
     expect(screen.getByTestId("passphrase-account")).toHaveAttribute("autocomplete", "username");
+    expect(screen.getByTestId("unlock-sign-out")).toHaveTextContent("Sign out");
+  });
+
+  it("says the server was locked mid-session when there is a page to return to", () => {
+    const client = testQueryClient();
+    client.setQueryData(keys.sysStatus, sealed);
+    renderWithProviders(<UnlockPage />, { client, path: "/unlock?return_to=%2Fprojects" });
+    expect(screen.getByTestId("unlock-description")).toHaveTextContent(
+      "The server was locked while you were using it. The server is locked",
+    );
+  });
+
+  it("shows and hides the passphrase on request", () => {
+    renderUnlock();
+    const field = screen.getByTestId("unlock-passphrase");
+    expect(field).toHaveAttribute("type", "password");
+    fireEvent.click(screen.getByRole("button", { name: "Show passphrase" }));
+    expect(field).toHaveAttribute("type", "text");
+    fireEvent.click(screen.getByRole("button", { name: "Hide passphrase" }));
+    expect(field).toHaveAttribute("type", "password");
   });
 
   it("explains an empty submit instead of disabling the button", () => {
@@ -79,8 +102,12 @@ describe("UnlockPage", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10);
     });
-    expect(screen.getByTestId("unlock-backoff")).toHaveTextContent("Too many wrong passphrases");
+    const alert = screen.getByTestId("unlock-backoff");
+    expect(alert).toHaveTextContent("Too many wrong passphrases");
+    expect(alert).toHaveTextContent("Wait a few seconds, then try again.");
     expect(screen.getByTestId("unlock-countdown")).toHaveTextContent("3");
+    // The ticking number is hidden from screen readers, so the alert is not read out every second.
+    expect(screen.getByTestId("unlock-countdown-text")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByTestId("unlock-submit")).toBeDisabled();
     expect(screen.getByTestId("unlock-submit")).toHaveAttribute("aria-describedby", "unlock-wait");
 
@@ -93,7 +120,11 @@ describe("UnlockPage", () => {
       await vi.advanceTimersByTimeAsync(2_100);
     });
     expect(screen.queryByTestId("unlock-countdown")).toBeNull();
-    expect(screen.getByTestId("unlock-backoff")).toHaveTextContent("You can try again now.");
+    expect(screen.queryByTestId("unlock-backoff")).toBeNull();
+    const over = screen.getByTestId("unlock-backoff-over");
+    expect(over).toHaveTextContent("You can try again now.");
+    expect(over).toHaveAttribute("role", "status");
+    expect(over).toHaveAttribute("aria-live", "polite");
     expect(screen.getByTestId("unlock-submit")).toBeEnabled();
   });
 

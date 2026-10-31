@@ -18,6 +18,7 @@ use sekret_client::{ClientOptions, HttpClient, Location, SekretApi};
 use self::config::{Credentials, Overrides, Resolved, StoredToken};
 use self::format::{ExportFormat, flatten, line_diff, parse_dotenv, render, table};
 use self::login::{GithubActionsTokenSource, IdTokenSource, MachineCredential};
+use crate::prompt::Prompter;
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
@@ -162,6 +163,9 @@ pub struct ExportArgs {
     pub format: ExportFormat,
     #[arg(long)]
     pub recursive: bool,
+    /// Load this blocked name anyway, for dotenv and shell output. Repeatable.
+    #[arg(long = "allow", value_name = "NAME")]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -250,6 +254,9 @@ pub enum EnvCommand {
         shell: shell::Shell,
         #[arg(long)]
         recursive: bool,
+        /// Load this blocked name anyway. Repeatable.
+        #[arg(long = "allow", value_name = "NAME")]
+        allow: Vec<String>,
     },
     /// Print shell code that removes what `env use` loaded.
     Unload {
@@ -264,6 +271,9 @@ pub enum EnvCommand {
 pub struct RunArgs {
     #[arg(long)]
     pub recursive: bool,
+    /// Load this blocked name anyway. Repeatable.
+    #[arg(long = "allow", value_name = "NAME")]
+    pub allow: Vec<String>,
     /// Command to run with the secrets in its environment.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -276,6 +286,16 @@ pub fn now() -> i64 {
         .unwrap_or_default()
 }
 
+/// The saved logins, printing any warning about the file's permissions.
+fn read_credentials(path: &std::path::Path) -> anyhow::Result<Credentials> {
+    let mut warnings = Vec::new();
+    let credentials = config::load_credentials(path, &mut warnings)?;
+    for warning in warnings {
+        eprintln!("sekret: {warning}");
+    }
+    Ok(credentials)
+}
+
 pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
     let cwd = std::env::current_dir()?;
     let mut warnings = Vec::new();
@@ -283,7 +303,7 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
     for warning in warnings {
         eprintln!("sekret: {warning}");
     }
-    let credentials = config::load_credentials(&config::credentials_path()?)?;
+    let credentials = read_credentials(&config::credentials_path()?)?;
     config::resolve(
         Overrides {
             server: args.server.clone(),
@@ -393,17 +413,61 @@ pub async fn machine_credential(
     }))
 }
 
-/// Machine credentials only go to a server named by a flag, `SEKRET_URL` or an earlier login,
-/// never to one that only a project file names.
-pub fn require_confirmed_server(resolved: &Resolved) -> anyhow::Result<()> {
-    if resolved.server_confirmed {
-        return Ok(());
-    }
-    bail!(
+fn unconfirmed(server: &str) -> anyhow::Error {
+    anyhow::anyhow!(
         "{} comes only from {}, so no credential is sent to it; pass --server or set SEKRET_URL to confirm the server",
-        resolved.server,
+        format::one_line(server),
         config::PROJECT_FILE
     )
+}
+
+/// Passphrases, setup codes and tokens only go to a server named by a flag or `SEKRET_URL`, or
+/// one the person confirmed at `sekret login`, never to one that only a project file names.
+pub fn require_confirmed_server(resolved: &Resolved) -> anyhow::Result<()> {
+    if resolved.server_confirmed() {
+        return Ok(());
+    }
+    Err(unconfirmed(&resolved.server))
+}
+
+/// Credentials from flags or the environment only go to a server named the same way: a saved
+/// login does not vouch for a server to anything but its own token.
+pub fn require_explicit_server(resolved: &Resolved) -> anyhow::Result<()> {
+    if resolved.source == config::ServerSource::Explicit {
+        return Ok(());
+    }
+    Err(unconfirmed(&resolved.server))
+}
+
+/// The client for `sekret sys` over the network, once the server is confirmed.
+pub fn sys_client(args: &ClientArgs) -> anyhow::Result<HttpClient> {
+    let resolved = resolve(args)?;
+    require_confirmed_server(&resolved)?;
+    client(args, &resolved, resolved.token.clone())
+}
+
+/// A browser login to a server only the project file names saves a token that confirms it from
+/// then on, so the person must agree to it at a terminal first, seeing exactly where it goes.
+pub fn confirm_login_server(resolved: &Resolved, prompter: &dyn Prompter, interactive: bool) -> anyhow::Result<()> {
+    if resolved.source != config::ServerSource::ProjectFile {
+        return Ok(());
+    }
+    if !interactive {
+        return Err(unconfirmed(&resolved.server));
+    }
+    let shown = format::one_line(&resolved.server);
+    let host = url::Url::parse(&resolved.server)
+        .ok()
+        .and_then(|url| url.host_str().map(String::from))
+        .unwrap_or_else(|| shown.clone());
+    let answer = prompter.line(&format!(
+        "Only {} names this server:\n\n    {shown}\n    host: {host}\n\nLog in to it and trust it from now on? [y/N] ",
+        config::PROJECT_FILE
+    ))?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+    bail!("not logging in to {shown}")
 }
 
 pub async fn run_login(client_args: &ClientArgs, args: LoginArgs) -> anyhow::Result<()> {
@@ -413,10 +477,13 @@ pub async fn run_login(client_args: &ClientArgs, args: LoginArgs) -> anyhow::Res
     let mut stderr = std::io::stderr();
     let token = match machine_credential(&args, &github).await? {
         Some(credential) => {
-            require_confirmed_server(&resolved)?;
+            require_explicit_server(&resolved)?;
             login::machine_login(&api, credential).await?
         }
         None => {
+            let interactive =
+                std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
+            confirm_login_server(&resolved, &crate::prompt::Terminal, interactive)?;
             let opener = |url: &str| !args.no_browser && login::open_in_browser(url);
             login::device_login(&api, &resolved.server, &mut stderr, &opener, Duration::from_secs(10)).await?
         }
@@ -426,7 +493,7 @@ pub async fn run_login(client_args: &ClientArgs, args: LoginArgs) -> anyhow::Res
         return Ok(());
     }
     let path = config::credentials_path()?;
-    let mut credentials = config::load_credentials(&path)?;
+    let mut credentials = read_credentials(&path)?;
     credentials.servers.insert(
         resolved.server.clone(),
         StoredToken {
@@ -435,7 +502,7 @@ pub async fn run_login(client_args: &ClientArgs, args: LoginArgs) -> anyhow::Res
         },
     );
     config::save_credentials(&path, &credentials)?;
-    writeln!(stderr, "Logged in to {}", resolved.server)?;
+    writeln!(stderr, "Logged in to {}", format::one_line(&resolved.server))?;
     Ok(())
 }
 
@@ -448,11 +515,11 @@ pub async fn run_logout(client_args: &ClientArgs) -> anyhow::Result<()> {
         }
     }
     let path = config::credentials_path()?;
-    let mut credentials: Credentials = config::load_credentials(&path)?;
+    let mut credentials = read_credentials(&path)?;
     if credentials.servers.remove(&resolved.server).is_some() {
         config::save_credentials(&path, &credentials)?;
     }
-    eprintln!("Logged out of {}", resolved.server);
+    eprintln!("Logged out of {}", format::one_line(&resolved.server));
     Ok(())
 }
 
@@ -465,7 +532,7 @@ fn summarise(result: &BatchResult) -> String {
         ("unchanged", &result.unchanged),
     ] {
         if !keys.is_empty() {
-            parts.push(format!("{label}: {}", keys.join(", ")));
+            parts.push(format!("{label}: {}", format::one_line(&keys.join(", "))));
         }
     }
     if parts.is_empty() {
@@ -584,7 +651,7 @@ pub async fn secrets(
             };
             write!(out, "{}", table(headers, &rows))?;
             for folder in list.folders {
-                writeln!(out, "{folder}/")?;
+                writeln!(out, "{}/", format::one_line(&folder))?;
             }
         }
         SecretsCommand::Get { key, json } => {
@@ -661,7 +728,7 @@ pub async fn secrets(
             write!(
                 out,
                 "--- version {from}\n+++ version {to}\n{}",
-                line_diff(&value_of(from)?, &value_of(to)?)
+                sekret_client::terminal_safe(&line_diff(&value_of(from)?, &value_of(to)?))
             )?;
         }
         SecretsCommand::History { key, values, .. } => {
@@ -773,11 +840,17 @@ pub async fn snapshots(
     Ok(())
 }
 
+/// The names `run`, `env use` and export may load: `--allow` flags plus the project file's `allow`.
+pub fn load_policy(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shell::LoadPolicy> {
+    shell::LoadPolicy::new(flags.iter().chain(&resolved.allow).cloned())
+}
+
 /// Formats that get sourced into a shell leave out keys that are unsafe as variables, like `run`.
 pub async fn export(
     api: &dyn SekretApi,
     at: Location,
     args: &ExportArgs,
+    policy: &shell::LoadPolicy,
     out: &mut dyn Write,
     notes: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -785,7 +858,7 @@ pub async fn export(
     let vars = flatten(&raw.secrets)?;
     let vars = match args.format {
         ExportFormat::Dotenv | ExportFormat::Shell => {
-            let (kept, skipped) = shell::split_loadable(vars);
+            let (kept, skipped) = policy.split(vars);
             note_skipped(notes, &skipped)?;
             kept
         }
@@ -809,23 +882,36 @@ pub async fn project_policy(api: &dyn SekretApi, project: String, flags: &Policy
     ))
 }
 
+/// How `env use` builds its shell code.
+pub struct EnvUse<'a> {
+    pub shell: shell::Shell,
+    pub recursive: bool,
+    pub policy: &'a shell::LoadPolicy,
+    /// Keys the previous switch loaded, to unset first.
+    pub previous: &'a [String],
+}
+
 /// Writes shell code that switches to `at`, and a summary for the person or agent on `notes`.
 pub async fn env_use(
     api: &dyn SekretApi,
     at: Location,
-    shell: shell::Shell,
-    recursive: bool,
-    previous: &[String],
+    options: EnvUse<'_>,
     out: &mut dyn Write,
     notes: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let raw = api.raw(at.clone(), recursive).await?;
+    let raw = api.raw(at.clone(), options.recursive).await?;
     let origin = shell::Origin {
         project: at.project,
         environment: at.environment,
         path: at.path,
     };
-    let switch = shell::switch_script(shell, previous, &flatten(&raw.secrets)?, &origin);
+    let switch = shell::switch_script(
+        options.shell,
+        options.previous,
+        flatten(&raw.secrets)?,
+        options.policy,
+        &origin,
+    );
     write!(out, "{}", switch.script)?;
     writeln!(
         notes,
@@ -839,14 +925,7 @@ pub async fn env_use(
             origin.path.clone()
         }
     )?;
-    if !switch.skipped.is_empty() {
-        writeln!(
-            notes,
-            "sekret: skipped keys that are not valid variable names or start with SEKRET_: {}",
-            switch.skipped.join(", ")
-        )?;
-    }
-    Ok(())
+    note_skipped(notes, &switch.skipped)
 }
 
 /// Describes what this shell has loaded, without values.
@@ -862,13 +941,14 @@ pub async fn run_command(
     api: &dyn SekretApi,
     at: Location,
     args: &RunArgs,
+    policy: &shell::LoadPolicy,
     notes: &mut dyn Write,
 ) -> anyhow::Result<i32> {
     let Some((program, rest)) = args.command.split_first() else {
         bail!("no command given");
     };
     let raw = api.raw(at, args.recursive).await?;
-    let (vars, skipped) = shell::split_loadable(flatten(&raw.secrets)?);
+    let (vars, skipped) = policy.split(flatten(&raw.secrets)?);
     note_skipped(notes, &skipped)?;
     let mut command = tokio::process::Command::new(program);
     command.args(rest);
@@ -884,16 +964,10 @@ pub async fn run_command(
     Ok(status.code().unwrap_or(1))
 }
 
-fn note_skipped(notes: &mut dyn Write, skipped: &[String]) -> anyhow::Result<()> {
-    if skipped.is_empty() {
-        return Ok(());
+fn note_skipped(notes: &mut dyn Write, skipped: &[shell::Skipped]) -> anyhow::Result<()> {
+    for line in shell::describe_skipped(skipped) {
+        writeln!(notes, "{line}")?;
     }
-    writeln!(
-        notes,
-        "sekret: skipped {} because they are not valid variable names, start with SEKRET_ or change how programs \
-         are loaded or run",
-        skipped.join(", ")
-    )?;
     Ok(())
 }
 
@@ -1085,10 +1159,8 @@ mod tests {
         export(
             &api,
             at(),
-            &ExportArgs {
-                format: ExportFormat::Dotenv,
-                recursive: false,
-            },
+            &export_args(ExportFormat::Dotenv),
+            &strict(),
             &mut out,
             &mut Vec::new(),
         )
@@ -1096,16 +1168,34 @@ mod tests {
         .context("export")?;
         assert_eq!(out, b"GREETING=\"hello world\"\n");
 
-        let args = RunArgs {
-            recursive: false,
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "test \"$GREETING\" = 'hello world' && exit 7".into(),
-            ],
-        };
-        assert_eq!(run_command(&api, at(), &args, &mut Vec::new()).await.context("run")?, 7);
+        let args = run_args("test \"$GREETING\" = 'hello world' && exit 7");
+        assert_eq!(
+            run_command(&api, at(), &args, &strict(), &mut Vec::new())
+                .await
+                .context("run")?,
+            7
+        );
         Ok(())
+    }
+
+    fn strict() -> shell::LoadPolicy {
+        shell::LoadPolicy::default()
+    }
+
+    fn export_args(format: ExportFormat) -> ExportArgs {
+        ExportArgs {
+            format,
+            recursive: false,
+            allow: vec![],
+        }
+    }
+
+    fn run_args(script: &str) -> RunArgs {
+        RunArgs {
+            recursive: false,
+            allow: vec![],
+            command: vec!["sh".into(), "-c".into(), script.into()],
+        }
     }
 
     fn hostile_raw() -> RawSecrets {
@@ -1131,28 +1221,24 @@ mod tests {
     async fn run_and_dotenv_export_leave_out_unsafe_and_sekret_keys() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
         api.expect_raw().returning(|_, _| Ok(hostile_raw()));
-        let args = RunArgs {
-            recursive: false,
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "test \"$GREETING\" = hi && test -z \"${HTTPS_PROXY-}\" && test -z \"${GIT_ASKPASS-}\" \
-                 && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7"
-                    .into(),
-            ],
-        };
+        let args = run_args(
+            "test \"$GREETING\" = hi && test -z \"${HTTPS_PROXY-}\" && test -z \"${GIT_ASKPASS-}\" \
+             && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7",
+        );
         let mut notes = Vec::new();
-        assert_eq!(run_command(&api, at(), &args, &mut notes).await.context("run")?, 7);
+        assert_eq!(
+            run_command(&api, at(), &args, &strict(), &mut notes)
+                .await
+                .context("run")?,
+            7
+        );
         let notes = String::from_utf8(notes).context("utf8")?;
         assert!(notes.contains("HTTPS_PROXY") && notes.contains("SEKRET_URL") && notes.contains("bad.key"));
+        assert!(!notes.contains("evil.test"), "values never reach the notes");
 
         for format in [ExportFormat::Dotenv, ExportFormat::Shell] {
             let (mut out, mut notes) = (Vec::new(), Vec::new());
-            let args = ExportArgs {
-                format,
-                recursive: false,
-            };
-            export(&api, at(), &args, &mut out, &mut notes)
+            export(&api, at(), &export_args(format), &strict(), &mut out, &mut notes)
                 .await
                 .context("export")?;
             let out = String::from_utf8(out).context("utf8")?;
@@ -1163,17 +1249,57 @@ mod tests {
             assert!(String::from_utf8(notes).context("utf8")?.contains("HTTPS_PROXY"));
         }
         let mut json = Vec::new();
-        let args = ExportArgs {
-            format: ExportFormat::Json,
-            recursive: false,
-        };
-        export(&api, at(), &args, &mut json, &mut Vec::new())
-            .await
-            .context("json")?;
+        export(
+            &api,
+            at(),
+            &export_args(ExportFormat::Json),
+            &strict(),
+            &mut json,
+            &mut Vec::new(),
+        )
+        .await
+        .context("json")?;
         assert!(
             String::from_utf8(json).context("utf8")?.contains("HTTPS_PROXY"),
             "JSON is data, not sourced, so it keeps every key"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allowed_names_are_loaded_but_sekret_settings_never_are() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_raw().returning(|_, _| Ok(hostile_raw()));
+        let mut resolved = resolved(config::ServerSource::Explicit);
+        resolved.allow = vec!["HTTPS_PROXY".into()];
+        let policy = load_policy(&resolved, &["GIT_ASKPASS".into()])?;
+        let args = run_args(
+            "test \"$HTTPS_PROXY\" = http://evil.test:3128 && test \"$GIT_ASKPASS\" = /tmp/evil \
+             && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7",
+        );
+        let mut notes = Vec::new();
+        assert_eq!(run_command(&api, at(), &args, &policy, &mut notes).await?, 7);
+        let notes = String::from_utf8(notes)?;
+        assert!(
+            notes.contains("SEKRET_URL") && !notes.contains("HTTPS_PROXY"),
+            "{notes}"
+        );
+        let mut out = Vec::new();
+        export(
+            &api,
+            at(),
+            &export_args(ExportFormat::Shell),
+            &policy,
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await?;
+        let out = String::from_utf8(out)?;
+        assert!(
+            out.contains("export HTTPS_PROXY=") && out.contains("export GIT_ASKPASS="),
+            "{out}"
+        );
+        assert!(load_policy(&resolved, &["SEKRET_TOKEN".into()]).is_err());
         Ok(())
     }
 
@@ -1191,19 +1317,57 @@ mod tests {
         assert_eq!(shell_history_warning(&["A=-".into()], true), None);
     }
 
-    #[test]
-    fn machine_credentials_need_a_confirmed_server() {
-        let mut resolved = Resolved {
+    fn resolved(source: config::ServerSource) -> Resolved {
+        Resolved {
             server: "https://evil.test".into(),
             token: None,
             project: None,
             environment: None,
             path: "/".into(),
-            server_confirmed: false,
-        };
-        assert!(require_confirmed_server(&resolved).is_err());
-        resolved.server_confirmed = true;
-        assert!(require_confirmed_server(&resolved).is_ok());
+            source,
+            allow: vec![],
+        }
+    }
+
+    #[test]
+    fn secrets_need_a_confirmed_server_and_machine_credentials_an_explicit_one() {
+        use config::ServerSource::{Explicit, LoggedIn, ProjectFile};
+        assert!(require_confirmed_server(&resolved(ProjectFile)).is_err());
+        assert!(require_confirmed_server(&resolved(LoggedIn)).is_ok());
+        assert!(require_confirmed_server(&resolved(Explicit)).is_ok());
+        assert!(require_explicit_server(&resolved(ProjectFile)).is_err());
+        assert!(
+            require_explicit_server(&resolved(LoggedIn)).is_err(),
+            "a saved login does not vouch for a client secret"
+        );
+        assert!(require_explicit_server(&resolved(Explicit)).is_ok());
+    }
+
+    #[test]
+    fn a_login_to_a_server_only_the_project_file_names_needs_a_yes_at_a_terminal() -> anyhow::Result<()> {
+        use crate::prompt::tests::Scripted;
+        use config::ServerSource::{Explicit, LoggedIn, ProjectFile};
+        let mut hostile = resolved(ProjectFile);
+        // A Cyrillic letter that looks Latin, plus an escape sequence to hide the rest.
+        hostile.server = "https://s\u{0435}kret.example/\u{1b}[8m".into();
+        let refused = confirm_login_server(&hostile, &Scripted::new(&[]), false);
+        assert!(refused.is_err_and(|e| e.to_string().contains("no credential is sent")));
+        let declined = confirm_login_server(&hostile, &Scripted::new(&[""]), true);
+        assert!(declined.is_err_and(|e| e.to_string().contains("not logging in")));
+        let answers = Scripted::new(&["yes"]);
+        confirm_login_server(&hostile, &answers, true)?;
+        let asked = answers.asked().join("\n");
+        assert!(
+            asked.contains("host: xn--"),
+            "the look-alike host is shown as punycode: {asked}"
+        );
+        assert!(!asked.contains('\u{1b}'), "{asked:?}");
+        for source in [Explicit, LoggedIn] {
+            let nothing_asked = Scripted::new(&[]);
+            confirm_login_server(&resolved(source), &nothing_asked, false)?;
+            assert!(nothing_asked.asked().is_empty());
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1293,17 +1457,15 @@ mod tests {
         let mut prod = at();
         prod.environment = "prod".into();
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        env_use(
-            &api,
-            prod,
-            shell::Shell::Bash,
-            false,
-            &["OLD".into()],
-            &mut out,
-            &mut notes,
-        )
-        .await
-        .context("env use")?;
+        let options = EnvUse {
+            shell: shell::Shell::Bash,
+            recursive: false,
+            policy: &strict(),
+            previous: &["OLD".into()],
+        };
+        env_use(&api, prod, options, &mut out, &mut notes)
+            .await
+            .context("env use")?;
         let script = String::from_utf8(out).context("utf8")?;
         let notes = String::from_utf8(notes).context("utf8")?;
         assert!(script.starts_with("unset OLD\n"));
@@ -1326,7 +1488,13 @@ mod tests {
             })
         });
         let (mut out, mut notes) = (Vec::new(), Vec::new());
-        let result = env_use(&api, at(), shell::Shell::Bash, false, &[], &mut out, &mut notes).await;
+        let options = EnvUse {
+            shell: shell::Shell::Bash,
+            recursive: false,
+            policy: &strict(),
+            previous: &[],
+        };
+        let result = env_use(&api, at(), options, &mut out, &mut notes).await;
         assert!(result.is_err());
         assert!(out.is_empty(), "nothing to eval on failure");
     }

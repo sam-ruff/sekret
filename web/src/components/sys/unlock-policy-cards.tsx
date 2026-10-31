@@ -12,7 +12,7 @@ const POLICY_TEXT: Record<UnlockPolicy, string> = {
   manual:
     "Someone types the passphrase after every restart, including after a power cut. The key is only ever in memory, so a stolen disk or backup is useless. Pair it with an alert so someone knows when to unlock.",
   remember:
-    "Type the passphrase once. The server saves a key file on its own disk and unlocks itself after restarts. Leaked backups and database dumps stay safe, but anyone who takes the whole disk can unlock it unless a remember secret is configured.",
+    "Type the passphrase once. The server saves a key file on its own disk and unlocks itself after restarts. Leaked backups and database dumps stay safe, but anyone who takes the whole disk can unlock it, unless the key file is also protected with a separate secret (see the docs).",
   "passphrase-file":
     "The server reads the passphrase from a file or environment variable at start and unlocks itself. Anyone who can read that file or the service's environment can unlock the server. You set the file up on the host.",
 };
@@ -33,6 +33,21 @@ const POLICY_NEEDS: Partial<Record<UnlockPolicy, ReactNode>> = {
   ),
 };
 
+/** What the host already has when the policy comes from its configuration. */
+const CONFIGURED_NEEDS: Partial<Record<UnlockPolicy, ReactNode>> = {
+  remember: (
+    <>
+      Uses the key file named by <code className="font-mono">seal.remember_file</code>.
+    </>
+  ),
+  "passphrase-file": (
+    <>
+      Reads the passphrase from the file named by <code className="font-mono">seal.passphrase_file</code>, or from{" "}
+      <code className="font-mono">SEKRET_UNLOCK_PASSPHRASE</code>.
+    </>
+  ),
+};
+
 function PolicyTitle({ policy, id }: { policy: UnlockPolicy; id?: string }) {
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
@@ -42,8 +57,8 @@ function PolicyTitle({ policy, id }: { policy: UnlockPolicy; id?: string }) {
   );
 }
 
-function PolicyNeeds({ policy, testId }: { policy: UnlockPolicy; testId: string }) {
-  const needs = POLICY_NEEDS[policy];
+function PolicyNeeds({ policy, testId, configured }: { policy: UnlockPolicy; testId: string; configured?: boolean }) {
+  const needs = (configured ? CONFIGURED_NEEDS : POLICY_NEEDS)[policy];
   if (!needs) return null;
   return (
     <p className="flex gap-2 rounded-md bg-muted/60 px-3 py-2 text-sm text-muted-foreground" data-testid={testId}>
@@ -105,17 +120,17 @@ export function UnlockPolicyCards({ idPrefix, value, onChange, disabled }: Unloc
                 className="mt-0.5"
                 data-testid={id}
               />
-              <div className="min-w-0 space-y-1">
+              <div className="min-w-0 space-y-2">
                 <PolicyTitle policy={policy} id={`${id}-title`} />
                 <p id={`${id}-text`} className="text-sm text-muted-foreground">
                   {POLICY_TEXT[policy]}
                 </p>
+                {policy === value && <PolicyNeeds policy={policy} testId={`${idPrefix}-policy-needs`} />}
               </div>
             </label>
           );
         })}
       </RadioGroup>
-      <PolicyNeeds policy={value} testId={`${idPrefix}-policy-needs`} />
     </div>
   );
 }
@@ -136,7 +151,7 @@ export function ConfiguredPolicy({ policy, testId }: { policy: UnlockPolicy | nu
           </p>
         </div>
       </div>
-      {policy && <PolicyNeeds policy={policy} testId={`${testId}-needs`} />}
+      {policy && <PolicyNeeds policy={policy} testId={`${testId}-needs`} configured />}
     </div>
   );
 }

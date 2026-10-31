@@ -37,6 +37,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/cli/deny": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Refuses a pending CLI login. The terminal that started it is told the login has ended. */
+        post: operations["cli_deny"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/cli/pending": {
         parameters: {
             query?: never;
@@ -834,7 +851,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** @description Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase. */
+        /** @description Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase. Stored data that no longer decrypts is refused with `unreadable_data`, naming it by id, unless `skip_unreadable` is set. */
         post: operations["change_passphrase"];
         delete?: never;
         options?: never;
@@ -1065,6 +1082,12 @@ export interface components {
         ChangePassphrase: {
             current: string;
             new: string;
+            /**
+             * @description Re-encrypt what can be read and leave values, project keys or stored credentials that no
+             *     longer decrypt as they are, auditing each. Without it, the change is refused and the error
+             *     lists them.
+             */
+            skip_unreadable?: boolean;
         };
         /** @enum {string} */
         Charset: "alphanumeric" | "symbols" | "hex" | "base64url" | "numeric";
@@ -1090,6 +1113,10 @@ export interface components {
         };
         /** @description The code the person typed from their own terminal; a code carried in a link is not enough. */
         CliApproveRequest: {
+            code: string;
+        };
+        /** @description A CLI login to refuse; the code is typed or carried from the approval page. */
+        CliDenyRequest: {
             code: string;
         };
         CliPollRequest: {
@@ -1364,6 +1391,12 @@ export interface components {
             expires_at: number;
             /** @description The client address that started the login, as the server saw it. */
             requested_from_ip: string;
+            /**
+             * @description Whether the requester's address matches the address of the browser asking. Behind shared
+             *     NAT this can be true for someone else, and a VPN can make it false for the same person.
+             */
+            same_address: boolean;
+            /** @description Reported by the requester, so it can be faked. */
             user_agent: string;
         };
         /** @description A secret's own setting: follow the project, or use `policy` (which may switch everything off). */
@@ -1687,6 +1720,51 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["CliApproveRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cli_deny: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CliDenyRequest"];
             };
         };
         responses: {
@@ -3400,6 +3478,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description `seal_config_tampered`: the seal configuration failed its integrity check, so it is not backed up */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Another backup is running */
             429: {
                 headers: {
@@ -3570,6 +3657,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description `unreadable_data`, `seal_config_tampered` or not in passphrase mode */
             409: {
                 headers: {
                     [name: string]: unknown;

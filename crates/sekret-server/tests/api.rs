@@ -1173,6 +1173,30 @@ async fn third_review_regressions(db: String) -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert!(!audit.to_string().contains("HIDDEN_KEY"), "{audit}");
 
+    // Audit entries do not record tags, so a deny scoped by tag hides the key there too.
+    h.post(
+        &format!("{SECRETS}/dev/secrets/batch"),
+        &h.admin,
+        json!({"upserts": [{"key": "PCI_CARD", "value": "4111", "tags": ["pci"]}]}),
+    )
+    .await?;
+    let no_pci = json!({"name": "No PCI", "rules": [
+        {"effect": "allow", "subject": "secrets", "actions": ["read"]},
+        {"effect": "deny", "subject": "secrets", "actions": ["read"], "conditions": {"tags": ["pci"]}},
+        {"effect": "allow", "subject": "audit-log", "actions": ["read"]}
+    ]});
+    h.put("/api/v1/projects/app/roles/no-pci", &h.admin, no_pci).await?;
+    let (_, no_pci_token) = h.machine("no-pci", "app", "no-pci").await?;
+    let (status, audit) = h.get("/api/v1/projects/app/audit?limit=500", &no_pci_token).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!audit.to_string().contains("PCI_CARD"), "{audit}");
+    let (_, listed) = h.get(&format!("{SECRETS}/dev/secrets"), &no_pci_token).await?;
+    assert!(!listed.to_string().contains("PCI_CARD"), "{listed}");
+    assert!(
+        listed.to_string().contains("DB_URL"),
+        "untagged secrets stay visible: {listed}"
+    );
+
     // An organisation audit grant does not open project audit logs.
     let org_auditor = json!({"name": "Org auditor", "rules": [
         {"effect": "allow", "subject": "org-audit-log", "actions": ["read"]}
@@ -1614,10 +1638,17 @@ async fn root_key_rotation_keeps_secrets_readable(db: String) -> anyhow::Result<
     h.set_secrets("app", "dev", "/", &[("A", "before")]).await?;
     let new_root = RootKey::generate().context("key")?;
     let old_root = h.state.keyring.root().map_err(api_error("root"))?;
-    let count = sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &old_root, &new_root, None)
-        .await
-        .map_err(api_error("rotate"))?;
-    assert_eq!(count, 1);
+    let report = sekret_server::admin::rotate_root_key(
+        h.state.store.as_ref(),
+        &old_root,
+        &new_root,
+        None,
+        sekret_server::admin::Rotation::default(),
+    )
+    .await
+    .map_err(api_error("rotate"))?;
+    assert_eq!(report.projects, 1);
+    assert!(report.skipped.is_empty());
     let project = h
         .state
         .store
@@ -1680,9 +1711,15 @@ async fn kubernetes_reviewer_tokens_are_write_only_and_survive_rotation(db: Stri
 
     let new_root = RootKey::generate().context("key")?;
     let old_root = h.state.keyring.root().map_err(api_error("root"))?;
-    sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &old_root, &new_root, None)
-        .await
-        .map_err(api_error("rotate"))?;
+    sekret_server::admin::rotate_root_key(
+        h.state.store.as_ref(),
+        &old_root,
+        &new_root,
+        None,
+        sekret_server::admin::Rotation::default(),
+    )
+    .await
+    .map_err(api_error("rotate"))?;
     let rotated: sekret_api::AuthMethodConfig = serde_json::from_value(stored_config().await?).context("config")?;
     let sekret_api::AuthMethodConfig::Kubernetes(k8s) = rotated else {
         anyhow::bail!("kubernetes config expected");

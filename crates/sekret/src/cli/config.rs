@@ -14,6 +14,8 @@ pub struct ProjectFile {
     pub project: Option<String>,
     pub environment: Option<String>,
     pub path: Option<String>,
+    /// Blocked variable names that `run`, `env use` and export load anyway.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,86 +31,227 @@ pub struct Credentials {
     pub servers: BTreeMap<String, StoredToken>,
 }
 
+/// Owner, group and permission bits of a file or directory, as `stat` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ownership {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// The user running the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Me {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Me {
+    /// With user private groups (the usual `umask 002` setups) a person's primary group shares
+    /// their user id and holds only them, so it writing to a file is them writing to it.
+    fn group_is_private(self, gid: u32) -> bool {
+        gid == self.gid && gid == self.uid
+    }
+
+    fn group_can_write(self, item: Ownership) -> bool {
+        item.mode & 0o020 != 0 && !self.group_is_private(item.gid)
+    }
+}
+
 /// Why a project file found on the way up is not used, or `None` when it is trusted. `owners` are
-/// the owners of the file and, for a symlink, of the link too; `dir_mode` is its directory's mode.
-pub fn distrust_reason(owners: &[u32], dir_mode: u32, me: u32) -> Option<&'static str> {
-    if owners.iter().any(|owner| *owner != me) {
+/// the owners of the opened file and, for a symlink, of the link too. Root may own the directory,
+/// since root can change anything anyway.
+pub fn distrust_reason(owners: &[u32], dir: Ownership, me: Me) -> Option<&'static str> {
+    if owners.iter().any(|owner| *owner != me.uid) {
         return Some("it belongs to another user");
     }
-    if dir_mode & 0o002 != 0 {
+    if dir.uid != me.uid && dir.uid != 0 {
+        return Some("its directory belongs to another user");
+    }
+    if dir.mode & 0o002 != 0 {
         return Some("its directory is writable by every user");
+    }
+    if me.group_can_write(dir) {
+        return Some("its directory is writable by its group");
     }
     None
 }
 
 #[cfg(unix)]
-fn untrusted(path: &Path) -> Option<&'static str> {
+fn current_user() -> Me {
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    Me { uid, gid }
+}
+
+#[cfg(unix)]
+fn ownership(meta: &std::fs::Metadata) -> Ownership {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(link), Ok(target)) = (path.symlink_metadata(), path.metadata()) else {
-        return Some("it cannot be inspected");
-    };
+    Ownership {
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode(),
+    }
+}
+
+/// Opens a file once, without blocking on a FIFO, and returns it with the metadata of the open
+/// handle, so what is checked is what gets read.
+fn open_checked(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
+fn read_open(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let limit = sekret_server::files::TEXT_FILE_LIMIT;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        bail!("{} is larger than {limit} bytes", path.display());
+    }
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{} is not UTF-8", path.display()))?;
+    Ok(text.to_string())
+}
+
+/// The project file opened for reading if this user may trust it, else why not.
+#[cfg(unix)]
+fn open_trusted(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::MetadataExt;
+    let link = path
+        .symlink_metadata()
+        .map_err(|_| "it cannot be inspected".to_string())?;
+    let (file, meta) = open_checked(path).map_err(|e| format!("it cannot be opened: {e}"))?;
     let dir = path.parent().unwrap_or(Path::new("."));
-    let Ok(dir_meta) = dir.metadata() else {
-        return Some("its directory cannot be inspected");
-    };
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    distrust_reason(&[link.uid(), target.uid()], dir_meta.mode(), me)
+    let dir_meta = dir
+        .metadata()
+        .map_err(|_| "its directory cannot be inspected".to_string())?;
+    if let Some(reason) = distrust_reason(&[link.uid(), meta.uid()], ownership(&dir_meta), current_user()) {
+        return Err(reason.to_string());
+    }
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn untrusted(_path: &Path) -> Option<&'static str> {
-    None
+fn open_trusted(path: &Path) -> Result<std::fs::File, String> {
+    open_checked(path)
+        .map(|(file, _)| file)
+        .map_err(|e| format!("it cannot be opened: {e}"))
 }
 
-/// The nearest `.sekret.toml` this user owns, skipping ones planted by someone else with a warning.
-pub fn find_project_file(start: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
+/// The nearest `.sekret.toml` this user may trust, opened, skipping ones planted by someone else
+/// with a warning. Each candidate is checked on the open handle that is then read.
+pub fn find_project_file(start: &Path, warnings: &mut Vec<String>) -> Option<(PathBuf, std::fs::File)> {
     for candidate in start.ancestors().map(|dir| dir.join(PROJECT_FILE)) {
-        if !candidate.is_file() {
+        if candidate.symlink_metadata().is_err() {
             continue;
         }
-        let Some(reason) = untrusted(&candidate) else {
-            return Some(candidate);
-        };
-        warnings.push(format!("ignoring {} because {reason}", candidate.display()));
+        match open_trusted(&candidate) {
+            Ok(file) => return Some((candidate, file)),
+            Err(reason) => warnings.push(format!("ignoring {} because {reason}", candidate.display())),
+        }
     }
     None
 }
 
 /// Reads a small text file, following symlinks and refusing anything that is not a regular file.
 pub fn read_text(path: &Path) -> anyhow::Result<String> {
-    let bytes = sekret_server::files::read_limited(path, sekret_server::files::TEXT_FILE_LIMIT)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let text = std::str::from_utf8(&bytes).with_context(|| format!("{} is not UTF-8", path.display()))?;
-    Ok(text.to_string())
+    let (file, _) = open_checked(path).with_context(|| format!("reading {}", path.display()))?;
+    read_open(file, path)
 }
 
 /// The project file and where it was found.
 pub fn load_project_file(start: &Path, warnings: &mut Vec<String>) -> anyhow::Result<(ProjectFile, Option<PathBuf>)> {
-    let Some(path) = find_project_file(start, warnings) else {
+    let Some((path, opened)) = find_project_file(start, warnings) else {
         return Ok((ProjectFile::default(), None));
     };
-    let text = read_text(&path)?;
+    let text = read_open(opened, &path)?;
     let file = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok((file, Some(path)))
 }
 
+/// `$XDG_CONFIG_HOME/sekret/credentials.toml`, or under `~/.config`. A relative
+/// `XDG_CONFIG_HOME` is ignored, as the XDG specification says.
 pub fn credentials_path() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
-        return Ok(PathBuf::from(dir).join("sekret").join("credentials.toml"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("sekret")
-        .join("credentials.toml"))
+    credentials_path_from(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))
 }
 
-pub fn load_credentials(path: &Path) -> anyhow::Result<Credentials> {
-    if !path.exists() {
+pub fn credentials_path_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> anyhow::Result<PathBuf> {
+    let base = match xdg_config_home.map(PathBuf::from).filter(|dir| dir.is_absolute()) {
+        Some(dir) => dir,
+        None => PathBuf::from(home.context("HOME is not set")?).join(".config"),
+    };
+    Ok(base.join("sekret").join("credentials.toml"))
+}
+
+/// Why the credentials file must not be used, from its own and its directory's owner and mode.
+/// Anyone else who can change it could point a saved login at their own server.
+pub fn credentials_refusal(file: Ownership, dir: Ownership, me: Me) -> Option<&'static str> {
+    if file.uid != me.uid {
+        return Some("it belongs to another user");
+    }
+    if file.mode & 0o002 != 0 || me.group_can_write(file) {
+        return Some("other users can change it; run `chmod 600` on it");
+    }
+    if dir.uid != me.uid {
+        return Some("its directory belongs to another user");
+    }
+    if dir.mode & 0o002 != 0 || me.group_can_write(dir) {
+        return Some("other users can change its directory; run `chmod 700` on it");
+    }
+    None
+}
+
+/// Whether anyone but this user can read the file.
+fn others_can_read(file: Ownership, me: Me) -> bool {
+    file.mode & 0o004 != 0 || (file.mode & 0o040 != 0 && !me.group_is_private(file.gid))
+}
+
+/// The saved logins. A credentials file other users can read is used with a warning; one they
+/// can change, or that is not this user's, is refused.
+pub fn load_credentials(path: &Path, warnings: &mut Vec<String>) -> anyhow::Result<Credentials> {
+    if path.symlink_metadata().is_err() {
         return Ok(Credentials::default());
     }
-    let text = zeroize::Zeroizing::new(read_text(path)?);
+    let (file, meta) = open_checked(path).with_context(|| format!("reading {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir_meta = dir
+            .metadata()
+            .with_context(|| format!("inspecting {}", dir.display()))?;
+        let (file_owner, dir_owner, me) = (ownership(&meta), ownership(&dir_meta), current_user());
+        if let Some(reason) = credentials_refusal(file_owner, dir_owner, me) {
+            bail!("not using {} because {reason}", path.display());
+        }
+        if others_can_read(file_owner, me) {
+            warnings.push(format!(
+                "{} can be read by other users, who could take your tokens; run `chmod 600` on it",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (&meta, &warnings);
+    let text = zeroize::Zeroizing::new(read_open(file, path)?);
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -122,6 +265,17 @@ pub fn save_credentials(path: &Path, credentials: &Credentials) -> anyhow::Resul
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// How the person chose the server, which decides what may be sent to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSource {
+    /// `--server` or `SEKRET_URL`.
+    Explicit,
+    /// Only the project file names it, but `sekret login` saved a token for it.
+    LoggedIn,
+    /// Only the project file names it, and anyone who could write that file chose it.
+    ProjectFile,
+}
+
 /// Everything a client command needs, after flags, environment and project file are merged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
@@ -130,9 +284,9 @@ pub struct Resolved {
     pub project: Option<String>,
     pub environment: Option<String>,
     pub path: String,
-    /// The server came from a flag or `SEKRET_URL`, or is one `sekret login` saved a token for,
-    /// rather than only from a project file that anyone could have written.
-    pub server_confirmed: bool,
+    pub source: ServerSource,
+    /// Blocked variable names the project file allows.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,11 +311,19 @@ pub fn resolve(
         bail!("no server configured; pass --server, set SEKRET_URL or add `server` to {PROJECT_FILE}");
     };
     let server = server.trim_end_matches('/').to_string();
-    let server_confirmed = from_flag || credentials.servers.contains_key(&server);
-    if overrides.token.is_some() && !server_confirmed {
+    let source = if from_flag {
+        ServerSource::Explicit
+    } else if credentials.servers.contains_key(&server) {
+        ServerSource::LoggedIn
+    } else {
+        ServerSource::ProjectFile
+    };
+    // A saved login is for its own token only; it does not vouch for the server to other credentials.
+    if overrides.token.is_some() && source != ServerSource::Explicit {
         bail!(
-            "{server} comes only from {PROJECT_FILE}, so the token from --token or SEKRET_TOKEN is not sent to it; \
-             pass --server or set SEKRET_URL to confirm the server"
+            "{} comes only from {PROJECT_FILE}, so the token from --token or SEKRET_TOKEN is not sent to it; \
+             pass --server or set SEKRET_URL to confirm the server",
+            sekret_client::terminal_safe(&server)
         );
     }
     let token = overrides.token.or_else(|| {
@@ -177,7 +339,8 @@ pub fn resolve(
         project: overrides.project.or(file.project),
         environment: overrides.environment.or(file.environment),
         path: overrides.path.or(file.path).unwrap_or_else(|| "/".into()),
-        server_confirmed,
+        source,
+        allow: file.allow,
     })
 }
 
@@ -209,6 +372,11 @@ pub fn same_origin(server: &str, link: &str) -> bool {
 }
 
 impl Resolved {
+    /// Named by a flag or `SEKRET_URL`, or confirmed by the person at `sekret login`.
+    pub fn server_confirmed(&self) -> bool {
+        self.source != ServerSource::ProjectFile
+    }
+
     pub fn require_project(&self) -> anyhow::Result<(String, String)> {
         let project = self
             .project
@@ -245,7 +413,7 @@ mod tests {
             server: Some("https://sekret.example.com/".into()),
             project: Some("app".into()),
             environment: Some("dev".into()),
-            path: None,
+            ..Default::default()
         };
         let resolved = resolve(
             Overrides {
@@ -301,19 +469,169 @@ mod tests {
         Ok(())
     }
 
+    const ME: Me = Me { uid: 1000, gid: 1000 };
+    /// A group shared with other people, such as `users`.
+    const SHARED: u32 = 100;
+
+    fn dir(uid: u32, mode: u32) -> Ownership {
+        Ownership { uid, gid: SHARED, mode }
+    }
+
     #[test]
     fn project_files_from_other_users_or_open_directories_are_distrusted() {
-        assert_eq!(distrust_reason(&[1000, 1000], 0o755, 1000), None);
-        assert!(distrust_reason(&[1001, 1000], 0o755, 1000).is_some(), "a planted file");
+        assert_eq!(distrust_reason(&[1000, 1000], dir(1000, 0o755), ME), None);
+        assert_eq!(
+            distrust_reason(&[1000], dir(0, 0o755), ME),
+            None,
+            "root may own the directory"
+        );
         assert!(
-            distrust_reason(&[1000, 0], 0o755, 1000).is_some(),
+            distrust_reason(&[1001, 1000], dir(1000, 0o755), ME).is_some(),
+            "a planted file"
+        );
+        assert!(
+            distrust_reason(&[1000, 0], dir(1000, 0o755), ME).is_some(),
             "a symlink to another user's file"
         );
-        assert!(distrust_reason(&[1000], 0o777, 1000).is_some());
+        assert!(distrust_reason(&[1000], dir(1000, 0o777), ME).is_some());
         assert!(
-            distrust_reason(&[1000], 0o1777, 1000).is_some(),
+            distrust_reason(&[1000], dir(1000, 0o1777), ME).is_some(),
             "sticky directories such as /tmp too"
         );
+        assert_eq!(
+            distrust_reason(&[1000], dir(1000, 0o775), ME),
+            Some("its directory is writable by its group")
+        );
+        let private = Ownership {
+            gid: 1000,
+            ..dir(1000, 0o775)
+        };
+        assert_eq!(
+            distrust_reason(&[1000], private, ME),
+            None,
+            "umask 002 with a private group writes only as this user"
+        );
+        assert!(
+            distrust_reason(&[1000], private, Me { uid: 1000, gid: 1001 }).is_some(),
+            "a primary group that is not the user's own is shared"
+        );
+        assert_eq!(
+            distrust_reason(&[1000], dir(1001, 0o755), ME),
+            Some("its directory belongs to another user"),
+            "its owner could swap the file"
+        );
+    }
+
+    /// A supplementary group of the current user that is not their private one, to stand in for a
+    /// group shared with others.
+    #[cfg(unix)]
+    fn shared_group() -> anyhow::Result<Option<u32>> {
+        let output = std::process::Command::new("id").arg("-G").output().context("id")?;
+        let me = current_user();
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .filter_map(|g| g.parse::<u32>().ok())
+            .find(|g| !me.group_is_private(*g)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_file_in_a_group_writable_directory_is_skipped() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(group) = shared_group()? else {
+            return Ok(());
+        };
+        let top = tempfile::tempdir().context("dir")?;
+        std::fs::set_permissions(top.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        let shared = top.path().join("shared");
+        std::fs::create_dir(&shared).context("mkdir")?;
+        std::os::unix::fs::chown(&shared, None, Some(group)).context("chgrp")?;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).context("chmod")?;
+        std::fs::write(shared.join(PROJECT_FILE), "server = \"http://evil.test\"\n").context("plant")?;
+        let mut warnings = Vec::new();
+        let (file, found) = load_project_file(&shared, &mut warnings).context("load")?;
+        assert_eq!(file.server, None);
+        assert_eq!(found, None);
+        assert!(
+            warnings.iter().any(|w| w.contains("writable by its group")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_as_the_project_file_is_skipped_without_hanging() -> anyhow::Result<()> {
+        let top = tempfile::tempdir().context("dir")?;
+        let path = top.path().join(PROJECT_FILE);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .context("mkfifo")?;
+        anyhow::ensure!(status.success(), "mkfifo failed");
+        let mut warnings = Vec::new();
+        let (_, found) = load_project_file(top.path(), &mut warnings).context("load")?;
+        assert_eq!(found, None);
+        assert!(
+            warnings.iter().any(|w| w.contains("not a regular file")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_relative_xdg_config_home_is_ignored() -> anyhow::Result<()> {
+        let path = credentials_path_from(Some("rel/config".into()), Some("/home/me".into()))?;
+        assert_eq!(path, PathBuf::from("/home/me/.config/sekret/credentials.toml"));
+        let path = credentials_path_from(Some("/xdg".into()), Some("/home/me".into()))?;
+        assert_eq!(path, PathBuf::from("/xdg/sekret/credentials.toml"));
+        let path = credentials_path_from(Some("".into()), Some("/home/me".into()))?;
+        assert_eq!(path, PathBuf::from("/home/me/.config/sekret/credentials.toml"));
+        assert!(credentials_path_from(Some("rel".into()), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn credentials_others_can_change_are_refused() {
+        let me = ME.uid;
+        assert_eq!(credentials_refusal(dir(me, 0o600), dir(me, 0o700), ME), None);
+        assert_eq!(
+            credentials_refusal(dir(me, 0o644), dir(me, 0o755), ME),
+            None,
+            "readable is only warned about"
+        );
+        assert!(others_can_read(dir(me, 0o640), ME));
+        assert!(!others_can_read(dir(me, 0o600), ME));
+        assert!(credentials_refusal(dir(1001, 0o600), dir(me, 0o700), ME).is_some());
+        assert!(credentials_refusal(dir(me, 0o620), dir(me, 0o700), ME).is_some());
+        assert!(credentials_refusal(dir(me, 0o602), dir(me, 0o700), ME).is_some());
+        assert!(credentials_refusal(dir(me, 0o600), dir(1001, 0o700), ME).is_some());
+        assert!(credentials_refusal(dir(me, 0o600), dir(me, 0o770), ME).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_credentials_files_are_warned_about_or_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let top = tempfile::tempdir().context("dir")?;
+        let path = top.path().join("sekret").join("credentials.toml");
+        save_credentials(&path, &stored("abc", 5)).context("save")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+        let mut warnings = Vec::new();
+        assert_eq!(load_credentials(&path, &mut warnings)?, stored("abc", 5));
+        assert!(
+            warnings.iter().any(|w| w.contains("read by other users")),
+            "{warnings:?}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let refused = load_credentials(&path, &mut Vec::new());
+        assert!(refused.is_err_and(|e| e.to_string().contains("can change it")));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        let parent = path.parent().context("parent")?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let refused = load_credentials(&path, &mut Vec::new());
+        assert!(refused.is_err_and(|e| e.to_string().contains("its directory")));
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -359,15 +677,21 @@ mod tests {
             server: Some("https://evil.test".into()),
             ..with_token.clone()
         };
-        assert!(resolve(confirmed, hostile, &Credentials::default(), 0)?.server_confirmed);
-        // So is having logged in to it.
+        let resolved = resolve(confirmed, hostile, &Credentials::default(), 0)?;
+        assert_eq!(resolved.source, ServerSource::Explicit);
+        assert!(resolved.server_confirmed());
+        // A saved login only vouches for its own token: once an attacker's server had been logged
+        // in to, it would otherwise collect every SEKRET_TOKEN too.
         let known = ProjectFile {
             server: Some("https://sekret.example.com".into()),
             ..Default::default()
         };
-        let resolved = resolve(with_token, known.clone(), &stored("t", 100), 0)?;
-        assert_eq!(resolved.token.as_deref(), Some("skt_secret"));
-        assert!(resolved.server_confirmed);
+        let refused = resolve(with_token, known.clone(), &stored("t", 100), 0);
+        assert!(refused.is_err_and(|e| e.to_string().contains("not sent")));
+        let resolved = resolve(Overrides::default(), known, &stored("t", 100), 0)?;
+        assert_eq!(resolved.token.as_deref(), Some("t"));
+        assert_eq!(resolved.source, ServerSource::LoggedIn);
+        assert!(resolved.server_confirmed());
         // Without a flag token, the stored login only ever goes to its own server.
         let unknown = ProjectFile {
             server: Some("https://evil.test".into()),
@@ -375,7 +699,16 @@ mod tests {
         };
         let resolved = resolve(Overrides::default(), unknown, &stored("t", 100), 0)?;
         assert_eq!(resolved.token, None);
-        assert!(!resolved.server_confirmed);
+        assert_eq!(resolved.source, ServerSource::ProjectFile);
+        assert!(!resolved.server_confirmed());
+        Ok(())
+    }
+
+    #[test]
+    fn the_project_file_can_allow_blocked_names() -> anyhow::Result<()> {
+        let file: ProjectFile = toml::from_str("server = \"https://s\"\nallow = [\"KUBECONFIG\"]\n")?;
+        let resolved = resolve(Overrides::default(), file, &Credentials::default(), 0)?;
+        assert_eq!(resolved.allow, ["KUBECONFIG"]);
         Ok(())
     }
 
@@ -417,7 +750,12 @@ mod tests {
         let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("sekret").join("credentials.toml");
         save_credentials(&path, &stored("abc", 5)).context("save")?;
-        assert_eq!(load_credentials(&path).context("load")?, stored("abc", 5));
+        let mut warnings = Vec::new();
+        assert_eq!(
+            load_credentials(&path, &mut warnings).context("load")?,
+            stored("abc", 5)
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -431,7 +769,10 @@ mod tests {
         let planted = path.with_extension("tmp");
         std::fs::write(&planted, "planted").context("plant")?;
         save_credentials(&path, &stored("def", 6)).context("save again")?;
-        assert_eq!(load_credentials(&path).context("load")?, stored("def", 6));
+        assert_eq!(
+            load_credentials(&path, &mut warnings).context("load")?,
+            stored("def", 6)
+        );
         assert_eq!(std::fs::read_to_string(&planted).context("read")?, "planted");
         Ok(())
     }

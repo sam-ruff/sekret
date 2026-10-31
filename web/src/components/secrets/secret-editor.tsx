@@ -54,6 +54,12 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
   return (
     <form
       onSubmit={submit}
+      onKeyDown={(event) => {
+        // Popovers such as the character set list are portalled, so their Escape is not ours.
+        if (event.key !== "Escape" || busy || !event.currentTarget.contains(event.target as Node)) return;
+        event.preventDefault();
+        onCancel();
+      }}
       className="space-y-4 rounded-xl border border-primary/30 bg-card p-4 shadow-sm"
       data-testid={isNew ? "new-secret-form" : `edit-secret-${initial.key}`}
     >

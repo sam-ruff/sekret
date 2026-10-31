@@ -132,7 +132,8 @@ pub struct Resource<'a> {
     pub environment: Option<&'a str>,
     pub path: Option<&'a str>,
     pub key: Option<&'a str>,
-    pub tags: &'a [String],
+    /// `None` when the tags are unknown, so a deny scoped by tag still applies.
+    pub tags: Option<&'a [String]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +156,10 @@ fn allow_applies(conditions: &Conditions, resource: &Resource<'_>) -> bool {
         || resource
             .key
             .is_some_and(|key| conditions.keys.iter().any(|g| glob_match(g, key, None)));
-    let tags_ok = conditions.tags.is_empty() || resource.tags.iter().any(|t| conditions.tags.contains(t));
+    let tags_ok = conditions.tags.is_empty()
+        || resource
+            .tags
+            .is_some_and(|tags| tags.iter().any(|t| conditions.tags.contains(t)));
     env_ok && path_ok && key_ok && tags_ok
 }
 
@@ -174,7 +178,10 @@ fn deny_applies(conditions: &Conditions, resource: &Resource<'_>) -> bool {
         || resource
             .key
             .is_none_or(|key| conditions.keys.iter().any(|g| glob_match(g, key, None)));
-    let tags_hit = conditions.tags.is_empty() || resource.tags.iter().any(|t| conditions.tags.contains(t));
+    let tags_hit = conditions.tags.is_empty()
+        || resource
+            .tags
+            .is_none_or(|tags| tags.iter().any(|t| conditions.tags.contains(t)));
     env_hit && path_hit && key_hit && tags_hit
 }
 
@@ -349,7 +356,7 @@ mod tests {
             environment: Some(env),
             path: Some(path),
             key: Some(key),
-            tags: &[],
+            tags: Some(&[]),
         }
     }
 
@@ -438,7 +445,7 @@ mod tests {
         );
         let tags = vec!["shared".to_string()];
         let tagged = Resource {
-            tags: &tags,
+            tags: Some(&tags),
             ..secret("x", "/", "A")
         };
         assert_eq!(
@@ -449,6 +456,56 @@ mod tests {
             authorise(&rules, Subject::Secrets, Action::Edit, &secret("x", "/", "A")),
             Decision::Deny
         );
+        let unknown = Resource {
+            tags: None,
+            ..secret("x", "/", "A")
+        };
+        assert_eq!(
+            authorise(&rules, Subject::Secrets, Action::Edit, &unknown),
+            Decision::Deny,
+            "unknown tags never satisfy an allow"
+        );
+    }
+
+    #[test]
+    fn a_deny_scoped_by_tag_applies_when_tags_are_unknown() {
+        let mut rules = BuiltinRole::ProjectAdmin.rules();
+        rules.push(scoped(
+            Effect::Deny,
+            &[Action::Read, Action::ReadValue],
+            Conditions {
+                tags: vec!["pci".into()],
+                ..Default::default()
+            },
+        ));
+        let pci = vec!["pci".to_string()];
+        let other = vec!["web".to_string()];
+        let with = |tags: Option<&'static [String]>| Resource {
+            tags,
+            ..secret("prod", "/", "CARD")
+        };
+        let check = |r: &Resource| authorise(&rules, Subject::Secrets, Action::Read, r);
+        assert_eq!(
+            check(&Resource {
+                tags: Some(&pci),
+                ..with(None)
+            }),
+            Decision::Deny
+        );
+        assert_eq!(
+            check(&Resource {
+                tags: Some(&other),
+                ..with(None)
+            }),
+            Decision::Allow
+        );
+        assert_eq!(check(&with(Some(&[]))), Decision::Allow);
+        assert_eq!(check(&with(None)), Decision::Deny, "unknown tags may be pci");
+        let whole_environment = Resource {
+            environment: Some("prod"),
+            ..Default::default()
+        };
+        assert_eq!(check(&whole_environment), Decision::Deny);
     }
 
     #[test]

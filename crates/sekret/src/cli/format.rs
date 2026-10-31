@@ -70,16 +70,22 @@ pub fn render(secrets: &BTreeMap<String, String>, format: ExportFormat) -> anyho
             .iter()
             .map(|(k, v)| format!("{k}={}\n", dotenv_value(v)))
             .collect(),
-        // Output meant for `source`, so names a shell would act on are left out.
+        // Callers choose which names to load; anything else could not be a variable at all.
         ExportFormat::Shell => secrets
             .iter()
-            .filter(|(k, _)| !super::shell::is_unsafe_name(k) && super::shell::is_variable_name(k))
+            .filter(|(k, _)| super::shell::is_variable_name(k))
             .map(|(k, v)| format!("export {k}={}\n", shell_value(v)))
             .collect(),
-        // JSON strings are valid YAML scalars, which sidesteps YAML's quoting rules.
+        // JSON strings are valid YAML scalars, which sidesteps YAML's quoting rules for keys and values.
         ExportFormat::Yaml => secrets
             .iter()
-            .map(|(k, v)| Ok(format!("{k}: {}\n", serde_json::to_string(v)?)))
+            .map(|(k, v)| {
+                Ok(format!(
+                    "{}: {}\n",
+                    serde_json::to_string(k)?,
+                    serde_json::to_string(v)?
+                ))
+            })
             .collect::<anyhow::Result<String>>()?,
         ExportFormat::Json => format!("{}\n", serde_json::to_string_pretty(secrets)?),
     };
@@ -132,17 +138,22 @@ pub fn timestamp(secs: i64) -> String {
     )
 }
 
-/// Pads columns so plain-text tables line up.
+/// Pads columns so plain-text tables line up. Cells come from the server, so they are kept to
+/// one line of printable text.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| one_line(cell)).collect())
+        .collect();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in rows {
+    for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             if let Some(w) = widths.get_mut(i) {
                 *w = (*w).max(cell.chars().count());
             }
         }
     }
-    let line = |cells: Vec<String>| {
+    let line = |cells: &[String]| {
         let padded: Vec<String> = cells
             .iter()
             .enumerate()
@@ -150,11 +161,17 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
             .collect();
         format!("{}\n", padded.join("  ").trim_end())
     };
-    let mut out = line(headers.iter().map(|h| h.to_string()).collect());
-    for row in rows {
-        out.push_str(&line(row.clone()));
+    let header: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let mut out = line(&header);
+    for row in &rows {
+        out.push_str(&line(row));
     }
     out
+}
+
+/// Server text for one table cell: printable, with line breaks and tabs shown as spaces.
+pub fn one_line(text: &str) -> String {
+    sekret_client::terminal_safe(text).replace(['\n', '\t'], " ")
 }
 
 /// A unified-style line diff: unchanged lines start with two spaces, removed with `- `, added with `+ `.
@@ -263,7 +280,7 @@ mod tests {
         let back: BTreeMap<String, String> = serde_json::from_str(&json).context("parse")?;
         assert_eq!(back, secrets());
         let yaml = render(&secrets(), ExportFormat::Yaml).context("yaml")?;
-        assert!(yaml.starts_with("A: \"plain\"\n"));
+        assert!(yaml.starts_with("\"A\": \"plain\"\n"));
         assert!(yaml.contains("\\n"));
         Ok(())
     }
@@ -294,6 +311,34 @@ mod tests {
         };
         assert!(flatten(&[make("/")]).is_ok());
         assert!(flatten(&[make("/"), make("/a")]).is_err());
+    }
+
+    #[test]
+    fn yaml_keys_are_quoted_so_they_cannot_add_entries() -> anyhow::Result<()> {
+        let hostile = BTreeMap::from([
+            ("A: injected\nB".to_string(), "v".to_string()),
+            ("? complex".to_string(), "w".to_string()),
+            ("- item".to_string(), "x".to_string()),
+            ("!!binary".to_string(), "y".to_string()),
+            ("&anchor".to_string(), "z".to_string()),
+            ("true".to_string(), "t".to_string()),
+        ]);
+        let yaml = render(&hostile, ExportFormat::Yaml).context("yaml")?;
+        let parsed: BTreeMap<String, String> = serde_saphyr::from_str(&yaml).context("parse")?;
+        assert_eq!(parsed, hostile, "{yaml}");
+        Ok(())
+    }
+
+    #[test]
+    fn table_cells_cannot_drive_the_terminal() {
+        let out = table(
+            &["KEY", "BY"],
+            &[vec![
+                "A".into(),
+                "user:\u{1b}]52;c;ZXZpbA==\u{7}x\nFAKE  ROW\u{1b}[2J".into(),
+            ]],
+        );
+        assert_eq!(out, "KEY  BY\nA    user:x FAKE  ROW\n");
     }
 
     #[test]

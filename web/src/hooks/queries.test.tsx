@@ -21,18 +21,17 @@ describe("useSealWatch", () => {
     return { invalidate, hook };
   }
 
-  it("checks the status every 15 seconds and when the tab comes back while values are shown", () => {
+  it("checks the status and the session every 15 seconds and when the tab comes back while values are shown", () => {
     const { invalidate } = watch(true);
     expect(SEAL_WATCH_INTERVAL_MS).toBe(15_000);
     act(() => vi.advanceTimersByTime(15_000));
-    expect(invalidate).toHaveBeenCalledTimes(1);
-    expect(invalidate).toHaveBeenLastCalledWith({ queryKey: keys.sysStatus });
+    expect(invalidate.mock.calls).toEqual([[{ queryKey: keys.sysStatus }], [{ queryKey: keys.me }]]);
 
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
-    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(invalidate).toHaveBeenCalledTimes(4);
   });
 
   it("stays quiet when nothing is revealed, and stops when values are hidden", () => {

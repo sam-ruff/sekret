@@ -1,5 +1,6 @@
 interface PageWindow {
-  addEventListener: (type: "pageshow", listener: (event: PageTransitionEvent) => void) => void;
+  addEventListener: (type: "pageshow" | "pagehide", listener: (event: PageTransitionEvent) => void) => void;
+  removeEventListener: (type: "pageshow" | "pagehide", listener: (event: PageTransitionEvent) => void) => void;
   location: { reload: () => void };
 }
 
@@ -11,4 +12,14 @@ export function reloadWhenRestored(win: PageWindow = window): void {
   win.addEventListener("pageshow", (event) => {
     if (event.persisted) win.location.reload();
   });
+}
+
+/**
+ * Runs `forget` as the page is hidden for good or stored in the back-forward cache, so the stored
+ * copy holds no secrets. Returns a function that stops watching.
+ */
+export function forgetWhenHidden(forget: () => void, win: PageWindow = window): () => void {
+  const onHide = () => forget();
+  win.addEventListener("pagehide", onHide);
+  return () => win.removeEventListener("pagehide", onHide);
 }

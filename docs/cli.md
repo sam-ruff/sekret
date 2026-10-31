@@ -15,13 +15,24 @@ Every command is part of the single `sekret` binary. `sekret <command> --help` p
 | `--ca-file` | `SEKRET_CA_FILE` | Extra PEM CA certificates to trust. |
 | `--client-cert`, `--client-key` | `SEKRET_CLIENT_CERT`, `SEKRET_CLIENT_KEY` | PEM client certificate and key, for servers or proxies that require mTLS. |
 
-A `.sekret.toml` in the current directory or one above it can set `server`, `project`, `environment` and `path`. Because such a file can arrive with any repository you clone, a server it names is not trusted with credentials on its own: a token from `--token` or `SEKRET_TOKEN`, or a machine login's secret, is only sent when `--server`, `SEKRET_URL` or an earlier `sekret login` names the same server. Otherwise the command stops with an error. Project files owned by another user, or in a directory everyone can write to, are skipped with a warning. Project files, credentials, CA and client certificate files are limited to 1 MiB.
+A `.sekret.toml` in the current directory or one above it can set `server`, `project`, `environment`, `path` and `allow` (see [Using secrets](#using-secrets)). Because such a file can arrive with any repository you clone, a server it names is not trusted with anything secret on its own:
+
+- A token from `--token` or `SEKRET_TOKEN`, and a machine login's client secret or OIDC token, only go to a server named by `--server` or `SEKRET_URL`. Having logged in to the server before is not enough.
+- `sekret sys` commands, which send passphrases and setup codes, need the server named by `--server` or `SEKRET_URL`, or one you have logged in to.
+- `sekret login` in the browser to a server only a project file names shows its address and host and asks you to confirm at a terminal. Without a terminal it stops.
+- A saved login token only ever goes to the server it was saved for.
+
+Otherwise the command stops with an error. Project files are skipped with a warning when they, or a symlink to them, belong to another user, when their directory belongs to another user (root is fine), or when their directory can be written by every user or by a shared group. A group-writable directory is fine when the group is your own private group, the usual setup with `umask 002`. The file is checked on the same open handle it is read from.
+
+Saved logins live in `$XDG_CONFIG_HOME/sekret/credentials.toml`, or `~/.config/sekret/credentials.toml` when that variable is unset or not an absolute path. The CLI writes the file with mode 0600 in a 0700 directory, refuses it if it belongs to someone else or others can change it or its directory, and warns if others can read it. Project files, credentials, CA and client certificate files are limited to 1 MiB.
+
+Text from the server, such as error messages, table cells, the login code and its link, is printed with control characters and terminal escape sequences removed, so a server cannot rewrite or hide what your terminal shows.
 
 ## Signing in
 
 | Command | What it does |
 |---|---|
-| `sekret login` | Opens the browser to approve this CLI, then saves a token. The approval page shows the address and program the request came from, and you type the code the CLI prints to approve it. `--no-browser` prints the link instead, and a link to a different site from the server is refused. When the server sets `auth.cli_login_max_auth_age`, approving may ask you to sign in to your identity provider again. |
+| `sekret login` | Opens the browser to approve this CLI, then saves a token. The approval page shows the address the request came from, whether it matches your browser's, and the program it reported, which can be faked; none of that proves the request is yours, so only approve a code you started. You type the code the CLI prints to approve it, or refuse a request you did not start, which ends it at once. `--no-browser` prints the link instead, and a link to a different site from the server is refused. When the server sets `auth.cli_login_max_auth_age`, approving may ask you to sign in to your identity provider again. |
 | `sekret login --github-actions --identity-id ID` | Logs in as a machine identity with the job's GitHub OIDC token. |
 | `sekret login --oidc-token-file F --identity-id ID` | The same with any OIDC token in a file; `--oidc-token-env VAR` reads a variable. |
 | `sekret login --kubernetes --identity-id ID` | Logs in with the pod's service account token. |
@@ -53,18 +64,24 @@ Add `--print-token` to any machine login to print the token rather than save it.
 
 | Command | What it does |
 |---|---|
-| `sekret run [--recursive] -- CMD ARGS...` | Runs a command with the secrets as environment variables. Exits with the command's status. The command never sees `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET`, `SEKRET_UNLOCK_PASSPHRASE` or `SEKRET_REMEMBER_SECRET`. |
-| `sekret export [--format dotenv\|json\|yaml\|shell] [--recursive]` | Prints secrets in a format. |
-| `sekret env use [ENV] [--shell bash\|zsh\|sh\|fish]` | Prints shell code that swaps this shell's secrets for an environment's. Use inside `eval`. |
+| `sekret run [--recursive] [--allow NAME]... -- CMD ARGS...` | Runs a command with the secrets as environment variables. Exits with the command's status. The command never sees `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET`, `SEKRET_UNLOCK_PASSPHRASE` or `SEKRET_REMEMBER_SECRET`, and sekret removes them from its own environment before starting it, so the command cannot read them from its parent either. |
+| `sekret export [--format dotenv\|json\|yaml\|shell] [--recursive] [--allow NAME]...` | Prints secrets in a format. YAML keys and values are quoted. |
+| `sekret env use [ENV] [--shell bash\|zsh\|sh\|fish] [--allow NAME]...` | Prints shell code that swaps this shell's secrets for an environment's. Use inside `eval`. |
 | `sekret env unload` | Prints shell code that removes them again. |
 | `sekret env status` | Shows what this shell has loaded, names only. |
 | `sekret shell-init [bash\|zsh\|sh\|fish]` | Prints the `sekret-env` function. See [Shells and AI agents](integrations/shells-and-agents.md). |
 
-`sekret run`, `sekret env use` and the `dotenv` and `shell` export formats leave out secrets whose names start with `SEKRET_`, are not valid variable names, or change how programs load and run, such as `LD_PRELOAD`, `GIT_ASKPASS` or `HTTPS_PROXY`, and name them on standard error. See [Shells and AI agents](integrations/shells-and-agents.md). JSON and YAML keep every key.
+`sekret run`, `sekret env use` and the `dotenv` and `shell` export formats only load names made of letters, digits and underscores that do not start with a digit. Of those, they leave out names starting with `SEKRET_`, and a broad set of names that change what programs run or where they connect, such as `LD_PRELOAD`, `GIT_EXTERNAL_DIFF`, `PAGER` or `HTTPS_PROXY`. Each skipped key is named on standard error with the reason, never its value. A blocked name loads when you name it exactly with `--allow NAME`, which can be repeated, or list it in the project file:
+
+```toml
+allow = ["KUBECONFIG", "GIT_PAGER"]
+```
+
+`SEKRET_*` names can never be allowed. The full blocked set is in [Shells and AI agents](integrations/shells-and-agents.md). JSON and YAML keep every key.
 
 ## Setting up, unlocking and backing up
 
-These talk to a running server, so they work from any machine that can reach it. Status, setup and unsealing need no token.
+These talk to a running server, so they work from any machine that can reach it. Status, setup and unsealing need no token, but the server must be named by `--server` or `SEKRET_URL`, or be one you have logged in to, since these commands send passphrases and setup codes.
 
 | Command | What it does |
 |---|---|
@@ -72,12 +89,12 @@ These talk to a running server, so they work from any machine that can reach it.
 | `sekret sys init [--setup-code-file F] [--passphrase-file F] [--unlock P] [--key-file-mode]` | First-boot setup through the API, with the code from the server log. Asks for the passphrase twice and whether to require it after every restart, then prints a one-hour admin token once. With web setup turned off, use `sekret admin init` on the host instead. |
 | `sekret sys unseal [--passphrase-file F] [--socket PATH]` | Unlocks a sealed server. With `--socket`, it goes through the server's Unix socket on this host (`server.unix_socket`), which needs no server URL and is not held back by the network's rate limits. |
 | `sekret sys seal` | Drops the root key from the server's memory. A remembered unlock is kept, so the next restart still unlocks itself. Org admins only. |
-| `sekret sys change-passphrase [--passphrase-file F] [--new-passphrase-file F]` | Changes the passphrase, replacing the root key and re-encrypting every secret. Older backups still open with the old passphrase. Org admins only. |
+| `sekret sys change-passphrase [--passphrase-file F] [--new-passphrase-file F] [--skip-unreadable]` | Changes the passphrase, replacing the root key and re-encrypting every secret. Older backups still open with the old passphrase. Refuses, naming them, if any values or stored credentials no longer decrypt; `--skip-unreadable` leaves those as they are and audits them. Org admins only. |
 | `sekret sys unlock-policy manual\|remember\|passphrase-file [--passphrase-file F]` | Changes how the server unlocks after a restart. `remember` and `passphrase-file` ask for the current passphrase. See [Unlocking](unlocking.md). |
 | `sekret sys forget-unlock` | Deletes the remembered unlock. Org admins only. |
 | `sekret sys backup -o FILE` | Downloads an encrypted backup, written with mode 0600 under a temporary name and then renamed, or to standard output with `-o -`. Needs the `backups` read permission. |
 
-Every `--passphrase-file` and `--setup-code-file` also accepts `-`, which reads the first line of standard input. Without one, the CLI asks without echoing. Files and standard input are limited to 4 KiB, and a leading byte order mark and one trailing line ending are dropped. `--setup-code C` still works but puts the code where other users can see it in the process list.
+Every `--passphrase-file` and `--setup-code-file` also accepts `-`, which reads the first line of standard input. Without one, the CLI asks without echoing. Files and standard input are limited to 4 KiB, and a leading byte order mark and one trailing line ending are dropped, once: commands that talk to the server send the text as read and the server drops them, while the offline `sekret admin` commands drop them themselves. `--setup-code C` still works but puts the code where other users can see it in the process list.
 
 For an org admin, `sekret sys status` also says how the server was unlocked (`passphrase`, `remember`, `passphrase-file` or `key-file`) and flags a root key file that overrode passphrase mode. Anyone else sees only the state.
 
@@ -88,13 +105,14 @@ For an org admin, `sekret sys status` also says how the server was unlocked (`pa
 | `sekret server [--config FILE]` | Runs the API and web interface. See [Configuration](configuration.md). |
 | `sekret server --print-config` | Prints a commented example configuration file with every default. |
 | `sekret admin generate-root-key` | Prints a new random root key. |
-| `sekret admin bootstrap` | Prints a one-hour organisation admin token. Run it on the server host; in passphrase mode it asks for the passphrase. It works while the server runs, which makes it the way back in when nobody can sign in. |
-| `sekret admin init [--key-file-mode] [--passphrase-file F] [--unlock P]` | Sets up the database on the host, for servers with web setup turned off. Stop the server first, then start it afterwards. |
-| `sekret admin rotate-root-key [--new-root-key-file F] [--passphrase-file F]` | Replaces the root key and re-encrypts every secret under new project keys. In passphrase mode it checks the passphrase against the stored wrap first, even when a key file is present, and wraps the new key under it. Refuses while a server is using the database. |
+| `sekret admin bootstrap [--ttl SECONDS]` | Prints an organisation admin token, valid for an hour unless `--ttl` says otherwise, at most a day. Run it on the server host; in passphrase mode it asks for the passphrase. It works while the server runs, which makes it the way back in when nobody can sign in. It never changes the database's tables, and refuses a database whose schema is from another sekret version: run the bootstrap of the version the server runs. |
+| `sekret admin init [--key-file-mode] [--passphrase-file F] [--unlock P] [--ttl SECONDS]` | Sets up the database on the host, for servers with web setup turned off, and prints an admin token (an hour by default, at most a day). Stop the server first, then start it afterwards. |
+| `sekret admin rotate-root-key [--new-root-key-file F] [--passphrase-file F] [--skip-unreadable]` | Replaces the root key and re-encrypts every secret under new project keys. In passphrase mode it checks the passphrase against the stored wrap first, even when a key file is present, and wraps the new key under it. Refuses, naming them, if any values, project keys or stored credentials no longer decrypt; `--skip-unreadable` leaves those as they are and audits them. Refuses while a server is using the database. |
+| `sekret admin reset-epoch [--passphrase-file F]` | Re-signs the seal configuration and sets every seal epoch mark to its counter, lowering them if need be: after restoring an older database in place, or when a mark is damaged. A configuration that fails its signature falls back to the manual unlock policy. Refuses while a server is using the database. See [Unlocking](unlocking.md#the-policy-cannot-be-changed-behind-your-back). |
 | `sekret admin set-seal-mode passphrase\|key-file --root-key-file F` | Moves between passphrase and key-file mode. Refuses while a server is using the database. |
 | `sekret admin restore --backup FILE --database-url sqlite://NEW.db` | Writes the database from a backup into a new SQLite file. Prints when the backup was taken and its root key fingerprint first, refuses if the file or a `-wal`, `-shm` or `-journal` beside it exists, and checks the restored copy before linking it into place. Never overwrites. |
 
-`init`, `rotate-root-key`, `set-seal-mode` and `restore` take the database's lock (`<db>.lock`, or an advisory lock on Postgres) and stop with an error while a server holds it. Each admin command that changes the database records itself in the audit log, from the address `local`.
+`init`, `rotate-root-key`, `set-seal-mode`, `reset-epoch` and `restore` take the database's lock (a `flock` on the SQLite file and on `<db>.lock` beside its real path, or an advisory lock on Postgres) and stop with an error while a server holds it, whatever path or link they reach the database by. Every admin command except `init` and `restore` needs the database to exist already, so a mistyped `--database-url` stops with an error instead of creating an empty database. Admin commands take `--database-url-file` (or `SEKRET_DATABASE_URL_FILE`) as well as `--database-url`, and `--remember-file` (or `SEKRET_REMEMBER_FILE`, or `seal.remember_file` from `--config`), so they read and raise the seal epoch mark beside the remember file the way the server does. Each admin command that changes the database records itself in the audit log, from the address `local`.
 | `sekret admin web-check` | Exits non-zero unless the binary contains the web interface. |
 | `sekret operator --server-url URL` | Runs the Kubernetes operator. See [Kubernetes](integrations/kubernetes.md). |
 | `sekret operator crd` | Prints the CustomResourceDefinition. |

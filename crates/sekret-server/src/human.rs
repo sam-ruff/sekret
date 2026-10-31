@@ -5,7 +5,8 @@ use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sekret_api::{
-    AuthConfig, CliApproveRequest, CliPollRequest, CliStartResponse, LogoutResponse, PendingCliLogin, TokenResponse,
+    AuthConfig, CliApproveRequest, CliDenyRequest, CliPollRequest, CliStartResponse, LogoutResponse, PendingCliLogin,
+    TokenResponse,
 };
 use sekret_core::crypto::{constant_time_eq, fill_random, generate_token, hash_token};
 use sekret_store::{CliLogin, CliPoll, LoginState, PrincipalKind, UserLogin};
@@ -28,12 +29,36 @@ const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ23456789";
 
 /// Only same-site relative paths are allowed as post-login destinations.
 pub fn safe_return_to(value: Option<&str>) -> String {
+    value.and_then(same_origin_path).unwrap_or_else(|| "/".to_string())
+}
+
+/// The path normalised as a browser would resolve it, matching the web client's check.
+fn same_origin_path(path: &str) -> Option<String> {
     // Browsers drop tabs and newlines, so `/\t/evil.test` would otherwise become `//evil.test`.
-    let plain = |path: &str| !path.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control());
-    match value {
-        Some(path) if path.starts_with('/') && !path.starts_with("//") && plain(path) => path.to_string(),
-        _ => "/".to_string(),
+    let plain = !path.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control());
+    if !plain || !path.starts_with('/') || path.starts_with("//") {
+        return None;
     }
+    let base = url::Url::parse("http://sekret.invalid").ok()?;
+    let resolved = base.join(path).ok()?;
+    if resolved.origin() != base.origin() {
+        return None;
+    }
+    // "/..//x" normalises to "//x", which a browser reads as another host.
+    let normalised = resolved.path();
+    if normalised.starts_with("//") || normalised.starts_with("/\\") {
+        return None;
+    }
+    let mut out = normalised.to_string();
+    if let Some(query) = resolved.query() {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = resolved.fragment() {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    Some(out)
 }
 
 /// Ties a login attempt to the browser that started it, so a callback URL cannot be replayed into another browser.
@@ -551,11 +576,56 @@ pub async fn cli_pending(
         .ok_or_else(|| ApiError::not_found("login code"))?;
     Ok(Json(PendingCliLogin {
         code_hint: None,
+        same_address: login.requested_from_ip == ip.to_string(),
         requested_from_ip: login.requested_from_ip,
         user_agent: login.user_agent,
         created_at: login.created_at,
         expires_at: login.expires_at,
     }))
+}
+
+#[utoipa::path(post, path = "/api/v1/auth/cli/deny", tag = "auth", request_body = CliDenyRequest,
+    description = "Refuses a pending CLI login. The terminal that started it is told the login has ended.",
+    responses((status = 204), (status = 403, body = sekret_api::ErrorBody), (status = 404, body = sekret_api::ErrorBody),
+        (status = 429, body = sekret_api::ErrorBody)),
+    security(("bearer" = [])))]
+pub async fn cli_deny(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    principal: Principal,
+    Json(request): Json<CliDenyRequest>,
+) -> ApiResult<StatusCode> {
+    require_browser_session(&principal)?;
+    if !state.login_limiter.allow_ip(ip) {
+        return Err(ApiError::too_many_requests());
+    }
+    let code = normalise_user_code(&request.code);
+    let now = state.clock.now();
+    let Some(login) = state.store.get_cli_login(&code, now).await? else {
+        return Err(ApiError::not_found("login code"));
+    };
+    if !state.store.deny_cli_login(&code, now).await? {
+        return Err(ApiError::not_found("login code"));
+    }
+    audit(
+        &state,
+        &principal,
+        ip,
+        "auth.cli-deny",
+        AuditTarget::default(),
+        requester_details(&login),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Where a CLI login came from, for its audit entries.
+fn requester_details(login: &CliLogin) -> Value {
+    json!({
+        "requested_from_ip": login.requested_from_ip,
+        "user_agent": login.user_agent,
+        "requested_at": login.created_at,
+    })
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/cli/approve", tag = "auth", request_body = CliApproveRequest,
@@ -600,11 +670,11 @@ pub async fn cli_approve(
             ))));
         }
     }
-    if !state
-        .store
-        .approve_cli_login(&code, &principal.id, state.clock.now())
-        .await?
-    {
+    let now = state.clock.now();
+    let Some(login) = state.store.get_cli_login(&code, now).await? else {
+        return Err(ApiError::not_found("login code"));
+    };
+    if !state.store.approve_cli_login(&code, &principal.id, now).await? {
         return Err(ApiError::not_found("login code"));
     }
     audit(
@@ -613,7 +683,7 @@ pub async fn cli_approve(
         ip,
         "auth.cli-approve",
         AuditTarget::default(),
-        json!({}),
+        requester_details(&login),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -622,7 +692,7 @@ pub async fn cli_approve(
 /// How long a CLI token may be renewed to. With re-authentication on, or when the user's access
 /// may come from identity provider groups, which only refresh at the next browser sign-in, it
 /// cannot be renewed past its first TTL.
-fn cli_max_ttl(state: &AppState, groups: &[String]) -> i64 {
+pub(crate) fn cli_max_ttl(state: &AppState, groups: &[String]) -> i64 {
     let ttl = state.config.cli_token_ttl;
     if state.config.cli_login_max_auth_age.is_some() || !groups.is_empty() {
         return ttl;
@@ -715,6 +785,25 @@ mod tests {
         assert_eq!(safe_return_to(Some("/\n/evil.test")), "/");
         assert_eq!(safe_return_to(Some("/ /evil.test")), "/");
         assert_eq!(safe_return_to(None), "/");
+    }
+
+    #[test]
+    fn return_to_rejects_paths_that_normalise_to_another_host() {
+        for attack in [
+            "/..//evil.test",
+            "/../..//evil.test/x",
+            "/./..//evil.test",
+            "/%2e%2e//evil.test",
+            "/%2E%2E//evil.test",
+            "/a/../..//evil.test",
+        ] {
+            assert_eq!(safe_return_to(Some(attack)), "/", "{attack}");
+        }
+        assert_eq!(safe_return_to(Some("/a/../projects?x=1#y")), "/projects?x=1#y");
+        assert_eq!(
+            safe_return_to(Some("/cli-login?code=AB%2DCD")),
+            "/cli-login?code=AB%2DCD"
+        );
     }
 
     fn oidc_config(required_groups: &[&str], allowed_subjects: &[&str]) -> HumanOidcConfig {

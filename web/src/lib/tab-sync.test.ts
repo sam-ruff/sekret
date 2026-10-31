@@ -44,6 +44,14 @@ describe("tab sync", () => {
     expect(b.channels.size).toBe(0);
   });
 
+  it("tells other tabs who signed in", () => {
+    const b = bus();
+    const heard = vi.fn();
+    listen(heard, b.open);
+    broadcast({ kind: "signed-in", user: "u-bob" }, b.open);
+    expect(heard.mock.calls).toEqual([[{ kind: "signed-in", user: "u-bob" }]]);
+  });
+
   it("ignores anything that is not one of its messages", () => {
     const b = bus();
     const heard = vi.fn();
@@ -51,6 +59,9 @@ describe("tab sync", () => {
     const other = b.open();
     other.postMessage({ type: "signed-out" });
     other.postMessage("reveal-everything");
+    other.postMessage({ kind: "signed-in" });
+    other.postMessage({ kind: "signed-in", user: "" });
+    other.postMessage({ kind: "signed-in", user: 7 });
     expect(heard).not.toHaveBeenCalled();
   });
 

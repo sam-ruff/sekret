@@ -18,7 +18,7 @@ import { useProjectEnv } from "@/hooks/use-project-env";
 import { keys, useApiMutation } from "@/hooks/queries";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { formatDateTime, formatRelative } from "@/lib/format";
-import { normalisePath } from "@/lib/paths";
+import { folderLabel, normalisePath } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
 const KIND_STYLE: Record<SnapshotChange["kind"], { label: string; className: string; icon: typeof Plus }> = {
@@ -97,14 +97,14 @@ function SnapshotSheet({
         onClose();
       }}
     >
-      <SheetContent className="w-full gap-0 sm:max-w-xl" data-testid="snapshot-sheet">
-        <SheetHeader className="border-b">
+      <SheetContent className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl" data-testid="snapshot-sheet">
+        <SheetHeader className="border-b pr-12">
           <SheetTitle>Snapshot from {snapshot && formatRelative(snapshot.created_at)}</SheetTitle>
           <SheetDescription>
             {snapshot?.reason} · {snapshot?.actor} · {envName}
           </SheetDescription>
         </SheetHeader>
-        <ScrollArea className="min-h-0 flex-1">
+        <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-5 p-4">
             <Field>
               <FieldLabel htmlFor="restore-path">Limit to folder</FieldLabel>
@@ -148,7 +148,7 @@ function SnapshotSheet({
           open={confirming}
           onOpenChange={setConfirming}
           title="Restore this snapshot?"
-          description={`${changes.length} ${changes.length === 1 ? "secret" : "secrets"} under ${path} in ${envName} will be written as new versions. History is kept, so this can be undone with another restore.`}
+          description={`${changes.length} ${changes.length === 1 ? "secret" : "secrets"} under ${folderLabel(path)} in ${envName} will be written as new versions. History is kept, so this can be undone with another restore.`}
           confirmLabel="Restore"
           onConfirm={() => restore.mutateAsync()}
           testId="restore-confirm"

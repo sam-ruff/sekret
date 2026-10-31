@@ -220,7 +220,7 @@ export function IdentitiesPage() {
                 ),
             },
             {
-              header: "Token TTL",
+              header: "Token lifetime",
               cell: (i) => (
                 <span className="text-muted-foreground">
                   {formatDuration(i.token_ttl)} up to {formatDuration(i.token_max_ttl)}

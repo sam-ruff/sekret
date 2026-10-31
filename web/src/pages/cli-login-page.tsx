@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { CheckCircle2, LogIn, ShieldAlert, Terminal, XCircle } from "lucide-react";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { AlertTriangle, CheckCircle2, Info, LogIn, ShieldAlert, Terminal, XCircle } from "lucide-react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { ApiError, reauthUrl, startReauth } from "@/api/client";
 import { api } from "@/api/endpoints";
@@ -11,21 +11,49 @@ import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-pa
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useApiMutation, useMe } from "@/hooks/queries";
 import { codesMatch, isCompleteCode, normaliseUserCode } from "@/lib/cli-code";
-import { formatDateTime, formatRelative } from "@/lib/format";
+import { formatDateTime, formatExpiry, formatRelative } from "@/lib/format";
 
 type Outcome = "pending" | "approved" | "cancelled";
 
 const CODE_ERROR_ID = "cli-code-error";
+/** Remembers, across the reauthentication round trip, which request it was for. */
+const REAUTH_KEY = "sekret-cli-reauth";
 
-function Detail({ label, children, testId }: { label: string; children: ReactNode; testId: string }) {
+function rememberReauth(code: string): void {
+  try {
+    window.sessionStorage.setItem(REAUTH_KEY, code);
+  } catch {
+    // Without storage the note after signing in again is simply not shown.
+  }
+}
+
+/** Whether this page load is the return from signing in again for `code`. */
+function returnedFromReauth(code: string): boolean {
+  try {
+    return window.sessionStorage.getItem(REAUTH_KEY) === code;
+  } catch {
+    return false;
+  }
+}
+
+function forgetReauth(): void {
+  try {
+    window.sessionStorage.removeItem(REAUTH_KEY);
+  } catch {
+    // Nothing was stored.
+  }
+}
+
+function Detail({ label, children, testId }: { label: ReactNode; children: ReactNode; testId: string }) {
   return (
     <div className="flex flex-col gap-0.5 py-2 sm:flex-row sm:gap-4">
-      <dt className="text-sm text-muted-foreground sm:w-32 sm:shrink-0">{label}</dt>
+      <dt className="text-sm text-muted-foreground sm:w-40 sm:shrink-0">{label}</dt>
       <dd className="min-w-0 text-sm break-words" data-testid={testId}>
         {children}
       </dd>
@@ -40,16 +68,49 @@ function RequestDetails({ request }: { request: PendingCliLogin }) {
       <Detail label="Requested from" testId="cli-request-ip">
         <span className="font-mono">{request.requested_from_ip}</span>
       </Detail>
-      <Detail label="Program" testId="cli-request-agent">
+      <Detail
+        label={
+          <>
+            Program <span className="text-xs">(reported by the requester, can be faked)</span>
+          </>
+        }
+        testId="cli-request-agent"
+      >
         <span className="font-mono">{request.user_agent || "Not given"}</span>
       </Detail>
       <Detail label="Started" testId="cli-request-age">
         <span title={formatDateTime(request.created_at)}>{formatRelative(request.created_at)}</span>
       </Detail>
       <Detail label="Expires" testId="cli-request-expires">
-        {formatDateTime(request.expires_at)}
+        {formatExpiry(request.expires_at)}
       </Detail>
     </dl>
+  );
+}
+
+/** Shown when the request came from somewhere other than this browser's address. */
+function OtherAddress({ confirmed, onConfirm }: { confirmed: boolean; onConfirm: (on: boolean) => void }) {
+  return (
+    <Alert variant="destructive" data-testid="cli-other-address">
+      <AlertTriangle />
+      <AlertTitle>This sign-in came from a different network</AlertTitle>
+      <AlertDescription className="space-y-3">
+        <p>
+          The address above is not the one this browser uses. That is expected on a remote server or over a VPN, but it
+          is also what it looks like when someone else sent you the link. Approve only if you ran{" "}
+          <code className="font-mono">sekret login</code> yourself on that machine.
+        </p>
+        <label className="flex items-start gap-2 text-foreground">
+          <Checkbox
+            checked={confirmed}
+            onCheckedChange={(on) => onConfirm(on === true)}
+            className="mt-0.5"
+            data-testid="cli-confirm-own"
+          />
+          <span>I started this sign-in myself on that machine</span>
+        </label>
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -60,7 +121,10 @@ export function CliLoginPage() {
   const { data: me } = useMe();
   const [outcome, setOutcome] = useState<Outcome>("pending");
   const [typed, setTyped] = useState("");
+  const [confirmedOwn, setConfirmedOwn] = useState(false);
   const [reauthenticating, setReauthenticating] = useState(false);
+  const [signedInAgain] = useState(() => linkCode !== "" && returnedFromReauth(linkCode));
+  useEffect(() => forgetReauth(), []);
 
   const lookupCode = linkCode || (isCompleteCode(typed) ? normaliseUserCode(typed) : "");
   const request = useQuery({
@@ -72,7 +136,8 @@ export function CliLoginPage() {
 
   const complete = isCompleteCode(typed);
   const mismatch = complete && linkCode !== "" && !codesMatch(typed, linkCode);
-  const ready = complete && !mismatch && request.isSuccess;
+  const otherAddress = request.data?.same_address === false;
+  const ready = complete && !mismatch && request.isSuccess && (!otherAddress || confirmedOwn);
 
   const approve = useApiMutation({
     mutationFn: (code: string) => api.approveCli(code),
@@ -81,17 +146,39 @@ export function CliLoginPage() {
       if (!(error instanceof ApiError) || error.code !== "reauthentication_required") return false;
       // The server wants a fresh sign-in first; it brings the browser back here afterwards.
       setReauthenticating(true);
+      rememberReauth(lookupCode);
       startReauth(reauthUrl(error, `/cli-login?code=${encodeURIComponent(lookupCode)}`));
       return true;
     },
   });
+
+  const deny = useApiMutation({
+    mutationFn: (code: string) => api.denyCli(code),
+    onSuccess: () => setOutcome("cancelled"),
+    onError: (error) => {
+      // Already gone, so there is nothing left to refuse.
+      if (!(error instanceof ApiError) || error.status !== 404) return false;
+      setOutcome("cancelled");
+      return true;
+    },
+  });
+
+  const cancel = () => {
+    if (lookupCode === "") {
+      setOutcome("cancelled");
+      return;
+    }
+    deny.mutate(lookupCode);
+  };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (ready && !approve.isPending && !reauthenticating) approve.mutate(normaliseUserCode(typed));
   };
 
-  const unknown = request.error instanceof ApiError && request.error.status === 404;
+  const ended = request.error instanceof ApiError && request.error.status === 404;
+  const asking = outcome === "pending" && !ended;
+  const busy = approve.isPending || deny.isPending || reauthenticating;
 
   return (
     <StandalonePage className="max-w-lg">
@@ -104,7 +191,25 @@ export function CliLoginPage() {
         />
         <form onSubmit={submit} noValidate>
           <CardContent className="space-y-4">
-            {outcome === "pending" && (
+            {outcome === "pending" && ended && (
+              <Alert data-testid="cli-unknown">
+                <XCircle />
+                <AlertTitle>This sign-in request has ended</AlertTitle>
+                <AlertDescription>
+                  It expired or was already approved. Run <code className="font-mono">sekret login</code> again to get a
+                  new link.
+                </AlertDescription>
+              </Alert>
+            )}
+            {asking && signedInAgain && !reauthenticating && (
+              <Alert data-testid="cli-signed-in-again">
+                <Info />
+                <AlertDescription>
+                  You are signed in again. Type the code from your terminal once more to approve.
+                </AlertDescription>
+              </Alert>
+            )}
+            {asking && (
               <Alert className="border-warning/50 bg-warning/10" data-testid="cli-warning">
                 <ShieldAlert className="text-warning" />
                 <AlertTitle>Only approve a sign-in you started</AlertTitle>
@@ -114,22 +219,11 @@ export function CliLoginPage() {
                 </AlertDescription>
               </Alert>
             )}
-            {outcome === "pending" && request.isPending && lookupCode !== "" && <Skeleton className="h-36 w-full" />}
-            {outcome === "pending" && request.data && <RequestDetails request={request.data} />}
-            {outcome === "pending" && unknown && (
-              <Alert variant="destructive" data-testid="cli-unknown">
-                <XCircle />
-                <AlertTitle>No sign-in waiting for this code</AlertTitle>
-                <AlertDescription>
-                  It may have expired or been approved already. Run <code className="font-mono">sekret login</code>{" "}
-                  again for a new one.
-                </AlertDescription>
-              </Alert>
-            )}
-            {outcome === "pending" && request.error && !unknown && (
-              <ErrorState error={request.error} onRetry={() => void request.refetch()} />
-            )}
-            {outcome === "pending" && (
+            {asking && request.isPending && lookupCode !== "" && <Skeleton className="h-36 w-full" />}
+            {asking && request.data && <RequestDetails request={request.data} />}
+            {asking && otherAddress && <OtherAddress confirmed={confirmedOwn} onConfirm={setConfirmedOwn} />}
+            {asking && request.error && <ErrorState error={request.error} onRetry={() => void request.refetch()} />}
+            {asking && (
               <Field data-invalid={mismatch}>
                 <FieldLabel htmlFor="cli-code">Code from your terminal</FieldLabel>
                 <SecretInput
@@ -175,20 +269,21 @@ export function CliLoginPage() {
               <Alert data-testid="cli-cancelled">
                 <XCircle />
                 <AlertTitle>Cancelled</AlertTitle>
-                <AlertDescription>Nothing was approved. The CLI request will expire on its own.</AlertDescription>
+                <AlertDescription>
+                  {deny.isSuccess
+                    ? "Nothing was approved, and the terminal that asked is told the sign-in was refused."
+                    : "Nothing was approved."}
+                </AlertDescription>
               </Alert>
             )}
           </CardContent>
-          {outcome === "pending" && (
+          {asking && (
             <CardFooter className="mt-6 flex justify-end gap-2">
-              <Button type="button" variant="outline" onClick={() => setOutcome("cancelled")} data-testid="cli-cancel">
+              <Button type="button" variant="outline" onClick={cancel} disabled={busy} data-testid="cli-cancel">
+                {deny.isPending && <Spinner />}
                 Cancel
               </Button>
-              <Button
-                type="submit"
-                disabled={!ready || approve.isPending || reauthenticating}
-                data-testid="cli-approve"
-              >
+              <Button type="submit" disabled={!ready || busy} data-testid="cli-approve">
                 {(approve.isPending || reauthenticating) && <Spinner />}
                 Approve
               </Button>

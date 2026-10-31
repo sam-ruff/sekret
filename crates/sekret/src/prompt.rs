@@ -65,29 +65,48 @@ pub fn read_passphrase(
     prompt: &str,
     prompter: &dyn Prompter,
 ) -> anyhow::Result<Zeroizing<String>> {
+    let text = read_passphrase_for_api(file, prompt, prompter)?;
+    Ok(Zeroizing::new(trim_input(&text).to_string()))
+}
+
+/// The passphrase exactly as read, for sending to the API, which drops the byte order mark and
+/// line ending itself. Trimming here too would trim twice, so a passphrase file ending in two
+/// line endings would open the wrap online but not offline.
+pub fn read_passphrase_for_api(
+    file: Option<&Path>,
+    prompt: &str,
+    prompter: &dyn Prompter,
+) -> anyhow::Result<Zeroizing<String>> {
     let text = match file {
         None => prompter.secret(prompt)?,
         Some(path) if path == Path::new("-") => read_stdin_line()?,
         Some(path) => read_text_file(path)?,
     };
-    let passphrase = Zeroizing::new(trim_input(&text).to_string());
-    if passphrase.is_empty() {
+    if trim_input(&text).is_empty() {
         bail!("the passphrase is empty");
     }
-    Ok(passphrase)
+    Ok(text)
 }
 
 /// A new passphrase: from a file, or asked for twice. It must be strong enough.
 pub fn read_new_passphrase(file: Option<&Path>, prompter: &dyn Prompter) -> anyhow::Result<Zeroizing<String>> {
-    let passphrase = read_passphrase(file, "New passphrase: ", prompter)?;
+    let text = read_new_passphrase_for_api(file, prompter)?;
+    Ok(Zeroizing::new(trim_input(&text).to_string()))
+}
+
+/// [`read_new_passphrase`], untrimmed for the API; the checks apply to the trimmed form the
+/// server will use.
+pub fn read_new_passphrase_for_api(file: Option<&Path>, prompter: &dyn Prompter) -> anyhow::Result<Zeroizing<String>> {
+    let text = read_passphrase_for_api(file, "New passphrase: ", prompter)?;
+    let passphrase = trim_input(&text);
     if file.is_none() {
         let again = prompter.secret("Repeat it: ")?;
-        if *again != *passphrase {
+        if trim_input(&again) != passphrase {
             bail!("the passphrases do not match");
         }
     }
-    validate_passphrase(&passphrase)?;
-    Ok(passphrase)
+    validate_passphrase(passphrase)?;
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -96,26 +115,37 @@ pub mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
-    /// Answers questions from a script, in order.
-    pub struct Scripted(pub RefCell<VecDeque<String>>);
+    /// Answers questions from a script, in order, and records what was asked.
+    pub struct Scripted {
+        answers: RefCell<VecDeque<String>>,
+        asked: RefCell<Vec<String>>,
+    }
 
     impl Scripted {
         pub fn new(answers: &[&str]) -> Self {
-            Self(RefCell::new(answers.iter().map(|a| a.to_string()).collect()))
+            Self {
+                answers: RefCell::new(answers.iter().map(|a| a.to_string()).collect()),
+                asked: RefCell::new(Vec::new()),
+            }
         }
 
-        fn next(&self) -> anyhow::Result<String> {
-            self.0.borrow_mut().pop_front().context("no scripted answer left")
+        pub fn asked(&self) -> Vec<String> {
+            self.asked.borrow().clone()
+        }
+
+        fn next(&self, prompt: &str) -> anyhow::Result<String> {
+            self.asked.borrow_mut().push(prompt.to_string());
+            self.answers.borrow_mut().pop_front().context("no scripted answer left")
         }
     }
 
     impl Prompter for Scripted {
-        fn secret(&self, _prompt: &str) -> anyhow::Result<Zeroizing<String>> {
-            self.next().map(Zeroizing::new)
+        fn secret(&self, prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+            self.next(prompt).map(Zeroizing::new)
         }
 
-        fn line(&self, _prompt: &str) -> anyhow::Result<String> {
-            self.next()
+        fn line(&self, prompt: &str) -> anyhow::Result<String> {
+            self.next(prompt)
         }
     }
 
@@ -151,6 +181,32 @@ pub mod tests {
         assert_eq!(
             read_passphrase(Some(&path), "", &Scripted::new(&[]))?.as_str(),
             "saved by notepad"
+        );
+        Ok(())
+    }
+
+    /// The API trims what it is sent, so the CLI sends what it read; trimming on both sides
+    /// dropped two line endings online but one offline.
+    #[test]
+    fn passphrases_for_the_api_are_trimmed_once_by_the_server() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("pass");
+        for content in ["two endings\n\n", "\u{feff}saved by notepad\r\n", "plain"] {
+            std::fs::write(&path, content).context("write")?;
+            let sent = read_passphrase_for_api(Some(&path), "", &Scripted::new(&[]))?;
+            assert_eq!(sent.as_str(), content, "sent exactly as read");
+            let offline = read_passphrase(Some(&path), "", &Scripted::new(&[]))?;
+            assert_eq!(trim_input(&sent), offline.as_str(), "{content:?}");
+        }
+        std::fs::write(&path, "\u{feff}\n").context("write")?;
+        assert!(read_passphrase_for_api(Some(&path), "", &Scripted::new(&[])).is_err());
+        std::fs::write(&path, "violet tractor sings beneath\n").context("write")?;
+        let new = read_new_passphrase_for_api(Some(&path), &Scripted::new(&[]))?;
+        assert_eq!(new.as_str(), "violet tractor sings beneath\n");
+        let typed = Scripted::new(&["violet tractor sings beneath", "violet tractor sings beneath"]);
+        assert_eq!(
+            read_new_passphrase_for_api(None, &typed)?.as_str(),
+            "violet tractor sings beneath"
         );
         Ok(())
     }

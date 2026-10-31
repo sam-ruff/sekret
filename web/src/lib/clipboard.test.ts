@@ -145,6 +145,42 @@ describe("ClipboardGuard", () => {
     expect(c.guard.hasPending()).toBe(false);
   });
 
+  it("clears an outstanding secret at once when the page is going, even without focus", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    c.setFocused(false);
+    expect(c.guard.hasOutstanding()).toBe(true);
+    await expect(c.guard.clearNow()).resolves.toBe("cleared");
+    expect(c.contents).toBe("");
+    expect(c.guard.hasOutstanding()).toBe(false);
+    // The timer that was waiting does nothing afterwards.
+    c.contents = "later text";
+    await c.runTimers();
+    expect(c.contents).toBe("later text");
+    await expect(c.guard.clearNow()).resolves.toBeNull();
+  });
+
+  it("clears nothing at once when no secret is outstanding", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    await c.runTimers();
+    c.contents = "their own text";
+    await expect(c.guard.clearNow()).resolves.toBeNull();
+    expect(c.contents).toBe("their own text");
+  });
+
+  it("does not wipe a later copy that was not a secret", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    c.contents = "https://example.com/docs";
+    c.guard.noteReplaced();
+    await c.runTimers();
+    expect(c.contents).toBe("https://example.com/docs");
+    expect(c.onNotCleared).not.toHaveBeenCalled();
+    await expect(c.guard.clearNow()).resolves.toBeNull();
+    expect(c.contents).toBe("https://example.com/docs");
+  });
+
   it("survives a missing or failing clipboard", async () => {
     const onNotCleared = vi.fn();
     const missing = new ClipboardGuard({

@@ -39,6 +39,8 @@ impl std::fmt::Debug for HumanOidcConfig {
     }
 }
 
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
 /// A Unix socket on the host for unsealing without the network's rate limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnixSocketSettings {
@@ -69,6 +71,8 @@ pub struct ServerConfig {
     pub allow_insecure_http: bool,
     pub snapshots_to_keep: i64,
     pub login_rate_per_minute: u32,
+    /// Connections served at once; further ones wait in the listen backlog.
+    pub max_connections: usize,
     /// Serve HTTPS directly; plain HTTP behind a TLS-terminating proxy when absent.
     pub tls: Option<TlsSettings>,
     pub seal: SealSettings,
@@ -118,19 +122,22 @@ fn sidecar(path: &std::path::Path, suffix: &str) -> PathBuf {
 }
 
 /// Where the epoch high-water mark is kept: beside the SQLite database, the remember file and the
-/// root key file, whichever there are. A Postgres server with none of the files has nowhere.
+/// root key file, whichever there are, each by its canonical path so that every way of naming
+/// a file finds the same mark. A Postgres server with none of the files has nowhere.
 pub fn epoch_files(
     database_url: &str,
     remember_file: Option<&std::path::Path>,
     root_key_file: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
-    sekret_store::sqlite_file(database_url)
+    let mut files: Vec<PathBuf> = sekret_store::sqlite_file(database_url)
         .as_deref()
         .into_iter()
         .chain(remember_file)
         .chain(root_key_file)
-        .map(|path| sidecar(path, ".epoch"))
-        .collect()
+        .map(|path| sidecar(&sekret_store::canonical_path(path), ".epoch"))
+        .collect();
+    files.dedup();
+    files
 }
 
 #[derive(Clone)]
@@ -178,6 +185,7 @@ impl ServerConfig {
             allow_insecure_http: true,
             snapshots_to_keep: 200,
             login_rate_per_minute: 1000,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             tls: None,
             seal: SealSettings::default(),
             unix_socket: None,
@@ -221,5 +229,19 @@ mod tests {
             ]
         );
         assert!(epoch_files("postgres://db/sekret", None, None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_database_path_shares_the_real_files_epoch_mark() -> Result<(), std::io::Error> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("sekret.db");
+        std::fs::write(&real, b"")?;
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let through_link = epoch_files(&format!("sqlite://{}", link.display()), None, None);
+        let direct = epoch_files(&format!("sqlite://{}", real.display()), None, None);
+        assert_eq!(through_link, direct);
+        Ok(())
     }
 }

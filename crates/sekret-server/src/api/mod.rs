@@ -41,7 +41,49 @@ pub async fn audit(
     target: AuditTarget<'_>,
     detail: Value,
 ) {
-    let entry = AuditEntry {
+    insert_audit(state, audit_entry(state, principal, ip, action, target, detail)).await;
+}
+
+/// Records a refusal, folding repeats about the same `subject` from the same source within a
+/// minute into one later entry with a count, so a flood of refusals cannot flood the audit log.
+pub async fn audit_refusal(
+    state: &AppState,
+    principal: &Principal,
+    subject: &str,
+    ip: IpAddr,
+    action: &str,
+    detail: Value,
+) {
+    let entry = audit_entry(state, principal, ip, action, AuditTarget::default(), detail);
+    let key = format!("{action}|{subject}|{}", crate::ratelimit::limiter_key(ip));
+    for entry in state.refusals.admit(key, entry) {
+        insert_audit(state, entry).await;
+    }
+}
+
+/// Writes the summaries of refusal windows that have closed.
+pub async fn flush_refusals(state: &AppState) {
+    for entry in state.refusals.drain() {
+        insert_audit(state, entry).await;
+    }
+}
+
+async fn insert_audit(state: &AppState, entry: AuditEntry) {
+    let action = entry.action.clone();
+    if let Err(error) = state.store.insert_audit(entry).await {
+        tracing::error!(%error, action, "failed to write audit entry");
+    }
+}
+
+fn audit_entry(
+    state: &AppState,
+    principal: &Principal,
+    ip: IpAddr,
+    action: &str,
+    target: AuditTarget<'_>,
+    detail: Value,
+) -> AuditEntry {
+    AuditEntry {
         id: uuid::Uuid::now_v7().to_string(),
         created_at: state.clock.now(),
         actor_kind: principal.kind.as_str().to_string(),
@@ -52,11 +94,8 @@ pub async fn audit(
         environment: target.environment.map(String::from),
         path: target.path.map(String::from),
         secret_key: target.key.map(String::from),
-        detail,
+        detail: crate::peer::annotate(detail, &ip.to_string()),
         ip: ip.to_string(),
-    };
-    if let Err(error) = state.store.insert_audit(entry).await {
-        tracing::error!(%error, action, "failed to write audit entry");
     }
 }
 
@@ -167,19 +206,29 @@ impl utoipa::Modify for BearerAuth {
     }
 }
 
-pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+/// Sign-in bodies are a few tokens at most, and anyone may send them.
+pub const AUTH_BODY_LIMIT: usize = 64 * 1024;
+
+fn auth_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(human::auth_config))
         .routes(routes!(human::logout))
         .routes(routes!(human::cli_start))
         .routes(routes!(human::cli_pending))
         .routes(routes!(human::cli_approve))
+        .routes(routes!(human::cli_deny))
         .routes(routes!(human::cli_poll))
         .routes(routes!(machine::oidc_login))
         .routes(routes!(machine::kubernetes_login))
         .routes(routes!(machine::universal_login))
         .routes(routes!(machine::renew))
         .routes(routes!(machine::revoke))
+        .layer(axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT))
+}
+
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(auth_router())
         .merge(org::router())
         .merge(projects::router())
         .merge(logo::router())

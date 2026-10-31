@@ -2,6 +2,7 @@ mod cli;
 mod prompt;
 mod server;
 mod settings;
+mod socket_check;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -106,14 +107,14 @@ async fn authenticated(args: &cli::ClientArgs) -> anyhow::Result<(cli::config::R
     let Some(token) = resolved.token.clone() else {
         anyhow::bail!(
             "not logged in to {}; run `sekret login` or set SEKRET_TOKEN",
-            resolved.server
+            cli::format::one_line(&resolved.server)
         );
     };
     let api = cli::client(args, &resolved, Some(token))?;
     Ok((resolved, api))
 }
 
-async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result<i32> {
+async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &settings::Sources) -> anyhow::Result<i32> {
     let mut out = std::io::stdout();
     match cli.command {
         Command::Operator(OperatorCommand {
@@ -124,16 +125,16 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
         }
         Command::Operator(OperatorCommand { args: Some(args), .. }) => sekret_operator::run(args).await?,
         Command::Operator(_) => anyhow::bail!("--server-url or SEKRET_URL is required"),
-        Command::Server(args) => server::run_server(*args, env_secrets).await?,
-        Command::Admin(command) => server::run_admin(command).await?,
+        Command::Server(args) => server::run_server(*args, env_secrets, sources).await?,
+        Command::Admin(command) => server::run_admin(command, sources).await?,
         Command::Sys(command) if command.socket().is_some() => {
             let path = command.socket().map(std::path::Path::to_path_buf).unwrap_or_default();
+            socket_check::check(&path)?;
             let api = cli::host_socket_client(&path)?;
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }
         Command::Sys(command) => {
-            let resolved = cli::resolve(&cli.client)?;
-            let api = cli::client(&cli.client, &resolved, resolved.token.clone())?;
+            let api = cli::sys_client(&cli.client)?;
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }
         Command::Openapi => println!("{}", sekret_server::openapi_json()),
@@ -143,7 +144,12 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
             let (resolved, api) = authenticated(&cli.client).await?;
             let me = api.me().await?;
             let label = if me.email.is_empty() { me.name } else { me.email };
-            println!("{label} ({:?}) on {}", me.kind, resolved.server);
+            println!(
+                "{} ({:?}) on {}",
+                cli::format::one_line(&label),
+                me.kind,
+                cli::format::one_line(&resolved.server)
+            );
         }
         Command::Projects {
             action:
@@ -174,7 +180,11 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
                     environments,
                 })
                 .await?;
-            println!("created project {} ({})", project.slug, project.id);
+            println!(
+                "created project {} ({})",
+                cli::format::one_line(&project.slug),
+                cli::format::one_line(&project.id)
+            );
         }
         Command::Projects { .. } => {
             let (_, api) = authenticated(&cli.client).await?;
@@ -199,11 +209,15 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
         }
         Command::Export(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            cli::export(&api, cli::location(&resolved)?, &args, &mut out, &mut std::io::stderr()).await?;
+            let policy = cli::load_policy(&resolved, &args.allow)?;
+            let at = cli::location(&resolved)?;
+            cli::export(&api, at, &args, &policy, &mut out, &mut std::io::stderr()).await?;
         }
         Command::Run(args) => {
             let (resolved, api) = authenticated(&cli.client).await?;
-            return cli::run_command(&api, cli::location(&resolved)?, &args, &mut std::io::stderr()).await;
+            let policy = cli::load_policy(&resolved, &args.allow)?;
+            let at = cli::location(&resolved)?;
+            return cli::run_command(&api, at, &args, &policy, &mut std::io::stderr()).await;
         }
         Command::ShellInit { shell } => print!("{}", cli::shell::init_script(shell)),
         Command::Policy(flags) => {
@@ -234,6 +248,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
             environment,
             shell,
             recursive,
+            allow,
         }) => {
             // Printing exports to a terminal would show every value; the output is meant for eval.
             if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
@@ -247,12 +262,17 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
             }
             let (resolved, api) = authenticated(&args).await?;
             let previous = cli::shell::previously_loaded(std::env::var(cli::shell::LOADED_KEYS_VAR).ok().as_deref());
+            let policy = cli::load_policy(&resolved, &allow)?;
+            let options = cli::EnvUse {
+                shell,
+                recursive,
+                policy: &policy,
+                previous: &previous,
+            };
             cli::env_use(
                 &api,
                 cli::location(&resolved)?,
-                shell,
-                recursive,
-                &previous,
+                options,
                 &mut out,
                 &mut std::io::stderr(),
             )
@@ -268,26 +288,36 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Which settings came from the environment, noted before secrets are removed from it.
+    let sources = settings::Sources::process();
     // Taken while the process still has one thread, so removing them from the environment is
     // safe and nothing the server starts inherits them.
     let env_secrets = match cli.command {
         Command::Server(_) => settings::EnvSecrets::take()?,
+        Command::Admin(_) => {
+            settings::scrub_database_url()?;
+            settings::EnvSecrets::default()
+        }
+        Command::Run(_) => {
+            settings::scrub_env(&cli::shell::CREDENTIAL_VARS)?;
+            settings::EnvSecrets::default()
+        }
         _ => settings::EnvSecrets::default(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?;
-    runtime.block_on(run(cli, env_secrets))
+    runtime.block_on(run(cli, env_secrets, sources))
 }
 
-async fn run(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result<()> {
+async fn run(cli: Cli, env_secrets: settings::EnvSecrets, sources: settings::Sources) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_env("SEKRET_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
         .with_writer(std::io::stderr)
         .init();
-    let code = dispatch(cli, env_secrets).await?;
+    let code = dispatch(cli, env_secrets, &sources).await?;
     if code != 0 {
         std::process::exit(code);
     }

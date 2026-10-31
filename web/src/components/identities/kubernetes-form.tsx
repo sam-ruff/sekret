@@ -2,13 +2,14 @@ import { LockKeyhole } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { REDACTED_CREDENTIAL, type KubernetesAuthConfig, type KubernetesMode } from "@/api/types";
 import { ListInput } from "@/components/list-input";
-import { SecretInput } from "@/components/secret-field";
+import { MaskedSecretInput } from "@/components/secret-field";
 import { Button } from "@/components/ui/button";
-import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
+import { formatDurationWords } from "@/lib/format";
 import {
   credentialPayload,
   DEFAULT_MAX_TOKEN_LIFETIME,
@@ -61,9 +62,8 @@ function ReviewerTokenField({ value, hadStored, disabled, onChange }: ReviewerTo
         </div>
       ) : (
         <div className="flex gap-2">
-          <SecretInput
+          <MaskedSecretInput
             id="k8s-reviewer-jwt"
-            type="password"
             value={value.value}
             disabled={disabled}
             placeholder={hadStored ? "Paste a new token, or leave empty to remove it" : "eyJhbGciOi..."}
@@ -218,15 +218,16 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
               disabled={disabled}
               rows={4}
               aria-invalid={!!jwks.error}
+              aria-describedby={jwks.error ? "k8s-jwks-error" : undefined}
               placeholder='Output of: kubectl get --raw /openid/v1/jwks'
               className="font-mono text-xs"
               onChange={(e) => setJwksText(e.target.value)}
               data-testid="k8s-jwks"
             />
             {jwks.error && (
-              <p className="text-xs text-destructive" data-testid="k8s-jwks-error">
+              <FieldError id="k8s-jwks-error" data-testid="k8s-jwks-error">
                 {jwks.error}
-              </p>
+              </FieldError>
             )}
           </Field>
         </div>
@@ -271,7 +272,7 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
       </div>
       <p className="text-xs text-muted-foreground">Namespaces and service accounts accept globs, such as team-*.</p>
       <Field data-invalid={maxLifetime === null}>
-        <FieldLabel htmlFor="k8s-max-lifetime">Maximum token lifetime (seconds)</FieldLabel>
+        <FieldLabel htmlFor="k8s-max-lifetime">Longest Kubernetes token accepted (seconds)</FieldLabel>
         <Input
           id="k8s-max-lifetime"
           inputMode="numeric"
@@ -279,21 +280,26 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
           disabled={disabled}
           className="w-full font-mono sm:w-40"
           aria-invalid={maxLifetime === null}
-          aria-describedby="k8s-max-lifetime-help"
+          aria-describedby={maxLifetime === null ? "k8s-max-lifetime-error" : "k8s-max-lifetime-help"}
           onChange={(e) => setLifetime(e.target.value)}
           data-testid="k8s-max-lifetime"
         />
-        <FieldDescription id="k8s-max-lifetime-help">
-          {maxLifetime === null
-            ? "Enter a whole number of seconds, 1 or more."
-            : "Tokens issued for longer than this are refused. Keep pods' projected token expirationSeconds at or below it."}
-        </FieldDescription>
+        {maxLifetime === null ? (
+          <FieldError id="k8s-max-lifetime-error" data-testid="k8s-max-lifetime-error">
+            Enter a whole number of seconds, 1 or more.
+          </FieldError>
+        ) : (
+          <FieldDescription id="k8s-max-lifetime-help" data-testid="k8s-max-lifetime-help">
+            Kubernetes tokens valid for longer than this are refused: {formatDurationWords(maxLifetime)}. Keep pods&apos;
+            projected token <code className="font-mono text-xs">expirationSeconds</code> at or below it.
+          </FieldDescription>
+        )}
       </Field>
       {!disabled && (
         <div className="flex justify-end">
           <Button type="submit" disabled={!valid || busy} data-testid="k8s-save">
             {busy && <Spinner />}
-            Save Kubernetes
+            Save Kubernetes settings
           </Button>
         </div>
       )}

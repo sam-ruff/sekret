@@ -30,7 +30,7 @@ export function LoginPage() {
         <StandaloneHeader
           title="Sign in to sekret"
           pageTitle="Sign in"
-          description="Secrets for your projects, kept in one place."
+          description="Sign in with your organisation account to manage secrets."
         />
         <CardContent className="space-y-4">
           {error && (

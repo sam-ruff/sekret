@@ -5,9 +5,9 @@ pub mod models;
 mod sql;
 
 use async_trait::async_trait;
-pub use lock::{InstanceLock, lock_file};
+pub use lock::{InstanceLock, canonical_path, lock_file};
 pub use models::*;
-pub use sql::{SqlStore, sqlite_file};
+pub use sql::{Open, SqlStore, sqlite_file, without_create};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -147,6 +147,8 @@ pub trait Store: Send + Sync {
     async fn create_cli_login(&self, login: CliLogin) -> StoreResult<()>;
     async fn get_cli_login(&self, user_code: &str, now: i64) -> StoreResult<Option<CliLogin>>;
     async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64) -> StoreResult<bool>;
+    /// Consumes a pending, unapproved login so its poller is told it has gone.
+    async fn deny_cli_login(&self, user_code: &str, now: i64) -> StoreResult<bool>;
     async fn poll_cli_login(&self, device_code_hash: &str, now: i64) -> StoreResult<CliPoll>;
 
     async fn purge_expired(&self, now: i64) -> StoreResult<()>;

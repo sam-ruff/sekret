@@ -292,8 +292,8 @@ async fn seal_and_unseal(db: String) -> anyhow::Result<()> {
     assert_eq!(code, StatusCode::FORBIDDEN);
     assert_eq!(
         audit_count(&h, &admin, "sys.forbidden").await?,
-        2,
-        "refusals are audited"
+        1,
+        "refusals are audited, with repeats within a minute folded into one entry"
     );
     let (code, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
     assert_eq!(code, StatusCode::OK, "{body}");

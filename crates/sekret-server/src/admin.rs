@@ -9,9 +9,12 @@ use sekret_store::{Binding, EncryptedValue, PrincipalKind, Rekey, SealConfig, St
 use crate::auth::{TokenKind, TokenRequest, mint_token};
 use crate::error::{ApiError, ApiResult};
 use crate::machine::reseal;
+use crate::seal::{HighWater, cautious_flags, verify_config};
 use crate::state::AppState;
 
 pub const BOOTSTRAP_SUBJECT: &str = "local|bootstrap-admin";
+/// The longest a break-glass admin token may last: a day.
+pub const MAX_BOOTSTRAP_TTL: i64 = 86_400;
 
 /// Creates (or reuses) the local break-glass admin and returns a short-lived admin token.
 pub async fn bootstrap_admin(state: &AppState, ttl: i64) -> ApiResult<String> {
@@ -20,6 +23,11 @@ pub async fn bootstrap_admin(state: &AppState, ttl: i64) -> ApiResult<String> {
 
 /// [`bootstrap_admin`], also returning when the token expires, in Unix seconds.
 pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(String, i64)> {
+    if !(1..=MAX_BOOTSTRAP_TTL).contains(&ttl) {
+        return Err(ApiError::bad_request(format!(
+            "an admin token lasts between 1 and {MAX_BOOTSTRAP_TTL} seconds"
+        )));
+    }
     let now = state.clock.now();
     let user = state
         .store
@@ -59,75 +67,122 @@ pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(Str
 }
 
 /// A stored configuration about to be signed again with a new key: kept as it is when its
-/// signature holds under `old_root`, otherwise reset to grant no unlock, so a database writer's
-/// change is never signed.
-pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig) -> SealConfig {
-    if crate::seal::check_signature(old_root, &config) == crate::seal::Signature::Valid {
+/// signature holds under `old_root` and it is not older than the recorded marks, otherwise reset
+/// to grant no unlock, so a database writer's change or rollback is never signed as it stands.
+pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater) -> SealConfig {
+    let Err(distrust) = verify_config(old_root, &config, marks) else {
         return config;
-    }
+    };
     tracing::error!(
-        "the seal configuration was changed without the root key; resetting it to the manual unlock policy"
+        action = distrust.action(),
+        "the seal configuration failed its integrity check; resetting it to the manual unlock policy"
     );
     SealConfig {
         unlock_policy: UnlockPolicy::Manual,
         remembered: None,
+        flags: cautious_flags(config.flags, false),
         ..config
     }
 }
 
+/// How a root key replacement treats the seal configuration and data it cannot read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rotation {
+    /// The epoch marks recorded outside the database; the new signature goes above them.
+    pub marks: HighWater,
+    /// Leave unreadable rows as they are instead of refusing.
+    pub skip_unreadable: bool,
+}
+
+/// What a root key replacement did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RotationReport {
+    pub projects: usize,
+    /// Rows that could not be read and were left as they were, by id; never their contents.
+    pub skipped: Vec<String>,
+}
+
 /// Re-encrypts each value under a fresh data key for its project, so nothing written under the
-/// old keys stays readable with them.
+/// old keys stays readable with them. Values that do not decrypt are named in `unreadable`.
 fn reencrypt_values(
     project_id: &str,
     old_key: &DataKey,
     new_key: &DataKey,
     values: Vec<EncryptedValue>,
+    unreadable: &mut Vec<String>,
 ) -> ApiResult<Vec<EncryptedValue>> {
-    values
-        .into_iter()
-        .map(|value| {
-            let ctx = ValueContext {
-                project_id,
-                secret_id: &value.secret_id,
-                version: value.version,
-            };
-            let plain = decrypt_value(old_key, &value.value, ctx)
-                .map_err(|e| ApiError::internal("decrypting a value for re-encryption", e))?;
-            Ok(EncryptedValue {
-                value: encrypt_value(new_key, &plain, ctx)?,
-                ..value
-            })
-        })
-        .collect()
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let ctx = ValueContext {
+            project_id,
+            secret_id: &value.secret_id,
+            version: value.version,
+        };
+        let Ok(plain) = decrypt_value(old_key, &value.value, ctx) else {
+            unreadable.push(format!(
+                "secret {} version {} in project {project_id}",
+                value.secret_id, value.version
+            ));
+            continue;
+        };
+        out.push(EncryptedValue {
+            value: encrypt_value(new_key, &plain, ctx)?,
+            ..value
+        });
+    }
+    Ok(out)
+}
+
+fn unreadable_rows(rows: &[String]) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::CONFLICT,
+        "unreadable_data",
+        format!(
+            "{} stored item(s) no longer decrypt, so the root key was not replaced: {}. Retry with skip_unreadable \
+             (--skip-unreadable) to leave them as they are",
+            rows.len(),
+            rows.join("; ")
+        ),
+    )
 }
 
 /// Replaces the root key: every project gets a fresh data key wrapped under `new_root`, every
 /// secret value (history included) is re-encrypted under it, machine credentials are resealed
 /// and the fingerprint recorded, all in one transaction. In passphrase mode `seal` carries the new
-/// wrap. Either way the stored seal configuration moves to its next epoch and is signed with the
-/// new root key, so the next start does not take the old signature for tampering.
+/// wrap. Either way the stored seal configuration moves past its epoch and the recorded marks and
+/// is signed with the new root key, so the next start does not take it for tampering.
 pub async fn rotate_root_key(
     store: &dyn Store,
     old_root: &RootKey,
     new_root: &RootKey,
     seal: Option<SealConfig>,
-) -> ApiResult<usize> {
+    rotation: Rotation,
+) -> ApiResult<RotationReport> {
     let seal = match seal {
         Some(config) => Some(config),
         None => store
             .get_seal_config()
             .await?
-            .map(|config| trusted_or_reset(old_root, config)),
+            .map(|config| trusted_or_reset(old_root, config, rotation.marks)),
     };
+    let mut unreadable = Vec::new();
     let projects = store.list_projects().await?;
     let mut rewrapped = Vec::with_capacity(projects.len());
     let mut values = Vec::new();
     for project in &projects {
-        let old_key: DataKey = unwrap_data_key(old_root, &project.wrapped_key, &project.id)
-            .map_err(|e| ApiError::internal("unwrapping project key", e))?;
+        let Ok(old_key) = unwrap_data_key(old_root, &project.wrapped_key, &project.id) else {
+            unreadable.push(format!("data key of project {}", project.id));
+            continue;
+        };
         let new_key = DataKey::generate()?;
         let stored = store.list_encrypted_values(&project.id).await?;
-        values.extend(reencrypt_values(&project.id, &old_key, &new_key, stored)?);
+        values.extend(reencrypt_values(
+            &project.id,
+            &old_key,
+            &new_key,
+            stored,
+            &mut unreadable,
+        )?);
         rewrapped.push((project.id.clone(), wrap_data_key(new_root, &new_key, &project.id)?));
     }
     let mut resealed = Vec::new();
@@ -135,15 +190,28 @@ pub async fn rotate_root_key(
         for mut method in store.list_auth_methods(&identity.id).await? {
             let config: AuthMethodConfig =
                 serde_json::from_value(method.config).map_err(|e| ApiError::internal("auth method config", e))?;
-            let Some(config) = reseal(old_root, new_root, &identity.id, &config)? else {
-                continue;
+            let config = match reseal(old_root, new_root, &identity.id, &config) {
+                Ok(Some(config)) => config,
+                Ok(None) => continue,
+                Err(_) => {
+                    unreadable.push(format!("{} credential of identity {}", method.kind, identity.id));
+                    continue;
+                }
             };
             method.config = serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
             resealed.push(method);
         }
     }
-    let count = rewrapped.len();
-    let seal = seal.map(|config| crate::seal::signed(new_root, config)).transpose()?;
+    if !unreadable.is_empty() && !rotation.skip_unreadable {
+        return Err(unreadable_rows(&unreadable));
+    }
+    for row in &unreadable {
+        tracing::warn!(row = %row, "left unreadable data as it was while replacing the root key");
+    }
+    let projects = rewrapped.len();
+    let seal = seal
+        .map(|config| crate::seal::signed(new_root, config, rotation.marks.floor()))
+        .transpose()?;
     store
         .replace_wrapped_keys(Rekey {
             keys: rewrapped,
@@ -153,5 +221,8 @@ pub async fn rotate_root_key(
             seal,
         })
         .await?;
-    Ok(count)
+    Ok(RotationReport {
+        projects,
+        skipped: unreadable,
+    })
 }

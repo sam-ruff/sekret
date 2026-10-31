@@ -34,9 +34,11 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/in
 import { Spinner } from "@/components/ui/spinner";
 import { folderQuery, useProjectEnv } from "@/hooks/use-project-env";
 import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useProject, useSealWatch } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { generatorFromDraft } from "@/lib/generation";
-import { isValidFolderName, joinPath } from "@/lib/paths";
+import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
 
 function NewFolderDialog({
   open,
@@ -70,7 +72,7 @@ function NewFolderDialog({
           <DialogHeader>
             <DialogTitle>New folder</DialogTitle>
             <DialogDescription>
-              Created inside <span className="font-mono">{parent}</span>.
+              Created inside <span className="font-mono">{folderLabel(parent)}</span>.
             </DialogDescription>
           </DialogHeader>
           <Field>
@@ -115,6 +117,7 @@ function SecretsView() {
   const projectQuery = useProject(project);
   const perms = useProjectPermissions(project);
   const queryClient = useQueryClient();
+  const isMobile = useIsMobile();
 
   const [filter, setFilter] = useState("");
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
@@ -164,7 +167,13 @@ function SecretsView() {
   /** Undefined while loading or not asked for. */
   const valueOf = (key: string): string | null | undefined =>
     revealAll && editing !== key ? allValues.data?.get(key) : singleQuery(key)?.data;
-  useSealWatch(revealAll || revealed.size > 0);
+  const anyRevealed = revealAll || revealed.size > 0;
+  useSealWatch(anyRevealed);
+  useIdle(anyRevealed, () => {
+    setRevealAll(false);
+    setRevealed(new Set());
+    setHiddenFromAll(new Set());
+  });
 
   const invalidate = [
     ["project", project, "secrets"],
@@ -187,6 +196,8 @@ function SecretsView() {
     onSuccess: () => {
       setAdding(false);
       setEditing(null);
+      // The finished mutation still holds the saved value as its variables.
+      save.reset();
     },
   });
 
@@ -288,7 +299,8 @@ function SecretsView() {
                   <Search />
                 </InputGroupAddon>
                 <InputGroupInput
-                  placeholder="Search keys, comments, tags"
+                  placeholder={isMobile ? "Search" : "Search keys, comments, tags"}
+                  aria-label="Search keys, comments and tags"
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
                   data-testid="secret-search"

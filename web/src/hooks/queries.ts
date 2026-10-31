@@ -71,12 +71,18 @@ export function forgetAllButStatus(queryClient: QueryClient): void {
 
 export const SEAL_WATCH_INTERVAL_MS = 15_000;
 
-/** While `active`, checks whether the server is still unlocked every so often and when the tab comes back. */
+/**
+ * While `active`, checks every so often and when the tab comes back whether the server is still
+ * unlocked and the session still alive, so values on screen go when either ends.
+ */
 export function useSealWatch(active: boolean, intervalMs = SEAL_WATCH_INTERVAL_MS): void {
   const queryClient = useQueryClient();
   useEffect(() => {
     if (!active) return;
-    const check = () => void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
+    const check = () => {
+      void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
+      void queryClient.invalidateQueries({ queryKey: keys.me });
+    };
     const onVisibility = () => {
       if (document.visibilityState === "visible") check();
     };

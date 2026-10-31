@@ -60,6 +60,8 @@ export const api = {
   pendingCli: (code: string) => unwrap(client.GET("/api/v1/auth/cli/pending", { params: { query: { code } } })),
   /** `code` must be the one the person typed from their terminal. */
   approveCli: (code: string) => unwrap(client.POST("/api/v1/auth/cli/approve", { body: { code } })),
+  /** Ends the request, so the terminal that started it stops waiting. */
+  denyCli: (code: string) => unwrap(client.POST("/api/v1/auth/cli/deny", { body: { code } })),
 
   projects: () => unwrap(client.GET("/api/v1/projects")),
   project: (project: string) => unwrap(client.GET("/api/v1/projects/{project}", { params: { path: { project } } })),

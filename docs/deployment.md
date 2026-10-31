@@ -36,6 +36,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/sekret
+RuntimeDirectory=sekret
+RuntimeDirectoryMode=0750
 CapabilityBoundingSet=
 MemoryDenyWriteExecute=true
 
@@ -67,13 +69,16 @@ sekret sys unseal --server https://sekret.example.com
 
 No sign-in is needed: the passphrase is the credential. Applications get 503 until then and should retry.
 
-On the server host you can also unlock through a Unix socket, which is not subject to the network's rate limits, so nobody guessing over the network can hold you up. Set `server.unix_socket` (and `server.unix_socket_mode: "0660"` if a group should be able to use it), then:
+!!! tip "Set up the Unix socket"
+    Network unlocks are rate limited, backed off and queued so that guessing is slow, and a large enough flood of guesses from many networks can still keep them busy. The Unix socket below is not, so set `server.unix_socket` on every server whose host you can log in to.
+
+On the server host you can also unlock through a Unix socket, which is not subject to the network's rate limits, back-off or queue, so nobody guessing over the network can hold you up. This is the recommended way to unlock on a host you can log in to. Set `server.unix_socket` (and `server.unix_socket_mode: "0660"` if a group should be able to use it), in a directory that belongs to the server's user and that other users cannot write to, such as `RuntimeDirectory=sekret` with `RuntimeDirectoryMode=0750` in the unit above. The server refuses to start otherwise, and the CLI refuses to send a passphrase to a socket in a directory others can write to, or one whose listening process is not the socket's owner. Then:
 
 ```sh
 sekret sys unseal --socket /run/sekret/sekret.sock
 ```
 
-The server serves only status and unseal on the socket. It holds a lock on its database for as long as it runs (`<db>.lock` beside a SQLite file, an advisory lock on Postgres), so `sekret admin init`, `rotate-root-key`, `set-seal-mode` and `restore` refuse to run until it stops. `sekret admin bootstrap` still works alongside it.
+The server serves only status and unseal on the socket. It holds a lock on its database for as long as it runs (a `flock` on the SQLite file and on `<db>.lock` beside it, an advisory lock on Postgres), so `sekret admin init`, `rotate-root-key`, `set-seal-mode` and `restore` refuse to run until it stops. `sekret admin bootstrap` still works alongside it, as long as it is the same sekret version as the server. A starting server waits up to 30 seconds for the lock, and a running server exits with an error if it loses it, so keep `Restart=on-failure`. See [One server per database](configuration.md#one-server-per-database).
 
 ## Alerting when sealed
 
@@ -124,6 +129,10 @@ For key-file mode, mount the key and add `-e SEKRET_ROOT_KEY_FILE=/run/secrets/r
 ```sh
 SEKRET_DATABASE_URL='postgres://sekret:password@db.example.com/sekret?sslmode=require'
 ```
+
+The URL holds the database password, so prefer `SEKRET_DATABASE_URL_FILE` (or `database.url_file`) naming a file only the sekret user can read, such as a systemd credential or a mounted secret. The server removes `SEKRET_DATABASE_URL` from its own environment once read, but whatever started it still holds it.
+
+Connect directly or through PgBouncer in session pooling mode. Transaction and statement pooling are not supported, because the server's lock on the database is tied to one session.
 
 Create an empty database owned by the sekret user; the server creates its tables on first start. Values are encrypted before they reach the database, so a Postgres backup holds ciphertext, but key names, folder paths, comments, tags and the audit log are stored in plain text.
 
@@ -179,7 +188,7 @@ Restore offline, on any host, into a new SQLite file:
 sekret admin restore --backup sekret-2026-10-30.skb --database-url 'sqlite:///var/lib/sekret/sekret.db?mode=rwc'
 ```
 
-It prints when the backup was taken and its root key fingerprint, asks for the passphrase (or reads `--passphrase-file`; `--root-key-file` for key-file backups) and checks it matches the backup. It refuses to overwrite an existing file, or to write where a `-wal`, `-shm` or `-journal` file from another database is waiting beside the target. It writes into a new private directory in the same folder, checks the copy is intact and belongs to the backup's root key, makes sure the file it checked is still the one it wrote, and only then links it into place; anything an interrupted restore left behind is removed first. The restore is recorded in the restored database's audit log as `admin.restore`. Start the server on the restored database and unlock it with the same passphrase. If you restore over the path of a database that had a newer seal configuration, delete its `<db>.epoch` file first, or the server takes the older configuration for a rollback and falls back to the manual unlock policy. Tokens, users and identities come back as they were. A remembered unlock does not, so the first start needs the passphrase.
+It prints when the backup was taken and its root key fingerprint, asks for the passphrase (or reads `--passphrase-file`; `--root-key-file` for key-file backups) and checks it matches the backup. It refuses to overwrite an existing file, or to write where a `-wal`, `-shm` or `-journal` file from another database is waiting beside the target. It writes into a new private directory in the same folder, checks the copy is intact and belongs to the backup's root key, makes sure the file it checked is still the one it wrote, and only then links it into place; anything an interrupted restore left behind is removed first. The restore is recorded in the restored database's audit log as `admin.restore`. Start the server on the restored database and unlock it with the same passphrase. If you put the restored file in place of a database that had a newer seal configuration, run `sekret admin reset-epoch` on it before starting the server, or the server takes the older configuration for a rollback and falls back to the manual unlock policy. Tokens, users and identities come back as they were. A remembered unlock does not, so the first start needs the passphrase.
 
 ## Health checks
 

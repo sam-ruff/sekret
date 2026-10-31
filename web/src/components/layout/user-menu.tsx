@@ -47,7 +47,7 @@ export function UserMenu() {
       <DropdownMenuTrigger asChild>
         <Button variant="ghost" size="icon" className="rounded-full" aria-label="Account" data-testid="user-menu">
           <Avatar className="size-8">
-            <AvatarFallback className="bg-primary/15 text-xs font-semibold text-primary">{initials(label)}</AvatarFallback>
+            <AvatarFallback className="bg-primary/15 text-xs font-semibold text-accent-foreground" data-testid="user-initials">{initials(label)}</AvatarFallback>
           </Avatar>
         </Button>
       </DropdownMenuTrigger>

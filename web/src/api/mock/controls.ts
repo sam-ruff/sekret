@@ -17,6 +17,8 @@ export interface MockControls {
   unsealedBy?: UnsealedBy;
   /** Replaces the signed-in user's organisation roles. */
   orgRole?: string;
+  /** Signing out continues at an identity provider's logout page. */
+  idpLogout?: boolean;
 }
 
 export function parseControls(search: string): MockControls {
@@ -29,6 +31,7 @@ export function parseControls(search: string): MockControls {
     configuredPolicy: UNLOCK_POLICIES.find((p) => p === params.get("mock-unlock")),
     unsealedBy: UNSEALED_BY.find((u) => u === params.get("mock-unsealed-by")),
     orgRole: params.get("mock-org-role") ?? undefined,
+    idpLogout: params.has("mock-idp-logout") ? true : undefined,
   };
 }
 

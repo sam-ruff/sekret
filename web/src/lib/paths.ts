@@ -13,6 +13,12 @@ export function parentPath(path: string): string {
   return `/${segments.slice(0, -1).join("/")}`;
 }
 
+/** How a folder is named in copy: the top level is "root", as in the breadcrumbs. */
+export function folderLabel(path: string): string {
+  const normalised = normalisePath(path);
+  return normalised === "/" ? "root" : normalised;
+}
+
 export interface Crumb {
   name: string;
   path: string;

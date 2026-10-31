@@ -48,6 +48,7 @@ export function CopyButton({ value, label = "Copy", className, testId, disabled,
       if (text == null) return;
       await writeClipboard(text);
       if (sensitive) clipboardGuard().clearLater(text);
+      else clipboardGuard().noteReplaced();
       setCopied(true);
       toast.success("Copied to clipboard");
     } catch {

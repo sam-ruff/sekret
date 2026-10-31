@@ -72,7 +72,9 @@ import {
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_CLI_ADDRESS,
   MOCK_CLI_USER_AGENT,
+  MOCK_IDP_LOGOUT_URL,
   MOCK_REAUTH_CODE_PREFIX,
+  MOCK_SAME_ADDRESS_CODE_PREFIX,
   MOCK_SETUP_CODE,
   MOCK_VERSION,
   publicStatusOf,
@@ -296,7 +298,7 @@ export class MockBackend {
   logout(): { logout_url: string | null } {
     this.state.signedOut = true;
     this.state.freshSignIn = false;
-    return { logout_url: null };
+    return { logout_url: this.state.idpLogoutUrl ?? null };
   }
 
   orgRules(): Rule[] {
@@ -348,6 +350,7 @@ export class MockBackend {
   applyControls(controls: MockControls): void {
     this.state.sys = sysFromControls(this.state.sys, controls);
     if (controls.orgRole) this.setMyOrgRole(controls.orgRole);
+    if (controls.idpLogout) this.state.idpLogoutUrl = MOCK_IDP_LOGOUT_URL;
   }
 
   // Projects
@@ -1755,20 +1758,40 @@ export class MockBackend {
     return normalised;
   }
 
+  /** A code still waiting: known, and neither approved nor denied yet. */
+  private waitingCliCode(code: string): string {
+    const normalised = this.knownCliCode(code);
+    if (this.state.endedCliCodes?.includes(normalised)) {
+      throw new MockError(404, "not_found", "that code is unknown or has expired");
+    }
+    return normalised;
+  }
+
+  private endCliLogin(code: string): void {
+    this.state.endedCliCodes = [...(this.state.endedCliCodes ?? []), code];
+  }
+
   pendingCli(code: string): PendingCliLogin {
-    this.knownCliCode(code);
+    const normalised = this.waitingCliCode(code);
     const now = Math.floor(Date.now() / 1000);
     return {
       code_hint: null,
       requested_from_ip: MOCK_CLI_ADDRESS,
+      same_address: normalised.startsWith(MOCK_SAME_ADDRESS_CODE_PREFIX),
       user_agent: MOCK_CLI_USER_AGENT,
       created_at: now - 60,
       expires_at: now + 540,
     };
   }
 
+  denyCli(code: string): void {
+    const normalised = this.waitingCliCode(code);
+    this.endCliLogin(normalised);
+    this.audit("auth.cli-deny", {}, {});
+  }
+
   approveCli(code: string): void {
-    const normalised = this.knownCliCode(code);
+    const normalised = this.waitingCliCode(code);
     if (normalised.startsWith(MOCK_REAUTH_CODE_PREFIX) && !this.state.freshSignIn) {
       const back = encodeURIComponent(`/cli-login?code=${encodeURIComponent(normalised)}`);
       throw new MockError(
@@ -1777,6 +1800,7 @@ export class MockBackend {
         `sign in again to approve this; continue at /auth/login?reauth=1&return_to=${back}`,
       );
     }
+    this.endCliLogin(normalised);
     this.audit("auth.cli-approve", {}, {});
   }
 }

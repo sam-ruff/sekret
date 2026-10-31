@@ -14,17 +14,18 @@ pub mod images;
 pub mod jwt;
 pub mod machine;
 pub mod net;
+pub mod peer;
 pub mod ratelimit;
 pub mod rotation;
 pub mod seal;
 pub mod secrets;
+pub mod serve;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod tls;
 mod web;
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Request, State};
@@ -107,11 +108,33 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long any request may take, and a backup, which reads and encrypts the whole database.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(600);
+/// System changes that run detached, so they are answered when they finish, however long that is.
+const DETACHED_CHANGES: [&str; 5] = [
+    "/api/v1/sys/init",
+    "/api/v1/sys/unseal",
+    "/api/v1/sys/passphrase",
+    "/api/v1/sys/unlock-policy",
+    "/api/v1/sys/forget-unlock",
+];
+
+/// How long a request to `path` may take. The detached changes have no limit: they finish in a
+/// task of their own whatever happens to the request, so a timeout would only tell the caller a
+/// change failed when it went through.
+fn time_limit(path: &str) -> Option<Duration> {
+    if DETACHED_CHANGES.contains(&path) {
+        return None;
+    }
+    match path {
+        "/api/v1/sys/backup" => Some(BACKUP_TIMEOUT),
+        _ => Some(REQUEST_TIMEOUT),
+    }
+}
 
 /// Changes outside the system and sign-in routes may encrypt under the root key, so they wait
-/// while it is being replaced. They only start waiting once their body has arrived and the caller
-/// is authenticated, so a slow or anonymous request cannot hold a rotation, and every writer
-/// queued behind it, up. Before writing, the database must still hold this server's root key.
+/// while it is being replaced. The caller is authenticated from the headers before the body is
+/// read, so an anonymous client cannot make the server buffer one, and the wait only starts once
+/// the body has arrived, so a slow request cannot hold a rotation, and every writer queued behind
+/// it, up. Before writing, the database must still hold this server's root key.
 async fn write_gate(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let writes = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
@@ -120,6 +143,10 @@ async fn write_gate(State(state): State<AppState>, request: Request, next: Next)
         return next.run(request).await;
     }
     let (mut parts, body) = request.into_parts();
+    let principal = match auth::Principal::from_request_parts(&mut parts, &state).await {
+        Ok(principal) => principal,
+        Err(error) => return error.into_response(),
+    };
     let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
         return ApiError::new(
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -127,10 +154,6 @@ async fn write_gate(State(state): State<AppState>, request: Request, next: Next)
             "the request body is too large or arrived too slowly",
         )
         .into_response();
-    };
-    let principal = match auth::Principal::from_request_parts(&mut parts, &state).await {
-        Ok(principal) => principal,
-        Err(error) => return error.into_response(),
     };
     parts.extensions.insert(principal);
     let _writing = state.keyring.writing().await;
@@ -141,11 +164,32 @@ async fn write_gate(State(state): State<AppState>, request: Request, next: Next)
         .await
 }
 
+/// System changes that write under the root key. Sealing is left out so it always works.
+const SYS_WRITES: [&str; 4] = [
+    "/api/v1/sys/passphrase",
+    "/api/v1/sys/unlock-policy",
+    "/api/v1/sys/forget-unlock",
+    "/api/v1/sys/backup",
+];
+
+/// The write gate skips the system routes, so their changes check here that the database still
+/// holds this server's root key, as other writes do.
+async fn sys_fingerprint_gate(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let writes = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let checked = writes && SYS_WRITES.contains(&request.uri().path());
+    if !checked || state.keyring.state() != SealState::Unsealed {
+        return next.run(request).await;
+    }
+    if let Err(error) = state.keyring.check_fingerprint(state.store.as_ref()).await {
+        return error.into_response();
+    }
+    next.run(request).await
+}
+
 /// Ends a request that runs too long. Work that must not stop halfway runs as its own task.
 async fn request_timeout(request: Request, next: Next) -> Response {
-    let limit = match request.uri().path() {
-        "/api/v1/sys/backup" => BACKUP_TIMEOUT,
-        _ => REQUEST_TIMEOUT,
+    let Some(limit) = time_limit(request.uri().path()) else {
+        return next.run(request).await;
     };
     match tokio::time::timeout(limit, next.run(request)).await {
         Ok(response) => response,
@@ -180,12 +224,14 @@ pub fn app(state: AppState) -> Router {
         .fallback(web::static_handler)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(), write_gate))
+        .layer(middleware::from_fn_with_state(state.clone(), sys_fingerprint_gate))
         .layer(TraceLayer::new_for_http())
         // Outside tracing, so a sealed server does not log every refused request as an error.
         .layer(middleware::from_fn_with_state(state.clone(), seal_gate))
         .layer(RequestBodyTimeoutLayer::new(BODY_TIMEOUT))
         .layer(middleware::from_fn(request_timeout))
         .layer(middleware::from_fn_with_state(state.clone(), security_headers))
+        .layer(middleware::from_fn(peer::record_peer))
         .with_state(state)
 }
 
@@ -293,6 +339,14 @@ async fn serve_http(state: AppState) -> Result<(), StartupError> {
             }
         }
     });
+    let refusal_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            api::flush_refusals(&refusal_state).await;
+        }
+    });
     let rotation_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -307,37 +361,33 @@ async fn serve_http(state: AppState) -> Result<(), StartupError> {
     });
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     let address = listener.local_addr()?;
-    if let Some(settings) = &state.config.tls {
-        let config = tls::server_config(settings)?;
-        let handle = axum_server::Handle::new();
-        let shutdown = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
-        let rustls = axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config));
-        let server = axum_server::from_tcp_rustls(listener.into_std()?, rustls)?;
-        tracing::info!(
-            target: LISTENING_TARGET,
-            url = %state.config.public_url,
-            tls = true,
-            mutual_tls = settings.client_ca_pem.is_some(),
-            "listening on {address}"
-        );
-        server
-            .handle(handle)
-            .serve(app(state).into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
-        return Ok(());
-    }
+    let tls_config = match &state.config.tls {
+        Some(settings) => Some(std::sync::Arc::new(tls::server_config(settings)?)),
+        None => None,
+    };
     tracing::info!(
         target: LISTENING_TARGET,
         url = %state.config.public_url,
-        tls = false,
+        tls = tls_config.is_some(),
+        mutual_tls = state.config.tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
+        max_connections = state.config.max_connections,
         "listening on {address}"
     );
-    axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let limits = serve::ConnectionLimits::new(state.config.max_connections);
+    serve::serve(listener, app(state), tls_config, limits, shutdown_signal()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_system_changes_are_never_cut_short() {
+        assert_eq!(time_limit("/api/v1/sys/passphrase"), None);
+        assert_eq!(time_limit("/api/v1/sys/unlock-policy"), None);
+        assert_eq!(time_limit("/api/v1/sys/backup"), Some(BACKUP_TIMEOUT));
+        assert_eq!(time_limit("/api/v1/projects"), Some(REQUEST_TIMEOUT));
+        assert_eq!(time_limit("/api/v1/sys/passphrase/"), Some(REQUEST_TIMEOUT));
+    }
 }

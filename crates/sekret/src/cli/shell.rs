@@ -34,10 +34,10 @@ pub struct Origin {
 pub struct Switch {
     pub script: String,
     pub loaded: Vec<String>,
-    /// Keys left out because they are not valid variable names or would clash with sekret's own.
-    pub skipped: Vec<String>,
+    pub skipped: Vec<Skipped>,
 }
 
+/// `^[A-Za-z_][A-Za-z0-9_]*$`
 pub fn is_variable_name(key: &str) -> bool {
     let mut chars = key.chars();
     let Some(first) = chars.next() else {
@@ -46,59 +46,212 @@ pub fn is_variable_name(key: &str) -> bool {
     (first.is_ascii_alphabetic() || first == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Names that change how a shell, the dynamic linker or a runtime behaves. Anyone who can write a
-/// secret could otherwise run code on the machine of whoever loads the environment.
-pub fn is_unsafe_name(key: &str) -> bool {
-    const EXACT: [&str; 27] = [
-        "PATH",
-        "BASH_ENV",
-        "ENV",
-        "PROMPT_COMMAND",
-        "IFS",
-        "SHELLOPTS",
-        "BASHOPTS",
-        "ZDOTDIR",
-        "HOME",
-        "SHELL",
-        "CDPATH",
-        "PYTHONSTARTUP",
-        "PYTHONHOME",
-        "PERL5OPT",
-        "RUBYOPT",
-        "RUBYLIB",
-        "NODE_PATH",
-        "NODE_OPTIONS",
-        "GIT_PROXY_COMMAND",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "LESSOPEN",
-        "LESSCLOSE",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-    ];
-    const PREFIXES: [&str; 7] = ["LD_", "DYLD_", "PS", "BASH_FUNC_", "fish_", "PYTHONPATH", "PERL5LIB"];
+/// Names a shell, the dynamic linker, a runtime or a tool reads to decide what to run or where
+/// to connect. Anyone who can write a secret could otherwise run code on the machine of whoever
+/// loads the environment. Compared case-insensitively, since zsh ties `path` and `fpath` to their
+/// upper-case forms and proxies are read in either case.
+const BLOCKED_EXACT: &[&str] = &[
+    "PATH",
+    "ENV",
+    "IFS",
+    "HOME",
+    "SHELL",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "ZDOTDIR",
+    "CDPATH",
+    "FPATH",
+    "MANPATH",
+    "MODULE_PATH",
+    "HISTFILE",
+    "TMOUT",
+    "MAIL",
+    "MAILPATH",
+    "BROWSER",
+    "VISUAL",
+    "INPUTRC",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
+    "GNUPGHOME",
+    "GOFLAGS",
+    "GOROOT",
+    "GOPATH",
+    "GOENV",
+    "GOTOOLCHAIN",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CC",
+    "CXX",
+    "CPP",
+    "LD",
+    "AR",
+    "MAKE",
+    "MAKEFLAGS",
+    "MFLAGS",
+];
+
+const BLOCKED_PREFIXES: &[&str] = &[
+    "BASH_",
+    "FISH_",
+    "TERM",
+    "LD_",
+    "DYLD_",
+    "MALLOC_",
+    "XDG_",
+    "GIT_",
+    "SSH_",
+    "GPG",
+    "CARGO_",
+    "RUSTC",
+    "RUSTUP_",
+    "PYTHON",
+    "PIP_",
+    "PERL",
+    "RUBY",
+    "GEM_",
+    "BUNDLE_",
+    "NODE_",
+    "NPM_",
+    "YARN_",
+    "JAVA_",
+    "_JAVA_",
+    "JDK_",
+    "CLASSPATH",
+    "LUA_",
+    "DOCKER_",
+    "KUBE",
+    "SSL_",
+    "OPENSSL_",
+    "CURL_",
+    "REQUESTS_CA",
+    "GTK_",
+    "QT_",
+    "GST_PLUGIN",
+];
+
+const BLOCKED_SUFFIXES: &[&str] = &["PAGER", "EDITOR", "ASKPASS", "_COMMAND", "_OPTIONS", "_PROXY"];
+
+/// `PS1`, `RPS2` and the like.
+fn is_numbered_prompt(upper: &str) -> bool {
+    ["PS", "RPS"].iter().any(|prefix| {
+        upper
+            .strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Whether a name is in the blocked set, which `--allow NAME` or `allow = [...]` can unblock.
+pub fn is_blocked(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    EXACT.contains(&upper.as_str())
-        || PREFIXES
-            .iter()
-            .any(|p| key.starts_with(p) || upper.starts_with(&p.to_ascii_uppercase()))
-        || upper.ends_with("_OPTIONS")
-        || upper == "GIT_SSH_COMMAND"
-        || upper.starts_with("GIT_CONFIG")
+    BLOCKED_EXACT.contains(&upper.as_str())
+        || BLOCKED_PREFIXES.iter().any(|p| upper.starts_with(p))
+        || BLOCKED_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        || upper.contains("PROMPT")
+        || is_numbered_prompt(&upper)
 }
 
-/// Whether a key may become an environment variable: a valid name, not one of sekret's own
-/// `SEKRET_*` settings and not one that changes how programs are loaded or run.
-pub fn is_loadable(key: &str) -> bool {
-    is_variable_name(key) && !key.starts_with("SEKRET_") && !is_unsafe_name(key)
+/// sekret's own settings are never loaded from secrets, even when allowed.
+fn is_sekret_setting(key: &str) -> bool {
+    key.to_ascii_uppercase().starts_with("SEKRET_")
 }
 
-/// Splits secrets into those that may be loaded and the names of those left out.
-pub fn split_loadable(vars: BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
-    let (kept, skipped): (BTreeMap<_, _>, BTreeMap<_, _>) = vars.into_iter().partition(|(k, _)| is_loadable(k));
-    (kept, skipped.into_keys().collect())
+/// Why a key was not loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkipReason {
+    InvalidName,
+    SekretSetting,
+    Blocked,
+}
+
+impl SkipReason {
+    fn explain(self) -> &'static str {
+        match self {
+            SkipReason::InvalidName => "they are not valid variable names",
+            SkipReason::SekretSetting => "SEKRET_* names are sekret's own settings",
+            SkipReason::Blocked => {
+                "they can change what programs run or where they connect; pass --allow NAME, or add the name to \
+                 `allow` in .sekret.toml, to load one anyway"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub key: String,
+    pub reason: SkipReason,
+}
+
+/// Which secrets may become environment variables: valid names that are not sekret's own and
+/// not blocked, unless explicitly allowed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadPolicy {
+    allowed: std::collections::BTreeSet<String>,
+}
+
+impl LoadPolicy {
+    /// `allowed` names unblock themselves exactly as written; sekret's own names cannot be allowed.
+    pub fn new(allowed: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
+        let mut set = std::collections::BTreeSet::new();
+        for name in allowed {
+            if !is_variable_name(&name) {
+                anyhow::bail!("cannot allow {name:?}: it is not a valid variable name");
+            }
+            if is_sekret_setting(&name) {
+                anyhow::bail!("cannot allow {name}: sekret's own SEKRET_* settings are never loaded from secrets");
+            }
+            set.insert(name);
+        }
+        Ok(Self { allowed: set })
+    }
+
+    pub fn check(&self, key: &str) -> Result<(), SkipReason> {
+        if !is_variable_name(key) {
+            return Err(SkipReason::InvalidName);
+        }
+        if is_sekret_setting(key) {
+            return Err(SkipReason::SekretSetting);
+        }
+        if is_blocked(key) && !self.allowed.contains(key) {
+            return Err(SkipReason::Blocked);
+        }
+        Ok(())
+    }
+
+    /// Splits secrets into those that may be loaded and those left out, with why.
+    pub fn split(&self, vars: BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<Skipped>) {
+        let mut kept = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for (key, value) in vars {
+            match self.check(&key) {
+                Ok(()) => {
+                    kept.insert(key, value);
+                }
+                Err(reason) => skipped.push(Skipped { key, reason }),
+            }
+        }
+        (kept, skipped)
+    }
+}
+
+/// One line per reason naming the skipped keys, never their values.
+pub fn describe_skipped(skipped: &[Skipped]) -> Vec<String> {
+    let mut by_reason: BTreeMap<SkipReason, Vec<String>> = BTreeMap::new();
+    for item in skipped {
+        by_reason
+            .entry(item.reason)
+            .or_default()
+            .push(super::format::one_line(&item.key));
+    }
+    by_reason
+        .into_iter()
+        .map(|(reason, keys)| format!("sekret: skipped {} because {}", keys.join(", "), reason.explain()))
+        .collect()
 }
 
 /// Credentials of the CLI and server that a child process never needs.
@@ -142,18 +295,20 @@ pub fn previously_loaded(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Removes what the last switch loaded, then exports `vars` and records them.
-pub fn switch_script(shell: Shell, previous: &[String], vars: &BTreeMap<String, String>, origin: &Origin) -> Switch {
+/// Removes what the last switch loaded, then exports what `policy` lets through and records it.
+pub fn switch_script(
+    shell: Shell,
+    previous: &[String],
+    vars: BTreeMap<String, String>,
+    policy: &LoadPolicy,
+    origin: &Origin,
+) -> Switch {
     let mut script = unset(shell, previous);
+    let (kept, skipped) = policy.split(vars);
     let mut loaded = Vec::new();
-    let mut skipped = Vec::new();
-    for (key, value) in vars {
-        if !is_loadable(key) {
-            skipped.push(key.clone());
-            continue;
-        }
-        script.push_str(&export(shell, key, value));
-        loaded.push(key.clone());
+    for (key, value) in kept {
+        script.push_str(&export(shell, &key, &value));
+        loaded.push(key);
     }
     script.push_str(&export(shell, "SEKRET_PROJECT", &origin.project));
     script.push_str(&export(shell, "SEKRET_ENVIRONMENT", &origin.environment));
@@ -234,18 +389,28 @@ mod tests {
             .collect())
     }
 
+    fn strict() -> LoadPolicy {
+        LoadPolicy::default()
+    }
+
+    fn skipped_keys(skipped: &[Skipped]) -> Vec<&str> {
+        skipped.iter().map(|s| s.key.as_str()).collect()
+    }
+
     #[test]
     fn switching_replaces_the_previous_environment() -> anyhow::Result<()> {
         let dev = switch_script(
             Shell::Bash,
             &[],
-            &vars(&[("DB_URL", "postgres://dev"), ("DEV_ONLY", "x")]),
+            vars(&[("DB_URL", "postgres://dev"), ("DEV_ONLY", "x")]),
+            &strict(),
             &origin("dev"),
         );
         let prod = switch_script(
             Shell::Bash,
             &dev.loaded,
-            &vars(&[("DB_URL", "postgres://prod")]),
+            vars(&[("DB_URL", "postgres://prod")]),
+            &strict(),
             &origin("prod"),
         );
         let state = bash_after(
@@ -259,7 +424,7 @@ mod tests {
     #[test]
     fn hostile_values_are_not_executed() -> anyhow::Result<()> {
         let value = "'; touch /tmp/sekret-pwned; echo '$(id) `id` \"\\ \n end";
-        let switch = switch_script(Shell::Bash, &[], &vars(&[("NASTY", value)]), &origin("dev"));
+        let switch = switch_script(Shell::Bash, &[], vars(&[("NASTY", value)]), &strict(), &origin("dev"));
         assert_eq!(bash_after(&switch.script, &["NASTY"])?.join("\n"), value);
         Ok(())
     }
@@ -269,11 +434,18 @@ mod tests {
         let switch = switch_script(
             Shell::Bash,
             &[],
-            &vars(&[("my.key", "a"), ("1ABC", "b"), ("SEKRET_TOKEN", "c"), ("OK_KEY", "d")]),
+            vars(&[
+                ("my.key", "a"),
+                ("1ABC", "b"),
+                ("SEKRET_TOKEN", "c"),
+                ("OK_KEY", "d"),
+                ("Ä", "e"),
+            ]),
+            &strict(),
             &origin("dev"),
         );
         assert_eq!(switch.loaded, ["OK_KEY"]);
-        assert_eq!(switch.skipped, ["1ABC", "SEKRET_TOKEN", "my.key"]);
+        assert_eq!(skipped_keys(&switch.skipped), ["1ABC", "SEKRET_TOKEN", "my.key", "Ä"]);
     }
 
     #[test]
@@ -290,13 +462,147 @@ mod tests {
             ("DATABASE_URL", "postgres://db"),
             ("PSQL_HOST", "db"),
         ]);
-        let switch = switch_script(Shell::Bash, &[], &hostile, &origin("dev"));
-        assert_eq!(switch.loaded, ["DATABASE_URL"]);
+        let switch = switch_script(Shell::Bash, &[], hostile, &strict(), &origin("dev"));
+        assert_eq!(switch.loaded, ["DATABASE_URL", "PSQL_HOST"]);
         assert!(!switch.script.contains("BASH_ENV") && !switch.script.contains("LD_PRELOAD"));
+        assert!(switch.skipped.iter().all(|s| s.reason == SkipReason::Blocked));
+    }
+
+    /// Every name the round 3 audit showed getting past the old denylist, among them ones that
+    /// run code (`GIT_EXTERNAL_DIFF`, `PAGER`, `EDITOR`, `GCONV_PATH`) or redirect traffic.
+    const BYPASSES: &[&str] = &[
+        "GIT_EXTERNAL_DIFF",
+        "GIT_EDITOR",
+        "GIT_PAGER",
+        "GIT_SSH",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "PAGER",
+        "MANPAGER",
+        "SYSTEMD_PAGER",
+        "EDITOR",
+        "VISUAL",
+        "SUDO_ASKPASS",
+        "DISPLAY_COMMAND",
+        "RPROMPT",
+        "RPS1",
+        "PS4",
+        "PROMPT",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_DIRS",
+        "SSH_AUTH_SOCK",
+        "GPG_AGENT_INFO",
+        "GNUPGHOME",
+        "CARGO_HOME",
+        "RUSTC_WRAPPER",
+        "RUSTUP_TOOLCHAIN",
+        "PYTHONUSERBASE",
+        "PERLLIB",
+        "RUBYGEMS_GEMDEPS",
+        "GEM_HOME",
+        "NODE_EXTRA_CA_CERTS",
+        "NPM_CONFIG_PREFIX",
+        "JAVA_HOME",
+        "CLASSPATH",
+        "DOCKER_HOST",
+        "KUBECONFIG",
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ftp_proxy",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+        "HISTFILE",
+        "FPATH",
+        "fpath",
+        "path",
+        "TMOUT",
+        "MAILPATH",
+        "MAIL",
+        "BROWSER",
+        "HOME",
+        "SHELL",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "BASH_FUNC_x%%",
+        "ZDOTDIR",
+        "TERMINFO",
+        "TERM",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "OPENSSL_CONF",
+        "LUA_INIT",
+    ];
+
+    #[test]
+    fn the_demonstrated_bypasses_are_all_refused() {
+        let policy = strict();
+        for name in BYPASSES {
+            assert!(policy.check(name).is_err(), "{name}");
+        }
+        for fine in [
+            "DATABASE_URL",
+            "API_KEY",
+            "STRIPE_SECRET",
+            "PSQL_HOST",
+            "_PRIVATE",
+            "REDIS_PASSWORD",
+        ] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
+    }
+
+    #[test]
+    fn blocked_names_load_only_when_allowed_by_exact_name() -> anyhow::Result<()> {
+        let policy = LoadPolicy::new(["GIT_PAGER".to_string(), "KUBECONFIG".to_string()])?;
+        assert_eq!(policy.check("GIT_PAGER"), Ok(()));
+        assert_eq!(policy.check("KUBECONFIG"), Ok(()));
+        assert_eq!(policy.check("git_pager"), Err(SkipReason::Blocked), "exact name only");
+        assert_eq!(policy.check("GIT_EXTERNAL_DIFF"), Err(SkipReason::Blocked));
         assert!(
-            switch.skipped.contains(&"PSQL_HOST".to_string()),
-            "PS* is treated as a prompt variable"
+            LoadPolicy::new(["SEKRET_URL".to_string()]).is_err(),
+            "sekret's own names stay out"
         );
+        assert!(LoadPolicy::new(["sekret_url".to_string()]).is_err());
+        assert!(LoadPolicy::new(["BAD-NAME".to_string()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_keys_are_explained_by_reason_without_values() {
+        let (_, skipped) = strict().split(vars(&[
+            ("GIT_EXTERNAL_DIFF", "/tmp/evil"),
+            ("bad.key", "v1"),
+            ("SEKRET_URL", "https://evil.test"),
+            ("bad\u{1b}[2Jkey", "v2"),
+        ]));
+        let lines = describe_skipped(&skipped);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("bad.key") && lines[0].contains("not valid variable names"));
+        assert!(lines[0].contains("badkey"), "server text is made printable: {lines:?}");
+        assert!(lines[1].contains("SEKRET_URL") && lines[1].contains("sekret's own"));
+        assert!(lines[2].contains("GIT_EXTERNAL_DIFF") && lines[2].contains("--allow"));
+        let all = lines.join("\n");
+        assert!(!all.contains("/tmp/evil") && !all.contains("evil.test") && !all.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn git_external_diff_from_a_secret_does_not_run() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let marker = dir.path().join("pwned");
+        let switch = switch_script(
+            Shell::Bash,
+            &[],
+            vars(&[("GIT_EXTERNAL_DIFF", &format!("touch {}", marker.display()))]),
+            &strict(),
+            &origin("dev"),
+        );
+        assert!(switch.loaded.is_empty());
+        assert_eq!(bash_after(&switch.script, &["GIT_EXTERNAL_DIFF"])?, ["<unset>"]);
+        Ok(())
     }
 
     #[test]
@@ -324,20 +630,19 @@ mod tests {
             "ENV",
             "PROMPT_COMMAND",
         ] {
-            assert!(is_unsafe_name(name), "{name}");
-            assert!(!is_loadable(name), "{name}");
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(strict().check(name), Err(SkipReason::Blocked), "{name}");
         }
-        assert!(!is_loadable("SEKRET_URL"));
-        assert!(!is_loadable("bad.key"));
-        assert!(is_loadable("DATABASE_URL"));
-        let (kept, skipped) = split_loadable(vars(&[("A", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
+        assert_eq!(strict().check("SEKRET_URL"), Err(SkipReason::SekretSetting));
+        assert_eq!(strict().check("bad.key"), Err(SkipReason::InvalidName));
+        let (kept, skipped) = strict().split(vars(&[("A", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["A"]);
-        assert_eq!(skipped, ["HTTPS_PROXY", "SEKRET_TOKEN"]);
+        assert_eq!(skipped_keys(&skipped), ["HTTPS_PROXY", "SEKRET_TOKEN"]);
     }
 
     #[test]
     fn unload_removes_only_what_was_loaded() -> anyhow::Result<()> {
-        let load = switch_script(Shell::Bash, &[], &vars(&[("A", "1")]), &origin("dev"));
+        let load = switch_script(Shell::Bash, &[], vars(&[("A", "1")]), &strict(), &origin("dev"));
         let unload = unload_script(Shell::Bash, &previously_loaded(Some("A")));
         let state = bash_after(
             &format!("KEEP=me\n{}{unload}", load.script),
@@ -355,7 +660,13 @@ mod tests {
 
     #[test]
     fn fish_output_uses_set() {
-        let switch = switch_script(Shell::Fish, &["OLD".into()], &vars(&[("A", "it's \\")]), &origin("dev"));
+        let switch = switch_script(
+            Shell::Fish,
+            &["OLD".into()],
+            vars(&[("A", "it's \\")]),
+            &strict(),
+            &origin("dev"),
+        );
         assert!(switch.script.starts_with("set -e OLD\n"));
         assert!(switch.script.contains("set -gx A 'it\\'s \\\\'\n"));
         assert!(init_script(Shell::Fish).contains("| source"));

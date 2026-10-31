@@ -123,15 +123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arc-swap"
-version = "1.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -343,28 +334,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-server"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
-dependencies = [
- "arc-swap",
- "bytes",
- "either",
- "fs-err",
- "http",
- "http-body",
- "hyper",
- "hyper-util",
- "pin-project-lite",
- "rustls",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tower-service",
 ]
 
 [[package]]
@@ -1506,16 +1475,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8878864ba14bb86e818a412bfd6f18f9eabd4ec0f008a28e8f7eb61db532fcf9"
 dependencies = [
  "futures-core",
-]
-
-[[package]]
-name = "fs-err"
-version = "3.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
-dependencies = [
- "autocfg",
- "tokio",
 ]
 
 [[package]]
@@ -3979,6 +3938,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "testcontainers-modules",
  "tokio",
  "toml",
  "tracing",
@@ -4029,6 +3989,7 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "icu_properties",
  "proptest",
  "serde",
  "serde_json",
@@ -4036,7 +3997,6 @@ dependencies = [
  "subtle",
  "thiserror",
  "unicode-normalization",
- "unicode-properties",
  "utoipa",
  "uuid",
  "zeroize",
@@ -4085,9 +4045,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "axum-server",
  "base64 0.23.1",
  "hex",
+ "hyper",
+ "hyper-util",
  "image",
  "ipnet",
  "jsonwebtoken",
@@ -4111,6 +4072,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http 0.7.1",
  "tracing",

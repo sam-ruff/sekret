@@ -70,8 +70,8 @@
   --accent-foreground: oklch(0.28 0.06 190);
   --destructive: oklch(0.577 0.215 27);
   --destructive-solid: oklch(0.577 0.215 27);
-  /* Dark enough for text on white and on its own tints (5.2:1). */
-  --success: oklch(0.52 0.13 150);
+  /* Dark enough for small text on white and on its own 15% tint over a card. */
+  --success: oklch(0.48 0.13 150);
   --warning: oklch(0.62 0.14 60);
   --border: oklch(0.91 0.01 190);
   --input: oklch(0.89 0.012 190);

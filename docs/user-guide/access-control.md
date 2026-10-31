@@ -60,7 +60,7 @@ The web interface has an editor for this, with a grid of subjects and actions an
 
 For a given action on a given secret, sekret collects every rule from every role the person holds, through their own membership, their groups and their organisation roles. If any matching rule denies, the answer is no. Otherwise, if any matching rule allows, the answer is yes. Otherwise it is no.
 
-A deny whose condition cannot be checked, for example a tag condition when the tags are not known yet, counts as matching. An allow in the same position does not. Both mistakes fail closed.
+A deny whose condition cannot be checked, for example a tag condition when the tags are not known yet, counts as matching. An allow in the same position does not. Both mistakes fail closed. Checks that are not about one secret, such as on a whole environment, a folder or an audit log entry, never know the tags, so a deny scoped by tag applies to them too: someone denied reading `restricted` secrets also sees key names hidden in the project audit log.
 
 ## Nobody can hand out more than they hold
 

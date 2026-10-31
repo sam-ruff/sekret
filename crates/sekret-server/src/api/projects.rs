@@ -932,7 +932,8 @@ pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
                 environment: Some(environment),
                 path,
                 key: Some(key),
-                tags: &[],
+                // An entry does not record the secret's tags, so a deny by tag hides the key.
+                tags: None,
             },
         )
     });

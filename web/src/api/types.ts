@@ -16,6 +16,7 @@ export type ChangePassphrase = Schemas["ChangePassphrase"];
 export type Charset = Schemas["Charset"];
 export type ClaimBindings = Schemas["ClaimBindings"];
 export type CliApproveRequest = Schemas["CliApproveRequest"];
+export type CliDenyRequest = Schemas["CliDenyRequest"];
 export type ClientSecret = Schemas["ClientSecret"];
 export type Conditions = Schemas["Conditions"];
 export type CreateClientSecret = Schemas["CreateClientSecret"];

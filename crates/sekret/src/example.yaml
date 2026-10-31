@@ -13,6 +13,8 @@ server:
   trusted_proxies: []
   # Allow http:// OIDC issuers and Kubernetes hosts. Development only.
   allow_insecure_http: false
+  # Connections served at once; more wait until one closes.
+  max_connections: 512
   # Unix socket on the host for `sekret sys unseal --socket`, which skips the network's
   # rate limits; file permissions decide who may use it.
   unix_socket: null
@@ -22,6 +24,8 @@ server:
 database:
   # sqlite://path?mode=rwc or postgres://user:pass@host/db.
   url: sqlite://sekret.db?mode=rwc
+  # Or a file holding the URL, so a Postgres password is not in the process list. Not both.
+  # url_file: /etc/sekret/database-url
   # Environment snapshots kept per environment.
   snapshots_to_keep: 200
 

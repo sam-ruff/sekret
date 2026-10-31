@@ -1,19 +1,31 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { onSealResponse, redirectToLogin } from "@/api/client";
+import type { Me } from "@/api/types";
 import { ErrorState } from "@/components/states";
 import { Spinner } from "@/components/ui/spinner";
 import { forgetAllButStatus, keys, useSysStatus } from "@/hooks/queries";
+import { clearCopiedSecret } from "@/lib/clipboard";
+import { browserNavigation, isLeaving, subscribeLeaving } from "@/lib/leaving";
 import { gateRedirect } from "@/lib/sys-gate";
 import { listen } from "@/lib/tab-sync";
 import { StandalonePage } from "./standalone-page";
+
+function GateSpinner() {
+  return (
+    <div className="flex min-h-svh items-center justify-center" data-testid="status-gate-loading">
+      <Spinner className="size-6 text-muted-foreground" />
+    </div>
+  );
+}
 
 /**
  * Checks whether the server is set up and unlocked before anything else loads, and sends the
  * browser to the setup or unlock page when it is not, including when it is sealed mid-session.
  * Whenever the server turns out to be locked, every cached query but the status is dropped and the
- * pages unmount, so no secret or revealed value stays on screen or in memory.
+ * pages unmount, so no secret or revealed value stays on screen or in memory. The same happens
+ * while the page is leaving, so a sign-out or a page the browser stores away shows nothing.
  */
 export function StatusGate({ children }: { children: ReactNode }) {
   const status = useSysStatus();
@@ -21,6 +33,7 @@ export function StatusGate({ children }: { children: ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [rechecking, setRechecking] = useState(false);
+  const leaving = useSyncExternalStore(subscribeLeaving, isLeaving);
 
   useEffect(
     () =>
@@ -35,6 +48,16 @@ export function StatusGate({ children }: { children: ReactNode }) {
   useEffect(
     () =>
       listen((message) => {
+        if (isLeaving()) return;
+        if (typeof message === "object") {
+          // Another tab signed in; if as someone else, everything here belongs to the previous person.
+          const shown = queryClient.getQueryData<Me>(keys.me);
+          if (!shown || shown.id === message.user) return;
+          forgetAllButStatus(queryClient);
+          void clearCopiedSecret();
+          browserNavigation.reload();
+          return;
+        }
         forgetAllButStatus(queryClient);
         if (message === "signed-out") {
           redirectToLogin();
@@ -53,9 +76,10 @@ export function StatusGate({ children }: { children: ReactNode }) {
   const target = status.data ? gateRedirect(status.data.state, location) : null;
 
   useEffect(() => {
-    if (target) void navigate(target, { replace: true });
+    if (target && !isLeaving()) void navigate(target, { replace: true });
   }, [target, navigate]);
 
+  if (leaving) return <GateSpinner />;
   if (status.error && !status.data) {
     return (
       <StandalonePage>
@@ -63,12 +87,6 @@ export function StatusGate({ children }: { children: ReactNode }) {
       </StandalonePage>
     );
   }
-  if (!status.data || target || rechecking) {
-    return (
-      <div className="flex min-h-svh items-center justify-center" data-testid="status-gate-loading">
-        <Spinner className="size-6 text-muted-foreground" />
-      </div>
-    );
-  }
+  if (!status.data || target || rechecking) return <GateSpinner />;
   return children;
 }

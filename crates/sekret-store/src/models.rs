@@ -1,5 +1,5 @@
 use sekret_core::permissions::Rule;
-use sekret_core::seal::{SealMode, UnlockPolicy, WrappedRootKey};
+use sekret_core::seal::{SealFlags, SealMode, UnlockPolicy, WrappedRootKey};
 use serde::{Deserialize, Serialize};
 
 /// How the root key is protected. `wrapped` is set only in passphrase mode.
@@ -15,6 +15,8 @@ pub struct SealConfig {
     /// Authenticates the row under a key derived from the root key; absent on databases from
     /// before it existed.
     pub mac: Option<Vec<u8>>,
+    /// Covered by `mac`.
+    pub flags: SealFlags,
     pub created_at: i64,
     pub updated_at: i64,
 }

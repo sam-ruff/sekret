@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use sekret_store::AuditEntry;
 
 /// Buckets idle for longer than this are dropped by the periodic sweep.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -57,6 +59,21 @@ pub fn limiter_key(ip: IpAddr) -> IpAddr {
                 0,
                 0,
             ))
+        }
+    }
+}
+
+/// A whole network rather than one host: the IPv4 /24 or IPv6 /48 that `ip` is in, which one
+/// party can easily hold many addresses of.
+pub fn prefix_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(segments[0], segments[1], segments[2], 0, 0, 0, 0, 0))
         }
     }
 }
@@ -138,10 +155,15 @@ struct Failures {
     window_start: Instant,
     window_failures: u32,
     global_until: Option<Instant>,
+    last_eviction: Option<Instant>,
 }
 
+/// How long after forgetting sources the back-off stays wary of new ones.
+const LOAD_MEMORY: Duration = Duration::from_secs(600);
+
 /// Exponential back-off after wrong passphrases, per source address (or IPv6 /64), with a short
-/// server-wide pause when failures arrive from many sources at once.
+/// pause for every source that has failed when failures arrive from many sources at once.
+/// Sources that have never failed are not paused.
 pub struct FailureBackoff {
     state: Mutex<Failures>,
 }
@@ -154,6 +176,7 @@ impl Default for FailureBackoff {
                 window_start: Instant::now(),
                 window_failures: 0,
                 global_until: None,
+                last_eviction: None,
             }),
         }
     }
@@ -170,14 +193,14 @@ impl FailureBackoff {
         self.wait_at(ip, Instant::now())
     }
 
+    /// A source with no failures never waits, so a flood of wrong guesses from elsewhere cannot
+    /// pause the owner; it waits its turn for the derivation instead.
     fn wait_at(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let Ok(state) = self.state.lock() else {
             return Some(GLOBAL_PAUSE);
         };
-        let own = state
-            .sources
-            .get(&limiter_key(ip))
-            .and_then(|source| left(source.until, now));
+        let source = state.sources.get(&limiter_key(ip))?;
+        let own = left(source.until, now);
         let global = left(state.global_until, now);
         own.max(global)
     }
@@ -201,9 +224,15 @@ impl FailureBackoff {
         let key = limiter_key(ip);
         if !state.sources.contains_key(&key) && state.sources.len() >= MAX_SOURCES {
             evict_oldest(&mut state.sources, MAX_SOURCES / 16, |s| s.last);
+            state.last_eviction = Some(now);
         }
+        // While sources are being forgotten, one may be an evicted one coming back, so new
+        // sources get one free failure rather than a fresh allowance.
+        let under_load = state
+            .last_eviction
+            .is_some_and(|at| now.saturating_duration_since(at) < LOAD_MEMORY);
         let source = state.sources.entry(key).or_insert(Source {
-            failures: 0,
+            failures: if under_load { FREE_FAILURES - 1 } else { 0 },
             until: None,
             last: now,
         });
@@ -230,6 +259,95 @@ impl FailureBackoff {
             .map(|s| s.sources.get(&limiter_key(ip)).map_or(0, |source| source.failures))
             .unwrap_or(u32::MAX)
     }
+}
+
+/// Refusals repeated within this long are counted rather than each written.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+/// Callers and sources remembered at once; the least recently refused are forgotten first.
+const MAX_REFUSAL_KEYS: usize = 10_000;
+
+struct Folded {
+    started: Instant,
+    last: Instant,
+    repeats: u32,
+    latest: AuditEntry,
+}
+
+/// Folds a flood of refusal audit entries into one entry a minute per key, typically a caller
+/// and source, with a count of the repeats, so refusals cannot flood the audit log.
+#[derive(Default)]
+pub struct AuditThrottle {
+    keys: Mutex<HashMap<String, Folded>>,
+}
+
+impl AuditThrottle {
+    /// The entries to write now for `entry`: itself when it opens a window, after the previous
+    /// window's summary if that one had repeats; nothing when it falls inside an open window.
+    pub fn admit(&self, key: String, entry: AuditEntry) -> Vec<AuditEntry> {
+        self.admit_at(key, entry, Instant::now())
+    }
+
+    pub fn admit_at(&self, key: String, entry: AuditEntry, now: Instant) -> Vec<AuditEntry> {
+        let Ok(mut keys) = self.keys.lock() else {
+            return vec![entry];
+        };
+        if let Some(folded) = keys.get_mut(&key)
+            && now.saturating_duration_since(folded.started) < REFUSAL_WINDOW
+        {
+            folded.repeats = folded.repeats.saturating_add(1);
+            folded.last = now;
+            folded.latest = entry;
+            return Vec::new();
+        }
+        if !keys.contains_key(&key) && keys.len() >= MAX_REFUSAL_KEYS {
+            evict_oldest(&mut keys, MAX_REFUSAL_KEYS / 16, |f| f.last);
+        }
+        let previous = keys.insert(
+            key,
+            Folded {
+                started: now,
+                last: now,
+                repeats: 0,
+                latest: entry.clone(),
+            },
+        );
+        previous.and_then(summary).into_iter().chain([entry]).collect()
+    }
+
+    /// Summaries of windows that have closed with repeats in them; their keys are forgotten.
+    pub fn drain(&self) -> Vec<AuditEntry> {
+        self.drain_at(Instant::now())
+    }
+
+    pub fn drain_at(&self, now: Instant) -> Vec<AuditEntry> {
+        let Ok(mut keys) = self.keys.lock() else {
+            return Vec::new();
+        };
+        let closed: Vec<String> = keys
+            .iter()
+            .filter(|(_, f)| now.saturating_duration_since(f.started) >= REFUSAL_WINDOW)
+            .map(|(k, _)| k.clone())
+            .collect();
+        closed
+            .into_iter()
+            .filter_map(|key| keys.remove(&key))
+            .filter_map(summary)
+            .collect()
+    }
+}
+
+/// The latest refusal of a window, saying how many more there were than the one already written.
+fn summary(folded: Folded) -> Option<AuditEntry> {
+    if folded.repeats == 0 {
+        return None;
+    }
+    let mut entry = folded.latest;
+    entry.id = uuid::Uuid::now_v7().to_string();
+    if let serde_json::Value::Object(fields) = &mut entry.detail {
+        fields.insert("repeats".into(), folded.repeats.into());
+        fields.insert("window_seconds".into(), REFUSAL_WINDOW.as_secs().into());
+    }
+    Some(entry)
 }
 
 /// A wait rounded up, so the exact back-off is not revealed: to 5 seconds below a minute, then to
@@ -338,17 +456,43 @@ mod tests {
     }
 
     #[test]
-    fn a_flood_from_many_sources_pauses_everyone_only_briefly() -> anyhow::Result<()> {
+    fn a_flood_from_many_sources_pauses_only_sources_that_have_failed() -> anyhow::Result<()> {
         let backoff = FailureBackoff::default();
         let owner: IpAddr = "192.0.2.10".parse().context("ip")?;
+        let flooder = IpAddr::from([10, 1, 0, 0]);
         let start = Instant::now();
         for i in 0..=GLOBAL_BURST {
             let source = IpAddr::from([10, 1, (i / 256) as u8, (i % 256) as u8]);
             backoff.failed_at(source, start);
         }
-        let wait = backoff.wait_at(owner, start).context("a global pause")?;
+        assert_eq!(backoff.wait_at(owner, start), None, "the owner has never failed");
+        let wait = backoff.wait_at(flooder, start).context("a global pause")?;
         assert!(wait <= GLOBAL_PAUSE, "{wait:?}");
-        assert_eq!(backoff.wait_at(owner, start + GLOBAL_PAUSE), None);
+        assert_eq!(backoff.wait_at(flooder, start + GLOBAL_PAUSE), None);
+        Ok(())
+    }
+
+    #[test]
+    fn sources_arriving_after_evictions_get_one_free_failure() -> anyhow::Result<()> {
+        let backoff = FailureBackoff::default();
+        let start = Instant::now();
+        let before: IpAddr = "172.16.0.1".parse().context("ip")?;
+        backoff.failed_at(before, start);
+        assert_eq!(backoff.wait_at(before, start), None, "no load yet: the usual allowance");
+        for i in 0..MAX_SOURCES as u32 {
+            let at = start + GLOBAL_WINDOW * (i + 1);
+            backoff.failed_at(IpAddr::from((u32::from_be_bytes([11, 0, 0, 0]) + i).to_be_bytes()), at);
+        }
+        let late = start + GLOBAL_WINDOW * (MAX_SOURCES as u32 + 2);
+        let returning: IpAddr = "172.16.0.2".parse().context("ip")?;
+        backoff.failed_at(returning, late);
+        assert_eq!(backoff.wait_at(returning, late), None, "one free failure");
+        let later = late + GLOBAL_WINDOW;
+        backoff.failed_at(returning, later);
+        assert!(
+            backoff.wait_at(returning, later).is_some(),
+            "an evicted source coming back does not get five more"
+        );
         Ok(())
     }
 
@@ -366,6 +510,72 @@ mod tests {
         }
         assert_eq!(backoff.failures(first), 0, "the oldest source made room");
         Ok(())
+    }
+
+    fn refusal(n: i64) -> AuditEntry {
+        AuditEntry {
+            id: format!("entry-{n}"),
+            created_at: n,
+            actor_kind: "user".into(),
+            actor_id: "u1".into(),
+            actor_name: "user:u1".into(),
+            action: "sys.forbidden".into(),
+            project_id: None,
+            environment: None,
+            path: None,
+            secret_key: None,
+            detail: serde_json::json!({}),
+            ip: "203.0.113.9".into(),
+        }
+    }
+
+    #[test]
+    fn a_flood_of_refusals_becomes_one_entry_and_a_count_a_minute() {
+        let throttle = AuditThrottle::default();
+        let start = Instant::now();
+        let mut written = Vec::new();
+        for n in 0..1000 {
+            let at = start + Duration::from_millis(u64::try_from(n).unwrap_or(0) * 10);
+            written.extend(throttle.admit_at("k".into(), refusal(n), at));
+        }
+        assert_eq!(written.len(), 1, "the first is written at once, the rest are counted");
+        assert_eq!(written[0].created_at, 0);
+        assert!(
+            throttle.drain_at(start + Duration::from_secs(30)).is_empty(),
+            "still open"
+        );
+        let summaries = throttle.drain_at(start + REFUSAL_WINDOW);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].detail["repeats"], 999);
+        assert_eq!(summaries[0].created_at, 999, "the summary carries the latest refusal");
+        assert!(throttle.drain_at(start + REFUSAL_WINDOW * 2).is_empty());
+
+        let other = throttle.admit_at("other".into(), refusal(1), start);
+        assert_eq!(other.len(), 1, "another caller or source has its own window");
+    }
+
+    #[test]
+    fn a_new_window_writes_the_previous_summary_first() {
+        let throttle = AuditThrottle::default();
+        let start = Instant::now();
+        assert_eq!(throttle.admit_at("k".into(), refusal(1), start).len(), 1);
+        assert!(throttle.admit_at("k".into(), refusal(2), start).is_empty());
+        let next = throttle.admit_at("k".into(), refusal(3), start + REFUSAL_WINDOW);
+        assert_eq!(next.len(), 2);
+        assert_eq!(
+            (next[0].created_at, &next[0].detail["repeats"]),
+            (2, &serde_json::json!(1))
+        );
+        assert_eq!(next[1].created_at, 3);
+        let quiet = throttle.admit_at("q".into(), refusal(4), start);
+        assert_eq!(quiet.len(), 1);
+        assert!(
+            throttle
+                .drain_at(start + REFUSAL_WINDOW)
+                .iter()
+                .all(|e| e.created_at != 4),
+            "a window with no repeats needs no summary"
+        );
     }
 
     #[test]

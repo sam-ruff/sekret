@@ -83,16 +83,18 @@ pub async fn device_login(
     max_interval: Duration,
 ) -> anyhow::Result<TokenResponse> {
     let start = api.cli_start().await.context("starting login")?;
+    let shown_url = super::format::one_line(&start.verification_url);
     // A link elsewhere would send the person to approve on a site the server does not control.
     if !super::config::same_origin(server, &start.verification_url) {
-        bail!(
-            "the server sent an approval link for another site ({}); not opening it",
-            start.verification_url
-        );
+        bail!("the server sent an approval link for another site ({shown_url}); not opening it");
     }
-    writeln!(out, "Confirm this code in your browser: {}", start.user_code)?;
+    writeln!(
+        out,
+        "Confirm this code in your browser: {}",
+        super::format::one_line(&start.user_code)
+    )?;
     if !open_browser(&start.verification_url) {
-        writeln!(out, "Open {} to continue.", start.verification_url)?;
+        writeln!(out, "Open {shown_url} to continue.")?;
     }
     let interval = Duration::from_secs(start.interval.max(1) as u64).min(max_interval);
     let attempts = (start.expires_in / start.interval.max(1)).max(1);
@@ -226,6 +228,30 @@ mod tests {
         assert!(error.to_string().contains("another site"), "{error}");
         assert!(!opened.get(), "the browser is never opened on the foreign link");
         assert!(out.is_empty(), "no code is shown for a foreign link");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_code_and_link_cannot_drive_the_terminal() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| {
+            Ok(CliStartResponse {
+                user_code: "\u{1b}[2J\u{1b}]0;pwned\u{7}ABCD\r\n-EFGH".into(),
+                verification_url: "https://sekret.example.com/cli-login?code=\u{1b}[8mHIDDEN\u{1b}[0m".into(),
+                ..start()
+            })
+        });
+        api.expect_cli_poll().returning(|_| Ok(token()));
+        let mut out = Vec::new();
+        device_login(&api, SERVER, &mut out, &|_| false, Duration::ZERO)
+            .await
+            .context("login")?;
+        let printed = String::from_utf8(out).context("utf8")?;
+        assert!(!printed.contains('\u{1b}') && !printed.contains('\r'), "{printed:?}");
+        assert!(
+            printed.contains("ABCD -EFGH") && printed.contains("code=HIDDEN"),
+            "{printed:?}"
+        );
         Ok(())
     }
 

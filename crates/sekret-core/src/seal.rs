@@ -5,10 +5,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
+use icu_properties::props::{BinaryProperty, DefaultIgnorableCodePoint, EnumeratedProperty, GeneralCategory};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
-use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 use utoipa::ToSchema;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -224,28 +224,52 @@ pub fn has_control_characters(text: &str) -> bool {
     text.chars().any(|c| u32::from(c) < 0x20 || c == '\u{7f}')
 }
 
-/// Controls (C0, C1 and DEL), invisible format characters such as zero-width spaces, line and
-/// paragraph separators, and the non-breaking space: none can be typed back reliably.
+/// Characters that cannot be typed back reliably: controls (C0, C1 and DEL), format characters,
+/// every space but U+0020, line and paragraph separators, default-ignorable code points such as
+/// variation selectors and the Hangul filler, private-use and unassigned code points.
 pub fn is_forbidden_char(c: char) -> bool {
-    c == '\u{a0}'
-        || matches!(
-            c.general_category(),
-            GeneralCategory::Control
-                | GeneralCategory::Format
-                | GeneralCategory::LineSeparator
-                | GeneralCategory::ParagraphSeparator
-        )
+    if c == ' ' {
+        return false;
+    }
+    // The Braille blank is a symbol to Unicode, but shows as a space.
+    if c == '\u{2800}' || DefaultIgnorableCodePoint::for_char(c) {
+        return true;
+    }
+    matches!(
+        GeneralCategory::for_char(c),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::SpaceSeparator
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+            | GeneralCategory::PrivateUse
+            | GeneralCategory::Surrogate
+            | GeneralCategory::Unassigned
+    )
 }
 
 pub fn has_forbidden_characters(text: &str) -> bool {
     text.chars().any(is_forbidden_char)
 }
 
-/// The NFC form, so the same passphrase typed on systems that compose accents differently opens
-/// the same wrap. NFC grows UTF-8 at most threefold, so the buffer never reallocates.
+/// The NFC form, which wraps made before NFKC used. NFC grows UTF-8 at most threefold, so the
+/// buffer never reallocates.
 pub fn nfc(text: &str) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(text.len().saturating_mul(3)));
     for c in text.nfc() {
+        out.push(c);
+    }
+    out
+}
+
+/// The NFKC form, so the same passphrase typed with composed or decomposed accents, full-width
+/// letters or ligatures opens the same wrap. Collected through a sized buffer that is zeroed.
+pub fn nfkc(text: &str) -> Zeroizing<String> {
+    // NFKC can grow text far more than NFC (one ligature becomes several letters), so the
+    // buffer is sized by counting first rather than guessing.
+    let len: usize = text.nfkc().map(char::len_utf8).sum();
+    let mut out = Zeroizing::new(String::with_capacity(len));
+    for c in text.nfkc() {
         out.push(c);
     }
     out
@@ -276,7 +300,7 @@ pub fn passphrase_strength(passphrase: &str) -> PassphraseStrength {
             "Use letters, digits, spaces and punctuation only.",
         );
     }
-    let passphrase = nfc(passphrase);
+    let passphrase = nfkc(passphrase);
     let passphrase = passphrase.as_str();
     let entropy = zxcvbn::zxcvbn(passphrase, &["sekret"]);
     let score = u8::from(entropy.score());
@@ -338,11 +362,11 @@ pub fn wrap_root_key(root: &RootKey, passphrase: &str) -> Result<WrappedRootKey,
     wrap_root_key_with(root, passphrase, KdfParams::default())
 }
 
-/// Wraps under the NFC form of `passphrase`.
+/// Wraps under the NFKC form of `passphrase`.
 pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -> Result<WrappedRootKey, CryptoError> {
     let mut salt = vec![0u8; SALT_LEN];
     fill_random(&mut salt)?;
-    let kek = derive_kek(&nfc(passphrase), &salt, params)?;
+    let kek = derive_kek(&nfkc(passphrase), &salt, params)?;
     let ciphertext = seal(&kek, root.bytes(), ROOT_KEY_AAD)?;
     Ok(WrappedRootKey {
         salt,
@@ -354,8 +378,8 @@ pub fn wrap_root_key_with(root: &RootKey, passphrase: &str, params: KdfParams) -
 /// A root key opened with a passphrase.
 pub struct Unwrapped {
     pub root: RootKey,
-    /// The wrap was made from a passphrase as typed rather than its NFC form, so it should be
-    /// made again.
+    /// The wrap was made from an older form of the passphrase (NFC, or as typed) rather than its
+    /// NFKC form, so it should be made again.
     pub needs_rewrap: bool,
 }
 
@@ -364,24 +388,25 @@ pub fn unwrap_root_key(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Roo
     unwrap_root_key_checked(wrapped, passphrase).map(|u| u.root)
 }
 
-/// Tries the NFC form first, then the passphrase as typed, which wraps made before
-/// normalisation used.
+/// Tries the NFKC form first, then the NFC form and the passphrase as typed, which older wraps
+/// used. Each distinct form costs one derivation.
 pub fn unwrap_root_key_checked(wrapped: &WrappedRootKey, passphrase: &str) -> Result<Unwrapped, CryptoError> {
-    let normal = nfc(passphrase);
-    match open_with_passphrase(wrapped, &normal) {
-        Ok(root) => {
-            return Ok(Unwrapped {
-                root,
-                needs_rewrap: false,
-            });
+    let compatible = nfkc(passphrase);
+    let composed = nfc(passphrase);
+    let raw = Zeroizing::new(passphrase.to_string());
+    let mut tried: Vec<&str> = Vec::with_capacity(3);
+    for (form, needs_rewrap) in [(&compatible, false), (&composed, true), (&raw, true)] {
+        if tried.contains(&form.as_str()) {
+            continue;
         }
-        Err(CryptoError::Decrypt) if normal.as_str() != passphrase => {}
-        Err(error) => return Err(error),
+        tried.push(form.as_str());
+        match open_with_passphrase(wrapped, form) {
+            Ok(root) => return Ok(Unwrapped { root, needs_rewrap }),
+            Err(CryptoError::Decrypt) => {}
+            Err(error) => return Err(error),
+        }
     }
-    open_with_passphrase(wrapped, passphrase).map(|root| Unwrapped {
-        root,
-        needs_rewrap: true,
-    })
+    Err(CryptoError::Decrypt)
 }
 
 fn open_with_passphrase(wrapped: &WrappedRootKey, passphrase: &str) -> Result<RootKey, CryptoError> {
@@ -504,6 +529,46 @@ pub fn recall_root_key(
     root_from_plain(&open(&key, remembered, aad)?)
 }
 
+/// Facts about the seal configuration that only ever move one way, signed with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealFlags {
+    /// Reviewer tokens sealed before they were bound to their cluster have been moved, so a
+    /// token in the old format is never accepted or moved again.
+    pub reviewer_tokens_migrated: bool,
+    /// The remembered wrap was made with a remember secret, so one without it is never written
+    /// in its place. Only forgetting the unlock clears it.
+    pub remember_secret: bool,
+}
+
+impl SealFlags {
+    const REVIEWER_TOKENS_MIGRATED: i64 = 1;
+    const REMEMBER_SECRET: i64 = 2;
+
+    /// The flags as stored in the database.
+    pub fn bits(self) -> i64 {
+        let mut bits = 0;
+        if self.reviewer_tokens_migrated {
+            bits |= Self::REVIEWER_TOKENS_MIGRATED;
+        }
+        if self.remember_secret {
+            bits |= Self::REMEMBER_SECRET;
+        }
+        bits
+    }
+
+    /// Unknown bits are refused, so a flag this version does not understand is never dropped.
+    pub fn from_bits(bits: i64) -> Option<Self> {
+        let known = Self::REVIEWER_TOKENS_MIGRATED | Self::REMEMBER_SECRET;
+        if bits & !known != 0 {
+            return None;
+        }
+        Some(Self {
+            reviewer_tokens_migrated: bits & Self::REVIEWER_TOKENS_MIGRATED != 0,
+            remember_secret: bits & Self::REMEMBER_SECRET != 0,
+        })
+    }
+}
+
 /// Everything about the seal configuration that a database writer must not be able to change
 /// without the root key.
 #[derive(Debug, Clone, Copy)]
@@ -515,6 +580,7 @@ pub struct SealBinding<'a> {
     pub epoch: i64,
     pub wrapped: Option<&'a WrappedRootKey>,
     pub remembered: Option<&'a [u8]>,
+    pub flags: SealFlags,
 }
 
 fn push_field(message: &mut Vec<u8>, field: &[u8]) {
@@ -553,6 +619,13 @@ impl SealBinding<'_> {
         push_field(&mut message, &self.epoch.to_be_bytes());
         push_field(&mut message, &optional_digest(wrap));
         push_field(&mut message, &optional_digest(self.remembered.map(<[u8]>::to_vec)));
+        // Appended only when set, so configurations signed before flags existed still verify,
+        // and clearing a flag changes the message.
+        let bits = self.flags.bits();
+        if bits != 0 {
+            push_field(&mut message, b"flags");
+            push_field(&mut message, &bits.to_be_bytes());
+        }
         Ok(message)
     }
 }
@@ -945,6 +1018,7 @@ mod tests {
             epoch: 3,
             wrapped: Some(&wrapped),
             remembered: None,
+            flags: SealFlags::default(),
         };
         let mac = seal_config_mac(&root, &binding).context("mac")?;
         verify_seal_config(&root, &binding, &mac).context("verify")?;
@@ -976,6 +1050,20 @@ mod tests {
                 remembered: Some(&remembered),
                 ..binding
             },
+            SealBinding {
+                flags: SealFlags {
+                    reviewer_tokens_migrated: true,
+                    ..SealFlags::default()
+                },
+                ..binding
+            },
+            SealBinding {
+                flags: SealFlags {
+                    remember_secret: true,
+                    ..SealFlags::default()
+                },
+                ..binding
+            },
         ];
         for tampered in changed {
             assert_eq!(
@@ -987,6 +1075,102 @@ mod tests {
         let other = RootKey::generate().context("root")?;
         assert!(verify_seal_config(&other, &binding, &mac).is_err());
         assert!(verify_seal_config(&root, &binding, &mac[..16]).is_err());
+        Ok(())
+    }
+
+    /// A configuration signed before flags existed: the message is exactly the six old fields.
+    #[test]
+    fn signatures_from_before_flags_still_verify_and_flags_cannot_be_cleared() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let fingerprint = root.fingerprint();
+        let binding = SealBinding {
+            mode: SealMode::KeyFile,
+            policy: UnlockPolicy::Manual,
+            fingerprint: &fingerprint,
+            epoch: 4,
+            wrapped: None,
+            remembered: None,
+            flags: SealFlags::default(),
+        };
+        let mut old_message = Vec::new();
+        for field in [
+            b"key-file".as_slice(),
+            b"manual",
+            fingerprint.as_bytes(),
+            &4i64.to_be_bytes(),
+            &[0],
+            &[0],
+        ] {
+            push_field(&mut old_message, field);
+        }
+        assert_eq!(binding.message().context("message")?, old_message);
+        let flagged = SealBinding {
+            flags: SealFlags {
+                reviewer_tokens_migrated: true,
+                remember_secret: true,
+            },
+            ..binding
+        };
+        let mac = seal_config_mac(&root, &flagged).context("mac")?;
+        assert!(
+            verify_seal_config(&root, &binding, &mac).is_err(),
+            "clearing the flags breaks the signature"
+        );
+        for bits in 0..4 {
+            assert_eq!(SealFlags::from_bits(bits).map(SealFlags::bits), Some(bits));
+        }
+        assert_eq!(SealFlags::from_bits(4), None, "unknown flags are refused");
+        Ok(())
+    }
+
+    #[test]
+    fn spaces_ignorables_private_use_and_unassigned_characters_are_refused() {
+        for bad in [
+            "violet tractor\u{2002}sings beneath",
+            "violet tractor\u{3000}sings beneath",
+            "violet tractor\u{202f}sings beneath",
+            "violet tractor\u{34f}sings beneath",
+            "violet tractor\u{3164}sings beneath",
+            "violet tractor\u{fe0f}sings beneath",
+            "violet tractor\u{2800}sings beneath",
+            "violet tractor\u{115f}sings beneath",
+            "violet tractor\u{e000}sings beneath",
+            "violet tractor\u{f0000}sings beneath",
+            "violet tractor\u{378}sings beneath",
+            "violet tractor\u{e01ef}sings beneath",
+        ] {
+            assert!(has_forbidden_characters(bad), "{bad:?}");
+            assert!(!passphrase_strength(bad).acceptable, "{bad:?}");
+        }
+        assert!(!has_forbidden_characters(
+            "violet tractor sings beneath, ünïcödé 日本語 ½"
+        ));
+    }
+
+    #[test]
+    fn new_wraps_use_nfkc_and_older_forms_still_open() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        // Full-width letters and a ligature fold to plain ones under NFKC only.
+        let typed = "\u{ff56}iolet tractor \u{fb01}nds beneath";
+        let folded = "violet tractor finds beneath";
+        let wrapped = wrap_root_key_with(&root, typed, CHEAP).context("wrap")?;
+        let opened = unwrap_root_key_checked(&wrapped, folded).context("unwrap")?;
+        assert_eq!(opened.root.fingerprint(), root.fingerprint());
+        assert!(!opened.needs_rewrap);
+
+        // What the previous version stored: the NFC form, which keeps the full-width letter.
+        let mut salt = vec![0u8; SALT_LEN];
+        fill_random(&mut salt).context("salt")?;
+        let kek = derive_kek(&nfc(typed), &salt, CHEAP).context("kek")?;
+        let legacy = WrappedRootKey {
+            ciphertext: seal(&kek, root.bytes(), ROOT_KEY_AAD).context("seal")?,
+            salt,
+            params: CHEAP,
+        };
+        let opened = unwrap_root_key_checked(&legacy, typed).context("unwrap")?;
+        assert_eq!(opened.root.fingerprint(), root.fingerprint());
+        assert!(opened.needs_rewrap, "an NFC wrap is redone under NFKC");
+        assert_eq!(unwrap_root_key(&legacy, folded).err(), Some(CryptoError::Decrypt));
         Ok(())
     }
 

@@ -350,6 +350,7 @@ async fn sample_backup(dir: &Path) -> anyhow::Result<(std::path::PathBuf, std::p
             remembered: None,
             epoch: 0,
             mac: None,
+            flags: sekret_core::seal::SealFlags::default(),
             created_at: 1,
             updated_at: 1,
         };

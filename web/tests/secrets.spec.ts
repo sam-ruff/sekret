@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { expectToast, openProject, secretAction, secretRow } from "./helpers";
+import { expectToast, isMobile, openProject, secretAction, secretRow } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await openProject(page);
@@ -107,6 +107,57 @@ test("imports a pasted .env file in one batch", async ({ page }) => {
   await expect(secretRow(page, "GREETING").getByTestId("secret-value")).toHaveText("hello # world");
   await expect(secretRow(page, "PORT").getByTestId("secret-value")).toHaveText("8080");
   await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-value")).toHaveText("error");
+});
+
+test("names duplicate keys, the root folder, and imports from a chosen file", async ({ page }) => {
+  await page.getByTestId("secrets-more").click();
+  await page.getByTestId("import-env").click();
+  const dialog = page.getByTestId("import-env-dialog");
+  await expect(dialog.getByTestId("import-env-where")).toHaveText(
+    "Secrets are written to Development, in the root folder, as one change. Existing keys are updated.",
+  );
+  await dialog.getByTestId("import-env-text").fill(["API_URL=https://example.com", "B=1", "API_URL=dupe"].join("\n"));
+  await expect(dialog.getByTestId("import-env-duplicates")).toContainText(
+    "Line 3: API_URL is also on line 1. The value from line 3 is used.",
+  );
+  await expect(dialog.getByTestId("import-env-summary")).toContainText("2 found");
+
+  await dialog.getByTestId("import-env-file").setInputFiles({
+    name: "app.env",
+    mimeType: "text/plain",
+    buffer: Buffer.from("FROM_FILE=yes\nOTHER=1\n"),
+  });
+  await expect(dialog.getByTestId("import-env-text")).toHaveValue("FROM_FILE=yes\nOTHER=1\n");
+  await expect(dialog.getByTestId("import-env-duplicates")).toHaveCount(0);
+  await expect(dialog.getByTestId("import-env-choose")).toHaveText("Choose file…");
+  await dialog.getByTestId("import-env-submit").click();
+  await expectToast(page, "Imported: 2 added, 0 updated, 0 unchanged");
+});
+
+test("Escape closes the new secret editor, and the value field keeps password managers out", async ({ page }) => {
+  await page.getByTestId("add-secret").click();
+  const form = page.getByTestId("new-secret-form");
+  const value = form.getByTestId("secret-value-input");
+  await expect(value).toHaveAttribute("data-1p-ignore", "true");
+  await expect(value).toHaveAttribute("data-lpignore", "true");
+  await expect(value).toHaveAttribute("data-bwignore", "true");
+  await expect(value).toHaveAttribute("data-form-type", "other");
+  await form.getByTestId("secret-key-input").fill("HALF_DONE");
+  await form.getByTestId("secret-key-input").press("Escape");
+  await expect(form).toHaveCount(0);
+  await expect(page.getByTestId("add-secret")).toBeEnabled();
+});
+
+test("the search box fits a phone with a short placeholder", async ({ page }) => {
+  const search = page.getByTestId("secret-search");
+  await expect(search).toHaveAttribute("placeholder", isMobile(page) ? "Search" : "Search keys, comments, tags");
+  await expect(search).toHaveAccessibleName("Search keys, comments and tags");
+});
+
+test("new folders say they go in the root folder by that name", async ({ page }) => {
+  await page.getByTestId("secrets-more").click();
+  await page.getByTestId("new-folder").click();
+  await expect(page.getByTestId("new-folder-dialog")).toContainText("Created inside root.");
 });
 
 test("switches environments with the tabs", async ({ page }) => {

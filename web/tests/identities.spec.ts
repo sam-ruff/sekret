@@ -102,6 +102,89 @@ test("keeps, replaces and clears a stored Kubernetes reviewer token", async ({ p
   await expect(k8s.getByTestId("k8s-reviewer-jwt-stored")).toHaveCount(0);
 });
 
+test("labels token lifetimes in plain words", async ({ page }) => {
+  await page.goto("/org/identities");
+  await expect(page.getByTestId("identity-link-github-deploy")).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("TTL");
+  await page.getByTestId("identity-link-github-deploy").click();
+  const form = page.getByTestId("identity-details-form");
+  await expect(form.getByLabel("Token lifetime (seconds)")).toBeVisible();
+  await expect(form.getByLabel("Longest renewed lifetime (seconds)")).toBeVisible();
+  await form.getByTestId("identity-ttl").fill("5400");
+  await expect(form.getByTestId("identity-ttl-hint")).toHaveText("How long each token lasts: 1 hour 30 minutes.");
+  await expect(form).not.toContainText("TTL");
+
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-billing-worker").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const k8s = page.getByTestId("auth-method-kubernetes");
+  const lifetime = k8s.getByLabel("Longest Kubernetes token accepted (seconds)");
+  await expect(lifetime).toHaveValue("600");
+  await expect(k8s.getByTestId("k8s-max-lifetime-help")).toHaveText(
+    "Kubernetes tokens valid for longer than this are refused: 10 minutes. Keep pods' projected token expirationSeconds at or below it.",
+  );
+  await lifetime.fill("soon");
+  await expect(k8s.getByTestId("k8s-max-lifetime-error")).toHaveText("Enter a whole number of seconds, 1 or more.");
+  await expect(lifetime).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
+  await expect(k8s.getByTestId("k8s-save")).toHaveText("Save Kubernetes settings");
+  await expect(k8s.getByTestId("k8s-save")).toBeDisabled();
+});
+
+test("takes the reviewer token in a masked text field password managers skip", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-billing-worker").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const k8s = page.getByTestId("auth-method-kubernetes");
+  await k8s.getByTestId("k8s-reviewer-jwt-replace").click();
+  const field = k8s.getByTestId("k8s-reviewer-jwt");
+  await expect(field).toHaveAttribute("type", "text");
+  for (const [name, value] of [
+    ["data-1p-ignore", "true"],
+    ["data-lpignore", "true"],
+    ["data-bwignore", "true"],
+    ["data-form-type", "other"],
+  ]) {
+    await expect(field).toHaveAttribute(name, value);
+  }
+  expect(await field.evaluate((el) => getComputedStyle(el).getPropertyValue("-webkit-text-security"))).toBe("disc");
+});
+
+test("a later copy of the client id is not wiped by the client secret's timer", async ({ page }) => {
+  await page.addInitScript(() => {
+    let contents = "";
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: (text: string) => {
+          contents = text;
+          return Promise.resolve();
+        },
+        readText: () => Promise.resolve(contents),
+      },
+      configurable: true,
+    });
+    (window as unknown as { readClipboard: () => string }).readClipboard = () => contents;
+  });
+  await page.clock.install();
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const universal = page.getByTestId("auth-method-universal");
+  const status = universal.getByTestId("auth-method-universal-status");
+  await expect(status).toBeVisible();
+  if ((await status.textContent())?.includes("Not configured")) await universal.getByTestId("universal-enable").click();
+  await universal.getByTestId("new-client-secret").click();
+  await page.getByTestId("client-secret-create").click();
+  const once = page.getByTestId("client-secret-once-dialog");
+  await once.getByTestId("client-secret-copy").click();
+  await once.getByTestId("client-id-copy").click();
+  const clientId = await page.evaluate(() => (window as unknown as { readClipboard: () => string }).readClipboard());
+  expect(clientId).not.toMatch(/^sks_/);
+  await page.clock.fastForward(46_000);
+  await page.clock.runFor(100);
+  expect(await page.evaluate(() => (window as unknown as { readClipboard: () => string }).readClipboard())).toBe(clientId);
+  await expect(page.locator("[data-sonner-toast]").filter({ hasText: "Clipboard not cleared" })).toHaveCount(0);
+});
+
 test("edits identity settings and revokes tokens", async ({ page }) => {
   await page.goto("/org/identities");
   await page.getByTestId("identity-link-github-deploy").click();

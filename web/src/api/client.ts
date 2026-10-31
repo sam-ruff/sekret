@@ -1,4 +1,6 @@
 import createClient, { type Middleware } from "openapi-fetch";
+import { clearCopiedSecret } from "@/lib/clipboard";
+import { browserNavigation, isLeaving } from "@/lib/leaving";
 import { safeReturnTo } from "@/lib/safe-url";
 import type { paths } from "./schema";
 import type { PassphraseStrength } from "./types";
@@ -85,10 +87,11 @@ function currentLocation(): string {
   return `${window.location.pathname}${window.location.search}`;
 }
 
-/** Sends the browser to the login page unless it is already there. */
+/** Sends the browser to the login page unless it is already there or already leaving, such as to sign out. */
 export function redirectToLogin(): void {
-  if (window.location.pathname === "/login") return;
-  window.location.assign(loginPath(currentLocation()));
+  if (isLeaving() || window.location.pathname === "/login") return;
+  void clearCopiedSecret();
+  browserNavigation.assign(loginPath(currentLocation()));
 }
 
 const csrf: Middleware = {
@@ -119,7 +122,7 @@ const WRONG_SECRET_CODES = new Set(["invalid_passphrase", "invalid_setup_code"])
 function failure(response: Response, body: unknown): ApiError {
   const error = ApiError.from(response.status, body);
   if (response.status === 401 && !WRONG_SECRET_CODES.has(error.code)) redirectToLogin();
-  if (isSealError(error)) sealListeners.forEach((listener) => listener());
+  if (isSealError(error) && !isLeaving()) sealListeners.forEach((listener) => listener());
   return error;
 }
 

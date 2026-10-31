@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -28,6 +27,8 @@ pub struct Options {
     /// A clock the test can move; the system clock when absent.
     pub clock: Option<Arc<sekret_server::clock::FixedClock>>,
     pub keys: Keys,
+    /// Proxies whose `X-Forwarded-For` the server believes.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 /// Where the test server's root key comes from.
@@ -48,6 +49,7 @@ impl Default for Options {
             oidc: None,
             clock: None,
             keys: Keys::Generated,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -145,6 +147,7 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
     let mut config = ServerConfig::for_tests(&options.database_url);
     config.public_url = format!("http://{addr}");
     config.oidc = options.oidc;
+    config.trusted_proxies = options.trusted_proxies;
     let keyring = match options.keys {
         Keys::Generated => {
             let root_key = RootKey::generate().context("root key")?;
@@ -174,11 +177,15 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
         token_reviewer: Arc::new(ReqwestTokenReviewer::new(true)),
     });
     let app = sekret_server::app(state.clone());
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
-            eprintln!("test server stopped: {error}");
-        }
-    });
+    // The production accept loop, so its limits apply to every test.
+    let limits = sekret_server::serve::ConnectionLimits::new(sekret_server::config::DEFAULT_MAX_CONNECTIONS);
+    tokio::spawn(sekret_server::serve::serve(
+        listener,
+        app,
+        None,
+        limits,
+        std::future::pending(),
+    ));
     let admin = match state.keyring.state() {
         SealState::Unsealed => sekret_server::admin::bootstrap_admin(&state, 3600)
             .await

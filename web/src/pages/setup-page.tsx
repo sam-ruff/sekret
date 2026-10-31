@@ -19,7 +19,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { keys, useSysStatus } from "@/hooks/queries";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { errorMessage } from "@/lib/errors";
-import { formatDateTime } from "@/lib/format";
+import { formatExpiry } from "@/lib/format";
 import { passphraseProblem, problemText } from "@/lib/passphrase";
 
 /** What the person keeps from setup; the mutation's own copy is dropped straight away. */
@@ -213,7 +213,8 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
 
 function AdminTokenCard({ created }: { created: Created }) {
   const navigate = useNavigate();
-  const expiry = created.expiresAt ? formatDateTime(created.expiresAt) : "it expires";
+  const expiry = created.expiresAt ? `expires ${formatExpiry(created.expiresAt)}` : "expires after a while";
+  const snippet = (token: string) => `export SEKRET_URL=${window.location.origin}\nexport SEKRET_TOKEN=${token}`;
   return (
     <StandalonePage className="max-w-xl">
       <Card className="shadow-lg shadow-primary/5" data-testid="setup-done">
@@ -223,9 +224,8 @@ function AdminTokenCard({ created }: { created: Created }) {
             <ShieldAlert className="text-warning" />
             <AlertTitle>Save the admin token</AlertTitle>
             <AlertDescription data-testid="admin-token-help">
-              Copy this token now. It is shown once and lasts until {expiry}. It lets the CLI act as an organisation
-              admin, for example to add users or set up sign-in. The web interface signs you in through your identity
-              provider.
+              Copy this token now. It is shown once and {expiry}. It lets the CLI act as an organisation admin, for
+              example to add users or set up sign-in. The web interface signs you in through your identity provider.
             </AlertDescription>
           </Alert>
           <div className="space-y-1.5">
@@ -236,20 +236,23 @@ function AdminTokenCard({ created }: { created: Created }) {
               </code>
               <CopyButton value={created.token} label="Copy admin token" testId="admin-token-copy" sensitive />
             </div>
-            {created.expiresAt && (
-              <p className="text-xs text-muted-foreground" data-testid="admin-token-expiry">
-                Expires {formatDateTime(created.expiresAt)}.
-              </p>
-            )}
           </div>
           <div className="space-y-1.5">
             <p className="flex items-center gap-1.5 text-sm font-medium">
               <Terminal className="size-4" aria-hidden />
               Use it with the CLI
             </p>
-            <pre className="overflow-x-auto rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs" data-testid="admin-token-cli">
-              {`export SEKRET_URL=${window.location.origin}\nexport SEKRET_TOKEN=<token>`}
-            </pre>
+            <div className="flex items-start gap-1 rounded-md border bg-muted/50 py-1 pr-1 pl-3">
+              <pre className="min-w-0 flex-1 overflow-x-auto py-1 font-mono text-xs" data-testid="admin-token-cli">
+                {snippet("<token>")}
+              </pre>
+              <CopyButton
+                value={snippet(created.token)}
+                label="Copy these commands with the token"
+                testId="admin-token-cli-copy"
+                sensitive
+              />
+            </div>
           </div>
         </CardContent>
         <CardFooter>
@@ -291,7 +294,7 @@ function SetupDisabled() {
           description={
             <>
               Web setup is turned off. Run <code className="font-mono">sekret admin init</code> on the host, then restart
-              the server.
+              the server. Reload this page once it is done.
             </>
           }
         />

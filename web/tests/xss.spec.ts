@@ -167,7 +167,8 @@ test("users, identities, auth methods and access render as text", async ({ page 
 test("markup in the CLI login link is never rendered or prefilled", async ({ page }) => {
   await page.goto(`/cli-login?code=${encodeURIComponent(X.img)}`);
   await expect(page.getByTestId("cli-unknown")).toBeVisible();
-  await expect(page.getByTestId("cli-code-input")).toHaveValue("");
+  // An unknown request offers nothing to type into, let alone prefilled.
+  await expect(page.getByTestId("cli-code-input")).toHaveCount(0);
   await expect(page.getByTestId("cli-login")).not.toContainText("ONERROR", { ignoreCase: true });
   await expectNoXss(page);
 });

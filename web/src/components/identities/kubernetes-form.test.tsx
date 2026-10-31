@@ -76,15 +76,32 @@ describe("KubernetesForm reviewer token", () => {
     const { saved, onSave } = renderForm(config(null));
     const field = screen.getByTestId("k8s-max-lifetime");
     expect(field).toHaveValue("3600");
+    expect(screen.getByLabelText("Longest Kubernetes token accepted (seconds)")).toBe(field);
+    expect(screen.getByTestId("k8s-max-lifetime-help")).toHaveTextContent(
+      "Kubernetes tokens valid for longer than this are refused: 1 hour. Keep pods' projected token expirationSeconds at or below it.",
+    );
+    expect(screen.getByTestId("k8s-save")).toHaveTextContent("Save Kubernetes settings");
     await userEvent.clear(field);
     await userEvent.type(field, "0");
     expect(screen.getByTestId("k8s-save")).toBeDisabled();
-    expect(screen.getByText("Enter a whole number of seconds, 1 or more.")).toBeInTheDocument();
+    const error = screen.getByTestId("k8s-max-lifetime-error");
+    expect(error).toHaveTextContent("Enter a whole number of seconds, 1 or more.");
+    expect(error).toHaveAttribute("role", "alert");
+    expect(field).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
     await userEvent.clear(field);
     await userEvent.type(field, "900");
     await userEvent.click(screen.getByTestId("k8s-save"));
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(saved()?.max_token_lifetime).toBe(900);
+  });
+
+  it("takes the reviewer token in a masked text field that password managers leave alone", async () => {
+    renderForm(config(null));
+    const field = screen.getByTestId("k8s-reviewer-jwt");
+    expect(field).toHaveAttribute("type", "text");
+    expect(field).toHaveAttribute("data-1p-ignore", "true");
+    expect(field).toHaveAttribute("data-lpignore", "true");
+    expect(field.className).toContain("[-webkit-text-security:disc]");
   });
 
   it("explains the auth-delegator binding", () => {

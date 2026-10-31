@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isValidSecretKey, parseDotenv } from "./dotenv";
+import { duplicateText, isValidSecretKey, parseDotenv } from "./dotenv";
 
 describe("parseDotenv", () => {
   it("parses simple pairs and ignores comments and blanks", () => {
@@ -42,6 +42,20 @@ describe("parseDotenv", () => {
     expect(result.entries).toEqual([
       { key: "A", value: "second" },
       { key: "B", value: "" },
+    ]);
+  });
+
+  it("names every key set on more than one line and the line that wins", () => {
+    const result = parseDotenv('API_URL=a\nB=1\n# note\nAPI_URL="b"\nB=2\nAPI_URL=c\nC=3');
+    expect(result.duplicates).toEqual([
+      { key: "B", line: 5, earlier: [2] },
+      { key: "API_URL", line: 6, earlier: [1, 4] },
+    ]);
+    expect(result.entries).toContainEqual({ key: "API_URL", value: "c" });
+    expect(parseDotenv("A=1\nB=2").duplicates).toEqual([]);
+    expect(result.duplicates.map(duplicateText)).toEqual([
+      "Line 5: B is also on line 2. The value from line 5 is used.",
+      "Line 6: API_URL is also on lines 1 and 4. The value from line 6 is used.",
     ]);
   });
 

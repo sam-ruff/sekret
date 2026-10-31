@@ -19,9 +19,6 @@ unimplemented = "deny"
 [profile.dev.package.argon2]
 opt-level = 3
 
-[profile.dev.package.blake2]
-opt-level = 3
-
 [profile.release]
 lto = "thin"
 codegen-units = 4

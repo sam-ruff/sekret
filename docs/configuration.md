@@ -34,9 +34,11 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `server.listen` | `--listen` | `SEKRET_LISTEN` | `0.0.0.0:8080` | Address and port to listen on. |
 | `server.trusted_proxies` | `--trusted-proxies` | `SEKRET_TRUSTED_PROXIES` | none | CIDRs of reverse proxies whose `X-Forwarded-For` header is believed. |
 | `server.allow_insecure_http` | `--allow-insecure-http` | `SEKRET_ALLOW_INSECURE_HTTP` | `false` | Allows `http://` OIDC issuers and Kubernetes API servers. For local testing only. |
-| `server.unix_socket` | `--unix-socket` | `SEKRET_UNIX_SOCKET` | none | A Unix socket on the host serving only status and unseal, for `sekret sys unseal --socket`. The network's rate limits and back-off do not apply to it. |
+| `server.max_connections` | `--max-connections` | `SEKRET_MAX_CONNECTIONS` | `512` | Connections served at once, over HTTP and HTTPS. Further clients wait until one closes. Every connection must finish sending a request's headers (and its TLS handshake) within 10 seconds, and one with nothing running and no traffic for 60 seconds is closed. |
+| `server.unix_socket` | `--unix-socket` | `SEKRET_UNIX_SOCKET` | none | A Unix socket on the host serving only status and unseal, for `sekret sys unseal --socket`. The network's rate limits and back-off do not apply to it. Its directory must belong to the server's user and not be writable by other users, such as `/run/sekret` with mode 0750. |
 | `server.unix_socket_mode` | `--unix-socket-mode` | `SEKRET_UNIX_SOCKET_MODE` | `0600` | `0600` for the server's user only, or `0660` to let the socket's group unseal too. Quote it in the file. |
-| `database.url` | `--database-url` | `SEKRET_DATABASE_URL` | `sqlite://sekret.db?mode=rwc` | `sqlite://path?mode=rwc` or `postgres://user:pass@host/db`. |
+| `database.url` | `--database-url` | `SEKRET_DATABASE_URL` | `sqlite://sekret.db?mode=rwc` | `sqlite://path?mode=rwc` or `postgres://user:pass@host/db`. The server and the `admin` commands remove `SEKRET_DATABASE_URL` from their own environment once read. |
+| `database.url_file` | `--database-url-file` | `SEKRET_DATABASE_URL_FILE` | none | File holding the database URL, so a Postgres password stays out of the process list and the environment. Set either this or `database.url` at each level; a flag still beats an environment variable, which beats the file. |
 | `database.snapshots_to_keep` | `--snapshots-to-keep` | `SEKRET_SNAPSHOTS_TO_KEEP` | `200` | Snapshots kept per environment. |
 | `auth.default_org_role` | `--default-org-role` | `SEKRET_DEFAULT_ORG_ROLE` | `org-member` | Organisation role everyone who signs in receives. Empty for none. The server warns at every start when it is `org-admin` or `backup-reader`. |
 | `auth.session_ttl` | `--session-ttl` | `SEKRET_SESSION_TTL` | `43200` | Browser session length in seconds. |
@@ -59,8 +61,8 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `seal.root_key_file` | `--root-key-file` | `SEKRET_ROOT_KEY_FILE` | none | The root key file in key-file mode, raw, base64 or hex. |
 | `seal.unlock` | `--unlock` | `SEKRET_UNLOCK` | unset | `manual`, `remember` or `passphrase-file`. Unset, the choice made at setup applies. See [Unlocking](unlocking.md). |
 | `seal.remember_file` | `--remember-file` | `SEKRET_REMEMBER_FILE` | none | Device key file for the `remember` policy, which needs it set. It may not be the database, root key, a passphrase file or another file sekret uses. |
-| `seal.remember_secret_file` | `--remember-secret-file` | `SEKRET_REMEMBER_SECRET_FILE` | none | File holding a secret of at least 32 characters mixed into the remember key, so the disk alone cannot unlock. `SEKRET_REMEMBER_SECRET` holding the value itself also works. See [Unlocking](unlocking.md#remember-secret). |
-| `seal.passphrase_file` | `--unlock-passphrase-file` | `SEKRET_UNLOCK_PASSPHRASE_FILE` | none | Passphrase for the `passphrase-file` policy, read only under that policy. `SEKRET_UNLOCK_PASSPHRASE` holding the passphrase itself also works; the server wipes it from its own environment, but whatever started the server still holds it. |
+| `seal.remember_secret_file` | `--remember-secret-file` | `SEKRET_REMEMBER_SECRET_FILE` | none | File holding a secret of at least 32 characters mixed into the remember key, so the disk alone cannot unlock. `SEKRET_REMEMBER_SECRET` holding the value itself also works, and counts as an environment variable: it beats the file setting but loses to the flag and to `SEKRET_REMEMBER_SECRET_FILE`. Once an unlock is remembered with a secret, removing the secret stops the server remembering at all until the unlock is forgotten. See [Unlocking](unlocking.md#remember-secret). |
+| `seal.passphrase_file` | `--unlock-passphrase-file` | `SEKRET_UNLOCK_PASSPHRASE_FILE` | none | Passphrase for the `passphrase-file` policy, read only under that policy. `SEKRET_UNLOCK_PASSPHRASE` holding the passphrase itself also works, with the same precedence as `SEKRET_REMEMBER_SECRET`; the server wipes it from its own environment, but whatever started the server still holds it. |
 | `setup.web` | `--web-setup` | `SEKRET_WEB_SETUP` | `true` | Offer first-boot setup through the API and web interface. When false, no setup code is made; set up with `auto_init` or `sekret admin init`. |
 | `setup.auto_init` | `--auto-init` | `SEKRET_AUTO_INIT` | `false` | Set up an empty database at start, without a person. Skipped when the database already has a root key; refused when it holds projects or identities. |
 | `setup.passphrase_file` | `--setup-passphrase-file` | `SEKRET_SETUP_PASSPHRASE_FILE` | none | First passphrase for `auto_init`, read only when the database is not set up yet. Required for `auto_init` in passphrase mode unless the unlock policy is `passphrase-file`, which uses the unlock passphrase. The server warns while the file still exists afterwards. |
@@ -71,19 +73,28 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 
 Lists such as `--oidc-admin-groups` take comma-separated values on the command line and YAML lists in the file. Switches such as `--auto-init` can be given bare or as `--auto-init=false`; in the file they must be `true` or `false`, and `yes`, `no`, `on` and `off` are refused. Configuration errors give the line and column but never echo the value, so a password in a database URL does not end up in a log.
 
-Every file the server reads (configuration, keys, passphrases, secrets) must be a regular file and is read with a size limit, 4 KiB for keys, passphrases and secrets, so pointing a setting at `/dev/zero` or a FIFO fails straight away. Key files may be symlinks, because Kubernetes mounts secrets that way; the remember file may not. The files the server writes (the remember file, setup code file, admin token file and Unix socket) must each be a file of their own: the server refuses to start when one is the same file as the database, its `-wal`, `-shm`, `.lock` or `.epoch` files, a key, passphrase or secret file, the configuration file, the TLS key or each other.
+Every file the server reads (configuration, keys, passphrases, secrets) must be a regular file and is read with a size limit, 4 KiB for keys, passphrases and secrets, so pointing a setting at `/dev/zero` or a FIFO fails straight away. Key files may be symlinks, because Kubernetes mounts secrets that way; the remember file may not. The files the server writes (the remember file, setup code file, admin token file and Unix socket) must each be a file of their own: the server refuses to start when one is the same file as the database, its `-wal`, `-shm` or `.lock` files, any of the `.epoch` marks beside the database, the remember file and the root key file, a key, passphrase or secret file, the configuration file, the TLS key or each other.
 
-At start the server logs, at `info`, each seal, unlock and setup setting, `auth.default_org_role`, the trusted proxies and `allow_insecure_http`, with its value (never a secret) and where it came from: flag, environment, file or default. It warns about settings that weaken it:
+At start the server logs, at `info`, every setting with its value and where it came from: flag, environment, file or default. Secrets are never shown; a database URL is shown with its password replaced by `***`, and a URL file only by its path. It warns about settings that weaken it:
 
 - `allow_insecure_http`, and an `http://` public URL with a non-loopback listen address;
 - trusted proxy ranges wider than /16 for IPv4 or /32 for IPv6, outside private address space, or covering more than a /8 between them;
 - `auth.default_org_role` set to `org-admin` or `backup-reader`;
 - the `passphrase-file` policy coming from the environment;
-- an environment variable overriding the file for any unlock, setup or seal setting, `auth.default_org_role`, `server.trusted_proxies`, `server.allow_insecure_http` or the OIDC group and subject lists;
+- an environment variable overriding the file for any setting;
+- a secret, passphrase or database URL given in more than one way, naming the one ignored;
 - a root key, passphrase, secret, remember, OIDC client secret or TLS key file that the group or other users can read, or that another user owns (symlinks are followed, so the mounted target is what counts);
 - a remember file on the same filesystem as the database, or anywhere under its directory. Set `SEKRET_LOG` to a [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) such as `info` or `sekret_server=debug` to change logging; logs go to standard error.
 
-The `admin` commands also accept `--config`, and take the database URL and root key file from it.
+The `admin` commands also accept `--config`, and take the database URL (or URL file) and root key file from it.
+
+### One server per database
+
+A server holds a lock on its database for as long as it runs, and the `admin` commands that write take the same lock and refuse while a server holds it. For SQLite the lock is an exclusive `flock` on the database file itself and on a `.lock` file beside its real path, so a symlink or hard link to the database meets the same lock. For Postgres it is a session advisory lock on a connection of its own, which asks Postgres to send TCP keepalives so that a server on a host that vanished loses it within about a minute.
+
+A starting server waits up to 30 seconds for the lock, so a restart may overlap the server it replaces. A running server checks every 10 seconds that it still holds the lock, and exits with an error if it does not: the Postgres session was dropped, or the SQLite file was replaced. Run it under a supervisor that restarts it.
+
+Postgres behind PgBouncer in transaction or statement pooling mode is not supported: the advisory lock belongs to a session, which those modes share between clients. Use session pooling or connect directly.
 
 ## First-boot setup
 
@@ -148,7 +159,7 @@ sekret admin rotate-root-key --root-key-file /etc/sekret/root.key --new-root-key
 mv /etc/sekret/root.key.new /etc/sekret/root.key
 ```
 
-Rotation gives every project a new data key, re-encrypts every secret value under it (history included), reseals every stored credential, such as Kubernetes reviewer tokens, and records the new key, all in one transaction. Changing the passphrase through the API or `sekret sys change-passphrase` does the same while the server runs. A remembered unlock is dropped, so the next start needs the passphrase once. Backups and database copies taken before still open with the old key and passphrase; see [Security model](security.md#changing-the-passphrase).
+Rotation gives every project a new data key, re-encrypts every secret value under it (history included), reseals every stored credential, such as Kubernetes reviewer tokens, and records the new key, all in one transaction. Changing the passphrase through the API or `sekret sys change-passphrase` does the same while the server runs. A remembered unlock is dropped, so the next start needs the passphrase once. If anything no longer decrypts, rotation stops and names it; `--skip-unreadable` (or `skip_unreadable` in the API request) leaves those rows as they are and audits them. Backups and database copies taken before still open with the old key and passphrase; see [Security model](security.md#changing-the-passphrase).
 
 ## CLI login re-authentication
 
@@ -157,7 +168,7 @@ By default any signed-in browser session can approve a `sekret login`. Set `auth
 - The server stores `auth_time` from the ID token on each browser session.
 - When someone approves a CLI login with a session that authenticated longer ago than the limit, the API answers 403 `reauthentication_required`, and the approval page sends the browser to `/auth/login?reauth=1&return_to=...`.
 - That sign-in asks the provider for `max_age` set to the limit, and `prompt=login` when the session is older, so the provider asks for the password and any second factor again. The callback refuses an ID token whose `auth_time` is still too old.
-- CLI tokens issued this way cannot be renewed past `auth.cli_token_ttl`. Once one expires, `sekret login` goes through the browser again.
+- CLI tokens issued this way cannot be renewed past `auth.cli_token_ttl`. Once one expires, `sekret login` goes through the browser again. The limit is checked at each renewal, so turning the setting on also stops tokens issued before it from being renewed further.
 
 For example, with Keycloak and a client whose browser flow requires a passkey as a second factor:
 
@@ -198,7 +209,7 @@ Group membership is copied from the token at each sign-in. Removing someone from
 
 ## Reverse proxies
 
-sekret speaks plain HTTP and expects TLS to end at a reverse proxy in front of it. Set `--trusted-proxies` to the proxy's address so that rate limiting and machine identities' trusted CIDRs see the real client address; without it, every request appears to come from the proxy. Only the rightmost address in `X-Forwarded-For` that is not a trusted proxy is used, across all of the header's lines. If any entry is not a plain address, the client is treated as unknown, which no identity's trusted CIDRs match, rather than as the proxy. Keep the trusted ranges narrow: the server warns about IPv4 ranges wider than /16, IPv6 ranges wider than /32, and public ranges.
+sekret speaks plain HTTP and expects TLS to end at a reverse proxy in front of it. Set `--trusted-proxies` to the proxy's address so that rate limiting and machine identities' trusted CIDRs see the real client address; without it, every request appears to come from the proxy. Only the rightmost address in `X-Forwarded-For` that is not a trusted proxy is used, across all of the header's lines; entries may carry a port, as in `203.0.113.9:51234` or `[2001:db8::7]:443`. Anything a client wrote to the left of that address is ignored, garbage included. If an entry that is not an address comes before any untrusted one, the client is treated as unknown, which no identity's trusted CIDRs match, rather than as the proxy. Audit entries for proxied requests also record the proxy's own address as `peer` in their detail. Keep the trusted ranges narrow: the server warns about IPv4 ranges wider than /16, IPv6 ranges wider than /32, and public ranges.
 
 ## TLS and mutual TLS
 
@@ -244,4 +255,6 @@ environment = "dev"
 path = "/"
 ```
 
-`sekret login` saves its token in `$XDG_CONFIG_HOME/sekret/credentials.toml` (usually `~/.config/sekret/`) with mode 0600, in a 0700 directory, keyed by server. It writes a new file under a random name and renames it into place. `SEKRET_TOKEN` overrides it. For a server with a certificate from a private CA, pass `--ca-file` or set `SEKRET_CA_FILE`.
+A `.sekret.toml` may also list `allow = ["NAME", ...]`, blocked variable names that `sekret run`, `sekret env use` and export load anyway; see [Shells and AI agents](integrations/shells-and-agents.md). A server that only the project file names is not sent tokens from `SEKRET_TOKEN`, machine login secrets, passphrases or setup codes; see the [CLI reference](cli.md#options-shared-by-every-command).
+
+`sekret login` saves its token in `$XDG_CONFIG_HOME/sekret/credentials.toml` (usually `~/.config/sekret/`, which is also used when `XDG_CONFIG_HOME` is not an absolute path) with mode 0600, in a 0700 directory, keyed by server. It writes a new file under a random name and renames it into place, and refuses to read one that another user owns or can change. `SEKRET_TOKEN` overrides it. For a server with a certificate from a private CA, pass `--ca-file` or set `SEKRET_CA_FILE`.

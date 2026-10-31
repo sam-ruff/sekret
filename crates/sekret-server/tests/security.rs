@@ -187,7 +187,18 @@ async fn a_tampered_configuration_never_unlocks_at_start(db: String) -> anyhow::
         "sealed",
         "a bad signature stops the automatic unlock"
     );
+    assert!(!db.dir.path().join("unlock.key").exists());
+    // Nothing proved the stored wrap, so the tampered row is not signed; the passphrase repairs it.
     let config = h.state.store.get_seal_config().await?.context("config")?;
+    assert_eq!(
+        config.unlock_policy,
+        UnlockPolicy::Remember,
+        "left as the writer made it"
+    );
+    assert_eq!(unseal(&h, PASSPHRASE).await?.0, StatusCode::OK);
+    let config = h.state.store.get_seal_config().await?.context("config")?;
+    let root = h.state.keyring.root().map_err(api_error("root"))?;
+    assert_eq!(check_signature(&root, &config), Signature::Valid);
     assert_eq!(config.unlock_policy, UnlockPolicy::Manual);
     assert_eq!(config.remembered, None);
     Ok(())
@@ -311,7 +322,7 @@ async fn an_older_signed_configuration_is_a_rollback(db: String) -> anyhow::Resu
         .put("/api/v1/sys/unlock-policy", &admin, json!({"policy": "manual"}))
         .await?;
     assert_eq!(code, StatusCode::OK);
-    let mark = sekret_server::seal::high_water(&marks).context("mark")?;
+    let mark = sekret_server::seal::high_water(&marks).highest.context("mark")?;
     assert!(mark > granting.epoch);
 
     // A database writer puts the old, validly signed passphrase-file configuration back.
@@ -464,10 +475,8 @@ async fn key_derivations_run_one_at_a_time_and_survive_cancellation() -> anyhow:
         .send()
         .await;
     assert!(abandoned.is_err(), "the first request timed out");
-    let (code, body) = unseal(&h, PASSPHRASE).await?;
-    assert_eq!(
-        (code, body["error"].clone()),
-        (StatusCode::TOO_MANY_REQUESTS, json!("kdf_busy")),
+    assert!(
+        h.state.keyring.kdf_permit().is_err(),
         "the abandoned derivation is still running"
     );
     for _ in 0..50 {
@@ -766,7 +775,7 @@ async fn old_argon2_costs_are_upgraded_on_unseal(db: String) -> anyhow::Result<(
         wrapped: Some(wrap_root_key_with(&root, PASSPHRASE, old).context("wrap")?),
         ..config
     };
-    h.state.store.update_seal_config(signed(&root, downgraded)?).await?;
+    h.state.store.update_seal_config(signed(&root, downgraded, 0)?).await?;
     let restarted = fresh(&db.url, SealSettings::default()).await?;
     assert_eq!(unseal(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
     let upgraded = restarted.state.store.get_seal_config().await?.context("config")?;

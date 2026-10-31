@@ -47,7 +47,7 @@ pub fn secret_resource<'a>(env: &'a str, path: &'a str, key: &'a str, tags: &'a 
         environment: Some(env),
         path: Some(path),
         key: Some(key),
-        tags,
+        tags: Some(tags),
     }
 }
 

@@ -6,6 +6,7 @@ test("login page offers a generic sign-in on the shared standalone layout", asyn
   await expect(page.getByTestId("sign-in")).toHaveText(/^Sign in$/);
   await expect(page.getByTestId("sign-in")).not.toContainText("Keycloak");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Sign in to sekret");
+  await expect(page.getByTestId("login-card")).toContainText("Sign in with your organisation account to manage secrets.");
   await expect(page).toHaveTitle("Sign in · sekret");
   await expect(page.getByTestId("login-error")).toHaveCount(0);
 

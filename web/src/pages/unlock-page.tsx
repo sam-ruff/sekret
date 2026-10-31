@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, LockKeyhole, LockOpen, Timer } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useSearchParams } from "react-router";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import { PassphraseAccountField } from "@/components/sys/passphrase-fields";
@@ -9,16 +10,19 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
-import { SecretInput } from "@/components/secret-field";
+import { PassphraseInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
 import { keys } from "@/hooks/queries";
 import { useCountdown } from "@/hooks/use-countdown";
 import { backoffSeconds, errorMessage } from "@/lib/errors";
+import { signOut } from "@/lib/session";
 
 const INPUT_ERROR_ID = "unlock-passphrase-error";
 
 export function UnlockPage() {
   const queryClient = useQueryClient();
+  const [params] = useSearchParams();
+  const interrupted = params.has("return_to");
   const input = useRef<HTMLInputElement>(null);
   const [passphrase, setPassphrase] = useState("");
   const [empty, setEmpty] = useState(false);
@@ -72,7 +76,12 @@ export function UnlockPage() {
         <StandaloneHeader
           title="Unlock sekret"
           pageTitle="Unlock"
-          description="sekret is locked. Enter the passphrase to decrypt secrets."
+          description={
+            <span data-testid="unlock-description">
+              {interrupted && "The server was locked while you were using it. "}
+              The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.
+            </span>
+          }
           icon={<LockKeyhole />}
         />
         <form onSubmit={submit} noValidate>
@@ -80,10 +89,9 @@ export function UnlockPage() {
             <PassphraseAccountField />
             <Field data-invalid={!!inputError}>
               <FieldLabel htmlFor="unlock-passphrase">Passphrase</FieldLabel>
-              <SecretInput
+              <PassphraseInput
                 ref={input}
                 id="unlock-passphrase"
-                type="password"
                 autoComplete="current-password"
                 autoFocus
                 value={passphrase}
@@ -98,20 +106,24 @@ export function UnlockPage() {
                 </FieldError>
               )}
             </Field>
-            {backingOff && (
+            {waiting && (
               <Alert variant="destructive" data-testid="unlock-backoff">
                 <Timer />
                 <AlertTitle>Too many wrong passphrases</AlertTitle>
                 <AlertDescription id="unlock-wait">
-                  {waiting ? (
-                    <span>
-                      Try again in <span data-testid="unlock-countdown">{waitSeconds}</span>{" "}
-                      {waitSeconds === 1 ? "second" : "seconds"}.
-                    </span>
-                  ) : (
-                    "You can try again now."
-                  )}
+                  Wait a few seconds, then try again.{" "}
+                  {/* Read out once by the alert; a number changing every second would be read every second. */}
+                  <span aria-hidden data-testid="unlock-countdown-text">
+                    <span data-testid="unlock-countdown">{waitSeconds}</span> {waitSeconds === 1 ? "second" : "seconds"}{" "}
+                    left.
+                  </span>
                 </AlertDescription>
+              </Alert>
+            )}
+            {backingOff && !waiting && (
+              <Alert role="status" aria-live="polite" data-testid="unlock-backoff-over">
+                <Timer />
+                <AlertDescription>You can try again now.</AlertDescription>
               </Alert>
             )}
             {busy && (
@@ -136,7 +148,7 @@ export function UnlockPage() {
               </Alert>
             )}
           </CardContent>
-          <CardFooter className="mt-6">
+          <CardFooter className="mt-6 flex-col gap-2">
             <Button
               type="submit"
               size="lg"
@@ -147,6 +159,16 @@ export function UnlockPage() {
             >
               {unseal.isPending ? <Spinner /> : <LockOpen />}
               Unlock
+            </Button>
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="text-muted-foreground"
+              onClick={() => void signOut(queryClient)}
+              data-testid="unlock-sign-out"
+            >
+              Sign out
             </Button>
           </CardFooter>
         </form>

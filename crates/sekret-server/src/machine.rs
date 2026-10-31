@@ -194,9 +194,10 @@ pub fn reseal(
     Ok(Some(AuthMethodConfig::Kubernetes(k8s)))
 }
 
-/// Re-seals reviewer tokens stored before they were bound to their cluster. Runs once the root
-/// key is in memory; best effort, since a token that cannot be moved only stops its own logins.
-pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) {
+/// Re-seals reviewer tokens stored before they were bound to their cluster. Best effort, since a
+/// token that cannot be moved only stops its own logins; false when the database could not be
+/// read or written, so the migration is tried again.
+pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) -> bool {
     let result: ApiResult<usize> = async {
         let mut moved = 0;
         for identity in store.list_identities().await? {
@@ -225,9 +226,15 @@ pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) {
     }
     .await;
     match result {
-        Ok(0) => {}
-        Ok(moved) => tracing::info!(moved, "bound stored reviewer tokens to their clusters"),
-        Err(error) => tracing::warn!(error = %error.message, "could not re-seal stored reviewer tokens"),
+        Ok(0) => true,
+        Ok(moved) => {
+            tracing::info!(moved, "bound stored reviewer tokens to their clusters");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(error = %error.message, "could not re-seal stored reviewer tokens");
+            false
+        }
     }
 }
 
@@ -313,9 +320,9 @@ pub async fn verify_kubernetes(
             if !review.authenticated || !audience_ok {
                 return Err(LoginError::NotAuthenticated);
             }
-            if let Some(claims) = unverified_claims(token) {
-                check_lifetime(&claims, config.max_token_lifetime)?;
-            }
+            // `max_token_lifetime` is always set, so a lifetime that cannot be read is refused.
+            let claims = unverified_claims(token).ok_or_else(|| LoginError::Token("claims cannot be read".into()))?;
+            check_lifetime(&claims, config.max_token_lifetime)?;
             review.username
         }
         KubernetesMode::Jwks => {
@@ -382,16 +389,28 @@ async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAdd
 
 /// Records a refused machine login. The caller only ever sees `login_failed`.
 async fn audit_failure(state: &AppState, ip: std::net::IpAddr, identity_id: &str, reason: &str) {
-    // Bounded, since the id comes from the request.
-    let identity: String = identity_id.chars().take(64).collect();
-    crate::seal::audit_system(
-        state.store.as_ref(),
-        state.clock.now(),
-        &ip.to_string(),
+    let identity = audited_identity_id(identity_id);
+    crate::api::audit_refusal(
+        state,
+        &Principal::system("system"),
+        &identity,
+        ip,
         "auth.machine-login.failed",
         json!({"identity_id": identity, "reason": reason}),
     )
     .await;
+}
+
+/// The identity id from a login request as it may be audited. Anything not shaped like an id,
+/// such as a client secret pasted into the wrong field, is replaced by a short hash so repeats
+/// can still be matched up.
+pub fn audited_identity_id(raw: &str) -> String {
+    let is_id = uuid::Uuid::try_parse(raw).is_ok_and(|id| id.to_string() == raw);
+    if is_id {
+        return raw.to_string();
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    format!("hash:{}", hex::encode(&digest[..8]))
 }
 
 /// [`login_identity`]'s later checks, audited the same way when they refuse.
@@ -596,7 +615,12 @@ pub async fn renew(
         .into_iter()
         .find(|t| t.id == principal.token_id)
         .ok_or_else(ApiError::unauthorised)?;
-    let expires_at = (now + ttl).min(record.max_expires_at);
+    let mut expires_at = (now + ttl).min(record.max_expires_at);
+    // Groups and the re-authentication setting may have changed since the token was minted.
+    if record.kind == TokenKind::Cli.as_str() {
+        let cap = record.created_at + crate::human::cli_max_ttl(&state, &principal.groups);
+        expires_at = expires_at.min(cap);
+    }
     state.store.extend_token(&record.id, expires_at).await?;
     audit(
         &state,
@@ -610,7 +634,7 @@ pub async fn renew(
     Ok(Json(TokenResponse {
         access_token: String::new(),
         token_type: "Bearer".into(),
-        expires_in: expires_at - now,
+        expires_in: (expires_at - now).max(0),
     }))
 }
 
@@ -733,10 +757,15 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(
-            verify_kubernetes(&jwt, &reviewer, &config, "opaque").await.is_ok(),
-            "claims that cannot be read are left to the API server"
-        );
+        // The lifetime cap always applies, so a token whose claims cannot be read is refused even
+        // when the API server accepts it.
+        for unreadable in ["opaque", "a.!!!.c", "a.bm90LWpzb24.c"] {
+            assert_eq!(
+                verify_kubernetes(&jwt, &reviewer, &config, unreadable).await,
+                Err(LoginError::Token("claims cannot be read".into())),
+                "{unreadable}"
+            );
+        }
         Ok(())
     }
 
@@ -777,39 +806,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_review_checks_bindings() {
+    async fn token_review_checks_bindings() -> anyhow::Result<()> {
+        // The stand-in API server takes the service account from the token's subject.
         let mut reviewer = MockTokenReviewer::new();
         reviewer
             .expect_review()
             .withf(|request| request.reviewer.as_deref().map(String::as_str) == Some("reviewer-jwt"))
             .returning(|request| {
+                let sub = unverified_claims(&request.token)
+                    .and_then(|claims| claims["sub"].as_str().map(String::from))
+                    .unwrap_or_default();
                 Ok(TokenReviewResult {
-                    authenticated: request.token != "bad",
-                    username: format!("system:serviceaccount:{}", request.token),
+                    authenticated: sub != "bad",
+                    username: format!("system:serviceaccount:{sub}"),
                     audiences: vec!["sekret".into()],
                 })
             });
         let config = k8s_config(KubernetesMode::TokenReview);
         let jwt = verifier(0);
+        let issuer = TestIssuer::new("https://kubernetes.default.svc.cluster.local");
+        let token = |sub: &str| issuer.sign(json!({"sub": sub, "iat": issuer.now, "exp": issuer.now + 600}));
         let reviewer_token = Some(Zeroizing::new("reviewer-jwt".to_string()));
-        assert!(
-            super::verify_kubernetes(&jwt, &reviewer, &config, reviewer_token, "apps:web-1")
-                .await
-                .is_ok()
-        );
-        let reviewer_token = Some(Zeroizing::new("reviewer-jwt".to_string()));
-        let verify =
-            |token: &'static str| super::verify_kubernetes(&jwt, &reviewer, &config, reviewer_token.clone(), token);
-        assert!(verify("apps:web-1").await.is_ok());
+        let verify = |token: String| {
+            let reviewer_token = reviewer_token.clone();
+            let (jwt, reviewer, config) = (&jwt, &reviewer, &config);
+            async move { super::verify_kubernetes(jwt, reviewer, config, reviewer_token, &token).await }
+        };
+        assert!(verify(token("apps:web-1")?).await.is_ok());
         assert_eq!(
-            verify("kube-system:web-1").await,
+            verify(token("kube-system:web-1")?).await,
             Err(LoginError::Binding("namespace".into()))
         );
         assert_eq!(
-            verify("apps:worker").await,
+            verify(token("apps:worker")?).await,
             Err(LoginError::Binding("service account".into()))
         );
-        assert_eq!(verify("bad").await, Err(LoginError::NotAuthenticated));
+        assert_eq!(verify(token("bad")?).await, Err(LoginError::NotAuthenticated));
+        Ok(())
     }
 
     fn with_reviewer(token: &str) -> AuthMethodConfig {
@@ -920,7 +953,7 @@ mod tests {
             }
             Ok(())
         });
-        migrate_reviewer_tokens(&store, &root).await;
+        assert!(migrate_reviewer_tokens(&store, &root).await);
         let moved = saved.lock().ok().and_then(|m| m.clone()).context("saved")?;
         let AuthMethodConfig::Kubernetes(moved) = serde_json::from_value(moved.config)? else {
             bail!("kubernetes config expected");

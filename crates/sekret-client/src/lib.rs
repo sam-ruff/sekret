@@ -43,6 +43,54 @@ impl ClientError {
 
 pub type ClientResult<T> = Result<T, ClientError>;
 
+/// Server-supplied text made safe to print: control characters other than newline and tab,
+/// escape sequences and bidirectional overrides are removed, so a server cannot rewrite the
+/// terminal or disguise what it shows.
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            skip_escape_sequence(&mut chars);
+            continue;
+        }
+        if c == '\n' || c == '\t' || !is_unprintable(c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_unprintable(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Drops the rest of an escape sequence: CSI up to its final byte, OSC, DCS and similar strings
+/// up to their terminator, otherwise the single character after the escape.
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => {
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        }
+        Some(']' | 'P' | 'X' | '^' | '_') => {
+            while let Some(c) = chars.next() {
+                if c == '\u{7}' || c == '\u{9c}' {
+                    break;
+                }
+                if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Identifies a secret or folder within a project environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
@@ -237,7 +285,7 @@ impl HttpClient {
         } else {
             &bytes[..]
         };
-        serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(terminal_safe(&e.to_string())))
     }
 
     /// The status and body of a successful response, or the API error.
@@ -264,9 +312,12 @@ impl HttpClient {
             let error: Option<ErrorBody> = serde_json::from_slice(&bytes).ok();
             return Err(ClientError::Api {
                 status: status.as_u16(),
-                code: error.as_ref().map(|e| e.error.clone()).unwrap_or_else(|| "http".into()),
+                code: error
+                    .as_ref()
+                    .map(|e| terminal_safe(&e.error))
+                    .unwrap_or_else(|| "http".into()),
                 message: error
-                    .map(|e| e.message)
+                    .map(|e| terminal_safe(&e.message))
                     .unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into()),
             });
         }
@@ -675,6 +726,39 @@ mod tests {
             .context("expected a pending error")?;
         assert_eq!(error.code(), Some("authorization_pending"));
         assert_eq!(error.status(), Some(400));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_escapes_and_controls_are_removed() {
+        assert_eq!(terminal_safe("plain text\nline\ttab"), "plain text\nline\ttab");
+        assert_eq!(terminal_safe("\u{1b}[2J\u{1b}[1;31mred\u{1b}[0m"), "red");
+        assert_eq!(
+            terminal_safe("\u{1b}]8;;https://evil.test\u{7}click\u{1b}]8;;\u{1b}\\"),
+            "click",
+            "OSC 8 hyperlinks are dropped"
+        );
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{1b}\\after"), "after");
+        assert_eq!(terminal_safe("a\rb\u{8}c\u{7}d\u{0}e\u{7f}f"), "abcdef");
+        assert_eq!(terminal_safe("x\u{9b}31my"), "x31my", "C1 controls are removed");
+        assert_eq!(terminal_safe("ab\u{202e}cd\u{2066}e"), "abcde");
+        assert_eq!(terminal_safe("trailing\u{1b}"), "trailing");
+    }
+
+    #[tokio::test]
+    async fn server_error_text_cannot_drive_the_terminal() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": "forbidden\u{1b}[2J", "message": "denied\u{1b}]52;c;cm0gLXJmIH4=\u{7}\r\u{1b}[1Aok"
+            })))
+            .mount(&server)
+            .await;
+        let error = client(&server, None)?.me().await.err().context("expected an error")?;
+        let shown = error.to_string();
+        assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
+        assert_eq!(shown, "deniedok (403 forbidden)");
         Ok(())
     }
 

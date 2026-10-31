@@ -31,6 +31,42 @@ export function formatRelative(seconds: number, nowSeconds = Date.now() / 1000):
   return relative.format(Math.round(delta / 60), "minute");
 }
 
+const clock = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+/**
+ * When something ends, relative first and the clock time after, such as "in 9 minutes (03:27)".
+ * The date is added when it is not today.
+ */
+export function formatExpiry(seconds: number, nowSeconds = Date.now() / 1000): string {
+  const delta = seconds - nowSeconds;
+  // Whole minutes, so a token minted a moment ago for an hour reads "in 1 hour", not "in 60 minutes".
+  const rounded = nowSeconds + Math.round(delta / 60) * 60;
+  const when = delta > 0 && delta < 45 ? "in less than a minute" : formatRelative(rounded, nowSeconds);
+  const at = new Date(seconds * 1000);
+  const sameDay = at.toDateString() === new Date(nowSeconds * 1000).toDateString();
+  return `${when} (${sameDay ? clock.format(at) : formatDateTime(seconds)})`;
+}
+
+const WORD_UNITS: [string, number][] = [
+  ["day", 86400],
+  ["hour", 3600],
+  ["minute", 60],
+  ["second", 1],
+];
+
+/** Durations in words, such as "1 hour", "15 minutes" or "1 day 6 hours". */
+export function formatDurationWords(seconds: number): string {
+  if (seconds <= 0) return "0 seconds";
+  const parts: string[] = [];
+  let left = Math.floor(seconds);
+  for (const [unit, size] of WORD_UNITS) {
+    const count = Math.floor(left / size);
+    left -= count * size;
+    if (count > 0) parts.push(`${count} ${unit}${count === 1 ? "" : "s"}`);
+  }
+  return parts.slice(0, 2).join(" ");
+}
+
 /** Short human durations such as "1h", "15m" or "1d 6h". */
 export function formatDuration(seconds: number): string {
   if (seconds <= 0) return "0s";

@@ -288,7 +288,8 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
             "sh",
             "-c",
             "test -z \"${SEKRET_TOKEN-}${SEKRET_CLIENT_SECRET-}${SEKRET_UNLOCK_PASSPHRASE-}${SEKRET_REMEMBER_SECRET-}\" \
-             && test -z \"${HTTPS_PROXY-}\" && test \"$SEKRET_URL\" != https://evil.test && exit 4",
+             && test -z \"${HTTPS_PROXY-}\" && test \"$SEKRET_URL\" != https://evil.test \
+             && ! grep -qa -e sks_client -e skt_ /proc/$PPID/environ && exit 4",
         ],
         &with_leaks,
         h,
@@ -304,6 +305,55 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
     let dotenv = ok(run(&["export"], &env, h, None)?)?;
     assert!(dotenv.contains("DB_URL") && !dotenv.contains("HTTPS_PROXY") && !dotenv.contains("evil.test"));
     ok(run(&["secrets", "delete", "HTTPS_PROXY", "SEKRET_URL"], &env, h, None)?)?;
+
+    // A secret named GIT_EXTERNAL_DIFF would run a program at the next `git diff`; it is skipped
+    // with a reason unless the person names it with --allow.
+    let marker = h.join("pwned");
+    let payload = format!("GIT_EXTERNAL_DIFF=touch {}", marker.display());
+    ok(run(&["secrets", "set", &payload, "GIT_PAGER=less"], &env, h, None)?)?;
+    let probe = "test -z \"${GIT_EXTERNAL_DIFF-}\" && test -z \"${GIT_PAGER-}\" && exit 5";
+    let skipped = run(&["run", "--", "sh", "-c", probe], &env, h, None)?;
+    let notes = String::from_utf8_lossy(&skipped.stderr).into_owned();
+    assert_eq!(skipped.status.code(), Some(5), "{notes}");
+    assert!(
+        notes.contains("GIT_EXTERNAL_DIFF") && notes.contains("--allow") && !notes.contains("touch"),
+        "{notes}"
+    );
+    let allowed = run(
+        &[
+            "run",
+            "--allow",
+            "GIT_PAGER",
+            "--",
+            "sh",
+            "-c",
+            "test \"$GIT_PAGER\" = less && exit 6",
+        ],
+        &env,
+        h,
+        None,
+    )?;
+    assert_eq!(
+        allowed.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let exported = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
+    assert!(!exported.contains("GIT_EXTERNAL_DIFF"), "{exported}");
+    std::fs::write(h.join(".sekret.toml"), "allow = [\"GIT_EXTERNAL_DIFF\"]\n").context("project file")?;
+    let from_file = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
+    assert!(from_file.contains("export GIT_EXTERNAL_DIFF="), "{from_file}");
+    std::fs::remove_file(h.join(".sekret.toml")).context("remove project file")?;
+    let refused = run(&["run", "--allow", "SEKRET_URL", "--", "true"], &env, h, None)?;
+    assert!(!refused.status.success());
+    assert!(!marker.exists());
+    ok(run(
+        &["secrets", "delete", "GIT_EXTERNAL_DIFF", "GIT_PAGER"],
+        &env,
+        h,
+        None,
+    )?)?;
 
     ok(run(
         &["secrets", "set", "DB_URL=postgres://three", "EXTRA=added-later"],
@@ -405,8 +455,12 @@ async fn machine_login_saves_and_uses_a_token(mode: Mode) -> anyhow::Result<()> 
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("permission"));
 
+    // The saved login vouches only for its own token, never for a client secret from the environment.
+    let saved_only = run(&["login", "--client-id", &id, "--print-token"], &login_env, h, None)?;
+    assert!(!saved_only.status.success());
+    assert!(String::from_utf8_lossy(&saved_only.stderr).contains("no credential is sent"));
     let printed = ok(run(
-        &["login", "--client-id", &id, "--print-token"],
+        &["login", "--client-id", &id, "--print-token", "--server", &server.url],
         &login_env,
         h,
         None,

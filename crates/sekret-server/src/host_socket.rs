@@ -7,32 +7,62 @@ use crate::StartupError;
 use crate::config::UnixSocketSettings;
 use crate::state::AppState;
 
+/// Why a socket's directory is unsafe: anyone who can write to it can swap the socket for one
+/// of their own and collect the passphrases sent to it.
+fn directory_problem(dir_uid: u32, dir_mode: u32, server_uid: u32) -> Option<&'static str> {
+    if dir_uid != server_uid {
+        return Some("must be owned by the user sekret runs as");
+    }
+    if dir_mode & 0o002 != 0 {
+        return Some("must not be writable by other users");
+    }
+    None
+}
+
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+#[cfg(unix)]
+fn check_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = parent_of(path);
+    let meta = std::fs::metadata(parent)?;
+    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
+    let server_uid = unsafe { libc::geteuid() };
+    let Some(problem) = directory_problem(meta.uid(), meta.mode(), server_uid) else {
+        return Ok(());
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("the socket's directory {} {problem}", parent.display()),
+    ))
+}
+
 #[cfg(unix)]
 fn listen(socket: &UnixSocketSettings) -> std::io::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let path = &socket.path;
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if !meta.file_type().is_socket() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("{} exists and is not a socket; not replacing it", path.display()),
-            ));
-        }
-        std::fs::remove_file(path)?;
+    check_directory(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && !meta.file_type().is_socket()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket; not replacing it", path.display()),
+        ));
     }
-    // Bound under a temporary name and only moved into place once its mode is set, so nobody
-    // can connect in between.
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(format!(".{}.tmp", std::process::id()));
-    let temp = std::path::PathBuf::from(temp);
-    let _ = std::fs::remove_file(&temp);
+    // Bound inside a fresh owner-only directory and only moved into place once its mode is set,
+    // so nobody can connect in between, whatever the process umask.
+    let staging = tempfile::Builder::new()
+        .prefix(".sekret-socket-")
+        .tempdir_in(parent_of(path))?;
+    let temp = staging.path().join("unseal.sock");
     let listener = tokio::net::UnixListener::bind(&temp)?;
-    let placed = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(socket.mode))
-        .and_then(|()| std::fs::rename(&temp, path));
-    if let Err(error) = placed {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(socket.mode))?;
+    std::fs::rename(&temp, path)?;
     Ok(listener)
 }
 
@@ -68,4 +98,21 @@ pub fn remove(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_private_directory_owned_by_the_server_may_hold_the_socket() {
+        assert_eq!(directory_problem(1000, 0o40700, 1000), None);
+        assert_eq!(directory_problem(1000, 0o40750, 1000), None);
+        assert!(
+            directory_problem(0, 0o40755, 1000).is_some(),
+            "someone else's directory"
+        );
+        assert!(directory_problem(1000, 0o40777, 1000).is_some(), "writable by anyone");
+        assert!(directory_problem(1000, 0o41777, 1000).is_some(), "like /tmp");
+    }
 }

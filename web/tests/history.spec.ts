@@ -1,6 +1,35 @@
 import { expect, test } from "@playwright/test";
 import { expectToast, openProject, secretAction, secretRow } from "./helpers";
 
+test.describe("on a 390 pixel phone", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("the history drawer fits with long values shown", async ({ page }) => {
+    await page.goto("/projects/storefront/secrets/staging");
+    await secretAction(page, "CSRF_SECRET", "secret-history");
+    const drawer = page.getByTestId("secret-drawer");
+    await expect(drawer.getByTestId("secret-drawer-where")).toHaveText("Staging · root");
+    await drawer.getByTestId("history-values-toggle").click();
+    await expect(drawer.getByTestId("diff-output")).toBeVisible();
+
+    const box = await drawer.boundingBox();
+    expect(box?.width).toBe(390);
+    const overflow = await drawer.evaluate((sheet) => {
+      const viewport = sheet.querySelector<HTMLElement>("[data-slot=scroll-area-viewport]");
+      const sheetRight = sheet.getBoundingClientRect().right;
+      // Anything drawn past the drawer's right edge, or a viewport wider than it shows.
+      const beyond = [...sheet.querySelectorAll<HTMLElement>("*")].filter((el) => el.getBoundingClientRect().right > sheetRight + 1);
+      return {
+        viewport: viewport ? viewport.scrollWidth - viewport.clientWidth : -1,
+        beyond: beyond.map((el) => el.getAttribute("data-testid") ?? el.tagName),
+      };
+    });
+    expect(overflow.viewport).toBeLessThanOrEqual(0);
+    expect(overflow.beyond).toEqual([]);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  });
+});
+
 test("hides history values until asked, then diffs versions and rolls back", async ({ page }) => {
   await openProject(page);
   await secretAction(page, "LOG_LEVEL", "secret-history");
