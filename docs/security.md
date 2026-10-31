@@ -33,7 +33,7 @@ The setup code is compared in constant time and never stored. It is printed to t
 Abuse of the unlock endpoints is limited in three ways:
 
 - **Per client:** setup, unlock and passphrase changes have a rate limit of their own, separate from sign-in, so exhausting one never locks anyone out of the other. IPv6 clients are counted per /64.
-- **Server-wide:** after five wrong passphrases in a row, from anywhere, every further attempt waits 1 second, then 2, 4 and so on up to 15 minutes, until one succeeds. This also delays the owner while an attack is under way, which is the price of capping guesses.
+- **Server-wide:** after five wrong passphrases in a row, from anywhere, every further attempt waits 1 second, then 2, 4 and so on up to a minute, until one succeeds. Argon2 already holds guessing to about one attempt a second, so the delay adds friction without locking the owner out for long while an attack is under way.
 - **Memory:** only one Argon2 derivation runs at a time, and a request that arrives while one is running gets 429 `kdf_busy` straight away rather than queueing. The derivation keeps its slot until it finishes, even if the client gives up. Passphrases over 1 KiB, setup codes over 64 bytes and system request bodies over 16 KiB are refused before any work is done.
 
 Setup, unlocks, passphrase changes and their failures (`sys.init.failed`, `sys.unseal.failed`, `sys.passphrase.failed`) are audited with the client address.

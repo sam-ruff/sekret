@@ -1,9 +1,33 @@
 import { ApiError } from "@/api/client";
 
+/** Plain wording for codes whose server message is written for logs and the CLI. */
+const FRIENDLY: Record<string, string> = {
+  kdf_busy: "Another unlock is in progress. Try again in a moment.",
+  backup_in_progress: "Another backup is being made. Try again when it finishes.",
+  passphrase_required: "Confirm this change with the current passphrase.",
+  reauthentication_required: "Sign in again to approve this.",
+};
+
 export function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return capitalise(error.message);
+  if (error instanceof ApiError) return apiErrorMessage(error);
   if (error instanceof Error && error.message) return error.message;
   return "Something went wrong.";
+}
+
+function apiErrorMessage(error: ApiError): string {
+  const friendly = FRIENDLY[error.code];
+  if (friendly) return friendly;
+  if (error.status === 413) return "That is too large for the server to accept.";
+  const seconds = backoffSeconds(error);
+  if (seconds !== null) return `Too many wrong passphrases. Try again in ${seconds} seconds.`;
+  return capitalise(error.message);
+}
+
+/** Seconds to wait after too many wrong passphrases, or null for any other error. */
+export function backoffSeconds(error: unknown): number | null {
+  if (!(error instanceof ApiError) || error.code !== "passphrase_backoff") return null;
+  const match = /(\d+)\s*second/.exec(error.message);
+  return match ? Math.max(1, Number(match[1])) : 60;
 }
 
 export function isEscalation(error: unknown): error is ApiError {

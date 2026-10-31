@@ -1,10 +1,12 @@
-import { CheckCircle2, ShieldAlert, Terminal, XCircle } from "lucide-react";
+import { CheckCircle2, LogIn, ShieldAlert, Terminal, XCircle } from "lucide-react";
 import { useState } from "react";
 import { useSearchParams } from "react-router";
+import { ApiError, reauthUrl, startReauth } from "@/api/client";
 import { api } from "@/api/endpoints";
+import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-page";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
 import { useApiMutation, useMe } from "@/hooks/queries";
 
@@ -16,23 +18,29 @@ export function CliLoginPage() {
   const { data: me } = useMe();
   const [outcome, setOutcome] = useState<Outcome>("pending");
 
+  const [reauthenticating, setReauthenticating] = useState(false);
+
   const approve = useApiMutation({
     mutationFn: () => api.approveCli(code),
     onSuccess: () => setOutcome("approved"),
+    onError: (error) => {
+      if (!(error instanceof ApiError) || error.code !== "reauthentication_required") return false;
+      // The server wants a fresh sign-in first; it brings the browser back here afterwards.
+      setReauthenticating(true);
+      startReauth(reauthUrl(error, `/cli-login?code=${encodeURIComponent(code)}`));
+      return true;
+    },
   });
 
   return (
-    <div className="flex min-h-svh items-center justify-center bg-gradient-to-b from-primary/10 via-background to-background px-4">
-      <Card className="w-full max-w-md" data-testid="cli-login">
-        <CardHeader>
-          <div className="mb-2 flex size-10 items-center justify-center rounded-lg bg-primary/15 text-primary">
-            <Terminal className="size-5" />
-          </div>
-          <CardTitle className="text-xl">Approve command line sign-in</CardTitle>
-          <CardDescription>
-            {me ? `The CLI will act as ${me.email || me.name}.` : "The CLI will act as you."}
-          </CardDescription>
-        </CardHeader>
+    <StandalonePage>
+      <Card data-testid="cli-login">
+        <StandaloneHeader
+          title="Approve command line sign-in"
+          pageTitle="Approve CLI sign-in"
+          icon={<Terminal />}
+          description={me ? `The CLI will act as ${me.email || me.name}.` : "The CLI will act as you."}
+        />
         <CardContent className="space-y-4">
           {code ? (
             <div className="rounded-xl border bg-muted/50 p-4 text-center">
@@ -65,6 +73,15 @@ export function CliLoginPage() {
               <AlertDescription>Return to your terminal. You can close this tab.</AlertDescription>
             </Alert>
           )}
+          {reauthenticating && (
+            <Alert data-testid="cli-reauth">
+              <LogIn />
+              <AlertTitle>Sign in again</AlertTitle>
+              <AlertDescription>
+                Approving needs a fresh sign-in. You come back here afterwards to approve.
+              </AlertDescription>
+            </Alert>
+          )}
           {outcome === "cancelled" && (
             <Alert data-testid="cli-cancelled">
               <XCircle />
@@ -78,13 +95,13 @@ export function CliLoginPage() {
             <Button variant="outline" onClick={() => setOutcome("cancelled")} data-testid="cli-cancel">
               Cancel
             </Button>
-            <Button onClick={() => approve.mutate()} disabled={approve.isPending} data-testid="cli-approve">
-              {approve.isPending && <Spinner />}
+            <Button onClick={() => approve.mutate()} disabled={approve.isPending || reauthenticating} data-testid="cli-approve">
+              {(approve.isPending || reauthenticating) && <Spinner />}
               Approve
             </Button>
           </CardFooter>
         )}
       </Card>
-    </div>
+    </StandalonePage>
   );
 }

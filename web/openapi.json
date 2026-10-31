@@ -4635,6 +4635,12 @@
               "null"
             ]
           },
+          "max_token_lifetime": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left\nout. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose\nclaims can be read.",
+            "minimum": 1
+          },
           "mode": {
             "$ref": "#/components/schemas/KubernetesMode"
           },

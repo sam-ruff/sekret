@@ -1,9 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
-import { expectToast, isMobile, navigate } from "./helpers";
+import { expectToast, isMobile, navigate, openProject, secretRow } from "./helpers";
 
 const SETUP_CODE = "MOCK-SETUP-CODE";
 const PASSPHRASE = "correct horse battery staple";
 const STRONG = "plum orbit gravel lantern";
+const KDF_BUSY = "mock kdf busy";
 
 async function fillSetup(page: Page, passphrase: string, code = SETUP_CODE): Promise<void> {
   await page.getByTestId("setup-code").fill(code);
@@ -25,35 +26,85 @@ async function sealBehindTheScenes(page: Page): Promise<void> {
   });
 }
 
+/** The fake server's answers to a backup by GET, by POST without the CSRF header, and by POST with it. */
+async function backupStatuses(page: Page): Promise<number[]> {
+  return page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as { mockFetch: (request: Request) => Promise<Response> };
+    const url = `${location.origin}/api/v1/sys/backup`;
+    const get = await mock.mockFetch(new Request(url));
+    const bare = await mock.mockFetch(new Request(url, { method: "POST" }));
+    const sent = await mock.mockFetch(new Request(url, { method: "POST", headers: { "x-sekret-csrf": "1" } }));
+    return [get.status, bare.status, sent.status];
+  });
+}
+
+/** A clipboard the test can read, and that reports reading as already allowed. */
+async function fakeClipboard(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    let contents = "";
+    const clipboard = {
+      writeText: (text: string) => {
+        contents = text;
+        return Promise.resolve();
+      },
+      readText: () => Promise.resolve(contents),
+    };
+    Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true });
+    (window as unknown as { readClipboard: () => string }).readClipboard = () => contents;
+  });
+}
+
+const clipboardText = (page: Page) => page.evaluate(() => (window as unknown as { readClipboard: () => string }).readClipboard());
+
 test.describe("first-boot setup", () => {
   test("defaults to manual, refuses a weak passphrase and shows the admin token once", async ({ page }) => {
     await page.goto("/projects?mock-state=uninitialised");
     await expect(page).toHaveURL(/\/setup$/);
+    await expect(page).toHaveTitle("Set up · sekret");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Set up sekret");
     await expect(page.getByTestId("sidebar")).toHaveCount(0);
     await expect(page.getByTestId("setup-policy-manual")).toHaveAttribute("data-state", "checked");
-    await expect(page.getByTestId("setup-policy-card-manual")).toContainText("Most secure");
+    await expect(page.getByTestId("setup-policy-card-manual")).toContainText("Default, most secure");
+    await expect(page.getByTestId("setup-policy-card-manual")).toContainText("Pair it with an alert");
     await expect(page.getByTestId("no-recovery")).toContainText("There is no recovery.");
+    await expect(page.getByTestId("no-recovery")).toContainText("Store it in a password manager.");
     await expect(page.getByTestId("unlock-docs-link")).toHaveAttribute("href", /unlocking\/$/);
+    await expect(page.getByTestId("setup-blocker")).toHaveText("Enter the setup code to continue.");
 
     await fillSetup(page, "password1234");
     const meter = page.getByTestId("setup-meter");
     await expect(meter).toHaveAttribute("data-acceptable", "false");
     await expect(page.getByTestId("setup-meter-feedback")).toContainText("commonly used password");
+    await expect(page.getByTestId("setup-meter-region")).toHaveAttribute("aria-live", "polite");
+    await expect(page.getByTestId("setup-passphrase")).toHaveAttribute("aria-describedby", "setup-meter");
     await expect(page.getByTestId("setup-submit")).toBeDisabled();
+    await expect(page.getByTestId("setup-blocker")).toHaveText("Choose a stronger passphrase to continue.");
 
     await page.getByTestId("setup-passphrase").fill(STRONG);
     await expect(page.getByTestId("setup-mismatch")).toBeVisible();
+    await expect(page.getByTestId("setup-confirm")).toHaveAttribute("aria-describedby", "setup-mismatch");
     await page.getByTestId("setup-confirm").fill(STRONG);
     await expect(meter).toHaveAttribute("data-acceptable", "true");
+    await expect(meter).toContainText("Strong enough");
 
     await page.getByTestId("setup-code").fill("WRONG-CODE");
     await page.getByTestId("setup-submit").click();
-    await expect(page.getByTestId("setup-code-error")).toContainText("setup code is wrong");
+    await expect(page.getByTestId("setup-code-error")).toHaveText(
+      "That setup code is wrong. Check the latest one in the server log.",
+    );
+    await expect(page.getByTestId("setup-code")).toBeFocused();
 
     await page.getByTestId("setup-code").fill(SETUP_CODE);
     await page.getByTestId("setup-submit").click();
     await expect(page.getByTestId("admin-token")).toHaveText(/^skt_[0-9a-f]{48}$/);
     await expect(page.getByTestId("admin-token-copy")).toBeVisible();
+    await expect(page.getByTestId("admin-token-help")).toContainText("It is shown once and lasts until");
+    await expect(page.getByTestId("admin-token-help")).toContainText("It lets the CLI act as an organisation admin");
+    await expect(page.getByTestId("admin-token-expiry")).toContainText("Expires");
+    await expect(page.getByTestId("admin-token-cli")).toContainText("export SEKRET_URL=");
+    await expect(page.getByTestId("admin-token-cli")).toContainText("export SEKRET_TOKEN=<token>");
+    await expect(page.getByTestId("setup-continue")).toHaveText("I have saved it, continue");
 
     await page.reload();
     await expect(page.getByTestId("setup-already")).toBeVisible();
@@ -63,16 +114,35 @@ test.describe("first-boot setup", () => {
     await expect(page.getByTestId("server-policy")).toHaveText("Manual");
   });
 
-  for (const [policy, label] of [
-    ["remember", "Remember"],
-    ["passphrase-file", "Passphrase file"],
+  test("clears the copied admin token from the clipboard after 45 seconds", async ({ page }) => {
+    await fakeClipboard(page);
+    await page.clock.install();
+    await page.goto("/?mock-state=uninitialised");
+    await fillSetup(page, STRONG);
+    await page.getByTestId("setup-submit").click();
+    const token = (await page.getByTestId("admin-token").textContent()) ?? "";
+    await page.getByTestId("admin-token-copy").click();
+    await expectToast(page, "Copied to clipboard");
+    expect(await clipboardText(page)).toBe(token);
+
+    await page.clock.fastForward(44_000);
+    expect(await clipboardText(page)).toBe(token);
+    await page.clock.fastForward(2_000);
+    await expect.poll(() => clipboardText(page)).toBe("");
+  });
+
+  for (const [policy, label, needs] of [
+    ["remember", "Remember", "seal.remember_file"],
+    ["passphrase-file", "Passphrase file", "Without it the server stays locked."],
   ] as const) {
     test(`sets up with the ${policy} policy`, async ({ page }) => {
       await page.goto("/?mock-state=uninitialised");
       await fillSetup(page, STRONG);
+      await expect(page.getByTestId("setup-policy-needs")).toHaveCount(0);
       await page.getByTestId(`setup-policy-card-${policy}`).click();
       await expect(page.getByTestId(`setup-policy-${policy}`)).toHaveAttribute("data-state", "checked");
       await expect(page.getByTestId("setup-policy-manual")).toHaveAttribute("data-state", "unchecked");
+      await expect(page.getByTestId("setup-policy-needs")).toContainText(needs);
       await page.getByTestId("setup-submit").click();
       await expect(page.getByTestId("setup-done")).toBeVisible();
       await page.getByTestId("setup-continue").click();
@@ -83,17 +153,42 @@ test.describe("first-boot setup", () => {
     });
   }
 
-  test("shows a policy fixed in configuration as read-only", async ({ page }) => {
+  test("names the radio cards and shows a visible focus ring on the whole card", async ({ page }) => {
+    await page.goto("/?mock-state=uninitialised");
+    const radio = page.getByRole("radio", { name: "Remember" });
+    await expect(radio).toHaveAttribute("aria-describedby", "setup-policy-remember-text");
+    await page.getByTestId("setup-policy-manual").focus();
+    await page.keyboard.press("ArrowDown");
+    await expect(radio).toBeFocused();
+    const ring = await page
+      .getByTestId("setup-policy-card-remember")
+      .evaluate((card) => getComputedStyle(card).boxShadow);
+    expect(ring).not.toBe("none");
+  });
+
+  test("shows a policy fixed in configuration by name before setup", async ({ page }) => {
     await page.goto("/?mock-state=uninitialised&mock-unlock=remember");
-    await expect(page.getByTestId("setup-policy-configured")).toContainText("set in the server configuration");
+    await expect(page.getByTestId("setup-policy-configured")).toContainText("Remember");
+    await expect(page.getByTestId("setup-policy-configured")).toContainText("Set in the server configuration");
     await expect(page.getByTestId("setup-policy-options")).toHaveCount(0);
   });
 
-  test("points to the host when web setup is off", async ({ page }) => {
+  test("skips the passphrase when the configuration names a key file", async ({ page }) => {
+    await page.goto("/?mock-state=uninitialised&mock-seal-mode=key-file");
+    await expect(page.getByTestId("setup-key-file")).toContainText("root key file");
+    await expect(page.getByTestId("setup-passphrase")).toHaveCount(0);
+    await expect(page.getByTestId("setup-policy-options")).toHaveCount(0);
+    await page.getByTestId("setup-code").fill(SETUP_CODE);
+    await page.getByTestId("setup-submit").click();
+    await expect(page.getByTestId("admin-token")).toBeVisible();
+  });
+
+  test("points to the host without a setup code when web setup is off", async ({ page }) => {
     await page.goto("/projects?mock-state=uninitialised&mock-web-setup=false");
     await expect(page).toHaveURL(/\/setup$/);
-    await expect(page.getByTestId("setup-disabled")).toContainText("This server is set up from its configuration");
-    await expect(page.getByTestId("setup-disabled")).toContainText("sekret admin init");
+    await expect(page.getByTestId("setup-disabled")).toContainText(
+      "Web setup is turned off. Run sekret admin init on the host, then restart the server.",
+    );
     await expect(page.getByTestId("setup-code")).toHaveCount(0);
   });
 });
@@ -102,59 +197,106 @@ test.describe("unlocking", () => {
   test("refuses a wrong passphrase, then returns to the page after the right one", async ({ page }) => {
     await page.goto("/org/users?mock-state=sealed");
     await expect(page).toHaveURL(/\/unlock\?return_to=%2Forg%2Fusers$/);
+    await expect(page).toHaveTitle("Unlock · sekret");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Unlock sekret");
     await expect(page.getByTestId("sidebar")).toHaveCount(0);
-    await expect(page.getByTestId("unlock-card")).toContainText("sekret restarted and needs its passphrase");
+    await expect(page.getByTestId("unlock-card")).toContainText("sekret is locked. Enter the passphrase to decrypt secrets.");
+    await expect(page.getByTestId("unlock-card")).not.toContainText("restarted");
     await expect(page.getByTestId("unlock-policy")).toContainText("Unlock policy: manual");
+
+    await page.getByTestId("unlock-submit").click();
+    await expect(page.getByTestId("unlock-empty")).toHaveText("Enter the passphrase to unlock.");
 
     await unlock(page, "not the passphrase");
     await expect(page.getByTestId("unlock-wrong")).toBeVisible();
+    await expect(page.getByTestId("unlock-passphrase")).toHaveAttribute("aria-describedby", "unlock-passphrase-error");
     await expect(page).toHaveURL(/\/unlock/);
 
     await unlock(page, PASSPHRASE);
     await expect(page).toHaveURL(/\/org\/users$/);
     await expect(page.getByTestId("page-title")).toHaveText("Users");
+    await expect(page).toHaveTitle("Users · sekret");
   });
 
-  test("explains a lost remembered unlock", async ({ page }) => {
+  test("explains a remember policy with nothing remembered", async ({ page }) => {
     await page.goto("/?mock-state=sealed&mock-unlock=remember");
     await expect(page.getByTestId("unlock-policy")).toContainText(
-      "The remembered unlock was lost; unlocking now will remember it again.",
+      "Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.",
     );
   });
 
-  test("reports rate limiting inline", async ({ page }) => {
+  test("counts down after too many wrong passphrases and keeps the button disabled", async ({ page }) => {
     await page.goto("/?mock-state=sealed");
     for (let i = 0; i < 5; i += 1) {
       await unlock(page, `wrong ${i}`);
       await expect(page.getByTestId("unlock-wrong")).toBeVisible();
     }
-    await unlock(page, "wrong again");
-    await expect(page.getByTestId("unlock-limited")).toContainText("Too many attempts");
+    await unlock(page, PASSPHRASE);
+    await expect(page.getByTestId("unlock-backoff")).toContainText("Too many wrong passphrases");
+    await expect(page.getByTestId("unlock-countdown")).toHaveText(/^[1-3]$/);
+    await expect(page.getByTestId("unlock-submit")).toBeDisabled();
+    await expect(page.getByTestId("unlock-backoff")).toContainText("You can try again now.", { timeout: 6_000 });
+    await expect(page.getByTestId("unlock-submit")).toBeEnabled();
+    await page.getByTestId("unlock-submit").click();
+    await expect(page).toHaveURL(/\/projects$/);
   });
 
-  test("moves an open tab to the unlock page when the server is sealed mid-session", async ({ page }) => {
-    await page.goto("/projects");
-    await expect(page.getByTestId("project-card-storefront")).toBeVisible();
+  test("asks to wait while another unlock is running", async ({ page }) => {
+    await page.goto("/?mock-state=sealed");
+    await unlock(page, KDF_BUSY);
+    await expect(page.getByTestId("unlock-busy")).toContainText("Another unlock is in progress. Try again in a moment.");
+    await expect(page.getByTestId("unlock-submit")).toBeEnabled();
+  });
+
+  test("moves an open tab to the unlock page when the server is sealed mid-session, forgetting revealed values", async ({
+    page,
+  }) => {
+    await openProject(page);
+    const row = secretRow(page, "LOG_LEVEL");
+    await row.getByTestId("secret-reveal").click();
+    await expect(row.getByTestId("secret-value")).toHaveText("warn");
+
     await sealBehindTheScenes(page);
-    await page.getByTestId("project-card-storefront").click();
-    await expect(page).toHaveURL(/\/unlock\?return_to=%2Fprojects%2Fstorefront%2Fsecrets/);
+    await page.getByTestId("env-tab-staging").click();
+    await expect(page).toHaveURL(/\/unlock\?return_to=%2Fprojects%2Fstorefront%2Fsecrets%2Fstaging/);
     await unlock(page, PASSPHRASE);
-    await expect(page).toHaveURL(/\/projects\/storefront\/secrets/);
-    await expect(page.getByTestId("env-tabs")).toBeVisible();
+    await expect(page).toHaveURL(/\/projects\/storefront\/secrets\/staging/);
+    // Reveals normally survive switching environments; the lock cleared them.
+    await page.getByTestId("env-tab-dev").click();
+    await expect(secretRow(page, "LOG_LEVEL")).toBeVisible();
+    await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-value")).not.toHaveText("warn");
+  });
+
+  test("notices a lock while values are revealed without any click", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await secretRow(page, "LOG_LEVEL").getByTestId("secret-reveal").click();
+    await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-value")).toHaveText("warn");
+    await sealBehindTheScenes(page);
+    await page.clock.fastForward(16_000);
+    await expect(page).toHaveURL(/\/unlock\?return_to=/);
   });
 });
 
 test.describe("server page", () => {
-  test("seals the server after confirming", async ({ page }) => {
+  test("locks the server after confirming", async ({ page }) => {
     await page.goto("/projects");
     await navigate(page, "nav-server");
+    await expect(page).toHaveTitle("Server · sekret");
     await expect(page.getByTestId("server-state")).toHaveText("Unlocked");
     await expect(page.getByTestId("server-mode")).toHaveText("Passphrase");
+    await expect(page.getByTestId("server-status")).toContainText("Protected by");
+    await expect(page.getByTestId("server-unsealed-by")).toHaveText("Passphrase, typed by a person");
     await expect(page.getByTestId("server-version")).toHaveText("0.0.0-mock");
+    await expect(page.getByTestId("server-status")).toContainText("Lock (seal) the server");
+    await expect(page.getByTestId("lock-help")).toContainText("Locking drops the key from memory straight away.");
+    await expect(page.getByTestId("server-key-file-override")).toHaveCount(0);
 
     await page.getByTestId("seal-now").click();
     const dialog = page.getByTestId("seal-dialog");
     await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("Lock the server now?");
+    await expect(dialog).toContainText("A remembered unlock still unlocks it after a restart.");
     await dialog.getByRole("button", { name: "Cancel" }).click();
     await expect(dialog).toBeHidden();
 
@@ -165,9 +307,17 @@ test.describe("server page", () => {
     await expect(page.getByTestId("server-state")).toHaveText("Unlocked");
   });
 
+  test("warns when a key file unlocked a passphrase server", async ({ page }) => {
+    await page.goto("/org/server?mock-unsealed-by=key-file");
+    await expect(page.getByTestId("server-unsealed-by")).toHaveText("Root key file");
+    await expect(page.getByTestId("server-key-file-override")).toContainText("A key file unlocked this server");
+  });
+
   test("changes the passphrase", async ({ page }) => {
     await page.goto("/org/server");
     const card = page.getByTestId("server-passphrase");
+    await expect(card.getByTestId("change-passphrase-help")).toContainText("A remembered unlock is forgotten");
+    await expect(card.getByTestId("change-blocker")).toHaveText("Enter the current passphrase to continue.");
     await card.getByTestId("current-passphrase").fill("not it");
     await card.getByTestId("change-passphrase").fill("password1234");
     await card.getByTestId("change-confirm").fill("password1234");
@@ -178,6 +328,7 @@ test.describe("server page", () => {
     await card.getByTestId("change-confirm").fill(STRONG);
     await card.getByTestId("change-submit").click();
     await expect(card.getByTestId("current-passphrase-wrong")).toBeVisible();
+    await expect(card.getByTestId("current-passphrase")).toHaveAttribute("aria-describedby", "current-passphrase-error");
 
     await card.getByTestId("current-passphrase").fill(PASSPHRASE);
     await card.getByTestId("change-submit").click();
@@ -192,37 +343,87 @@ test.describe("server page", () => {
     await expect(page).toHaveURL(/\/org\/server$/);
   });
 
-  test("changes the unlock policy and forgets a remembered unlock", async ({ page }) => {
+  test("confirms a weaker policy with the passphrase, and forgets a remembered unlock only after confirming", async ({
+    page,
+  }) => {
     await page.goto("/org/server");
     await expect(page.getByTestId("server-policy-manual")).toHaveAttribute("data-state", "checked");
     await expect(page.getByTestId("policy-save")).toBeDisabled();
+    await expect(page.getByTestId("policy-save-hint")).toHaveText("Choose a different policy to save.");
     await expect(page.getByTestId("forget-unlock")).toHaveCount(0);
 
     await page.getByTestId("server-policy-card-remember").click();
+    await expect(page.getByTestId("server-policy-needs")).toContainText("seal.remember_file");
     await page.getByTestId("policy-save").click();
+    const dialog = page.getByTestId("policy-dialog");
+    await expect(dialog).toContainText("Confirm with the current passphrase. This lets the server unlock without a person.");
+    await dialog.getByTestId("confirm-action").click();
+    await expect(dialog.getByTestId("policy-passphrase-error")).toHaveText("Enter the current passphrase.");
+    await dialog.getByTestId("policy-passphrase").fill("not it");
+    await dialog.getByTestId("confirm-action").click();
+    await expect(dialog.getByTestId("policy-passphrase-error")).toHaveText("That passphrase is wrong.");
+    await expect(page.getByTestId("server-policy")).toHaveText("Manual");
+
+    await dialog.getByTestId("policy-passphrase").fill(PASSPHRASE);
+    await dialog.getByTestId("confirm-action").click();
+    await expect(dialog).toBeHidden();
     await expectToast(page, "Unlock policy saved");
     await expect(page.getByTestId("server-policy")).toHaveText("Remember");
-    await expect(page.getByTestId("server-remembered")).toContainText("Yes");
+    await expect(page.getByTestId("server-remembered")).toContainText("yes");
+    await expect(page.getByTestId("server-remembered-box")).toContainText("Locking the server does not forget this.");
+    await expect(page.getByTestId("server-remembered")).toHaveCount(1);
 
     await page.getByTestId("forget-unlock").click();
+    const forget = page.getByTestId("forget-dialog");
+    await expect(forget).toContainText("Forget the remembered unlock?");
+    await expect(forget).toContainText("The key file is deleted.");
+    await forget.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByTestId("server-remembered")).toContainText("yes");
+
+    await page.getByTestId("forget-unlock").click();
+    await forget.getByTestId("confirm-action").click();
     await expectToast(page, "Remembered unlock forgotten");
-    await expect(page.getByTestId("server-remembered")).toHaveText("No");
+    await expect(page.getByTestId("server-remembered")).toHaveText("Remembered: no");
     await expect(page.getByTestId("forget-unlock")).toHaveCount(0);
+
+    // Going back to manual needs no passphrase.
+    await page.getByTestId("server-policy-card-manual").click();
+    await page.getByTestId("policy-save").click();
+    await expect(page.getByTestId("policy-dialog")).toHaveCount(0);
+    await expect(page.getByTestId("server-policy")).toHaveText("Manual");
+  });
+
+  test("keeps a remembered unlock through locking", async ({ page }) => {
+    await page.goto("/org/server");
+    await page.getByTestId("server-policy-card-remember").click();
+    await page.getByTestId("policy-save").click();
+    await page.getByTestId("policy-passphrase").fill(PASSPHRASE);
+    await page.getByTestId("policy-dialog").getByTestId("confirm-action").click();
+    await expect(page.getByTestId("server-remembered")).toContainText("yes");
+
+    await page.getByTestId("seal-now").click();
+    await page.getByTestId("seal-dialog").getByTestId("confirm-action").click();
+    await expect(page.getByTestId("unlock-policy")).toContainText("after locking by hand someone has to type the passphrase");
+    await unlock(page, PASSPHRASE);
+    await expect(page.getByTestId("server-remembered")).toContainText("yes");
   });
 
   test("shows a configured policy read-only", async ({ page }) => {
     await page.goto("/org/server?mock-unlock=passphrase-file");
     await expect(page.getByTestId("server-policy")).toContainText("Passphrase file (set in configuration)");
     await expect(page.getByTestId("server-policy-configured")).toContainText("cannot be changed here");
+    await expect(page.getByTestId("server-policy-configured-needs")).toContainText("SEKRET_UNLOCK_PASSPHRASE");
     await expect(page.getByTestId("policy-save")).toHaveCount(0);
   });
 
-  test("downloads an encrypted backup", async ({ page }) => {
+  test("downloads an encrypted backup with POST and the CSRF header", async ({ page }) => {
     await page.goto("/org/server");
     await expect(page.getByTestId("server-backup")).toContainText("needs the passphrase");
     const download = page.waitForEvent("download");
     await page.getByTestId("backup-download").click();
     expect((await download).suggestedFilename()).toMatch(/^sekret-backup-\d{8}T\d{6}Z\.skb$/);
+
+    expect(await backupStatuses(page)).toEqual([405, 403, 200]);
   });
 
   test("is hidden from people who are not admins", async ({ page }) => {
@@ -236,11 +437,21 @@ test.describe("server page", () => {
     await expect(page.getByTestId("seal-now")).toHaveCount(0);
   });
 
-  test("offers backup readers only the download", async ({ page }) => {
+  test("offers backup readers only the download, with a fitting description", async ({ page }) => {
     await page.goto("/org/server?mock-org-role=backup-reader");
     await expect(page.getByTestId("backup-download")).toBeVisible();
+    await expect(page.getByText("See whether this sekret server is unlocked and download encrypted backups.")).toBeVisible();
     await expect(page.getByTestId("seal-now")).toHaveCount(0);
     await expect(page.getByTestId("server-passphrase")).toHaveCount(0);
     await expect(page.getByTestId("server-unlock-policy")).toHaveCount(0);
   });
+});
+
+test("the documentation link says it opens a new tab", async ({ page }) => {
+  await page.goto("/projects");
+  if (isMobile(page)) await page.getByTestId("sidebar-trigger").click();
+  const link = page.getByTestId("nav-docs");
+  await expect(link).toHaveAttribute("target", "_blank");
+  await expect(link.getByTestId("nav-docs-external")).toBeVisible();
+  await expect(link).toContainText("(opens in a new tab)");
 });

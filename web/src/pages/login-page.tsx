@@ -1,15 +1,15 @@
-import { AlertCircle, LogIn } from "lucide-react";
+import { AlertCircle, ExternalLink, LogIn } from "lucide-react";
 import { useState } from "react";
 import { useSearchParams } from "react-router";
 import { startSignIn } from "@/api/client";
-import { ThemeToggle } from "@/components/layout/user-menu";
-import { Logo } from "@/components/logo";
+import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-page";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/hooks/queries";
+import { DOCS_URL } from "@/lib/links";
 
 export function LoginPage() {
   const [params] = useSearchParams();
@@ -24,16 +24,13 @@ export function LoginPage() {
   };
 
   return (
-    <div className="relative flex min-h-svh items-center justify-center bg-gradient-to-b from-primary/10 via-background to-background px-4">
-      <div className="absolute top-4 right-4">
-        <ThemeToggle />
-      </div>
-      <Card className="w-full max-w-sm shadow-lg shadow-primary/5" data-testid="login-card">
-        <CardHeader className="items-center text-center">
-          <Logo className="mx-auto mb-2 size-14 text-primary" title="sekret" />
-          <CardTitle className="text-xl">Sign in to sekret</CardTitle>
-          <CardDescription>Secrets for your projects, kept in one place.</CardDescription>
-        </CardHeader>
+    <StandalonePage className="max-w-sm">
+      <Card className="shadow-lg shadow-primary/5" data-testid="login-card">
+        <StandaloneHeader
+          title="Sign in to sekret"
+          pageTitle="Sign in"
+          description="Secrets for your projects, kept in one place."
+        />
         <CardContent className="space-y-4">
           {error && (
             <Alert variant="destructive" data-testid="login-error">
@@ -47,19 +44,33 @@ export function LoginPage() {
           ) : config?.oidc_enabled === false ? (
             <Alert data-testid="oidc-disabled">
               <AlertCircle />
-              <AlertTitle>Browser sign-in is not set up</AlertTitle>
+              <AlertTitle>No sign-in provider yet</AlertTitle>
               <AlertDescription>
-                This server has no OpenID Connect provider configured. Ask your administrator to enable it.
+                <p>
+                  This server has no sign-in provider yet. Use the admin token with the CLI, or see the{" "}
+                  <a
+                    href={`${DOCS_URL}configuration/`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
+                    data-testid="oidc-docs-link"
+                  >
+                    configuration guide
+                    <ExternalLink className="size-3" aria-hidden />
+                    <span className="sr-only">(opens in a new tab)</span>
+                  </a>
+                  .
+                </p>
               </AlertDescription>
             </Alert>
           ) : (
             <Button size="lg" className="w-full" onClick={signIn} disabled={leaving} data-testid="sign-in">
               {leaving ? <Spinner /> : <LogIn />}
-              Sign in with Keycloak
+              Sign in
             </Button>
           )}
         </CardContent>
       </Card>
-    </div>
+    </StandalonePage>
   );
 }

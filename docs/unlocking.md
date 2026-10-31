@@ -2,13 +2,15 @@
 
 In passphrase mode the root key is stored wrapped under your passphrase, and the server has to get it back into memory every time it starts. Until it does, the server is sealed: it answers `GET /api/v1/sys/status` and health checks, and refuses everything else with 503. The unlock policy decides how a sealed server gets unlocked.
 
-There are three policies. Choose one at setup, change it later on the Server page under Organisation or with `sekret sys unlock-policy`, or fix it in configuration with `seal.unlock`, in which case configuration wins and the interface shows it as set there. Key-file mode has no policy, because the key file is read on every start.
+The web interface calls a sealed server locked, and sealing it locking it.
+
+There are three policies. Choose one at setup, change it later on the Server page under Organisation or with `sekret sys unlock-policy`, or fix it in configuration with `seal.unlock`, in which case configuration wins and the interface shows it as set there. When configuration fixes the policy before setup, the setup page names it instead of offering a choice. Key-file mode has no policy, because the key file is read on every start; when configuration names a key file, the setup page asks only for the setup code.
 
 ![Choosing the passphrase and unlock policy during setup](assets/screenshots/setup-light.png)
 
 ## Manual
 
-Someone unlocks the server by hand after every start, on the unlock page or with `sekret sys unseal`. The passphrase is typed, used and wiped; the unwrapped root key exists only in the server's memory and nowhere else. Anyone who opens the web interface while the server is sealed lands on the unlock page, and goes back to where they were heading once it is unlocked.
+Someone unlocks the server by hand after every start, on the unlock page or with `sekret sys unseal`. The passphrase is typed, used and wiped; the unwrapped root key exists only in the server's memory and nowhere else. Anyone who opens the web interface while the server is sealed lands on the unlock page, and goes back to where they were heading once it is unlocked. A tab that was already open moves there too, and drops every secret it had loaded or revealed on the way. After several wrong passphrases the server makes everyone wait before the next try, and the unlock page counts down until then.
 
 ![The unlock page](assets/screenshots/unlock-dark.png)
 
@@ -36,11 +38,11 @@ A remember secret closes the stolen-disk gap. Set `seal.remember_secret_file` (o
 
 One trailing line ending is dropped, the same as for passphrases, and the environment variable is removed from the process as soon as it is read. If the secret is missing or wrong, the server stays sealed and says so in its log. Unlocking by hand then writes a fresh remember file under the secret now configured.
 
-### Sealing by hand
+### Locking by hand
 
-"Seal now" and `sekret sys seal` drop the root key from memory but keep the remembered unlock, so the next restart unlocks itself again. The status endpoint keeps reporting `remembered: true` while that is so. To make the next start need the passphrase, forget the unlock as well.
+"Lock now" on the Server page and `sekret sys seal` drop the root key from memory but keep the remembered unlock, so the next restart unlocks itself again. The status endpoint keeps reporting `remembered: true` while that is so. To make the next start need the passphrase, forget the unlock as well.
 
-To stop remembering, choose another policy or run `sekret sys forget-unlock` (or "Forget remembered unlock" on the Server page). Both delete the file and the database copy, and the next start needs the passphrase.
+To stop remembering, choose another policy or run `sekret sys forget-unlock` (or "Forget remembered unlock" on the Server page, which asks you to confirm). Both delete the file and the database copy, and the next start needs the passphrase.
 
 ## Passphrase file
 
@@ -76,7 +78,7 @@ sekret sys unlock-policy remember          # asks for the current passphrase
 sekret sys unlock-policy manual
 ```
 
-`remember` and `passphrase-file` make the server easier to unlock without a person, so they need the current passphrase as well as an organisation admin (`passphrase` in the body of `PUT /api/v1/sys/unlock-policy`, or `--passphrase-file` on the CLI). Going back to `manual` makes things stricter and needs no passphrase. Moving to `remember` while unlocked writes the remember file straight away. Moving away from it forgets the remembered unlock. When `seal.unlock` is set in configuration, change it there and restart; the API refuses to change it.
+`remember` and `passphrase-file` make the server easier to unlock without a person, so they need the current passphrase as well as an organisation admin (`passphrase` in the body of `PUT /api/v1/sys/unlock-policy`, `--passphrase-file` on the CLI, or the confirmation dialog on the Server page). Going back to `manual` makes things stricter and needs no passphrase. Moving to `remember` while unlocked writes the remember file straight away. Moving away from it forgets the remembered unlock. When `seal.unlock` is set in configuration, change it there and restart; the API refuses to change it.
 
 ## The policy cannot be changed behind your back
 

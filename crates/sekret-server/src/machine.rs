@@ -1,5 +1,7 @@
 use axum::Json;
 use axum::extract::State;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sekret_api::{
     AuthMethodConfig, AuthMethodKind, JwtLoginRequest, KubernetesAuthConfig, KubernetesMode, OidcAuthConfig,
     REDACTED_CREDENTIAL, TokenResponse, UniversalLoginRequest,
@@ -50,6 +52,9 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
             }
             if k8s.audiences.is_empty() {
                 return Err(ApiError::bad_request("at least one audience is required"));
+            }
+            if k8s.max_token_lifetime < 1 {
+                return Err(ApiError::bad_request("max_token_lifetime must be at least 1 second"));
             }
             for list in [&k8s.namespaces, &k8s.service_accounts, &k8s.audiences] {
                 sekret_core::validate::globs(list)?;
@@ -182,6 +187,33 @@ pub fn parse_service_account(username: &str) -> Option<(String, String)> {
     (!namespace.is_empty() && !name.is_empty() && !name.contains(':')).then(|| (namespace.into(), name.into()))
 }
 
+/// Refuses tokens that say nothing of when they were issued or live longer than `max` seconds.
+fn check_lifetime(claims: &Value, max: i64) -> Result<(), LoginError> {
+    let iat = claims["iat"]
+        .as_i64()
+        .ok_or_else(|| LoginError::Token("no iat".into()))?;
+    let exp = claims["exp"]
+        .as_i64()
+        .ok_or_else(|| LoginError::Token("no exp".into()))?;
+    let lifetime = exp.saturating_sub(iat);
+    if lifetime > max {
+        return Err(LoginError::Token(format!(
+            "lifetime of {lifetime}s is over max_token_lifetime {max}s"
+        )));
+    }
+    Ok(())
+}
+
+/// A JWT's payload without checking its signature, for tokens the API server has already accepted.
+fn unverified_claims(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 pub async fn verify_kubernetes(
     jwt: &JwtVerifier,
     reviewer: &dyn TokenReviewer,
@@ -207,6 +239,9 @@ pub async fn verify_kubernetes(
             let audience_ok = review.audiences.iter().any(|a| config.audiences.contains(a));
             if !review.authenticated || !audience_ok {
                 return Err(LoginError::NotAuthenticated);
+            }
+            if let Some(claims) = unverified_claims(token) {
+                check_lifetime(&claims, config.max_token_lifetime)?;
             }
             review.username
         }
@@ -234,6 +269,7 @@ pub async fn verify_kubernetes(
             if !audiences.iter().any(|a| config.audiences.iter().any(|c| c == a)) {
                 return Err(LoginError::Binding("audience".into()));
             }
+            check_lifetime(&claims, config.max_token_lifetime)?;
             claims["sub"].as_str().unwrap_or_default().to_string()
         }
     };
@@ -500,7 +536,94 @@ mod tests {
             namespaces: vec!["apps".into()],
             service_accounts: vec!["web-*".into()],
             audiences: vec!["sekret".into()],
+            max_token_lifetime: sekret_api::DEFAULT_MAX_TOKEN_LIFETIME,
         }
+    }
+
+    const SA: &str = "system:serviceaccount:apps:web-api";
+
+    #[tokio::test]
+    async fn jwks_mode_caps_token_lifetime() -> anyhow::Result<()> {
+        let issuer = TestIssuer::new("https://kubernetes.default.svc.cluster.local");
+        let mut config = k8s_config(KubernetesMode::Jwks);
+        config.jwks = Some(issuer.jwks());
+        let jwt = verifier(issuer.now);
+        let reviewer = MockTokenReviewer::new();
+        let token = |lifetime: i64| {
+            issuer.sign(json!({"aud": ["sekret"], "sub": SA, "iat": issuer.now, "exp": issuer.now + lifetime}))
+        };
+        let hour = token(3600)?;
+        let year = token(365 * 86400)?;
+        assert!(verify_kubernetes(&jwt, &reviewer, &config, &hour).await.is_ok());
+        assert!(matches!(
+            verify_kubernetes(&jwt, &reviewer, &config, &year).await,
+            Err(LoginError::Token(m)) if m.contains("max_token_lifetime")
+        ));
+        let no_iat = issuer.sign(json!({"aud": ["sekret"], "sub": SA, "iat": null}))?;
+        assert_eq!(
+            verify_kubernetes(&jwt, &reviewer, &config, &no_iat).await,
+            Err(LoginError::Token("no iat".into()))
+        );
+
+        config.max_token_lifetime = 600;
+        assert!(verify_kubernetes(&jwt, &reviewer, &config, &token(600)?).await.is_ok());
+        assert!(verify_kubernetes(&jwt, &reviewer, &config, &hour).await.is_err());
+        config.max_token_lifetime = 400 * 86400;
+        assert!(verify_kubernetes(&jwt, &reviewer, &config, &year).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_review_mode_caps_readable_token_lifetime() -> anyhow::Result<()> {
+        let mut reviewer = MockTokenReviewer::new();
+        reviewer.expect_review().returning(|_| {
+            Ok(TokenReviewResult {
+                authenticated: true,
+                username: SA.into(),
+                audiences: vec!["sekret".into()],
+            })
+        });
+        let mut config = k8s_config(KubernetesMode::TokenReview);
+        let jwt = verifier(0);
+        let issuer = TestIssuer::new("https://kubernetes.default.svc.cluster.local");
+        let token = |lifetime: i64| issuer.sign(json!({"sub": SA, "iat": issuer.now, "exp": issuer.now + lifetime}));
+        assert!(verify_kubernetes(&jwt, &reviewer, &config, &token(600)?).await.is_ok());
+        assert!(matches!(
+            verify_kubernetes(&jwt, &reviewer, &config, &token(86400)?).await,
+            Err(LoginError::Token(_))
+        ));
+        let no_iat = issuer.sign(json!({"sub": SA, "iat": null}))?;
+        assert_eq!(
+            verify_kubernetes(&jwt, &reviewer, &config, &no_iat).await,
+            Err(LoginError::Token("no iat".into()))
+        );
+        config.max_token_lifetime = 2 * 86400;
+        assert!(
+            verify_kubernetes(&jwt, &reviewer, &config, &token(86400)?)
+                .await
+                .is_ok()
+        );
+        assert!(
+            verify_kubernetes(&jwt, &reviewer, &config, "opaque").await.is_ok(),
+            "claims that cannot be read are left to the API server"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_lifetime_cap_must_be_positive() {
+        let mut k8s = k8s_config(KubernetesMode::TokenReview);
+        k8s.max_token_lifetime = 0;
+        assert!(validate_config(&AuthMethodConfig::Kubernetes(k8s), false).is_err());
+    }
+
+    #[test]
+    fn a_missing_cap_defaults_to_an_hour() -> anyhow::Result<()> {
+        let config: KubernetesAuthConfig = serde_json::from_value(json!({
+            "mode": "jwks", "namespaces": ["a"], "service_accounts": ["b"]
+        }))?;
+        assert_eq!(config.max_token_lifetime, 3600);
+        Ok(())
     }
 
     fn verifier(now: i64) -> JwtVerifier {

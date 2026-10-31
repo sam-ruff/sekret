@@ -181,6 +181,7 @@ export function IdentityPage() {
       {identity.data && (
         <>
           <PageHeader
+            documentTitle={identity.data.name}
             title={
               <span className="flex items-center gap-2">
                 <Bot className="size-6 shrink-0 text-primary" />

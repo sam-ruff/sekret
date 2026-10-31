@@ -17,6 +17,9 @@ pub struct HumanOidcConfig {
     pub admin_groups: Vec<String>,
     /// When non-empty, a user needs one of these groups to sign in at all.
     pub required_groups: Vec<String>,
+    /// When non-empty, only these ID token subjects may sign in, whatever their groups, so a
+    /// role granted inside the provider is not enough on its own.
+    pub allowed_subjects: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

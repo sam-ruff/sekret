@@ -233,6 +233,7 @@ export function seededState(realNow: number): MockState {
     namespaces: ["billing"],
     service_accounts: ["billing-worker", "billing-cron-*"],
     audiences: ["sekret"],
+    max_token_lifetime: 600,
   });
   backend.putAuthMethod(worker.id, "universal", { kind: "universal" });
   backend.createClientSecret(worker.id, { description: "Initial secret", ttl: null, max_uses: null });

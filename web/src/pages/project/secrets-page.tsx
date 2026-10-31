@@ -33,7 +33,7 @@ import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
 import { folderQuery, useProjectEnv } from "@/hooks/use-project-env";
-import { keys, useApiMutation, useProject } from "@/hooks/queries";
+import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useProject, useSealWatch } from "@/hooks/queries";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { generatorFromDraft } from "@/lib/generation";
 import { isValidFolderName, joinPath } from "@/lib/paths";
@@ -137,7 +137,9 @@ export function SecretsPage() {
     },
     enabled: !!env && wantValues,
     staleTime: 15_000,
+    gcTime: SECRET_VALUE_GC_TIME,
   });
+  useSealWatch(revealAll || revealed.size > 0);
 
   const invalidate = [
     ["project", project, "secrets"],
@@ -229,6 +231,7 @@ export function SecretsPage() {
         return new Map(result.secrets.map((s) => [s.key, s.value ?? null]));
       },
       staleTime: 15_000,
+      gcTime: SECRET_VALUE_GC_TIME,
     });
     return map.get(key);
   };

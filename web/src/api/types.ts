@@ -70,6 +70,7 @@ export type Subject = Schemas["Subject"];
 export type SysStatus = Schemas["SysStatus"];
 export type UnlockPolicy = Schemas["UnlockPolicy"];
 export type UnsealRequest = Schemas["UnsealRequest"];
+export type UnsealedBy = Schemas["UnsealedBy"];
 export type UpdateEnvironment = Schemas["UpdateEnvironment"];
 export type UpdateIdentity = Schemas["UpdateIdentity"];
 export type UpdateProject = Schemas["UpdateProject"];
@@ -81,6 +82,10 @@ export type UserSort = Schemas["UserSort"];
 export const REDACTED_CREDENTIAL = "[redacted]";
 
 export const UNLOCK_POLICIES: readonly UnlockPolicy[] = ["manual", "remember", "passphrase-file"];
+
+export const SEAL_MODES: readonly SealMode[] = ["passphrase", "key-file"];
+
+export const UNSEALED_BY: readonly UnsealedBy[] = ["passphrase", "remember", "key-file", "passphrase-file"];
 
 export const ACTIONS: readonly Action[] = ["read", "read-value", "create", "edit", "delete"];
 

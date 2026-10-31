@@ -1,5 +1,5 @@
-import type { SealState, UnlockPolicy } from "../types";
-import { UNLOCK_POLICIES } from "../types";
+import type { SealMode, SealState, UnlockPolicy, UnsealedBy } from "../types";
+import { SEAL_MODES, UNLOCK_POLICIES, UNSEALED_BY } from "../types";
 
 const STORAGE_KEY = "sekret-mock-controls";
 const PREFIX = "mock-";
@@ -9,8 +9,12 @@ const SEAL_STATES: readonly SealState[] = ["uninitialised", "sealed", "unsealed"
 export interface MockControls {
   state?: SealState;
   webSetup?: boolean;
+  /** A seal mode fixed by configuration, such as `key-file` before setup. */
+  sealMode?: SealMode;
   /** An unlock policy fixed by configuration. */
   configuredPolicy?: UnlockPolicy;
+  /** How the running server was unlocked. */
+  unsealedBy?: UnsealedBy;
   /** Replaces the signed-in user's organisation roles. */
   orgRole?: string;
 }
@@ -21,7 +25,9 @@ export function parseControls(search: string): MockControls {
   return {
     state: SEAL_STATES.find((s) => s === params.get("mock-state")),
     webSetup: webSetup === null ? undefined : webSetup !== "false",
+    sealMode: SEAL_MODES.find((m) => m === params.get("mock-seal-mode")),
     configuredPolicy: UNLOCK_POLICIES.find((p) => p === params.get("mock-unlock")),
+    unsealedBy: UNSEALED_BY.find((u) => u === params.get("mock-unsealed-by")),
     orgRole: params.get("mock-org-role") ?? undefined,
   };
 }

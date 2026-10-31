@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { keys, useApiMutation } from "@/hooks/queries";
+import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useSealWatch } from "@/hooks/queries";
 import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -100,18 +100,32 @@ function VersionDiff({ versions }: { versions: SecretVersion[] }) {
   );
 }
 
+function VersionValue({ version, shown }: { version: SecretVersion; shown: boolean }) {
+  if (!shown) return <span className="text-muted-foreground">{"•".repeat(10)}</span>;
+  if (version.value_hidden) {
+    return (
+      <span className="flex items-center gap-1 text-muted-foreground">
+        <Lock className="size-3" /> Hidden
+      </span>
+    );
+  }
+  return version.value || <span className="italic text-muted-foreground">empty</span>;
+}
+
 function VersionItem({
   version,
   current,
+  shown,
   canRollback,
   onRollback,
 }: {
   version: SecretVersion;
   current: boolean;
+  /** Values were fetched after the reader asked for them. */
+  shown: boolean;
   canRollback: boolean;
   onRollback: () => void;
 }) {
-  const [shown, setShown] = useState(false);
   return (
     <li className="space-y-2 rounded-lg border bg-card p-3" data-testid={`version-${version.version}`}>
       <div className="flex items-start justify-between gap-2">
@@ -138,29 +152,11 @@ function VersionItem({
       </div>
       {version.comment && <p className="text-sm text-muted-foreground">{version.comment}</p>}
       {!version.deleted && (
-        <div className="flex items-center gap-1">
-          <div className="min-w-0 flex-1 truncate rounded-md bg-muted/60 px-2 py-1 font-mono text-xs">
-            {version.value_hidden ? (
-              <span className="flex items-center gap-1 text-muted-foreground">
-                <Lock className="size-3" /> Hidden
-              </span>
-            ) : shown ? (
-              version.value || <span className="italic text-muted-foreground">empty</span>
-            ) : (
-              <span className="text-muted-foreground">{"•".repeat(10)}</span>
-            )}
-          </div>
-          {!version.value_hidden && (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => setShown(!shown)}
-              aria-label={shown ? "Hide value" : "Show value"}
-              data-testid={`version-reveal-${version.version}`}
-            >
-              {shown ? <EyeOff /> : <Eye />}
-            </Button>
-          )}
+        <div
+          className="min-w-0 truncate rounded-md bg-muted/60 px-2 py-1 font-mono text-xs"
+          data-testid={`version-value-${version.version}`}
+        >
+          <VersionValue version={version} shown={shown} />
         </div>
       )}
       {version.tags.length > 0 && (
@@ -179,14 +175,38 @@ function VersionItem({
 export function SecretDrawer({ project, env, envName, path, secretKey, canRollback, canEditPolicy, onRotate, onClose }: SecretDrawerProps) {
   const at = { project, env, path };
   const [target, setTarget] = useState<number | null>(null);
+  // Values are shown only for the secret they were asked for, and hidden again on close or a switch.
+  const [valuesFor, setValuesFor] = useState<string | null>(null);
+  const [openKey, setOpenKey] = useState(secretKey);
+  if (openKey !== secretKey) {
+    setOpenKey(secretKey);
+    setValuesFor(null);
+  }
+  const showValues = secretKey !== null && valuesFor === secretKey;
+
+  const historyKey = keys.versions(project, env, path, secretKey ?? "");
+  const loadVersions = async (values: boolean) => {
+    const list = await api.versions(at, secretKey ?? "", values);
+    return [...list].sort((a, b) => b.version - a.version);
+  };
   const versions = useQuery({
-    queryKey: keys.versions(project, env, path, secretKey ?? ""),
-    queryFn: async () => {
-      const list = await api.versions(at, secretKey ?? "");
-      return [...list].sort((a, b) => b.version - a.version);
-    },
+    queryKey: historyKey,
+    queryFn: () => loadVersions(false),
     enabled: secretKey !== null,
+    gcTime: SECRET_VALUE_GC_TIME,
   });
+  const withValues = useQuery({
+    queryKey: [...historyKey, "values"],
+    queryFn: () => loadVersions(true),
+    enabled: showValues,
+    gcTime: SECRET_VALUE_GC_TIME,
+  });
+  useSealWatch(showValues);
+
+  const close = () => {
+    setValuesFor(null);
+    onClose();
+  };
 
   const rollback = useApiMutation({
     mutationFn: (version: number) => api.rollback(at, secretKey ?? "", version),
@@ -194,11 +214,12 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
     success: (_, version) => `Rolled ${secretKey} back to version ${version}`,
   });
 
-  const list = versions.data ?? [];
+  const revealed = showValues ? withValues.data : undefined;
+  const list = revealed ?? versions.data ?? [];
   const currentVersion = list[0]?.version;
 
   return (
-    <Sheet open={secretKey !== null} onOpenChange={(open) => !open && onClose()}>
+    <Sheet open={secretKey !== null} onOpenChange={(open) => !open && close()}>
       <SheetContent className="w-full gap-0 sm:max-w-xl" data-testid="secret-drawer">
         <SheetHeader className="border-b">
           <SheetTitle className="flex items-center gap-2 font-mono">
@@ -219,8 +240,29 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
             {list.length > 0 && (
               <>
                 <section className="space-y-3">
-                  <h3 className="text-sm font-semibold">Compare versions</h3>
-                  <VersionDiff key={currentVersion} versions={list} />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold">Compare versions</h3>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setValuesFor(showValues ? null : secretKey)}
+                      aria-pressed={showValues}
+                      data-testid="history-values-toggle"
+                    >
+                      {showValues ? <EyeOff /> : <Eye />}
+                      {showValues ? "Hide values" : "Show values"}
+                    </Button>
+                  </div>
+                  {!showValues && (
+                    <p className="text-sm text-muted-foreground" data-testid="history-values-hidden">
+                      Values are hidden. Showing them is recorded in the audit log.
+                    </p>
+                  )}
+                  {showValues && withValues.isPending && <ListSkeleton rows={1} />}
+                  {showValues && withValues.error && (
+                    <ErrorState error={withValues.error} onRetry={() => void withValues.refetch()} />
+                  )}
+                  {revealed && <VersionDiff key={currentVersion} versions={revealed} />}
                 </section>
                 <section className="space-y-3">
                   <h3 className="text-sm font-semibold">History</h3>
@@ -230,6 +272,7 @@ export function SecretDrawer({ project, env, envName, path, secretKey, canRollba
                         key={v.version}
                         version={v}
                         current={v.version === currentVersion}
+                        shown={revealed !== undefined}
                         canRollback={canRollback}
                         onRollback={() => setTarget(v.version)}
                       />

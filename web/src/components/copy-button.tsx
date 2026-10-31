@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { clipboardGuard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 
 interface CopyButtonProps {
@@ -12,6 +13,8 @@ interface CopyButtonProps {
   className?: string;
   testId?: string;
   disabled?: boolean;
+  /** A secret, cleared from the clipboard after a while if it is still there. */
+  sensitive?: boolean;
 }
 
 async function writeClipboard(text: string): Promise<void> {
@@ -30,7 +33,7 @@ async function writeClipboard(text: string): Promise<void> {
   area.remove();
 }
 
-export function CopyButton({ value, label = "Copy", className, testId, disabled }: CopyButtonProps) {
+export function CopyButton({ value, label = "Copy", className, testId, disabled, sensitive }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -44,6 +47,7 @@ export function CopyButton({ value, label = "Copy", className, testId, disabled 
       const text = typeof value === "string" ? value : await value();
       if (text == null) return;
       await writeClipboard(text);
+      if (sensitive) clipboardGuard().clearLater(text);
       setCopied(true);
       toast.success("Copied to clipboard");
     } catch {

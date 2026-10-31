@@ -1,4 +1,13 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient, type QueryKey } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type Query,
+  type QueryClient,
+  type QueryKey,
+} from "@tanstack/react-query";
+import { useEffect } from "react";
 import { toast } from "sonner";
 import { isSealError } from "@/api/client";
 import { api, type IdentityQuery, type UserQuery } from "@/api/endpoints";
@@ -39,6 +48,36 @@ export const keys = {
 /** The gate keeps the status until a request finds the server sealed; `fresh` refetches it on mount. */
 export function useSysStatus(fresh = false) {
   return useQuery({ queryKey: keys.sysStatus, queryFn: api.sysStatus, staleTime: fresh ? 0 : Infinity });
+}
+
+/** Revealed values and history leave the cache as soon as nothing shows them. */
+export const SECRET_VALUE_GC_TIME = 0;
+
+/** Drops everything cached but the server status, so no secret outlives a sealed server. */
+export function forgetAllButStatus(queryClient: QueryClient): void {
+  const predicate = (query: Query) => query.queryKey[0] !== keys.sysStatus[0];
+  void queryClient.cancelQueries({ predicate });
+  queryClient.removeQueries({ predicate });
+}
+
+export const SEAL_WATCH_INTERVAL_MS = 15_000;
+
+/** While `active`, checks whether the server is still unlocked every so often and when the tab comes back. */
+export function useSealWatch(active: boolean, intervalMs = SEAL_WATCH_INTERVAL_MS): void {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (!active) return;
+    const check = () => void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    const timer = window.setInterval(check, intervalMs);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(timer);
+    };
+  }, [active, intervalMs, queryClient]);
 }
 
 export function useMe() {

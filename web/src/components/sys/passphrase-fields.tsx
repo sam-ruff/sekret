@@ -26,6 +26,8 @@ export function PassphraseFields({
   disabled,
 }: PassphraseFieldsProps) {
   const mismatch = confirm !== "" && confirm !== passphrase;
+  const meterId = `${idPrefix}-meter`;
+  const mismatchId = `${idPrefix}-mismatch`;
   return (
     <>
       <Field>
@@ -36,10 +38,11 @@ export function PassphraseFields({
           autoComplete="new-password"
           value={passphrase}
           disabled={disabled}
+          aria-describedby={meterId}
           onChange={(e) => onPassphraseChange(e.target.value)}
           data-testid={`${idPrefix}-passphrase`}
         />
-        <PassphraseMeter strength={strength} testId={`${idPrefix}-meter`} />
+        <PassphraseMeter strength={strength} testId={meterId} id={meterId} />
       </Field>
       <Field data-invalid={mismatch}>
         <FieldLabel htmlFor={`${idPrefix}-confirm`}>Type it again</FieldLabel>
@@ -50,11 +53,34 @@ export function PassphraseFields({
           value={confirm}
           disabled={disabled}
           aria-invalid={mismatch}
+          aria-describedby={mismatch ? mismatchId : undefined}
           onChange={(e) => onConfirmChange(e.target.value)}
           data-testid={`${idPrefix}-confirm`}
         />
-        {mismatch && <FieldError data-testid={`${idPrefix}-mismatch`}>The passphrases do not match.</FieldError>}
+        {mismatch && (
+          <FieldError id={mismatchId} data-testid={mismatchId}>
+            The passphrases do not match.
+          </FieldError>
+        )}
       </Field>
     </>
+  );
+}
+
+/**
+ * A hidden username so a password manager labels the saved passphrase clearly instead of guessing
+ * from nearby fields.
+ */
+export function PassphraseAccountField() {
+  return (
+    <input
+      type="text"
+      name="username"
+      autoComplete="username"
+      value={`sekret passphrase (${window.location.host})`}
+      readOnly
+      hidden
+      data-testid="passphrase-account"
+    />
   );
 }

@@ -34,3 +34,5 @@ Each response holds `entries`, the `total` matching the filters, and a `next_cur
 ## Actions
 
 The actions you will see most are `secret.read`, `secret.write`, `secret.rollback`, `secret.generate`, `secret.rotate`, `snapshot.restore`, `auth.login`, `auth.machine-login`, `auth.cli-login`, `auth.token-renew`, `identity.update`, `member.add` and `role.put`. Every action name has the form `area.verb`.
+
+A browser sign-in or `sekret login` approval turned away by `oidc.allowed_subjects` or `oidc.required_groups` is recorded as `auth.login.refused`, with the subject and the reason in its detail.

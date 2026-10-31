@@ -1,10 +1,23 @@
 import { expect, test } from "@playwright/test";
 
-test("login page offers Keycloak sign-in", async ({ page }) => {
+test("login page offers a generic sign-in on the shared standalone layout", async ({ page }) => {
   await page.goto("/login");
   await expect(page.getByTestId("login-card")).toBeVisible();
-  await expect(page.getByTestId("sign-in")).toHaveText(/Sign in with Keycloak/);
+  await expect(page.getByTestId("sign-in")).toHaveText(/^Sign in$/);
+  await expect(page.getByTestId("sign-in")).not.toContainText("Keycloak");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Sign in to sekret");
+  await expect(page).toHaveTitle("Sign in · sekret");
   await expect(page.getByTestId("login-error")).toHaveCount(0);
+
+  // Centred vertically at every width.
+  const card = await page.getByTestId("login-card").boundingBox();
+  const viewport = page.viewportSize();
+  expect(card && viewport).toBeTruthy();
+  if (card && viewport) {
+    const above = card.y;
+    const below = viewport.height - (card.y + card.height);
+    expect(Math.abs(above - below)).toBeLessThan(4);
+  }
 });
 
 test("login page shows the error from a failed sign-in", async ({ page }) => {

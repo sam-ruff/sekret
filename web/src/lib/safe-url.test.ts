@@ -16,6 +16,11 @@ describe("safeReturnTo", () => {
     ["javascript:alert(1)"],
     ["projects"],
     [""],
+    ["/..//x"],
+    ["/.//x"],
+    ["/%2e%2e//x"],
+    ["/a/..//x"],
+    ["/..//example.org/phish"],
   ])("falls back to the root for %j", (value) => {
     expect(safeReturnTo(value, origin)).toBe("/");
   });

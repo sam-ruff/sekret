@@ -27,6 +27,7 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-destructive-solid: var(--destructive-solid);
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-accent-foreground: var(--accent-foreground);
@@ -68,7 +69,9 @@
   --accent: oklch(0.94 0.025 182);
   --accent-foreground: oklch(0.28 0.06 190);
   --destructive: oklch(0.577 0.215 27);
-  --success: oklch(0.58 0.14 150);
+  --destructive-solid: oklch(0.577 0.215 27);
+  /* Dark enough for text on white and on its own tints (5.2:1). */
+  --success: oklch(0.52 0.13 150);
   --warning: oklch(0.62 0.14 60);
   --border: oklch(0.91 0.01 190);
   --input: oklch(0.89 0.012 190);
@@ -105,6 +108,8 @@
   --accent: oklch(0.28 0.035 190);
   --accent-foreground: oklch(0.95 0.01 190);
   --destructive: oklch(0.68 0.17 24);
+  /* Darker than the text colour so white text on it stays above 4.5:1. */
+  --destructive-solid: oklch(0.55 0.2 25);
   --success: oklch(0.7 0.13 150);
   --warning: oklch(0.78 0.13 75);
   --border: oklch(1 0 0 / 9%);

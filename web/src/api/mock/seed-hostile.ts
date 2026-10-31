@@ -40,6 +40,7 @@ export function hostileState(realNow: number): MockState {
       namespaces: [X.img],
       service_accounts: [X.svg],
       audiences: [X.script],
+      max_token_lifetime: 3600,
     },
   ];
 

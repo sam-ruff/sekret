@@ -145,11 +145,15 @@ function filenameFrom(disposition: string | null, fallback: string): string {
   return match?.[1] ?? fallback;
 }
 
-/** Fetches an attachment, keeping the filename the server suggests. */
-export async function fetchDownload(path: string, fallbackName: string): Promise<Download> {
+/** Fetches an attachment, keeping the filename the server suggests. Anything but GET carries the CSRF header. */
+export async function fetchDownload(path: string, fallbackName: string, method: "GET" | "POST" = "GET"): Promise<Download> {
+  const headers = new Headers();
+  if (method !== "GET") headers.set(CSRF_HEADER, "1");
   let response: Response;
   try {
-    response = await transport(new Request(new URL(path, window.location.origin), { credentials: "same-origin" }));
+    response = await transport(
+      new Request(new URL(path, window.location.origin), { method, headers, credentials: "same-origin" }),
+    );
   } catch {
     throw ApiError.from(0, undefined);
   }
@@ -178,4 +182,32 @@ export function startSignIn(returnTo: string): void {
     return;
   }
   window.location.assign(`/auth/login?return_to=${encodeURIComponent(safe)}`);
+}
+
+const REAUTH_PREFIX = "/auth/login?reauth=1&return_to=";
+
+/**
+ * Where to sign in again when the server wants a fresh login, taken from its message when that is a
+ * same-origin reauthentication link and built from `returnTo` otherwise.
+ */
+export function reauthUrl(error: ApiError, returnTo: string, origin = window.location.origin): string {
+  const quoted = /\/auth\/login\?\S+/.exec(error.message)?.[0];
+  if (quoted?.startsWith(REAUTH_PREFIX)) {
+    const target = new URLSearchParams(quoted.slice("/auth/login?".length)).get("return_to");
+    if (target && safeReturnTo(target, origin) === target) return quoted;
+  }
+  return `${REAUTH_PREFIX}${encodeURIComponent(safeReturnTo(returnTo, origin))}`;
+}
+
+/** Full-page navigation to sign in again; mock mode marks the session fresh and returns at once. */
+export function startReauth(url: string): void {
+  if (!mockMode) {
+    window.location.assign(url);
+    return;
+  }
+  const returnTo = safeReturnTo(new URL(url, window.location.origin).searchParams.get("return_to"));
+  void import("./mock/server").then((mock) => {
+    mock.mockSignIn(true);
+    window.location.assign(returnTo);
+  });
 }

@@ -8,7 +8,14 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
-import { credentialPayload, initialCredential, parseJwks, type WriteOnlyCredential } from "./identity-model";
+import {
+  credentialPayload,
+  DEFAULT_MAX_TOKEN_LIFETIME,
+  initialCredential,
+  parseJwks,
+  parseLifetime,
+  type WriteOnlyCredential,
+} from "./identity-model";
 
 interface KubernetesFormProps {
   initial?: KubernetesAuthConfig;
@@ -98,15 +105,18 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
   const [namespaces, setNamespaces] = useState<string[]>(initial?.namespaces ?? []);
   const [serviceAccounts, setServiceAccounts] = useState<string[]>(initial?.service_accounts ?? []);
   const [audiences, setAudiences] = useState<string[]>(initial?.audiences ?? ["sekret"]);
+  const [lifetime, setLifetime] = useState(String(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
 
   const jwks = parseJwks(jwksText);
+  const maxLifetime = parseLifetime(lifetime);
   const modeValid =
     mode === "token-review" ? host.trim() !== "" : issuer.trim() !== "" && !jwks.error && (!!jwks.value || jwksUrl.trim() !== "");
-  const valid = modeValid && namespaces.length > 0 && serviceAccounts.length > 0 && audiences.length > 0;
+  const valid =
+    modeValid && namespaces.length > 0 && serviceAccounts.length > 0 && audiences.length > 0 && maxLifetime !== null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!valid) return;
+    if (!valid || maxLifetime === null) return;
     const tokenReview = mode === "token-review";
     onSave({
       mode,
@@ -119,6 +129,7 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
       namespaces,
       service_accounts: serviceAccounts,
       audiences,
+      max_token_lifetime: maxLifetime,
     });
   };
 
@@ -260,6 +271,25 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
         </Field>
       </div>
       <p className="text-xs text-muted-foreground">Namespaces and service accounts accept globs, such as team-*.</p>
+      <Field data-invalid={maxLifetime === null}>
+        <FieldLabel htmlFor="k8s-max-lifetime">Maximum token lifetime (seconds)</FieldLabel>
+        <Input
+          id="k8s-max-lifetime"
+          inputMode="numeric"
+          value={lifetime}
+          disabled={disabled}
+          className="w-full font-mono sm:w-40"
+          aria-invalid={maxLifetime === null}
+          aria-describedby="k8s-max-lifetime-help"
+          onChange={(e) => setLifetime(e.target.value)}
+          data-testid="k8s-max-lifetime"
+        />
+        <FieldDescription id="k8s-max-lifetime-help">
+          {maxLifetime === null
+            ? "Enter a whole number of seconds, 1 or more."
+            : "Tokens issued for longer than this are refused. Keep pods' projected token expirationSeconds at or below it."}
+        </FieldDescription>
+      </Field>
       {!disabled && (
         <div className="flex justify-end">
           <Button type="submit" disabled={!valid || busy} data-testid="k8s-save">

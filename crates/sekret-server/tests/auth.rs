@@ -42,6 +42,7 @@ fn oidc_config(issuer: &TestIssuer) -> HumanOidcConfig {
         group_claims: vec!["roles".into()],
         admin_groups: vec!["sekret-admin".into()],
         required_groups: vec![],
+        allowed_subjects: vec![],
     }
 }
 

@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { assess, loadStrengthChecker, passphraseProblem, strengthLabel } from "./passphrase";
+import {
+  assess,
+  hasControlCharacters,
+  loadStrengthChecker,
+  passphraseBytes,
+  passphraseProblem,
+  precheck,
+  problemText,
+  strengthLabel,
+} from "./passphrase";
 
 const verdict = (score: number, warning: string | null = null, suggestions: string[] = []) => ({
   score,
@@ -7,14 +16,14 @@ const verdict = (score: number, warning: string | null = null, suggestions: stri
 });
 
 describe("assess", () => {
-  it("accepts a long passphrase scoring 3 or more", () => {
+  it("accepts only a long passphrase scoring 4, as the server does", () => {
     expect(assess("plum orbit gravel lantern", verdict(4))).toEqual({
       score: 4,
       acceptable: true,
       warning: null,
       suggestions: [],
     });
-    expect(assess("twelve chars", verdict(3)).acceptable).toBe(true);
+    expect(assess("twelve chars", verdict(3)).acceptable).toBe(false);
   });
 
   it("refuses a short passphrase whatever its score, as the server does", () => {
@@ -48,6 +57,26 @@ describe("loadStrengthChecker", () => {
     expect(check("plum orbit gravel lantern").acceptable).toBe(true);
     expect(check("sekretsekret").acceptable).toBe(false);
   });
+
+  it("refuses control characters and oversized input before zxcvbn", async () => {
+    const check = await loadStrengthChecker();
+    expect(check("plum orbit\tgravel lantern")).toMatchObject({ acceptable: false, warning: expect.stringMatching(/control characters/) });
+    expect(check("plum orbit gravel lantern\u007f").acceptable).toBe(false);
+    expect(check("a".repeat(1025))).toMatchObject({ acceptable: false, warning: "Use at most 1024 bytes." });
+  });
+});
+
+describe("precheck", () => {
+  it("counts bytes, not characters", () => {
+    expect(passphraseBytes("é")).toBe(2);
+    expect(precheck("é".repeat(512))).toBeNull();
+    expect(precheck("é".repeat(513))?.warning).toBe("Use at most 1024 bytes.");
+  });
+
+  it("finds control characters but allows spaces and punctuation", () => {
+    expect(hasControlCharacters("plum orbit, gravel! lantern?")).toBe(false);
+    expect(hasControlCharacters("line\nbreak")).toBe(true);
+  });
 });
 
 describe("passphraseProblem", () => {
@@ -59,6 +88,14 @@ describe("passphraseProblem", () => {
     expect(passphraseProblem("password1234", "password1234", weak)).toBe("weak");
     expect(passphraseProblem("plum orbit gravel", "plum orbit", strong)).toBe("mismatch");
     expect(passphraseProblem("plum orbit gravel", "plum orbit gravel", strong)).toBeUndefined();
+  });
+
+  it("refuses control characters even before the meter has loaded", () => {
+    expect(passphraseProblem("plum orbit\ngravel", "plum orbit\ngravel", null)).toBe("weak");
+  });
+
+  it("says why the form cannot be sent yet", () => {
+    expect(problemText("mismatch")).toBe("Type the passphrase again to continue.");
   });
 
   it("leaves strength to the server until the meter has loaded", () => {

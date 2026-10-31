@@ -48,6 +48,7 @@ Unknown keys are an error, so a misspelt setting stops the server instead of bei
 | `oidc.group_claims` | `--oidc-group-claims` | `SEKRET_OIDC_GROUP_CLAIMS` | `roles,groups` | Claims whose values become the user's groups. A name starting with `/` is a JSON pointer, such as `/realm_access/roles`. |
 | `oidc.admin_groups` | `--oidc-admin-groups` | `SEKRET_OIDC_ADMIN_GROUPS` | `sekret-admin` | Groups that make someone an organisation admin. |
 | `oidc.required_groups` | `--oidc-required-groups` | `SEKRET_OIDC_REQUIRED_GROUPS` | none | When set, only members of one of these groups may sign in. |
+| `oidc.allowed_subjects` | `--oidc-allowed-subjects` | `SEKRET_OIDC_ALLOWED_SUBJECTS` | none | When set, only ID tokens whose `sub` is listed may sign in or approve a `sekret login`, whatever their groups. Anyone else is sent back to the sign-in page and the attempt is audited as `auth.login.refused`. Pin the owner's subject here so that a role granted inside the identity provider is not enough on its own. |
 | `tls.cert_file` | `--tls-cert-file` | `SEKRET_TLS_CERT_FILE` | none | PEM certificate chain. With a key file, the server speaks HTTPS itself. |
 | `tls.key_file` | `--tls-key-file` | `SEKRET_TLS_KEY_FILE` | none | PEM private key for the certificate. |
 | `tls.client_ca_file` | `--tls-client-ca-file` | `SEKRET_TLS_CLIENT_CA_FILE` | none | PEM CA certificates that client certificates must chain to. Turns on mutual TLS. |

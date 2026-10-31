@@ -351,6 +351,11 @@ mod tests {
     const SA_TOKEN: &str = "sa-token-do-not-leak";
     const ACCESS_TOKEN: &str = "skt_access_do_not_leak";
 
+    #[test]
+    fn requested_tokens_fit_the_server_default_lifetime_cap() {
+        const { assert!(TOKEN_EXPIRY_SECONDS <= sekret_api::DEFAULT_MAX_TOKEN_LIFETIME) };
+    }
+
     fn cr() -> SekretSecret {
         let mut cr = SekretSecret::new(
             "app-config",

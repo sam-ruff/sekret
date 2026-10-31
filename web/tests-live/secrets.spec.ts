@@ -19,6 +19,10 @@ test("creates a project, adds and updates a secret, then rolls it back", async (
   const drawer = page.getByTestId("secret-drawer");
   await expect(drawer.getByTestId("version-2")).toContainText("Current");
   await expect(drawer.getByTestId("version-1")).toBeVisible();
+  // Values stay hidden until asked for.
+  await expect(drawer.getByTestId("diff-output")).toHaveCount(0);
+  await expect(drawer.getByTestId("version-value-1")).not.toContainText("first");
+  await drawer.getByTestId("history-values-toggle").click();
   await expect(drawer.getByTestId("diff-output").locator('[data-kind="removed"]')).toHaveText(/first/);
   await expect(drawer.getByTestId("diff-output").locator('[data-kind="added"]')).toHaveText(/second/);
 

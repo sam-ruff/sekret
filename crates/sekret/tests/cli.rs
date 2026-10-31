@@ -1,34 +1,24 @@
 //! Drives the real `sekret` binary: a server process plus CLI commands against it.
 
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use sekret_server::testkit::process::{log_filter, wait_for_listening};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sekret");
+const START_TIMEOUT: Duration = Duration::from_secs(20);
+
+static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
 struct Server {
-    child: Child,
+    _process: Process,
     url: String,
     admin: String,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> anyhow::Result<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .context("free port")
 }
 
 fn run(args: &[&str], env: &[(&str, &str)], home: &Path, stdin: Option<&str>) -> anyhow::Result<Output> {
@@ -102,16 +92,6 @@ in_both_seal_modes!(
 
 const PASSPHRASE: &str = "violet tractor sings beneath";
 
-async fn wait_for_health(url: &str) {
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client.get(format!("{url}/api/v1/health")).send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 async fn start_server(mode: Mode) -> anyhow::Result<Server> {
     match mode {
         Mode::KeyFile => start_key_file_server().await,
@@ -125,26 +105,23 @@ async fn start_passphrase_server() -> anyhow::Result<Server> {
     let d = dir.path();
     std::fs::write(d.join("pass"), format!("{PASSPHRASE}\n")).context("passphrase file")?;
     let db = format!("sqlite://{}?mode=rwc", d.join("sekret.db").display());
-    let port = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
     let token_file = d.join("admin-token").display().to_string();
-    let child = Command::new(BIN)
-        .args(["server", "--listen", &format!("127.0.0.1:{port}"), "--public-url", &url])
-        .args(["--database-url", &db, "--seal-mode", "passphrase", "--auto-init"])
-        .args([
+    let process = spawn(
+        &[
+            "--database-url",
+            &db,
+            "--seal-mode",
+            "passphrase",
+            "--auto-init",
             "--setup-passphrase-file",
             "pass",
             "--setup-admin-token-file",
             &token_file,
-        ])
-        .current_dir(d)
-        .env_clear()
-        .env("SEKRET_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("server")?;
-    wait_for_health(&url).await;
+        ],
+        d,
+    )
+    .await?;
+    let url = process.url.clone();
     let admin = std::fs::read_to_string(&token_file)
         .context("admin token")?
         .trim()
@@ -161,7 +138,7 @@ async fn start_passphrase_server() -> anyhow::Result<Server> {
     )?)?;
     assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(0));
     Ok(Server {
-        child,
+        _process: process,
         url,
         admin,
         _dir: dir,
@@ -175,27 +152,9 @@ async fn start_key_file_server() -> anyhow::Result<Server> {
     let key = ok(run(&["admin", "generate-root-key"], &[], dir.path(), None)?)?;
     std::fs::write(&key_file, key).context("write key")?;
     let db = format!("sqlite://{}?mode=rwc", dir.path().join("sekret.db").display());
-    let port = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
     let key_path = key_file.display().to_string();
-    let child = Command::new(BIN)
-        .args([
-            "server",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--public-url",
-            &url,
-            "--database-url",
-            &db,
-            "--root-key-file",
-            &key_path,
-        ])
-        .env("SEKRET_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("server")?;
-    wait_for_health(&url).await;
+    let process = spawn(&["--database-url", &db, "--root-key-file", &key_path], dir.path()).await?;
+    let url = process.url.clone();
     let admin = ok(run(
         &[
             "admin",
@@ -212,7 +171,7 @@ async fn start_key_file_server() -> anyhow::Result<Server> {
     .trim()
     .to_string();
     Ok(Server {
-        child,
+        _process: process,
         url,
         admin,
         _dir: dir,
@@ -534,25 +493,26 @@ async fn mutual_tls_end_to_end() -> anyhow::Result<()> {
     )
     .context("key")?;
     let db = format!("sqlite://{}?mode=rwc", dir.path().join("sekret.db").display());
-    let port = free_port()?;
-    let url = format!("https://127.0.0.1:{port}");
     let key_path = key_file.display().to_string();
-    let _server = Server {
-        child: Command::new(BIN)
-            .args(["server", "--listen", &format!("127.0.0.1:{port}"), "--public-url", &url])
-            .args(["--database-url", &db, "--root-key-file", &key_path])
-            .args(["--tls-cert-file", &pki.path("server.pem")])
-            .args(["--tls-key-file", &pki.path("server-key.pem")])
-            .args(["--tls-client-ca-file", &pki.path("ca.pem")])
-            .env("SEKRET_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("server")?,
-        url: url.clone(),
-        admin: String::new(),
-        _dir: dir,
-    };
+    let server = spawn_on(
+        "https",
+        &[
+            "--database-url",
+            &db,
+            "--root-key-file",
+            &key_path,
+            "--tls-cert-file",
+            &pki.path("server.pem"),
+            "--tls-key-file",
+            &pki.path("server-key.pem"),
+            "--tls-client-ca-file",
+            &pki.path("ca.pem"),
+        ],
+        &[],
+        dir.path(),
+    )
+    .await?;
+    let url = server.url.clone();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = std::fs::read(pki.path("ca.pem")).context("ca")?;
     let identity_pem = [
@@ -712,35 +672,36 @@ async fn spawn(args: &[&str], dir: &Path) -> anyhow::Result<Process> {
 }
 
 async fn spawn_with_env(args: &[&str], env: &[(&str, &str)], dir: &Path) -> anyhow::Result<Process> {
-    let port = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
-    let listen = format!("127.0.0.1:{port}");
-    let mut full = vec!["server", "--listen", &listen, "--public-url", &url];
-    full.extend_from_slice(args);
+    spawn_on("http", args, env, dir).await
+}
+
+/// Starts `sekret server` in `dir` on a port the kernel picks, logging to a file there.
+async fn spawn_on(scheme: &str, args: &[&str], env: &[(&str, &str)], dir: &Path) -> anyhow::Result<Process> {
+    let n = LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    let log = dir.join(format!("server-{n}.log"));
+    let public_url = format!("{scheme}://127.0.0.1");
+    let level = env
+        .iter()
+        .find(|(key, _)| *key == "SEKRET_LOG")
+        .map_or("warn", |(_, value)| *value);
     let child = Command::new(BIN)
-        .args(&full)
+        .args(["server", "--listen", "127.0.0.1:0", "--public-url", &public_url])
+        .args(args)
         .current_dir(dir)
         .env_clear()
-        .env("SEKRET_LOG", "warn")
         .envs(env.iter().copied())
+        .env("SEKRET_LOG", log_filter(level))
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(std::fs::File::create(&log).context("log")?)
         .spawn()
         .context("server")?;
-    let process = Process { child, url };
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client
-            .get(format!("{}/api/v1/health", process.url))
-            .send()
-            .await
-            .is_ok()
-        {
-            return Ok(process);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    anyhow::bail!("server did not start")
+    let mut process = Process {
+        child,
+        url: String::new(),
+    };
+    let address = wait_for_listening(&mut process.child, &log, START_TIMEOUT).await?;
+    process.url = format!("{scheme}://{address}");
+    Ok(process)
 }
 
 #[tokio::test]

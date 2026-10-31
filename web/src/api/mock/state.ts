@@ -14,6 +14,7 @@ import type {
   SealState,
   SecretPolicy,
   UnlockPolicy,
+  UnsealedBy,
   User,
 } from "../types";
 
@@ -25,9 +26,12 @@ export interface MockSys {
   /** The policy comes from configuration and cannot be changed through the API. */
   configured: boolean;
   remembered: boolean;
+  unsealedBy: UnsealedBy | null;
   webSetup: boolean;
   passphrase: string;
   failedUnseals: number;
+  /** Milliseconds since the epoch until which passphrase attempts are refused. */
+  backoffUntil: number;
 }
 
 export interface StoredVersion {
@@ -86,6 +90,8 @@ export type StoredIdentity = Omit<Identity, "auth_methods">;
 
 export interface MockState {
   signedOut: boolean;
+  /** Signed in again just now, which approving a CLI login can ask for. */
+  freshSignIn?: boolean;
   seq: number;
   me: Me;
   users: User[];

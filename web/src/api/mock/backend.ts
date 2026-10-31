@@ -66,6 +66,9 @@ import { builtinRoles, covers } from "./roles";
 import {
   compactUtc,
   MAX_FAILED_UNSEALS,
+  MOCK_BACKOFF_SECONDS,
+  MOCK_KDF_BUSY_PASSPHRASE,
+  MOCK_REAUTH_CODE_PREFIX,
   MOCK_SETUP_CODE,
   MOCK_VERSION,
   statusOf,
@@ -280,12 +283,14 @@ export class MockBackend {
     if (this.state.signedOut) throw new MockError(401, "unauthorised", "sign in required");
   }
 
-  signIn(): void {
+  signIn(fresh = false): void {
     this.state.signedOut = false;
+    this.state.freshSignIn = fresh;
   }
 
   logout(): { logout_url: string | null } {
     this.state.signedOut = true;
+    this.state.freshSignIn = false;
     return { logout_url: null };
   }
 
@@ -320,7 +325,13 @@ export class MockBackend {
   }
 
   me(): Me {
-    return { ...this.state.me, org_rules: this.orgRules() };
+    const roles = this.orgRoleSlugs();
+    return { ...this.state.me, org_rules: this.orgRules(), org_roles: roles, is_org_admin: roles.includes("org-admin") };
+  }
+
+  private orgRoleSlugs(): string[] {
+    const slugs = this.state.orgBindings.filter((b) => this.principalIsMe(b.principal_kind, b.principal_id)).map((b) => b.role);
+    return [...new Set(slugs)].sort();
   }
 
   /** Replaces the caller's organisation roles with one, to try the interface as someone else. */
@@ -913,6 +924,9 @@ export class MockBackend {
       values &&
       authorise(rules, "secret-versions", "read-value", resource) &&
       authorise(rules, "secrets", "read-value", resource);
+    if (reveal) {
+      this.audit("secret.history-read", { project_id: project.id, environment: env.slug, path, secret_key: key }, {});
+    }
     return [...s.versions].reverse().map((v) => ({
       version: v.version,
       value: reveal ? v.value : null,
@@ -1370,12 +1384,14 @@ export class MockBackend {
   /** Mirrors the server: the marker keeps the stored reviewer token, and an empty value clears it. */
   private withStoredReviewer(id: string, config: AuthMethodConfig): AuthMethodConfig {
     if (config.kind !== "kubernetes") return config;
+    // Left out means the server's default, as serde fills it in.
+    const withLifetime = { ...config, max_token_lifetime: config.max_token_lifetime ?? 3600 };
     const submitted = config.reviewer_jwt?.trim() || null;
-    if (submitted !== REDACTED_CREDENTIAL) return { ...config, reviewer_jwt: submitted };
+    if (submitted !== REDACTED_CREDENTIAL) return { ...withLifetime, reviewer_jwt: submitted };
     const stored = (this.state.authMethods[id] ?? []).find((m) => m.kind === "kubernetes");
     const previous = stored?.kind === "kubernetes" ? stored.reviewer_jwt : null;
     if (!previous) throw badRequest("there is no stored reviewer token to keep");
-    return { ...config, reviewer_jwt: previous };
+    return { ...withLifetime, reviewer_jwt: previous };
   }
 
   private validateAuthMethod(config: AuthMethodConfig): void {
@@ -1391,6 +1407,9 @@ export class MockBackend {
     if (config.kind === "kubernetes") {
       if ((config.audiences ?? []).length === 0) throw badRequest("at least one audience is required");
       if (config.mode === "token-review" && !config.host) throw badRequest("host is required");
+      if (config.max_token_lifetime != null && config.max_token_lifetime < 1) {
+        throw badRequest("max_token_lifetime must be at least 1 second");
+      }
       if (config.mode === "jwks") {
         if (!config.issuer) throw badRequest("issuer is required for JWKS mode");
         if (!config.jwks && !config.jwks_url) throw badRequest("supply jwks or jwks_url");
@@ -1525,7 +1544,7 @@ export class MockBackend {
   }
 
   private isOrgAdmin(): boolean {
-    return this.state.orgBindings.some((b) => b.role === "org-admin" && this.principalIsMe(b.principal_kind, b.principal_id));
+    return this.orgRoleSlugs().includes("org-admin");
   }
 
   private requireOrgAdmin(): void {
@@ -1565,8 +1584,15 @@ export class MockBackend {
     if (request.setup_code !== MOCK_SETUP_CODE) {
       throw new MockError(401, "invalid_setup_code", "the setup code is wrong; it is in the server log");
     }
-    if (request.mode !== "passphrase") {
-      throw badRequest("key-file mode needs a root key file path; start the server with --root-key-file");
+    if (sys.mode && request.mode !== sys.mode) {
+      throw badRequest(`the server is configured for ${sys.mode} mode`);
+    }
+    if (request.mode === "key-file") {
+      if (sys.mode !== "key-file") {
+        throw badRequest("key-file mode needs a root key file path; start the server with --root-key-file");
+      }
+      this.state.sys = { ...sys, state: "unsealed", unlockPolicy: null, unsealedBy: "key-file", failedUnseals: 0 };
+      return this.initialised();
     }
     if (!request.passphrase) throw badRequest("passphrase mode needs a passphrase");
     this.requireStrong(request.passphrase, check);
@@ -1577,29 +1603,55 @@ export class MockBackend {
       mode: "passphrase",
       unlockPolicy: policy,
       remembered: policy === "remember",
+      unsealedBy: "passphrase",
       passphrase: request.passphrase,
       failedUnseals: 0,
     };
+    return this.initialised();
+  }
+
+  private initialised(): InitResponse {
     this.systemAudit("sys.init", "setup");
     const raw = Array.from(crypto.getRandomValues(new Uint8Array(24)), (b) => b.toString(16).padStart(2, "0")).join("");
-    return { status: this.sysStatus(), admin_token: `skt_${raw}` };
+    return {
+      status: this.sysStatus(),
+      admin_token: `skt_${raw}`,
+      admin_token_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    };
+  }
+
+  /** Refuses while backing off after wrong passphrases, then counts this attempt if it is wrong. */
+  private verifyPassphrase(candidate: string): boolean {
+    const sys = this.state.sys;
+    const wait = Math.ceil((sys.backoffUntil - Date.now()) / 1000);
+    if (wait > 0) {
+      throw new MockError(429, "passphrase_backoff", `too many wrong passphrases; try again in ${wait} seconds`);
+    }
+    if (candidate === MOCK_KDF_BUSY_PASSPHRASE) {
+      throw new MockError(429, "kdf_busy", "another passphrase check is running; try again in a moment");
+    }
+    if (candidate === sys.passphrase) {
+      sys.failedUnseals = 0;
+      return true;
+    }
+    sys.failedUnseals += 1;
+    if (sys.failedUnseals >= MAX_FAILED_UNSEALS) {
+      sys.failedUnseals = 0;
+      sys.backoffUntil = Date.now() + MOCK_BACKOFF_SECONDS * 1000;
+    }
+    return false;
   }
 
   unseal(passphrase: string): SysStatus {
     const sys = this.state.sys;
     if (sys.state === "unsealed") return this.sysStatus();
     this.requireUnsealedOrSealed();
-    if (sys.failedUnseals >= MAX_FAILED_UNSEALS) {
-      sys.failedUnseals = 0;
-      throw new MockError(429, "rate_limited", "too many requests, slow down");
-    }
-    if (passphrase !== sys.passphrase) {
-      sys.failedUnseals += 1;
+    if (!this.verifyPassphrase(passphrase)) {
       this.systemAudit("sys.unseal.failed", "unseal");
       throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");
     }
     sys.state = "unsealed";
-    sys.failedUnseals = 0;
+    sys.unsealedBy = "passphrase";
     if (sys.unlockPolicy === "remember") sys.remembered = true;
     this.systemAudit("sys.unseal", "unseal");
     return this.sysStatus();
@@ -1612,7 +1664,9 @@ export class MockBackend {
   seal(): SysStatus {
     this.requireOrgAdmin();
     this.requirePassphraseMode();
+    // A remembered unlock survives sealing, as on the server.
     this.state.sys.state = "sealed";
+    this.state.sys.unsealedBy = null;
     this.audit("sys.seal", {});
     return this.sysStatus();
   }
@@ -1621,18 +1675,29 @@ export class MockBackend {
     this.requireOrgAdmin();
     this.requirePassphraseMode();
     this.requireStrong(request.new, check);
-    if (request.current !== this.state.sys.passphrase) {
+    if (!this.verifyPassphrase(request.current)) {
       throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");
     }
     this.state.sys.passphrase = request.new;
+    this.state.sys.remembered = false;
     this.audit("sys.passphrase", {});
   }
 
-  setUnlockPolicy(policy: UnlockPolicy): SysStatus {
+  setUnlockPolicy(policy: UnlockPolicy, passphrase?: string | null): SysStatus {
     this.requireOrgAdmin();
     this.requirePassphraseMode();
     if (this.state.sys.configured) {
       throw new MockError(409, "conflict", "the unlock policy is set in the server configuration; change it there");
+    }
+    if (policy !== "manual") {
+      if (!passphrase) {
+        throw new MockError(
+          400,
+          "passphrase_required",
+          "this change weakens how the server is unlocked; confirm it with the current passphrase",
+        );
+      }
+      if (!this.verifyPassphrase(passphrase)) throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");
     }
     this.state.sys.unlockPolicy = policy;
     this.state.sys.remembered = policy === "remember";
@@ -1666,8 +1731,17 @@ export class MockBackend {
   // CLI device login
 
   approveCli(code: string): void {
-    if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code.trim().toUpperCase()) || code.toUpperCase().startsWith("XXXX")) {
+    const normalised = code.trim().toUpperCase();
+    if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(normalised) || normalised.startsWith("XXXX")) {
       throw new MockError(404, "not_found", "that code is unknown or has expired");
+    }
+    if (normalised.startsWith(MOCK_REAUTH_CODE_PREFIX) && !this.state.freshSignIn) {
+      const back = encodeURIComponent(`/cli-login?code=${encodeURIComponent(normalised)}`);
+      throw new MockError(
+        403,
+        "reauthentication_required",
+        `sign in again to approve this; continue at /auth/login?reauth=1&return_to=${back}`,
+      );
     }
     this.audit("auth.cli-approve", {}, {});
   }

@@ -73,10 +73,13 @@ test("keeps, replaces and clears a stored Kubernetes reviewer token", async ({ p
   await expect(k8s.getByTestId("k8s-reviewer-jwt-stored")).toContainText("Token stored");
   await expect(k8s.getByTestId("k8s-reviewer-jwt")).toHaveCount(0);
 
-  // Saving untouched keeps the stored token.
+  // Saving untouched keeps the stored token and the custom token lifetime.
+  await expect(k8s.getByTestId("k8s-max-lifetime")).toHaveValue("600");
   await k8s.getByTestId("k8s-save").click();
   await expectToast(page, /saved/);
   await expect(k8s.getByTestId("k8s-reviewer-jwt-stored")).toBeVisible();
+  await page.reload();
+  await expect(page.getByTestId("auth-method-kubernetes").getByTestId("k8s-max-lifetime")).toHaveValue("600");
 
   // Replacing with a new token stores it without echoing it back.
   await k8s.getByTestId("k8s-reviewer-jwt-replace").click();

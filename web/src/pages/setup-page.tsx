@@ -1,70 +1,78 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { AlertCircle, ArrowRight, FileKey, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
+import { useRef, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { InitResponse, SysStatus, UnlockPolicy } from "@/api/types";
 import { CopyButton } from "@/components/copy-button";
-import { Logo } from "@/components/logo";
-import { PassphraseFields } from "@/components/sys/passphrase-fields";
+import { PassphraseAccountField, PassphraseFields } from "@/components/sys/passphrase-fields";
 import { StrengthFeedback } from "@/components/sys/passphrase-meter";
-import { StandalonePage } from "@/components/sys/standalone-page";
+import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-page";
 import { ConfiguredPolicy, UnlockDocsLink, UnlockPolicyCards } from "@/components/sys/unlock-policy-cards";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { keys, useSysStatus } from "@/hooks/queries";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { errorMessage } from "@/lib/errors";
-import { passphraseProblem } from "@/lib/passphrase";
-import { DOCS_URL } from "@/lib/links";
+import { formatDateTime } from "@/lib/format";
+import { passphraseProblem, problemText } from "@/lib/passphrase";
+
+/** What the person keeps from setup; the mutation's own copy is dropped straight away. */
+interface Created {
+  token: string;
+  expiresAt?: number;
+}
 
 export function SetupPage() {
   const { data: status } = useSysStatus();
-  const [created, setCreated] = useState<InitResponse | null>(null);
+  const [created, setCreated] = useState<Created | null>(null);
 
-  if (created) return <AdminTokenCard token={created.admin_token} />;
+  if (created) return <AdminTokenCard created={created} />;
   if (!status) return null;
   if (status.state !== "uninitialised") return <AlreadySetUp />;
   if (!status.web_setup) return <SetupDisabled />;
   return <SetupForm status={status} onCreated={setCreated} />;
 }
 
-function SetupHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <CardHeader>
-      <Logo className="mb-2 size-10 text-primary" title="sekret" />
-      <CardTitle className="text-xl">{title}</CardTitle>
-      <CardDescription>{description}</CardDescription>
-    </CardHeader>
-  );
-}
+const CODE_ERROR_ID = "setup-code-error";
+const CODE_HINT_ID = "setup-code-hint";
 
-function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (response: InitResponse) => void }) {
+function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (created: Created) => void }) {
   const queryClient = useQueryClient();
+  const codeInput = useRef<HTMLInputElement>(null);
+  const keyFile = status.seal_mode === "key-file";
   const [setupCode, setSetupCode] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [policy, setPolicy] = useState<UnlockPolicy>("manual");
-  const strength = usePassphraseStrength(passphrase);
+  const strength = usePassphraseStrength(keyFile ? "" : passphrase);
 
   const init = useMutation({
     mutationFn: () =>
-      api.init({
-        setup_code: setupCode.trim(),
-        mode: "passphrase",
-        passphrase,
-        unlock_policy: status.configured ? null : policy,
-      }),
-    onSuccess: (response) => {
+      api.init(
+        keyFile
+          ? { setup_code: setupCode.trim(), mode: "key-file" }
+          : {
+              setup_code: setupCode.trim(),
+              mode: "passphrase",
+              passphrase,
+              unlock_policy: status.configured ? null : policy,
+            },
+      ),
+    // The response holds the admin token; keep it only in the card's state.
+    gcTime: 0,
+    onSuccess: (response: InitResponse) => {
+      onCreated({ token: response.admin_token, expiresAt: response.admin_token_expires_at });
+      init.reset();
       queryClient.setQueryData(keys.sysStatus, response.status);
-      onCreated(response);
     },
     onError: (error) => {
+      if (error instanceof ApiError && error.code === "invalid_setup_code") codeInput.current?.focus();
       // Someone else finished setup, or it was turned off; the status shows which.
       if (error instanceof ApiError && (error.status === 409 || error.status === 403)) {
         void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
@@ -76,8 +84,9 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
   const codeError = error?.code === "invalid_setup_code" ? error : null;
   const weak = error?.code === "weak_passphrase" ? error : null;
   const otherError = init.error && !codeError && !weak ? init.error : null;
-  const problem = passphraseProblem(passphrase, confirm, strength);
-  const ready = setupCode.trim() !== "" && !problem && !init.isPending;
+  const problem = keyFile ? undefined : passphraseProblem(passphrase, confirm, strength);
+  const blocker = setupCode.trim() === "" ? "Enter the setup code to continue." : problem ? problemText(problem) : null;
+  const ready = !blocker && !init.isPending;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -87,9 +96,14 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
   return (
     <StandalonePage className="max-w-xl">
       <Card className="shadow-lg shadow-primary/5" data-testid="setup-card">
-        <SetupHeader
+        <StandaloneHeader
           title="Set up sekret"
-          description="Choose the passphrase that protects every secret on this server, and how it unlocks after a restart."
+          pageTitle="Set up"
+          description={
+            keyFile
+              ? "This server keeps its root key in a file, so there is no passphrase to choose."
+              : "Choose the passphrase that protects every secret on this server, and how it unlocks after a restart."
+          }
         />
         <form onSubmit={submit} noValidate>
           <CardContent>
@@ -97,6 +111,7 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
               <Field data-invalid={!!codeError}>
                 <FieldLabel htmlFor="setup-code">Setup code</FieldLabel>
                 <Input
+                  ref={codeInput}
                   id="setup-code"
                   autoComplete="off"
                   spellCheck={false}
@@ -104,50 +119,66 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
                   placeholder="XXXX-XXXX-XXXX"
                   value={setupCode}
                   aria-invalid={!!codeError}
+                  aria-describedby={codeError ? CODE_ERROR_ID : CODE_HINT_ID}
                   onChange={(e) => setSetupCode(e.target.value)}
                   data-testid="setup-code"
                 />
                 {codeError ? (
-                  <FieldError data-testid="setup-code-error">{errorMessage(codeError)}</FieldError>
+                  <FieldError id={CODE_ERROR_ID} data-testid="setup-code-error">
+                    That setup code is wrong. Check the latest one in the server log.
+                  </FieldError>
                 ) : (
-                  <FieldDescription>
-                    The server prints it in its log at start, and writes it to the setup code file if one is configured.
+                  <FieldDescription id={CODE_HINT_ID}>
+                    The server prints it in its log when it starts, and writes it to the setup code file if one is set.
+                    Restarting the server makes a new code.
                   </FieldDescription>
                 )}
               </Field>
 
-              <PassphraseFields
-                idPrefix="setup"
-                label="Passphrase"
-                passphrase={passphrase}
-                confirm={confirm}
-                strength={strength}
-                onPassphraseChange={setPassphrase}
-                onConfirmChange={setConfirm}
-              />
-              {weak && (
-                <Alert variant="destructive" data-testid="setup-weak">
-                  <AlertCircle />
-                  <AlertTitle>The server refused this passphrase</AlertTitle>
-                  <AlertDescription>
-                    {weak.strength ? <StrengthFeedback strength={weak.strength} /> : errorMessage(weak)}
-                  </AlertDescription>
-                </Alert>
-              )}
-              <p className="flex gap-2 rounded-md bg-muted/60 px-3 py-2 text-sm text-muted-foreground" data-testid="no-recovery">
-                <Info className="mt-0.5 size-4 shrink-0" />
-                There is no recovery. If you forget this passphrase, the secrets cannot be decrypted.
-              </p>
+              {keyFile ? (
+                <p className="flex gap-2 rounded-md bg-muted/60 px-3 py-2 text-sm text-muted-foreground" data-testid="setup-key-file">
+                  <FileKey className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  The server configuration names a root key file. Setup creates the key in that file and unlocks with it
+                  at every start. Keep a copy of the file somewhere safe: backups cannot be restored without it.
+                </p>
+              ) : (
+                <>
+                  <PassphraseAccountField />
+                  <PassphraseFields
+                    idPrefix="setup"
+                    label="Passphrase"
+                    passphrase={passphrase}
+                    confirm={confirm}
+                    strength={strength}
+                    onPassphraseChange={setPassphrase}
+                    onConfirmChange={setConfirm}
+                  />
+                  {weak && (
+                    <Alert variant="destructive" data-testid="setup-weak">
+                      <AlertCircle />
+                      <AlertTitle>The server refused this passphrase</AlertTitle>
+                      <AlertDescription>
+                        {weak.strength ? <StrengthFeedback strength={weak.strength} /> : errorMessage(weak)}
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                  <p className="flex gap-2 rounded-md bg-muted/60 px-3 py-2 text-sm text-muted-foreground" data-testid="no-recovery">
+                    <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                    There is no recovery. If you forget this passphrase, the secrets cannot be decrypted. Store it in a
+                    password manager.
+                  </p>
 
-              <FieldSet>
-                <FieldLegend>After a restart</FieldLegend>
-                {status.configured ? (
-                  <ConfiguredPolicy policy={status.unlock_policy} testId="setup-policy-configured" />
-                ) : (
-                  <UnlockPolicyCards idPrefix="setup" value={policy} onChange={setPolicy} />
-                )}
-                <UnlockDocsLink />
-              </FieldSet>
+                  <FieldSet>
+                    <FieldLegend>After a restart</FieldLegend>
+                    {status.configured ? (
+                      <ConfiguredPolicy policy={status.unlock_policy} testId="setup-policy-configured" />
+                    ) : (
+                      <UnlockPolicyCards idPrefix="setup" value={policy} onChange={setPolicy} />
+                    )}
+                    <UnlockDocsLink />
+                  </FieldSet>
+                </>
+              )}
 
               {otherError && (
                 <Alert variant="destructive" data-testid="setup-error">
@@ -158,11 +189,23 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
               )}
             </FieldGroup>
           </CardContent>
-          <CardFooter className="mt-6">
-            <Button type="submit" size="lg" className="w-full" disabled={!ready} data-testid="setup-submit">
+          <CardFooter className="mt-6 flex-col items-stretch gap-2">
+            <Button
+              type="submit"
+              size="lg"
+              className="w-full"
+              disabled={!ready}
+              aria-describedby={blocker ? "setup-blocker" : undefined}
+              data-testid="setup-submit"
+            >
               {init.isPending && <Spinner />}
               Set up sekret
             </Button>
+            {blocker && (
+              <p id="setup-blocker" className="text-center text-sm text-muted-foreground" data-testid="setup-blocker">
+                {blocker}
+              </p>
+            )}
           </CardFooter>
         </form>
       </Card>
@@ -170,38 +213,51 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (respo
   );
 }
 
-function AdminTokenCard({ token }: { token: string }) {
+function AdminTokenCard({ created }: { created: Created }) {
   const navigate = useNavigate();
+  const expiry = created.expiresAt ? formatDateTime(created.expiresAt) : "it expires";
   return (
     <StandalonePage className="max-w-xl">
       <Card className="shadow-lg shadow-primary/5" data-testid="setup-done">
-        <SetupHeader title="sekret is set up" description="The server is unlocked and ready to use." />
+        <StandaloneHeader title="sekret is set up" pageTitle="Set up" description="The server is unlocked and ready to use." />
         <CardContent className="space-y-4">
           <Alert className="border-warning/50 bg-warning/10">
             <ShieldAlert className="text-warning" />
-            <AlertTitle>This admin token is shown once</AlertTitle>
-            <AlertDescription>
-              It is short-lived and acts as an organisation admin. Store it somewhere safe, or skip it if an admin will
-              sign in through your identity provider.
+            <AlertTitle>Save the admin token</AlertTitle>
+            <AlertDescription data-testid="admin-token-help">
+              Copy this token now. It is shown once and lasts until {expiry}. It lets the CLI act as an organisation
+              admin, for example to add users or set up sign-in. The web interface signs you in through your identity
+              provider.
             </AlertDescription>
           </Alert>
           <div className="space-y-1.5">
             <p className="text-sm font-medium">Admin token</p>
             <div className="flex items-center gap-1 rounded-md border bg-muted/50 py-1 pr-1 pl-3">
               <code className="min-w-0 flex-1 font-mono text-sm break-all" data-testid="admin-token">
-                {token}
+                {created.token}
               </code>
-              <CopyButton value={token} label="Copy admin token" testId="admin-token-copy" />
+              <CopyButton value={created.token} label="Copy admin token" testId="admin-token-copy" sensitive />
             </div>
-            <p className="text-xs text-muted-foreground">
-              Use it with the CLI by setting <code className="font-mono">SEKRET_TOKEN</code>.
+            {created.expiresAt && (
+              <p className="text-xs text-muted-foreground" data-testid="admin-token-expiry">
+                Expires {formatDateTime(created.expiresAt)}.
+              </p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <p className="flex items-center gap-1.5 text-sm font-medium">
+              <Terminal className="size-4" aria-hidden />
+              Use it with the CLI
             </p>
+            <pre className="overflow-x-auto rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs" data-testid="admin-token-cli">
+              {`export SEKRET_URL=${window.location.origin}\nexport SEKRET_TOKEN=<token>`}
+            </pre>
           </div>
         </CardContent>
         <CardFooter>
           <Button size="lg" className="w-full" onClick={() => void navigate("/login")} data-testid="setup-continue">
-            <LogIn />
-            Continue to sign in
+            I have saved it, continue
+            <ArrowRight />
           </Button>
         </CardFooter>
       </Card>
@@ -214,7 +270,7 @@ function AlreadySetUp() {
   return (
     <StandalonePage>
       <Card data-testid="setup-already">
-        <SetupHeader title="Already set up" description="This server has been set up. Sign in to use it." />
+        <StandaloneHeader title="Already set up" pageTitle="Set up" description="This server has been set up. Sign in to use it." />
         <CardFooter>
           <Button className="w-full" onClick={() => void navigate("/login")}>
             <LogIn />
@@ -230,25 +286,17 @@ function SetupDisabled() {
   return (
     <StandalonePage>
       <Card data-testid="setup-disabled">
-        <CardHeader>
-          <div className="mb-2 flex size-10 items-center justify-center rounded-lg bg-primary/15 text-primary">
-            <Terminal className="size-5" />
-          </div>
-          <CardTitle className="text-xl">Set up on the host</CardTitle>
-          <CardDescription>
-            This server is set up from its configuration. Run <code className="font-mono">sekret admin init</code> on
-            the host, or see the{" "}
-            <a
-              href={`${DOCS_URL}getting-started/`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary underline-offset-4 hover:underline"
-            >
-              getting started guide
-            </a>
-            .
-          </CardDescription>
-        </CardHeader>
+        <StandaloneHeader
+          title="Set up on the host"
+          pageTitle="Set up"
+          icon={<Terminal />}
+          description={
+            <>
+              Web setup is turned off. Run <code className="font-mono">sekret admin init</code> on the host, then restart
+              the server.
+            </>
+          }
+        />
       </Card>
     </StandalonePage>
   );

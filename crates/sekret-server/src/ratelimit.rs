@@ -94,9 +94,11 @@ impl RateLimiter<IpAddr> {
     }
 }
 
-/// Failures allowed before any delay.
+/// Failures allowed before any delay, so a few typos never slow the owner down.
 const FREE_FAILURES: u32 = 5;
-const MAX_DELAY: Duration = Duration::from_secs(15 * 60);
+/// Argon2 at 256 MiB, one derivation at a time, already holds guessing to about one a second.
+/// The back-off only adds friction, so it stays short enough not to lock the owner out for long.
+const MAX_DELAY: Duration = Duration::from_secs(60);
 
 /// Server-wide exponential backoff after failed passphrase attempts, from any address.
 pub struct FailureBackoff {
@@ -216,9 +218,18 @@ mod tests {
         backoff.failed_at(start);
         assert_eq!(backoff.wait_at(start), Some(Duration::from_secs(4)));
         assert_eq!(backoff.wait_at(start + Duration::from_secs(4)), None);
+        let mut delays = Vec::new();
         for _ in 0..40 {
             backoff.failed_at(start);
+            delays.extend(backoff.wait_at(start));
         }
+        assert_eq!(
+            &delays[..4],
+            [8, 16, 32, 60].map(Duration::from_secs),
+            "doubling stops at the cap"
+        );
+        assert!(delays.iter().all(|d| *d <= MAX_DELAY));
+        assert_eq!(MAX_DELAY, Duration::from_secs(60));
         assert_eq!(backoff.wait_at(start), Some(MAX_DELAY));
         backoff.succeeded();
         assert_eq!(backoff.wait_at(start), None);

@@ -39,7 +39,7 @@ import { hasControls, takeControls } from "./controls";
 import { loadStrengthChecker } from "@/lib/passphrase";
 
 // Bumped whenever the stored shape changes, so an old session reseeds instead of breaking.
-const STORAGE_KEY = "sekret-mock-state-v3";
+const STORAGE_KEY = "sekret-mock-state-v4";
 const LATENCY_MS = 80;
 
 function loadState(): MockState {
@@ -198,11 +198,17 @@ route("POST", "/api/v1/sys/passphrase-strength", async (b, c) =>
 );
 route("POST", "/api/v1/sys/seal", (b) => b.seal());
 route("POST", "/api/v1/sys/passphrase", async (b, c) => b.changePassphrase(body<ChangePassphrase>(c), await loadStrengthChecker()), 204);
-route("PUT", "/api/v1/sys/unlock-policy", (b, c) => b.setUnlockPolicy(body<SetUnlockPolicy>(c).policy));
+route("PUT", "/api/v1/sys/unlock-policy", (b, c) => {
+  const request = body<SetUnlockPolicy>(c);
+  return b.setUnlockPolicy(request.policy, request.passphrase);
+});
 route("POST", "/api/v1/sys/forget-unlock", (b) => b.forgetUnlock());
-route("GET", "/api/v1/sys/backup", (b) => {
+route("POST", "/api/v1/sys/backup", (b) => {
   const file = b.backup();
   return new Binary(file.bytes, "application/octet-stream", file.filename);
+});
+route("GET", "/api/v1/sys/backup", () => {
+  throw new MockError(405, "method_not_allowed", "use POST to make a backup");
 });
 
 route("GET", "/api/v1/auth/config", () => ({ oidc_enabled: true, login_url: "/auth/login" }));
@@ -352,9 +358,10 @@ export async function mockFetch(request: Request): Promise<Response> {
   }
 }
 
-export function mockSignIn(): void {
+/** `fresh` stands for signing in again with the password and passkey, as reauthentication asks. */
+export function mockSignIn(fresh = false): void {
   const { backend: b, save } = backend();
-  b.signIn();
+  b.signIn(fresh);
   save();
 }
 

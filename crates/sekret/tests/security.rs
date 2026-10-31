@@ -1,22 +1,19 @@
 //! Regressions for the first security audit, through the real binary: setup codes, passphrase
 //! sources, offline rotation and restore.
 
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use sekret_server::testkit::process::{log_filter, read_log, wait_for_listening};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sekret");
 const PASSPHRASE: &str = "violet tractor sings beneath";
+const START_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn free_port() -> anyhow::Result<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .context("free port")
-}
+static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
 fn run(args: &[&str], env: &[(&str, &str)], dir: &Path) -> anyhow::Result<Output> {
     Command::new(BIN)
@@ -59,7 +56,7 @@ impl Drop for Server {
 
 impl Server {
     fn log(&self) -> String {
-        std::fs::read_to_string(&self.log).unwrap_or_default()
+        read_log(&self.log)
     }
 
     fn sys_status(&self, dir: &Path) -> anyhow::Result<Option<i32>> {
@@ -71,30 +68,32 @@ impl Server {
 
 async fn spawn(args: &[&str], env: &[(&str, &str)], dir: &Path) -> anyhow::Result<Server> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let port = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
-    let listen = format!("127.0.0.1:{port}");
-    let log = dir.join(format!("server-{port}.log"));
-    let mut full = vec!["server", "--listen", &listen, "--public-url", &url];
+    let n = LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    let log = dir.join(format!("server-{n}.log"));
+    let level = env
+        .iter()
+        .find(|(key, _)| *key == "SEKRET_LOG")
+        .map_or("info", |(_, value)| *value);
+    let mut full = vec!["server", "--listen", "127.0.0.1:0", "--public-url", "http://127.0.0.1"];
     full.extend_from_slice(args);
     let child = Command::new(BIN)
         .args(&full)
         .current_dir(dir)
         .env_clear()
         .envs(env.iter().copied())
+        .env("SEKRET_LOG", log_filter(level))
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).context("log")?)
         .spawn()
         .context("server")?;
-    let server = Server { child, url, log };
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client.get(format!("{}/api/v1/health", server.url)).send().await.is_ok() {
-            return Ok(server);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    anyhow::bail!("server did not start: {}", server.log())
+    let mut server = Server {
+        child,
+        url: String::new(),
+        log,
+    };
+    let address = wait_for_listening(&mut server.child, &server.log, START_TIMEOUT).await?;
+    server.url = format!("http://{address}");
+    Ok(server)
 }
 
 fn sqlite(dir: &Path, name: &str) -> String {
@@ -229,12 +228,11 @@ async fn auto_init_checks_the_admin_token_file_first() -> anyhow::Result<()> {
     std::fs::write(d.join("pass"), format!("{PASSPHRASE}\n")).context("pass")?;
     std::fs::write(d.join("token"), "already here").context("token")?;
     let db = sqlite(d, "sekret.db");
-    let port = free_port()?.to_string();
     let output = run(
         &[
             "server",
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--public-url",
             "http://127.0.0.1",
             "--database-url",

@@ -3,6 +3,7 @@ import {
   Bot,
   Camera,
   ChevronsUpDown,
+  ExternalLink,
   FolderKey,
   KeyRound,
   LayoutGrid,
@@ -185,6 +186,8 @@ export function AppSidebar() {
               <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" data-testid="nav-docs">
                 <BookOpen />
                 <span>Documentation</span>
+                <ExternalLink className="ml-auto size-3.5! opacity-70" aria-hidden data-testid="nav-docs-external" />
+                <span className="sr-only">(opens in a new tab)</span>
               </a>
             </SidebarMenuButton>
           </SidebarMenuItem>

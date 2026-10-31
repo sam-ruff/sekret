@@ -9,8 +9,23 @@ function barColour(strength: PassphraseStrength): string {
   return "bg-destructive";
 }
 
+interface PassphraseMeterProps {
+  strength: PassphraseStrength | null;
+  testId?: string;
+  /** For the input's `aria-describedby`; the region is announced politely as it changes. */
+  id?: string;
+}
+
 /** A score bar with zxcvbn's warning and suggestions. */
-export function PassphraseMeter({ strength, testId = "passphrase-meter" }: { strength: PassphraseStrength | null; testId?: string }) {
+export function PassphraseMeter({ strength, testId = "passphrase-meter", id }: PassphraseMeterProps) {
+  return (
+    <div id={id} aria-live="polite" data-testid={`${testId}-region`}>
+      <MeterBody strength={strength} testId={testId} />
+    </div>
+  );
+}
+
+function MeterBody({ strength, testId }: { strength: PassphraseStrength | null; testId: string }) {
   if (!strength) {
     return (
       <p className="text-xs text-muted-foreground" data-testid={testId}>

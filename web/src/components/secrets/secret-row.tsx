@@ -145,7 +145,7 @@ export function SecretRow({
         >
           {revealed ? <EyeOff /> : <Eye />}
         </Button>
-        <CopyButton value={onCopyValue} label={`Copy ${secret.key}`} disabled={hidden} testId="secret-copy" />
+        <CopyButton value={onCopyValue} label={`Copy ${secret.key}`} disabled={hidden} testId="secret-copy" sensitive />
       </div>
 
       <div className="col-start-2 row-start-1 flex items-start justify-end md:col-start-auto md:row-start-auto md:items-center">

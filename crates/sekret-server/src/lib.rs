@@ -200,6 +200,9 @@ async fn shutdown_signal() {
     }
 }
 
+/// Log target of the line naming the bound address, so a quiet log level can still keep it.
+pub const LISTENING_TARGET: &str = "sekret_server::listening";
+
 /// Runs the server. The keyring must come from [`seal::open_keyring`], which checks the root key.
 pub async fn serve(state: AppState) -> Result<(), StartupError> {
     if !web::embedded() {
@@ -227,6 +230,8 @@ pub async fn serve(state: AppState) -> Result<(), StartupError> {
             }
         }
     });
+    let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
+    let address = listener.local_addr()?;
     if let Some(settings) = &state.config.tls {
         let config = tls::server_config(settings)?;
         let handle = axum_server::Handle::new();
@@ -235,21 +240,27 @@ pub async fn serve(state: AppState) -> Result<(), StartupError> {
             shutdown_signal().await;
             shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
         });
-        tracing::info!(
-            address = %state.config.listen,
-            url = %state.config.public_url,
-            mutual_tls = settings.client_ca_pem.is_some(),
-            "sekret listening with TLS"
-        );
         let rustls = axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config));
-        axum_server::bind_rustls(state.config.listen, rustls)
+        let server = axum_server::from_tcp_rustls(listener.into_std()?, rustls)?;
+        tracing::info!(
+            target: LISTENING_TARGET,
+            url = %state.config.public_url,
+            tls = true,
+            mutual_tls = settings.client_ca_pem.is_some(),
+            "listening on {address}"
+        );
+        server
             .handle(handle)
             .serve(app(state).into_make_service_with_connect_info::<SocketAddr>())
             .await?;
         return Ok(());
     }
-    let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
-    tracing::info!(address = %listener.local_addr()?, url = %state.config.public_url, "sekret listening");
+    tracing::info!(
+        target: LISTENING_TARGET,
+        url = %state.config.public_url,
+        tls = false,
+        "listening on {address}"
+    );
     axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;

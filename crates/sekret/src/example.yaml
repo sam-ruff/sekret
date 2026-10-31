@@ -47,6 +47,8 @@ oidc:
   admin_groups: [sekret-admin]
   # When not empty, only members of one of these groups may sign in.
   required_groups: []
+  # When not empty, only ID tokens with one of these subjects (sub) may sign in, whatever their groups.
+  allowed_subjects: []
 
 tls:
   # PEM certificate chain and key, to serve HTTPS directly instead of behind a proxy.

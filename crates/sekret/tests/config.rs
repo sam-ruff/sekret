@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::net::TcpListener;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Child, Command, Output, Stdio};
@@ -17,12 +17,15 @@ use anyhow::{Context, bail, ensure};
 use reqwest::header::{COOKIE, LOCATION, SET_COOKIE, STRICT_TRANSPORT_SECURITY};
 use reqwest::{Method, StatusCode};
 use sekret_server::testkit::TestIssuer;
+use sekret_server::testkit::process::{HeldPort, ListenError, listening_address, read_log, wait_for_listening};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sekret");
 const PASSPHRASE: &str = "violet tractor sings beneath";
 const WRONG_PASSPHRASE: &str = "copper lantern drifts westward";
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+/// Starts on a chosen port retry this often when another process takes the port first.
+const PORT_ATTEMPTS: usize = 5;
 
 static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
@@ -66,7 +69,7 @@ const fn list(key: &'static str, flag: &'static str, env: &'static str, separato
     }
 }
 
-const OPTIONS: [Opt; 34] = [
+const OPTIONS: [Opt; 35] = [
     scalar("server.public_url", "public-url", "SEKRET_PUBLIC_URL"),
     scalar("server.listen", "listen", "SEKRET_LISTEN"),
     list(
@@ -118,6 +121,12 @@ const OPTIONS: [Opt; 34] = [
         "oidc.required_groups",
         "oidc-required-groups",
         "SEKRET_OIDC_REQUIRED_GROUPS",
+        ",",
+    ),
+    list(
+        "oidc.allowed_subjects",
+        "oidc-allowed-subjects",
+        "SEKRET_OIDC_ALLOWED_SUBJECTS",
         ",",
     ),
     scalar("tls.cert_file", "tls-cert-file", "SEKRET_TLS_CERT_FILE"),
@@ -198,34 +207,6 @@ fn place(
 // ---------------------------------------------------------------------------------------------
 // Sandboxes, launches and running servers
 // ---------------------------------------------------------------------------------------------
-
-fn free_port() -> anyhow::Result<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .context("free port")
-}
-
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        for next in chars.by_ref() {
-            if next.is_ascii_alphabetic() {
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn read_log(path: &Path) -> String {
-    strip_ansi(&std::fs::read_to_string(path).unwrap_or_default())
-}
 
 fn ok(output: Output) -> anyhow::Result<String> {
     ensure!(
@@ -361,7 +342,7 @@ impl Sandbox {
     fn launch(&self) -> Launch<'_> {
         Launch {
             sandbox: self,
-            port: free_port().unwrap_or(0),
+            held: None,
             settings: Vec::new(),
             defaults: Vec::new(),
             omitted: Vec::new(),
@@ -381,7 +362,8 @@ impl Sandbox {
 /// One server start: options set in particular ways, plus defaults for whatever is left.
 struct Launch<'a> {
     sandbox: &'a Sandbox,
-    port: u16,
+    /// A port to free just before the server starts; without one it listens on a port the kernel picks.
+    held: Option<HeldPort>,
     settings: Vec<(Way, &'static str, Vec<String>)>,
     /// Passed as flags unless the test sets the option itself.
     defaults: Vec<(&'static str, String)>,
@@ -394,8 +376,21 @@ struct Launch<'a> {
 }
 
 impl<'a> Launch<'a> {
-    fn addr(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
+    /// The built-in listen address and the port the built-in public URL names, if any.
+    fn listen(&self) -> anyhow::Result<(String, Option<u16>)> {
+        Ok(match &self.held {
+            Some(held) => {
+                let port = held.port().context("held port")?;
+                (format!("127.0.0.1:{port}"), Some(port))
+            }
+            None => ("127.0.0.1:0".to_string(), None),
+        })
+    }
+
+    /// Frees `held` just before the server starts, for tests about a particular port.
+    fn hold(mut self, held: HeldPort) -> Self {
+        self.held = Some(held);
+        self
     }
 
     fn set(mut self, way: Way, key: &'static str, value: &str) -> Self {
@@ -464,12 +459,14 @@ impl<'a> Launch<'a> {
         for (way, key, values) in &self.settings {
             place(*way, option(key)?, values, &mut args, &mut env, &mut sections)?;
         }
+        let (listen, port) = self.listen()?;
+        let public_url = match port {
+            Some(port) => format!("{}://127.0.0.1:{port}", self.scheme()),
+            None => format!("{}://127.0.0.1", self.scheme()),
+        };
         let built_in = [
-            ("server.listen", self.addr()),
-            (
-                "server.public_url",
-                format!("{}://127.0.0.1:{}", self.scheme(), self.port),
-            ),
+            ("server.listen", listen),
+            ("server.public_url", public_url),
             ("database.url", self.sandbox.db()),
         ];
         let defaults = built_in
@@ -523,20 +520,30 @@ impl<'a> Launch<'a> {
         }
     }
 
-    /// Starts the server and waits until it answers its health check.
-    async fn start(self) -> anyhow::Result<Running> {
+    /// Spawns the server, freeing any held port at the last moment.
+    fn spawn(&mut self) -> anyhow::Result<(Child, PathBuf)> {
         let (mut command, log) = self.command()?;
+        if let Some(held) = self.held.take() {
+            held.release().context("release port")?;
+        }
+        Ok((command.spawn().context("spawn server")?, log))
+    }
+
+    /// Starts the server and waits until it answers its health check.
+    async fn start(mut self) -> anyhow::Result<Running> {
         let client = self.client()?;
-        let url = format!("{}://127.0.0.1:{}", self.scheme(), self.port);
-        let child = command.spawn().context("spawn server")?;
+        let scheme = self.scheme();
+        let deadline = Instant::now() + START_TIMEOUT;
+        let (child, log) = self.spawn()?;
         let mut running = Running {
             child,
-            url,
+            url: String::new(),
             log,
             dir: self.sandbox.dir.path().to_path_buf(),
             client,
         };
-        let deadline = Instant::now() + START_TIMEOUT;
+        let address = wait_for_listening(&mut running.child, &running.log, START_TIMEOUT).await?;
+        running.url = format!("{scheme}://{}", loopback(address));
         while Instant::now() < deadline {
             if let Some(status) = running.child.try_wait().context("wait")? {
                 bail!("server exited with {status}:\n{}", running.log());
@@ -551,28 +558,50 @@ impl<'a> Launch<'a> {
     }
 
     /// Starts the server expecting it to refuse, and returns its log.
-    async fn refused(self) -> anyhow::Result<String> {
-        let (mut command, log) = self.command()?;
-        let client = self.client()?;
-        let health = format!("{}://127.0.0.1:{}/api/v1/health", self.scheme(), self.port);
-        let mut child = command.spawn().context("spawn server")?;
-        let deadline = Instant::now() + START_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().context("wait")? {
-                ensure!(!status.success(), "server exited cleanly:\n{}", read_log(&log));
-                return Ok(read_log(&log));
-            }
-            if client.get(&health).send().await.is_ok() {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("server started but should have refused:\n{}", read_log(&log));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    async fn refused(mut self) -> anyhow::Result<String> {
+        let (mut child, log) = self.spawn()?;
+        let outcome = wait_for_listening(&mut child, &log, START_TIMEOUT).await;
         let _ = child.kill();
         let _ = child.wait();
-        bail!("server neither started nor exited:\n{}", read_log(&log))
+        match outcome {
+            Ok(address) => bail!(
+                "server started on {address} but should have refused:\n{}",
+                read_log(&log)
+            ),
+            Err(ListenError::Exited { status, log }) => {
+                ensure!(!status.success(), "server exited cleanly:\n{log}");
+                Ok(log)
+            }
+            Err(error) => bail!("server neither started nor exited: {error}"),
+        }
     }
+}
+
+/// Where a client reaches a server bound to `address`, which may be the unspecified address.
+fn loopback(address: SocketAddr) -> SocketAddr {
+    if address.ip().is_unspecified() {
+        return SocketAddr::from(([127, 0, 0, 1], address.port()));
+    }
+    address
+}
+
+/// Starts `launch` on a port of its own, which it is given, retrying with another port when
+/// something else takes it in the moment between freeing it and the server binding it.
+async fn start_on_port<'a>(launch: impl Fn(u16) -> Launch<'a>) -> anyhow::Result<(Running, u16)> {
+    for _ in 0..PORT_ATTEMPTS {
+        let held = HeldPort::new().context("hold port")?;
+        let port = held.port().context("held port")?;
+        match launch(port).hold(held).start().await {
+            Ok(running) => return Ok((running, port)),
+            Err(error) if lost_port(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("lost the port to another process {PORT_ATTEMPTS} times")
+}
+
+fn lost_port(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ListenError>().is_some_and(ListenError::lost_port)
 }
 
 fn plain_client() -> anyhow::Result<reqwest::Client> {
@@ -999,9 +1028,9 @@ async fn listen_sets_the_address_served() -> anyhow::Result<()> {
     for way in WAYS {
         let sb = Sandbox::new()?;
         let key = sb.root_key("root.key")?;
-        let launch = sb.keyed(&key);
-        let addr = launch.addr();
-        let server = launch.set(way, "server.listen", &addr).start().await?;
+        let (server, port) =
+            start_on_port(|port| sb.keyed(&key).set(way, "server.listen", &format!("127.0.0.1:{port}"))).await?;
+        let addr = format!("127.0.0.1:{port}");
         assert!(server.url.ends_with(&addr), "{way:?}");
         let (code, _) = server.get("/api/v1/ready", Auth::None).await?;
         assert_eq!(code, StatusCode::OK, "{way:?}");
@@ -1504,6 +1533,81 @@ async fn oidc_settings_shape_browser_sign_in() -> anyhow::Result<()> {
             outsider.landed
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_allowed_subjects_pin_who_may_sign_in() -> anyhow::Result<()> {
+    let issuer = Issuer::start().await?;
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let admin = sb.bootstrap(&key)?;
+        let server = sb
+            .keyed(&key)
+            .oidc(&issuer)?
+            .set_list(way, "oidc.required_groups", &["sekret-users"])
+            .set_list(way, "oidc.allowed_subjects", &["owner", "deputy"])
+            .start()
+            .await?;
+        session_of(&server, &issuer, json!({"sub": "owner", "roles": ["sekret-users"]})).await?;
+        session_of(&server, &issuer, json!({"sub": "deputy", "roles": ["sekret-users"]})).await?;
+
+        let intruder = sign_in(
+            &server,
+            &issuer,
+            json!({"sub": "intruder", "roles": ["sekret-users", "sekret-admin"]}),
+        )
+        .await?;
+        assert!(intruder.session.is_none(), "{way:?}: the right groups are not enough");
+        assert!(
+            intruder.landed.starts_with("/login?error="),
+            "{way:?}: {}",
+            intruder.landed
+        );
+
+        let ungrouped = sign_in(&server, &issuer, json!({"sub": "owner", "roles": ["guests"]})).await?;
+        assert!(ungrouped.session.is_none(), "{way:?}: required groups still apply");
+
+        let (_, audit) = server
+            .get("/api/v1/audit?action=auth.login.refused", Auth::Bearer(&admin))
+            .await?;
+        let entries = audit["entries"].as_array().context("entries")?;
+        assert!(
+            entries.iter().any(|e| e["detail"]["subject"] == "intruder"
+                && e["detail"]["reason"] == "subject not in oidc.allowed_subjects"),
+            "{way:?}: {audit}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oidc_allowed_subjects_stop_older_sessions_approving_cli_logins() -> anyhow::Result<()> {
+    let issuer = Issuer::start().await?;
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let open = sb.keyed(&key).oidc(&issuer)?.start().await?;
+    let session = session_of(&open, &issuer, json!({"sub": "someone"})).await?;
+    drop(open);
+
+    let pinned = sb
+        .keyed(&key)
+        .oidc(&issuer)?
+        .set_list(Way::Flag, "oidc.allowed_subjects", &["owner"])
+        .start()
+        .await?;
+    let (code, started) = pinned.cli_start().await?;
+    ensure!(code == StatusCode::OK, "{started}");
+    let (code, body) = pinned
+        .call(
+            Method::POST,
+            "/api/v1/auth/cli/approve",
+            Auth::Session(&session),
+            Some(json!({"user_code": started["user_code"]})),
+        )
+        .await?;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
     Ok(())
 }
 
@@ -2561,17 +2665,8 @@ fn probe_client_auth(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Re
 
 fn probe_listen(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>> {
     Box::pin(async move {
-        let log = server.log();
-        let line = log
-            .lines()
-            .find(|l| l.contains("sekret listening"))
-            .context("listening line")?;
-        let address = line
-            .split("address=")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .context("address")?;
-        Ok(address.rsplit(':').next().unwrap_or_default().to_string())
+        let address = listening_address(&server.log()).context("listening line")?;
+        Ok(address.port().to_string())
     })
 }
 
@@ -2633,35 +2728,46 @@ async fn precedence_server_public_url() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn precedence_server_listen() -> anyhow::Result<()> {
-    let ports = [free_port()?, free_port()?, free_port()?];
-    let layers: [(&[Way], u16); 3] = [
-        (&[Way::Flag, Way::Env, Way::File], ports[0]),
-        (&[Way::Env, Way::File], ports[1]),
-        (&[Way::File], ports[2]),
+    let layers: [(&[Way], Way); 3] = [
+        (&[Way::Flag, Way::Env, Way::File], Way::Flag),
+        (&[Way::Env, Way::File], Way::Env),
+        (&[Way::File], Way::File),
     ];
-    for (ways, expected) in layers {
+    for (ways, winner) in layers {
         let sb = Sandbox::new()?;
         let key = sb.root_key("root.key")?;
-        let mut launch = sb.keyed(&key);
-        launch.port = expected;
-        for way in ways {
-            let port = match way {
-                Way::Flag => ports[0],
-                Way::Env => ports[1],
-                Way::File => ports[2],
-            };
-            launch = launch.set(*way, "server.listen", &format!("127.0.0.1:{port}"));
-        }
-        let server = launch.start().await?;
+        let (server, expected) = start_listen_layer(&sb, &key, ways, winner).await?;
         assert_eq!(probe_listen(&server).await?, expected.to_string(), "{ways:?}");
-        for other in ports.iter().filter(|p| **p != expected) {
-            assert!(
-                !reaches(&plain_client()?, &format!("http://127.0.0.1:{other}")).await,
-                "{ways:?}: nothing on {other}"
-            );
-        }
     }
     Ok(())
+}
+
+/// Starts with `server.listen` set in each of `ways` to a port of its own. The test keeps every
+/// losing port bound, so a server that chose one could not start; only the winner's is freed.
+async fn start_listen_layer(sb: &Sandbox, key: &str, ways: &[Way], winner: Way) -> anyhow::Result<(Running, u16)> {
+    for _ in 0..PORT_ATTEMPTS {
+        let mut launch = sb.keyed(key);
+        let mut losers = Vec::new();
+        let mut expected = None;
+        for way in ways {
+            let held = HeldPort::new().context("hold port")?;
+            let port = held.port().context("held port")?;
+            launch = launch.set(*way, "server.listen", &format!("127.0.0.1:{port}"));
+            if *way == winner {
+                expected = Some(port);
+                launch = launch.hold(held);
+            } else {
+                losers.push(held);
+            }
+        }
+        let expected = expected.context("the winner is one of the ways")?;
+        match launch.start().await {
+            Ok(running) => return Ok((running, expected)),
+            Err(error) if lost_port(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("the server could not bind in {PORT_ATTEMPTS} attempts; it may be choosing a losing port")
 }
 
 #[tokio::test]
@@ -2980,6 +3086,13 @@ fn previous_release() -> Option<PathBuf> {
     (!help.status.success()).then_some(path)
 }
 
+/// The address in the previous release's `sekret listening address=...` line.
+fn previous_listening_address(log: &str) -> Option<SocketAddr> {
+    log.lines()
+        .filter(|line| line.contains("sekret listening"))
+        .find_map(|line| line.split_once("address=")?.1.split_whitespace().next()?.parse().ok())
+}
+
 #[tokio::test]
 async fn data_written_by_the_previous_release_stays_readable() -> anyhow::Result<()> {
     let Some(previous) = previous_release() else {
@@ -2991,20 +3104,35 @@ async fn data_written_by_the_previous_release_stays_readable() -> anyhow::Result
     };
     let sb = Sandbox::new()?;
     let key = sb.root_key("root.key")?;
-    let port = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
+    let log = sb.path("previous.log");
     let mut old = Command::new(&previous)
-        .args(["server", "--listen", &format!("127.0.0.1:{port}"), "--public-url", &url])
+        .args(["server", "--listen", "127.0.0.1:0", "--public-url", "http://127.0.0.1"])
         .args(["--database-url", &sb.db(), "--root-key-file", &key])
         .current_dir(sb.dir.path())
         .env_clear()
-        .env("SEKRET_LOG", "warn")
+        .env("SEKRET_LOG", "info")
+        .env("NO_COLOR", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log).context("previous log")?)
         .spawn()
         .context("previous release")?;
-    let client = plain_client()?;
     let deadline = Instant::now() + START_TIMEOUT;
+    let address = loop {
+        if let Some(address) = previous_listening_address(&read_log(&log)) {
+            break address;
+        }
+        if let Some(status) = old.try_wait().context("wait")? {
+            bail!("previous release exited with {status}:\n{}", read_log(&log));
+        }
+        if Instant::now() >= deadline {
+            let _ = old.kill();
+            let _ = old.wait();
+            bail!("previous release did not start:\n{}", read_log(&log));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let url = format!("http://{address}");
+    let client = plain_client()?;
     while Instant::now() < deadline && !reaches(&client, &url).await {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

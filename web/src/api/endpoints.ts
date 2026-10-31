@@ -46,9 +46,10 @@ export const api = {
   unseal: (passphrase: string) => unwrap(client.POST("/api/v1/sys/unseal", { body: { passphrase } })),
   seal: () => unwrap(client.POST("/api/v1/sys/seal")),
   changePassphrase: (body: ChangePassphrase) => unwrap(client.POST("/api/v1/sys/passphrase", { body })),
-  setUnlockPolicy: (policy: UnlockPolicy) => unwrap(client.PUT("/api/v1/sys/unlock-policy", { body: { policy } })),
+  setUnlockPolicy: (policy: UnlockPolicy, passphrase?: string) =>
+    unwrap(client.PUT("/api/v1/sys/unlock-policy", { body: { policy, passphrase: passphrase ?? null } })),
   forgetUnlock: () => unwrap(client.POST("/api/v1/sys/forget-unlock")),
-  backup: () => fetchDownload("/api/v1/sys/backup", "sekret-backup.skb"),
+  backup: () => fetchDownload("/api/v1/sys/backup", "sekret-backup.skb", "POST"),
 
   authConfig: () => unwrap(client.GET("/api/v1/auth/config")),
   me: () => unwrap(client.GET("/api/v1/me")),
@@ -110,10 +111,10 @@ export const api = {
         body,
       }),
     ),
-  versions: (at: SecretLocation, key: string) =>
+  versions: (at: SecretLocation, key: string, values: boolean) =>
     unwrap(
       client.GET("/api/v1/projects/{project}/environments/{env}/secrets/{key}/versions", {
-        params: { path: { project: at.project, env: at.env, key }, query: { path: at.path, values: true } },
+        params: { path: { project: at.project, env: at.env, key }, query: { path: at.path, values } },
       }),
     ),
   rollback: (at: SecretLocation, key: string, version: number) =>

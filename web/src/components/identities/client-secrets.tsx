@@ -163,7 +163,12 @@ function CreatedSecretDialog({ created, onClose }: { created: CreatedClientSecre
                 <code className="min-w-0 flex-1 font-mono text-sm break-all" data-testid="client-secret-value">
                   {created.client_secret}
                 </code>
-                <CopyButton value={created.client_secret} label="Copy client secret" testId="client-secret-copy" />
+                <CopyButton
+                  value={created.client_secret}
+                  label="Copy client secret"
+                  testId="client-secret-copy"
+                  sensitive
+                />
               </div>
             </div>
           </div>

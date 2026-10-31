@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Download, Lock } from "lucide-react";
+import { AlertCircle, AlertTriangle, Download, Lock } from "lucide-react";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import { ApiError } from "@/api/client";
@@ -8,7 +8,7 @@ import type { SysStatus, UnlockPolicy } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { ErrorState } from "@/components/states";
-import { PassphraseFields } from "@/components/sys/passphrase-fields";
+import { PassphraseAccountField, PassphraseFields } from "@/components/sys/passphrase-fields";
 import { StrengthFeedback } from "@/components/sys/passphrase-meter";
 import { ConfiguredPolicy, UnlockDocsLink, UnlockPolicyCards } from "@/components/sys/unlock-policy-cards";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -23,8 +23,8 @@ import { keys, useApiMutation, useSysStatus } from "@/hooks/queries";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
 import { errorMessage } from "@/lib/errors";
-import { passphraseProblem } from "@/lib/passphrase";
-import { POLICY_NAMES } from "@/lib/sys-gate";
+import { passphraseProblem, problemText } from "@/lib/passphrase";
+import { keyFileOverride, POLICY_NAMES, UNSEALED_BY_NAMES } from "@/lib/sys-gate";
 
 const NO_ACCESS = new ApiError("Only organisation admins and backup readers can see this page.", 403, "forbidden");
 
@@ -34,7 +34,11 @@ export function ServerPage() {
   const admin = useIsOrgAdmin();
   const canBackup = org.can("backups", "read");
 
-  const header = <PageHeader title="Server" description="Sealing, unlocking and backups for this sekret server." />;
+  const header = admin ? (
+    <PageHeader title="Server" description="Locking, unlocking and backups for this sekret server." />
+  ) : (
+    <PageHeader title="Server" description="See whether this sekret server is unlocked and download encrypted backups." />
+  );
   if (org.ready && !admin && !canBackup) {
     return (
       <div className="space-y-6">
@@ -57,7 +61,7 @@ export function ServerPage() {
     <div className="space-y-6">
       {header}
       <div className="grid max-w-3xl gap-6">
-        <StatusCard status={status.data} canSeal={admin && passphraseMode} />
+        <StatusCard status={status.data} canLock={admin && passphraseMode} />
         {admin && passphraseMode && <UnlockPolicyCard key={status.data.unlock_policy ?? ""} status={status.data} />}
         {admin && passphraseMode && <ChangePassphraseCard />}
         {canBackup && <BackupCard passphraseMode={passphraseMode} />}
@@ -75,13 +79,13 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function StatusCard({ status, canSeal }: { status: SysStatus; canSeal: boolean }) {
+function StatusCard({ status, canLock }: { status: SysStatus; canLock: boolean }) {
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
 
   const seal = useApiMutation({
     mutationFn: api.seal,
-    // The status gate sees the sealed state and moves to the unlock page.
+    // The status gate sees the locked state, clears the cache and moves to the unlock page.
     onSuccess: (next) => queryClient.setQueryData(keys.sysStatus, next),
   });
 
@@ -92,16 +96,21 @@ function StatusCard({ status, canSeal }: { status: SysStatus; canSeal: boolean }
         <CardTitle>Status</CardTitle>
         <CardDescription>How this server keeps its root key.</CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
         <dl className="divide-y">
           <Row label="State">
             <Badge variant={status.state === "unsealed" ? "secondary" : "destructive"} data-testid="server-state">
-              {status.state === "unsealed" ? "Unlocked" : "Sealed"}
+              {status.state === "unsealed" ? "Unlocked" : "Locked"}
             </Badge>
           </Row>
-          <Row label="Root key">
+          <Row label="Protected by">
             <span data-testid="server-mode">{status.seal_mode === "key-file" ? "Key file" : "Passphrase"}</span>
           </Row>
+          {status.unsealed_by && (
+            <Row label="Unlocked by">
+              <span data-testid="server-unsealed-by">{UNSEALED_BY_NAMES[status.unsealed_by]}</span>
+            </Row>
+          )}
           {policy && (
             <Row label="Unlock policy">
               <span data-testid="server-policy">
@@ -110,32 +119,45 @@ function StatusCard({ status, canSeal }: { status: SysStatus; canSeal: boolean }
               </span>
             </Row>
           )}
-          {policy === "remember" && (
-            <Row label="Remembered">
-              <span data-testid="server-remembered">{status.remembered ? "Yes, it unlocks itself after a restart" : "No"}</span>
-            </Row>
-          )}
           <Row label="Version">
             <span className="font-mono" data-testid="server-version">
               {status.version}
             </span>
           </Row>
         </dl>
+        {keyFileOverride(status) && (
+          <Alert className="border-warning/50 bg-warning/10" data-testid="server-key-file-override">
+            <AlertTriangle className="text-warning" />
+            <AlertTitle>A key file unlocked this server</AlertTitle>
+            <AlertDescription>
+              The server is set up with a passphrase, but a root key file given at start unlocked it without one. Anyone
+              who can read that file can unlock the server. Remove the key file from the configuration unless that is
+              intended.
+            </AlertDescription>
+          </Alert>
+        )}
       </CardContent>
-      {canSeal && (
-        <CardFooter className="justify-end">
-          <Button variant="outline" onClick={() => setConfirming(true)} data-testid="seal-now">
+      {canLock && (
+        <CardFooter className="flex-col items-stretch gap-3 border-t sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <p className="text-sm font-medium">Lock (seal) the server</p>
+            <p className="text-sm text-muted-foreground" data-testid="lock-help">
+              Locking drops the key from memory straight away. Everything that reads secrets gets errors until someone
+              unlocks it with the passphrase.
+            </p>
+          </div>
+          <Button variant="outline" className="shrink-0" onClick={() => setConfirming(true)} data-testid="seal-now">
             <Lock />
-            Seal now
+            Lock now
           </Button>
         </CardFooter>
       )}
       <ConfirmDialog
         open={confirming}
         onOpenChange={setConfirming}
-        title="Seal the server?"
-        description="sekret drops its root key from memory. Every application and person gets an error until someone unlocks it with the passphrase."
-        confirmLabel="Seal now"
+        title="Lock the server now?"
+        description="Applications and people get errors until someone unlocks it with the passphrase. You will go to the unlock page. A remembered unlock still unlocks it after a restart."
+        confirmLabel="Lock now"
         destructive
         onConfirm={() => seal.mutateAsync()}
         testId="seal-dialog"
@@ -144,14 +166,30 @@ function StatusCard({ status, canSeal }: { status: SysStatus; canSeal: boolean }
   );
 }
 
+/** Errors the policy dialog shows next to its passphrase field rather than as a toast. */
+function isPassphraseError(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    (error.code === "invalid_passphrase" || error.code === "passphrase_required" || error.status === 429)
+  );
+}
+
 function UnlockPolicyCard({ status }: { status: SysStatus }) {
   const queryClient = useQueryClient();
   const current = status.unlock_policy ?? "manual";
   const [policy, setPolicy] = useState<UnlockPolicy>(current);
+  const [confirming, setConfirming] = useState(false);
+  const [forgetting, setForgetting] = useState(false);
+  const [passphrase, setPassphrase] = useState("");
+  const [empty, setEmpty] = useState(false);
 
   const save = useApiMutation({
-    mutationFn: () => api.setUnlockPolicy(policy),
-    onSuccess: (next) => queryClient.setQueryData(keys.sysStatus, next),
+    mutationFn: (confirmWith: string | undefined) => api.setUnlockPolicy(policy, confirmWith),
+    onSuccess: (next) => {
+      setPassphrase("");
+      queryClient.setQueryData(keys.sysStatus, next);
+    },
+    onError: (error) => isPassphraseError(error),
     success: "Unlock policy saved",
   });
   const forget = useApiMutation({
@@ -159,6 +197,29 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
     onSuccess: (next) => queryClient.setQueryData(keys.sysStatus, next),
     success: "Remembered unlock forgotten",
   });
+
+  // Anything but manual lets the server unlock without a person, so the server wants the passphrase.
+  const weakens = policy !== "manual";
+  const onSave = () => {
+    if (!weakens) {
+      save.mutate(undefined);
+      return;
+    }
+    save.reset();
+    setEmpty(false);
+    setPassphrase("");
+    setConfirming(true);
+  };
+  const confirmSave = async () => {
+    if (!passphrase) {
+      setEmpty(true);
+      throw new Error("no passphrase");
+    }
+    await save.mutateAsync(passphrase);
+  };
+
+  const dialogError = isPassphraseError(save.error) ? save.error : null;
+  const fieldError = empty && !passphrase ? "Enter the current passphrase." : dialogError ? passphraseErrorText(dialogError) : null;
 
   return (
     <Card data-testid="server-unlock-policy">
@@ -172,40 +233,113 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
         ) : (
           <UnlockPolicyCards idPrefix="server" value={policy} onChange={setPolicy} disabled={save.isPending} />
         )}
-        {status.remembered && (
+        {current === "remember" && (
           <div
             className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between"
             data-testid="server-remembered-box"
           >
-            <p className="text-sm text-muted-foreground">
-              The server keeps a key file so it can unlock itself after a restart. Forgetting deletes it, so the next
-              start needs the passphrase.
-            </p>
-            <Button
-              variant="outline"
-              className="shrink-0"
-              disabled={forget.isPending}
-              onClick={() => forget.mutate()}
-              data-testid="forget-unlock"
-            >
-              {forget.isPending && <Spinner />}
-              Forget remembered unlock
-            </Button>
+            <div className="space-y-1 text-sm">
+              <p className="font-medium" data-testid="server-remembered">
+                {status.remembered ? "Remembered: yes, it unlocks itself after a restart" : "Remembered: no"}
+              </p>
+              <p className="text-muted-foreground">
+                {status.remembered
+                  ? "Locking the server does not forget this. Forget it to make the next restart need the passphrase."
+                  : "Unlocking with the passphrase remembers it again."}
+              </p>
+            </div>
+            {status.remembered && (
+              <Button
+                variant="outline"
+                className="shrink-0"
+                disabled={forget.isPending}
+                onClick={() => setForgetting(true)}
+                data-testid="forget-unlock"
+              >
+                Forget remembered unlock
+              </Button>
+            )}
           </div>
         )}
         <UnlockDocsLink />
       </CardContent>
       {!status.configured && (
-        <CardFooter className="justify-end">
-          <Button disabled={policy === current || save.isPending} onClick={() => save.mutate()} data-testid="policy-save">
-            {save.isPending && <Spinner />}
+        <CardFooter className="flex-col items-end gap-2">
+          <Button disabled={policy === current || save.isPending} onClick={onSave} data-testid="policy-save">
+            {save.isPending && !confirming && <Spinner />}
             Save policy
           </Button>
+          {policy === current && (
+            <p className="text-sm text-muted-foreground" data-testid="policy-save-hint">
+              Choose a different policy to save.
+            </p>
+          )}
         </CardFooter>
       )}
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(open) => {
+          setConfirming(open);
+          if (!open) setPassphrase("");
+        }}
+        title={`Switch to ${POLICY_NAMES[policy]}?`}
+        description="Confirm with the current passphrase. This lets the server unlock without a person."
+        confirmLabel="Save policy"
+        onConfirm={confirmSave}
+        testId="policy-dialog"
+      >
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void confirmSave().then(
+              () => setConfirming(false),
+              () => undefined,
+            );
+          }}
+          noValidate
+        >
+          <PassphraseAccountField />
+          <Field data-invalid={!!fieldError}>
+            <FieldLabel htmlFor="policy-passphrase">Current passphrase</FieldLabel>
+            <Input
+              id="policy-passphrase"
+              type="password"
+              autoComplete="current-password"
+              autoFocus
+              value={passphrase}
+              aria-invalid={!!fieldError}
+              aria-describedby={fieldError ? "policy-passphrase-error" : undefined}
+              onChange={(e) => setPassphrase(e.target.value)}
+              data-testid="policy-passphrase"
+            />
+            {fieldError && (
+              <FieldError id="policy-passphrase-error" data-testid="policy-passphrase-error">
+                {fieldError}
+              </FieldError>
+            )}
+          </Field>
+        </form>
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={forgetting}
+        onOpenChange={setForgetting}
+        title="Forget the remembered unlock?"
+        description="The key file is deleted. After the next restart someone has to unlock the server with the passphrase."
+        confirmLabel="Forget"
+        destructive
+        onConfirm={() => forget.mutateAsync()}
+        testId="forget-dialog"
+      />
     </Card>
   );
 }
+
+function passphraseErrorText(error: ApiError): string {
+  if (error.code === "invalid_passphrase") return "That passphrase is wrong.";
+  return errorMessage(error);
+}
+
+const CURRENT_ERROR_ID = "current-passphrase-error";
 
 function ChangePassphraseCard() {
   const [current, setCurrent] = useState("");
@@ -227,7 +361,9 @@ function ChangePassphraseCard() {
   const wrong = error?.code === "invalid_passphrase" ? error : null;
   const weak = error?.code === "weak_passphrase" ? error : null;
   const otherError = change.error && !wrong && !weak ? change.error : null;
-  const ready = current !== "" && !passphraseProblem(passphrase, confirm, strength) && !change.isPending;
+  const problem = passphraseProblem(passphrase, confirm, strength);
+  const blocker = current === "" ? "Enter the current passphrase to continue." : problem ? problemText(problem) : null;
+  const ready = !blocker && !change.isPending;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -238,11 +374,17 @@ function ChangePassphraseCard() {
     <Card data-testid="server-passphrase">
       <CardHeader>
         <CardTitle>Change passphrase</CardTitle>
-        <CardDescription>Backups made before the change still open with the old passphrase.</CardDescription>
+        <CardDescription data-testid="change-passphrase-help">
+          Changing the passphrase also replaces the root key and re-encrypts every secret, so the old passphrase stops
+          working on this server. Backups made before the change still open with the old passphrase and hold the secrets
+          as they were then. A remembered unlock is forgotten, so the next restart needs the new passphrase. If the
+          server reads its passphrase from a file, update that file too.
+        </CardDescription>
       </CardHeader>
       <form onSubmit={submit} noValidate>
         <CardContent>
           <FieldGroup>
+            <PassphraseAccountField />
             <Field data-invalid={!!wrong}>
               <FieldLabel htmlFor="current-passphrase">Current passphrase</FieldLabel>
               <Input
@@ -251,10 +393,15 @@ function ChangePassphraseCard() {
                 autoComplete="current-password"
                 value={current}
                 aria-invalid={!!wrong}
+                aria-describedby={wrong ? CURRENT_ERROR_ID : undefined}
                 onChange={(e) => setCurrent(e.target.value)}
                 data-testid="current-passphrase"
               />
-              {wrong && <FieldError data-testid="current-passphrase-wrong">That passphrase is wrong.</FieldError>}
+              {wrong && (
+                <FieldError id={CURRENT_ERROR_ID} data-testid="current-passphrase-wrong">
+                  That passphrase is wrong.
+                </FieldError>
+              )}
             </Field>
             <PassphraseFields
               idPrefix="change"
@@ -283,11 +430,21 @@ function ChangePassphraseCard() {
             )}
           </FieldGroup>
         </CardContent>
-        <CardFooter className="mt-6 justify-end">
-          <Button type="submit" disabled={!ready} data-testid="change-submit">
+        <CardFooter className="mt-6 flex-col items-end gap-2">
+          <Button
+            type="submit"
+            disabled={!ready}
+            aria-describedby={blocker ? "change-blocker" : undefined}
+            data-testid="change-submit"
+          >
             {change.isPending && <Spinner />}
             Change passphrase
           </Button>
+          {blocker && (
+            <p id="change-blocker" className="text-sm text-muted-foreground" data-testid="change-blocker">
+              {blocker}
+            </p>
+          )}
         </CardFooter>
       </form>
     </Card>

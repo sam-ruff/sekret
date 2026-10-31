@@ -38,6 +38,8 @@ In TokenReview mode, sekret asks the cluster's API server whether the token is v
 
 Either way, the binding lists which namespaces and service account names are allowed, with `*` patterns.
 
+Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to `exp`, are refused, as are tokens with no `iat`. The default is 3600, so a cluster admin cannot mint a year-long token for the service account and keep using it after the account is deleted. The operator asks for ten-minute tokens. If a pod projects its own token, keep its `expirationSeconds` at or under the limit, or raise the limit. In TokenReview mode the limit applies whenever the token's claims can be read, which is the case for every service account token Kubernetes issues. In the web interface it is the "Maximum token lifetime" field on the identity's Kubernetes form.
+
 ```json
 {
   "kind": "kubernetes",
@@ -46,7 +48,8 @@ Either way, the binding lists which namespaces and service account names are all
   "jwks": {"keys": [{"kty": "RSA", "kid": "...", "n": "...", "e": "AQAB"}]},
   "namespaces": ["web"],
   "service_accounts": ["web-secrets"],
-  "audiences": ["sekret"]
+  "audiences": ["sekret"],
+  "max_token_lifetime": 3600
 }
 ```
 

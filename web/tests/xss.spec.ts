@@ -60,9 +60,9 @@ test("secret keys, values, comments, tags, folders, history and diff render as t
 
   await row.getByTestId("secret-key").click();
   const drawer = page.getByTestId("secret-drawer");
+  await drawer.getByTestId("history-values-toggle").click();
   await expect(drawer.getByTestId("diff-output")).toContainText(X.img);
   await expect(drawer.getByTestId("diff-output")).toContainText(X.svg);
-  await drawer.getByTestId("version-reveal-1").click();
   await expect(drawer.getByTestId("version-1")).toContainText(X.img);
   await expect(drawer.getByTestId("version-1")).toContainText(X.script);
   await expectNoXss(page);

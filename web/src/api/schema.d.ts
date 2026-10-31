@@ -1225,6 +1225,13 @@ export interface components {
             /** @description Inline JWKS document, as returned by `kubectl get --raw /openid/v1/jwks`. */
             jwks?: unknown;
             jwks_url?: string | null;
+            /**
+             * Format: int64
+             * @description Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left
+             *     out. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose
+             *     claims can be read.
+             */
+            max_token_lifetime?: number;
             mode: components["schemas"]["KubernetesMode"];
             /** @description Globs over namespaces. */
             namespaces: string[];

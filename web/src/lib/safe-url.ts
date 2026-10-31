@@ -8,6 +8,8 @@ function sameOriginPath(value: string, origin: string): string | undefined {
   try {
     const url = new URL(value, origin);
     if (url.origin !== new URL(origin).origin) return undefined;
+    // "/..//x" normalises to "//x", which a browser reads as another host.
+    if (url.pathname.startsWith("//") || url.pathname.startsWith("/\\")) return undefined;
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return undefined;

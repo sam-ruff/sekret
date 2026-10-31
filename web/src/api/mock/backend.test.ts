@@ -80,7 +80,7 @@ describe("mock backend", () => {
   });
 
   describe("Kubernetes reviewer token", () => {
-    const k8s = (reviewer_jwt?: string | null): AuthMethodConfig => ({
+    const k8s = (reviewer_jwt?: string | null, max_token_lifetime?: number): AuthMethodConfig => ({
       kind: "kubernetes",
       mode: "token-review",
       host: "https://k8s.example:6443",
@@ -88,6 +88,7 @@ describe("mock backend", () => {
       service_accounts: ["worker"],
       audiences: ["sekret"],
       ...(reviewer_jwt === undefined ? {} : { reviewer_jwt }),
+      ...(max_token_lifetime === undefined ? {} : { max_token_lifetime }),
     });
     const stored = (b: MockBackend, id: string) => {
       const method = b.listAuthMethods(id).find((m) => m.kind === "kubernetes");
@@ -110,6 +111,19 @@ describe("mock backend", () => {
       b.putAuthMethod(id, "kubernetes", k8s("eyJ.real.token"));
       b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL));
       expect(stored(b, id)).toBe(REDACTED_CREDENTIAL);
+    });
+
+    it("stores the token lifetime, defaulting to an hour, and refuses less than a second", () => {
+      const { b, id } = setup();
+      const lifetime = () => {
+        const method = b.listAuthMethods(id).find((m) => m.kind === "kubernetes");
+        return method?.kind === "kubernetes" ? method.max_token_lifetime : undefined;
+      };
+      b.putAuthMethod(id, "kubernetes", k8s("eyJ.real.token", 600));
+      expect(lifetime()).toBe(600);
+      b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL));
+      expect(lifetime()).toBe(3600);
+      expect(() => b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL, 0))).toThrow(MockError);
     });
 
     it("clears the token when it is empty or omitted", () => {

@@ -1,4 +1,4 @@
-import type { SealState, SysStatus, UnlockPolicy } from "@/api/types";
+import type { SealState, SysStatus, UnlockPolicy, UnsealedBy } from "@/api/types";
 import { safeReturnTo } from "./safe-url";
 
 export const SETUP_PATH = "/setup";
@@ -40,11 +40,23 @@ export function unlockPolicyLine(status: Pick<SysStatus, "unlock_policy" | "reme
       return `Unlock policy: manual. The server needs its passphrase after every start.${origin}`;
     case "remember":
       return status.remembered
-        ? `Unlock policy: remember. It unlocks itself after a restart, but not after being sealed by hand.${origin}`
-        : `Unlock policy: remember. The remembered unlock was lost; unlocking now will remember it again.${origin}`;
+        ? `Unlock policy: remember. It unlocks itself after a restart, but after locking by hand someone has to type the passphrase.${origin}`
+        : `Unlock policy: remember. It is not remembered at the moment; unlocking now remembers it again.${origin}`;
     case "passphrase-file":
-      return `Unlock policy: passphrase file. It unlocks itself at start unless the passphrase could not be read or it was sealed by hand.${origin}`;
+      return `Unlock policy: passphrase file. It unlocks itself at start unless the passphrase could not be read or it was locked by hand.${origin}`;
     default:
       return null;
   }
+}
+
+export const UNSEALED_BY_NAMES: Record<UnsealedBy, string> = {
+  passphrase: "Passphrase, typed by a person",
+  remember: "Remembered unlock",
+  "key-file": "Root key file",
+  "passphrase-file": "Passphrase file",
+};
+
+/** A key file given at start unlocks a passphrase-mode server without its passphrase. */
+export function keyFileOverride(status: Pick<SysStatus, "seal_mode" | "unsealed_by">): boolean {
+  return status.seal_mode === "passphrase" && status.unsealed_by === "key-file";
 }

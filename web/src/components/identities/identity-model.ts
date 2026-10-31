@@ -18,6 +18,17 @@ export function ttlProblem(draft: IdentityDraft): string | undefined {
   return undefined;
 }
 
+/** The server's cap on a service account token's `exp - iat` when none is set. */
+export const DEFAULT_MAX_TOKEN_LIFETIME = 3600;
+
+/** Whole seconds of at least one, or null when the text is not that. */
+export function parseLifetime(text: string): number | null {
+  const trimmed = text.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const seconds = Number(trimmed);
+  return Number.isSafeInteger(seconds) && seconds >= 1 ? seconds : null;
+}
+
 export function parseJwks(text: string): { value: unknown; error?: string } {
   if (!text.trim()) return { value: null };
   try {

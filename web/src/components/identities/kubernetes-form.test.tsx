@@ -63,6 +63,30 @@ describe("KubernetesForm reviewer token", () => {
     expect(saved()?.reviewer_jwt).toBe("eyJ.first");
   });
 
+  it("keeps a custom maximum token lifetime when editing other fields", async () => {
+    const { saved } = renderForm({ ...config(REDACTED_CREDENTIAL), max_token_lifetime: 600 });
+    expect(screen.getByTestId("k8s-max-lifetime")).toHaveValue("600");
+    await userEvent.clear(screen.getByTestId("k8s-host"));
+    await userEvent.type(screen.getByTestId("k8s-host"), "https://other.example:6443");
+    await userEvent.click(screen.getByTestId("k8s-save"));
+    expect(saved()).toMatchObject({ host: "https://other.example:6443", max_token_lifetime: 600 });
+  });
+
+  it("defaults the lifetime to an hour and refuses anything but whole seconds", async () => {
+    const { saved, onSave } = renderForm(config(null));
+    const field = screen.getByTestId("k8s-max-lifetime");
+    expect(field).toHaveValue("3600");
+    await userEvent.clear(field);
+    await userEvent.type(field, "0");
+    expect(screen.getByTestId("k8s-save")).toBeDisabled();
+    expect(screen.getByText("Enter a whole number of seconds, 1 or more.")).toBeInTheDocument();
+    await userEvent.clear(field);
+    await userEvent.type(field, "900");
+    await userEvent.click(screen.getByTestId("k8s-save"));
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(saved()?.max_token_lifetime).toBe(900);
+  });
+
   it("explains the auth-delegator binding", () => {
     renderForm();
     expect(screen.getByText("system:auth-delegator")).toBeInTheDocument();

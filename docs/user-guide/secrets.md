@@ -14,7 +14,7 @@ sekret secrets get DATABASE_URL
 sekret secrets delete OLD_KEY
 ```
 
-In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. Pasting a `.env` file into the import dialog creates or updates every key in it in one write.
+In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. A copied value is cleared from the clipboard after 45 seconds if it is still there. Pasting a `.env` file into the import dialog creates or updates every key in it in one write.
 
 Reading a key name and reading its value are separate permissions, so a role can let someone see which keys exist without seeing any values.
 
@@ -26,7 +26,7 @@ sekret secrets history DATABASE_URL --diff 3 5
 sekret secrets rollback DATABASE_URL 3
 ```
 
-The web interface shows the same history in a drawer, with a line diff between any two versions and a button to roll back.
+The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and a line diff between any two versions. Closing the drawer or opening another secret hides them again.
 
 ![A secret's history, with a diff between two versions](../assets/screenshots/history-light.png)
 

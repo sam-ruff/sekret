@@ -516,10 +516,24 @@ pub struct KubernetesAuthConfig {
     pub service_accounts: Vec<String>,
     #[serde(default = "default_k8s_audiences")]
     pub audiences: Vec<String>,
+    /// Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left
+    /// out. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose
+    /// claims can be read.
+    #[serde(default = "default_max_token_lifetime")]
+    #[schema(minimum = 1)]
+    pub max_token_lifetime: i64,
 }
 
 /// Stands in for a stored credential in responses.
 pub const REDACTED_CREDENTIAL: &str = "[redacted]";
+
+/// A cluster admin could otherwise mint a year-long token, which in JWKS mode outlives deleting
+/// its service account.
+pub const DEFAULT_MAX_TOKEN_LIFETIME: i64 = 3600;
+
+fn default_max_token_lifetime() -> i64 {
+    DEFAULT_MAX_TOKEN_LIFETIME
+}
 
 fn default_k8s_audiences() -> Vec<String> {
     vec!["sekret".into()]

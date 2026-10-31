@@ -1,5 +1,7 @@
 //! A fake OIDC issuer for tests: fixed Ed25519 keys that mint tokens and serve their JWKS.
 
+pub mod process;
+
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 
@@ -58,7 +60,7 @@ impl TestIssuer {
         })
     }
 
-    /// Signs `claims`, filling in `iss`, `iat` and `exp` when absent.
+    /// Signs `claims`, filling in `iss`, `iat` and `exp` when absent. Claims set to null are left out.
     pub fn sign(&self, claims: Value) -> Result<String, jsonwebtoken::errors::Error> {
         self.sign_with_kid(claims, self.kid)
     }
@@ -68,6 +70,7 @@ impl TestIssuer {
             map.entry("iss").or_insert_with(|| json!(self.url));
             map.entry("iat").or_insert_with(|| json!(self.now));
             map.entry("exp").or_insert_with(|| json!(self.now + 300));
+            map.retain(|_, value| !value.is_null());
         }
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(kid.to_string());

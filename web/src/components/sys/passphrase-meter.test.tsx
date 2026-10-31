@@ -28,6 +28,13 @@ describe("PassphraseMeter", () => {
     expect(meter).not.toHaveTextContent("Strong enough");
   });
 
+  it("announces changes politely under the id the input points at", () => {
+    render(<PassphraseMeter strength={null} id="setup-meter" />);
+    const region = screen.getByTestId("passphrase-meter-region");
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(region).toHaveAttribute("id", "setup-meter");
+  });
+
   it("says when a passphrase is strong enough", () => {
     render(<PassphraseMeter strength={{ score: 4, acceptable: true, warning: null, suggestions: [] }} />);
     expect(screen.getByTestId("passphrase-meter-label")).toHaveTextContent("Strong");

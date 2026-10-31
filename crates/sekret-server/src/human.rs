@@ -226,6 +226,39 @@ pub async fn callback(
     Ok(response)
 }
 
+/// Why an ID token with `subject` and `groups` may not sign in, or `None` when it may.
+pub fn login_refusal(config: &HumanOidcConfig, subject: &str, groups: &[String]) -> Option<&'static str> {
+    if !config.allowed_subjects.is_empty() && !config.allowed_subjects.iter().any(|s| s == subject) {
+        return Some("subject not in oidc.allowed_subjects");
+    }
+    if !config.required_groups.is_empty() && !groups.iter().any(|g| config.required_groups.contains(g)) {
+        return Some("not in any of oidc.required_groups");
+    }
+    None
+}
+
+async fn audit_refused(state: &AppState, ip: std::net::IpAddr, subject: &str, reason: &str) {
+    crate::seal::audit_system(
+        state.store.as_ref(),
+        state.clock.now(),
+        &ip.to_string(),
+        "auth.login.refused",
+        json!({"subject": subject, "reason": reason}),
+    )
+    .await;
+}
+
+/// Whether the user stored as `issuer|sub` is still in `oidc.allowed_subjects`.
+fn subject_allowed(config: &HumanOidcConfig, stored_subject: &str) -> bool {
+    if config.allowed_subjects.is_empty() {
+        return true;
+    }
+    let Some(sub) = stored_subject.strip_prefix(&format!("{}|", config.issuer)) else {
+        return false;
+    };
+    config.allowed_subjects.iter().any(|s| s == sub)
+}
+
 async fn finish_login(
     state: &AppState,
     ip: std::net::IpAddr,
@@ -306,7 +339,8 @@ async fn finish_login(
         .filter(|s| !s.is_empty())
         .ok_or_else(ApiError::login_failed)?;
     let groups = extract_groups(&claims, &config.group_claims);
-    if !config.required_groups.is_empty() && !groups.iter().any(|g| config.required_groups.contains(g)) {
+    if let Some(reason) = login_refusal(config, subject, &groups) {
+        audit_refused(state, ip, subject, reason).await;
         return Ok(login_error("Your account is not allowed to use sekret."));
     }
     let email = claims["email"].as_str().unwrap_or_default().to_string();
@@ -433,6 +467,17 @@ pub async fn cli_approve(
         return Err(ApiError::forbidden());
     }
     let code = request.user_code.trim().to_ascii_uppercase();
+    // A session from before the subject list changed must not mint a CLI token.
+    if let Some(config) = &state.config.oidc
+        && !config.allowed_subjects.is_empty()
+    {
+        let user = state.store.get_user(&principal.id).await?;
+        let stored = user.as_ref().map(|u| u.subject.as_str()).unwrap_or_default();
+        if !subject_allowed(config, stored) {
+            audit_refused(&state, ip, stored, "subject not in oidc.allowed_subjects").await;
+            return Err(ApiError::forbidden());
+        }
+    }
     if let Some(max_age) = state.config.cli_login_max_auth_age {
         let auth_time = state
             .store
@@ -557,6 +602,47 @@ mod tests {
         assert_eq!(safe_return_to(Some("/\n/evil.test")), "/");
         assert_eq!(safe_return_to(Some("/ /evil.test")), "/");
         assert_eq!(safe_return_to(None), "/");
+    }
+
+    fn oidc_config(required_groups: &[&str], allowed_subjects: &[&str]) -> HumanOidcConfig {
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect();
+        HumanOidcConfig {
+            issuer: "https://id.example".into(),
+            client_id: "sekret".into(),
+            client_secret: String::new(),
+            scopes: vec![],
+            group_claims: vec![],
+            admin_groups: vec![],
+            required_groups: strings(required_groups),
+            allowed_subjects: strings(allowed_subjects),
+        }
+    }
+
+    #[test]
+    fn allowed_subjects_are_checked_before_groups() {
+        let users = vec!["sekret-users".to_string()];
+        let open = oidc_config(&[], &[]);
+        assert_eq!(login_refusal(&open, "anyone", &[]), None, "empty means everyone");
+        let grouped = oidc_config(&["sekret-users"], &[]);
+        assert_eq!(login_refusal(&grouped, "anyone", &users), None);
+        assert!(login_refusal(&grouped, "anyone", &[]).is_some());
+        let pinned = oidc_config(&["sekret-users"], &["owner"]);
+        assert_eq!(login_refusal(&pinned, "owner", &users), None);
+        assert_eq!(
+            login_refusal(&pinned, "intruder", &users),
+            Some("subject not in oidc.allowed_subjects"),
+            "the right groups are not enough"
+        );
+        assert!(login_refusal(&pinned, "owner", &[]).is_some(), "groups still apply");
+    }
+
+    #[test]
+    fn stored_subjects_are_matched_under_the_issuer() {
+        let pinned = oidc_config(&[], &["owner"]);
+        assert!(subject_allowed(&pinned, "https://id.example|owner"));
+        assert!(!subject_allowed(&pinned, "https://id.example|intruder"));
+        assert!(!subject_allowed(&pinned, "https://other.example|owner"));
+        assert!(subject_allowed(&oidc_config(&[], &[]), "anything"));
     }
 
     #[test]
