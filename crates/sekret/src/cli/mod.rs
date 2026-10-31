@@ -2,6 +2,7 @@ pub mod config;
 pub mod format;
 pub mod login;
 pub mod shell;
+pub mod sys;
 
 use std::io::{Read, Write};
 use std::path::PathBuf;

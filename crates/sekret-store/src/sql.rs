@@ -1,6 +1,9 @@
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
+use sekret_core::seal::{KdfParams, SealMode, UnlockPolicy, WrappedRootKey};
 use sqlx::any::{AnyPoolOptions, AnyRow};
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, Connection, Row};
 
 use crate::models::*;
 use crate::{Store, StoreError, StoreResult};
@@ -9,6 +12,7 @@ use crate::{Store, StoreError, StoreResult};
 #[derive(Clone)]
 pub struct SqlStore {
     pool: AnyPool,
+    postgres: bool,
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -118,6 +122,7 @@ fn token_from(row: &AnyRow) -> StoreResult<AccessToken> {
         max_expires_at: row.try_get("max_expires_at")?,
         revoked: get_flag(row, "revoked")?,
         last_used_at: row.try_get("last_used_at")?,
+        auth_time: row.try_get("auth_time")?,
     })
 }
 
@@ -349,8 +354,154 @@ fn audit_filter(query: &AuditQuery) -> Filter {
     filter
 }
 
+fn seal_config_from(row: &AnyRow) -> StoreResult<SealConfig> {
+    let raw_mode: String = row.try_get("mode")?;
+    let mode =
+        SealMode::parse(&raw_mode).ok_or_else(|| StoreError::Corrupt(format!("unknown seal mode {raw_mode}")))?;
+    let raw_policy: String = row.try_get("unlock_policy")?;
+    let unlock_policy = UnlockPolicy::parse(&raw_policy)
+        .ok_or_else(|| StoreError::Corrupt(format!("unknown unlock policy {raw_policy}")))?;
+    let ciphertext: Option<Vec<u8>> = row.try_get("wrapped_root_key")?;
+    let salt: Option<Vec<u8>> = row.try_get("kdf_salt")?;
+    let params: Option<String> = row.try_get("kdf_params")?;
+    let wrapped = match (ciphertext, salt, params) {
+        (Some(ciphertext), Some(salt), Some(params)) => Some(WrappedRootKey {
+            salt,
+            params: from_json::<KdfParams>(&params)?,
+            ciphertext,
+        }),
+        (None, None, None) => None,
+        _ => return Err(StoreError::Corrupt("partial wrapped root key".into())),
+    };
+    Ok(SealConfig {
+        mode,
+        wrapped,
+        unlock_policy,
+        remembered: row.try_get("remembered_root_key")?,
+        epoch: row.try_get("epoch")?,
+        mac: row.try_get("config_mac")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// The columns of a seal configuration, ready to bind.
+struct SealColumns {
+    mode: &'static str,
+    ciphertext: Option<Vec<u8>>,
+    salt: Option<Vec<u8>>,
+    params: Option<String>,
+    policy: &'static str,
+}
+
+fn seal_columns(config: &SealConfig) -> StoreResult<SealColumns> {
+    let wrapped = config.wrapped.as_ref();
+    Ok(SealColumns {
+        mode: config.mode.as_str(),
+        ciphertext: wrapped.map(|w| w.ciphertext.clone()),
+        salt: wrapped.map(|w| w.salt.clone()),
+        params: wrapped.map(|w| to_json(&w.params)).transpose()?,
+        policy: config.unlock_policy.as_str(),
+    })
+}
+
+const UPDATE_SEAL: &str = "UPDATE seal_config SET mode = $1, wrapped_root_key = $2, kdf_salt = $3, kdf_params = $4, \
+                           unlock_policy = $5, remembered_root_key = $6, updated_at = $7, epoch = $8, config_mac = $9 \
+                           WHERE id = 1";
+
+fn update_seal(config: &SealConfig) -> StoreResult<sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments>> {
+    let columns = seal_columns(config)?;
+    Ok(sqlx::query(UPDATE_SEAL)
+        .bind(columns.mode)
+        .bind(columns.ciphertext)
+        .bind(columns.salt)
+        .bind(columns.params)
+        .bind(columns.policy)
+        .bind(config.remembered.clone())
+        .bind(config.updated_at)
+        .bind(config.epoch)
+        .bind(config.mac.clone()))
+}
+
 fn collect<T>(rows: Vec<AnyRow>, map: fn(&AnyRow) -> StoreResult<T>) -> StoreResult<Vec<T>> {
     rows.iter().map(map).collect()
+}
+
+/// The file behind a SQLite URL, or `None` for Postgres and in-memory databases.
+pub fn sqlite_file(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or_default();
+    if path.is_empty() || path.contains(":memory:") || url.contains("mode=memory") {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Creates the database file owner-only before SQLite does, tightens one that is readable by
+/// others, and warns about a parent directory others can write to.
+fn prepare_sqlite_file(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => tighten(path)?,
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Ok(meta) = std::fs::metadata(parent)
+            && meta.permissions().mode() & 0o022 != 0
+        {
+            tracing::warn!(
+                directory = %parent.display(),
+                "the database directory can be written by other users; restrict it to the sekret user"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Makes an existing database, WAL or shared-memory file owner-only.
+fn tighten(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return Ok(());
+        };
+        if !meta.is_file() || meta.permissions().mode() & 0o077 == 0 {
+            return Ok(());
+        }
+        tracing::warn!(path = %path.display(), "made the database file readable by its owner only");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Custom organisation roles that migration 0006 renames; zero on a fresh or already migrated database.
+async fn custom_backup_reader_roles(pool: &AnyPool) -> i64 {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM roles WHERE project_id = '' AND slug = 'backup-reader'")
+        .fetch_one(pool)
+        .await;
+    row.ok().and_then(|r| r.try_get::<i64, _>("n").ok()).unwrap_or(0)
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 impl SqlStore {
@@ -359,6 +510,12 @@ impl SqlStore {
         sqlx::any::install_default_drivers();
         let postgres = url.starts_with("postgres");
         let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        let file = if postgres { None } else { sqlite_file(url) };
+        if let Some(path) = &file
+            && url.contains("mode=rwc")
+        {
+            prepare_sqlite_file(path).map_err(|e| StoreError::Database(format!("{}: {e}", path.display())))?;
+        }
         // An in-memory SQLite database exists per connection, so it must not be pooled.
         let max = if in_memory {
             1
@@ -370,8 +527,18 @@ impl SqlStore {
         let pool = AnyPoolOptions::new()
             .max_connections(max)
             .min_connections(u32::from(in_memory))
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    // Overwrites freed pages, so an old seal configuration does not linger in the file.
+                    if !postgres {
+                        sqlx::query("PRAGMA secure_delete = ON").execute(conn).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(url)
             .await?;
+        let renamed = custom_backup_reader_roles(&pool).await;
         if postgres {
             sqlx::migrate!("./migrations/postgres").run(&pool).await?;
         } else {
@@ -380,7 +547,18 @@ impl SqlStore {
             }
             sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
         }
-        Ok(Self { pool })
+        if renamed > 0 {
+            tracing::warn!(
+                "a custom organisation role used the slug backup-reader, which is now built in; \
+                 it was renamed to backup-reader-custom along with its bindings"
+            );
+        }
+        if let Some(path) = &file {
+            for suffix in ["", "-wal", "-shm"] {
+                tighten(&sibling(path, suffix)).map_err(|e| StoreError::Database(e.to_string()))?;
+            }
+        }
+        Ok(Self { pool, postgres })
     }
 
     pub async fn ping(&self) -> StoreResult<()> {
@@ -407,6 +585,75 @@ impl Store for SqlStore {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn get_seal_config(&self) -> StoreResult<Option<SealConfig>> {
+        let row = sqlx::query("SELECT * FROM seal_config WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(seal_config_from).transpose()
+    }
+
+    async fn init_seal_config(&self, config: SealConfig, fingerprint: &str) -> StoreResult<()> {
+        let columns = seal_columns(&config)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO seal_config (id, mode, wrapped_root_key, kdf_salt, kdf_params, unlock_policy, \
+             remembered_root_key, created_at, updated_at, epoch, config_mac) \
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(columns.mode)
+        .bind(columns.ciphertext)
+        .bind(columns.salt)
+        .bind(columns.params)
+        .bind(columns.policy)
+        .bind(config.remembered)
+        .bind(config.created_at)
+        .bind(config.updated_at)
+        .bind(config.epoch)
+        .bind(config.mac)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('root_key_fingerprint', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_seal_config(&self, config: SealConfig) -> StoreResult<()> {
+        let result = update_seal(&config)?.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn snapshot_to(&self, path: &str, seal: SealConfig) -> StoreResult<()> {
+        if self.postgres {
+            return Err(StoreError::Unsupported(
+                "backups through the API need SQLite; use pg_dump for Postgres, whose secret values are already encrypted"
+                    .into(),
+            ));
+        }
+        // In-memory databases cannot be copied this way; they only exist in tests.
+        sqlx::query("VACUUM INTO $1").bind(path).execute(&self.pool).await?;
+        // The remembered wrap must never leave the host, so the copy gets the configuration it is
+        // given and rewrites its pages. No journal, so the old row is not copied out on the way.
+        let mut copy = sqlx::AnyConnection::connect(&format!("sqlite://{path}")).await?;
+        sqlx::query("PRAGMA journal_mode = OFF").execute(&mut copy).await?;
+        sqlx::query("PRAGMA secure_delete = ON").execute(&mut copy).await?;
+        update_seal(&seal)?.execute(&mut copy).await?;
+        sqlx::query("UPDATE seal_config SET remembered_root_key = NULL")
+            .execute(&mut copy)
+            .await?;
+        sqlx::query("VACUUM").execute(&mut copy).await?;
+        copy.close().await?;
         Ok(())
     }
 
@@ -655,8 +902,8 @@ impl Store for SqlStore {
     async fn create_token(&self, token: AccessToken) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO access_tokens (id, token_hash, kind, principal_kind, principal_id, description, created_at, \
-             expires_at, max_expires_at, revoked, last_used_at, source) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             expires_at, max_expires_at, revoked, last_used_at, source, auth_time) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&token.id)
         .bind(&token.token_hash)
@@ -670,6 +917,7 @@ impl Store for SqlStore {
         .bind(flag(token.revoked))
         .bind(token.last_used_at)
         .bind(&token.source)
+        .bind(token.auth_time)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -967,19 +1215,57 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn replace_wrapped_keys(
-        &self,
-        keys: Vec<(String, Vec<u8>)>,
-        auth_methods: Vec<AuthMethod>,
-        fingerprint: &str,
-    ) -> StoreResult<()> {
+    async fn list_encrypted_values(&self, project_id: &str) -> StoreResult<Vec<EncryptedValue>> {
+        let rows = sqlx::query(
+            "SELECT v.secret_id, v.version, v.value FROM secret_versions v JOIN secrets s ON s.id = v.secret_id \
+             WHERE s.project_id = $1 AND v.value IS NOT NULL ORDER BY v.secret_id, v.version",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(EncryptedValue {
+                    secret_id: row.try_get("secret_id")?,
+                    version: row.try_get("version")?,
+                    value: row.try_get("value")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn replace_wrapped_keys(&self, rekey: Rekey) -> StoreResult<()> {
+        let Rekey {
+            keys,
+            values,
+            auth_methods,
+            fingerprint,
+            seal,
+        } = rekey;
         let mut tx = self.pool.begin().await?;
+        if let Some(config) = seal {
+            let result = update_seal(&config)?.execute(&mut *tx).await?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::NotFound);
+            }
+        }
         for (id, key) in keys {
             sqlx::query("UPDATE projects SET wrapped_key = $1 WHERE id = $2")
                 .bind(key)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+        }
+        for value in values {
+            let result = sqlx::query("UPDATE secret_versions SET value = $1 WHERE secret_id = $2 AND version = $3")
+                .bind(value.value)
+                .bind(&value.secret_id)
+                .bind(value.version)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::Conflict);
+            }
         }
         for method in auth_methods {
             sqlx::query("UPDATE identity_auth_methods SET config = $1 WHERE identity_id = $2 AND kind = $3")
@@ -993,7 +1279,7 @@ impl Store for SqlStore {
             "INSERT INTO meta (key, value) VALUES ('root_key_fingerprint', $1) \
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         )
-        .bind(fingerprint)
+        .bind(&fingerprint)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1503,13 +1789,15 @@ impl Store for SqlStore {
 
     async fn put_login_state(&self, state: LoginState) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO login_states (state, nonce, pkce_verifier, return_to, created_at) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO login_states (state, nonce, pkce_verifier, return_to, created_at, max_age) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(&state.state)
         .bind(&state.nonce)
         .bind(&state.pkce_verifier)
         .bind(&state.return_to)
         .bind(state.created_at)
+        .bind(state.max_age)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1527,6 +1815,7 @@ impl Store for SqlStore {
                 pkce_verifier: row.try_get("pkce_verifier")?,
                 return_to: row.try_get("return_to")?,
                 created_at: row.try_get("created_at")?,
+                max_age: row.try_get("max_age")?,
             })
         })
         .transpose()

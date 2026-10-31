@@ -163,6 +163,72 @@ async fn keycloak_users_sign_in_with_mapped_roles() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seals the server, checks sign-in is refused, then unseals it through the CLI.
+async fn sealed_then_unsealed(stack: &Stack, passphrase: &str, earlier: &reqwest::Client) -> anyhow::Result<()> {
+    let sealed = admin_call(stack, reqwest::Method::POST, "/api/v1/sys/seal", json!({})).await?;
+    assert_eq!(sealed["state"], "sealed");
+    let response = browser()?
+        .get(format!("{}/auth/login?return_to=/", stack.url))
+        .send()
+        .await
+        .context("login while sealed")?;
+    assert_eq!(response.status().as_u16(), 503, "no sign-in while sealed");
+    let body: Value = response.json().await.context("json")?;
+    assert_eq!(body["error"], "sealed");
+    let (status, _) = session_call(stack, earlier, reqwest::Method::GET, "/api/v1/me", None).await?;
+    assert_eq!(status, 503, "an existing session is refused too");
+
+    let file = tempfile::NamedTempFile::new().context("passphrase file")?;
+    std::fs::write(file.path(), format!("{passphrase}\n")).context("write")?;
+    let path = file.path().display().to_string();
+    let unsealed = cli(
+        &["sys", "unseal", "--passphrase-file", &path],
+        &[("SEKRET_URL", &stack.url)],
+    )?;
+    assert!(
+        unsealed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unsealed.stderr)
+    );
+    Ok(())
+}
+
+/// Only in the passphrase-mode stage of scripts/system-test.sh, which exports the passphrase.
+#[tokio::test]
+async fn keycloak_sign_in_is_refused_while_sealed() -> anyhow::Result<()> {
+    let stack = stack()?;
+    let Ok(passphrase) = std::env::var("SEKRET_E2E_PASSPHRASE") else {
+        eprintln!("skipping: this stage runs the server in key-file mode");
+        return Ok(());
+    };
+    let earlier = sign_in(&stack, "alice", "alice-password").await?;
+    let outcome = sealed_then_unsealed(&stack, &passphrase, &earlier).await;
+    if outcome.is_err() {
+        // Leave the shared server usable for the rest of the suite.
+        let _ = reqwest::Client::new()
+            .post(format!("{}/api/v1/sys/unseal", stack.url))
+            .json(&json!({"passphrase": passphrase}))
+            .send()
+            .await;
+    }
+    outcome?;
+
+    let status: Value = reqwest::get(format!("{}/api/v1/sys/status", stack.url))
+        .await
+        .context("status")?
+        .json()
+        .await
+        .context("json")?;
+    assert_eq!(status["state"], "unsealed");
+    let (status, me) = session_call(&stack, &earlier, reqwest::Method::GET, "/api/v1/me", None).await?;
+    assert_eq!(status, 200, "the session from before the seal works again");
+    assert_eq!(me["email"], "alice@example.com");
+    let again = sign_in(&stack, "alice", "alice-password").await?;
+    let (status, _) = session_call(&stack, &again, reqwest::Method::GET, "/api/v1/me", None).await?;
+    assert_eq!(status, 200, "sign-in works after unlocking");
+    Ok(())
+}
+
 #[tokio::test]
 async fn keycloak_service_account_logs_in_as_machine_identity() -> anyhow::Result<()> {
     let stack = stack()?;

@@ -1,6 +1,9 @@
 mod cli;
+mod prompt;
 mod server;
+mod settings;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sekret_client::SekretApi;
 use tracing_subscriber::EnvFilter;
@@ -8,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(
     name = "sekret",
-    version,
+    version = sekret_core::VERSION,
     about = "Secrets management server, CLI and Kubernetes operator"
 )]
 struct Cli {
@@ -21,7 +24,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the API server and web interface.
-    Server(Box<server::ServerArgs>),
+    Server(Box<settings::ServerArgs>),
+    /// Set up, unlock, seal and back up a server.
+    #[command(subcommand)]
+    Sys(cli::sys::SysCommand),
     /// Administrative tasks run on the server host.
     #[command(subcommand)]
     Admin(server::AdminCommand),
@@ -107,7 +113,7 @@ async fn authenticated(args: &cli::ClientArgs) -> anyhow::Result<(cli::config::R
     Ok((resolved, api))
 }
 
-async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
+async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result<i32> {
     let mut out = std::io::stdout();
     match cli.command {
         Command::Operator(OperatorCommand {
@@ -118,8 +124,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Operator(OperatorCommand { args: Some(args), .. }) => sekret_operator::run(args).await?,
         Command::Operator(_) => anyhow::bail!("--server-url or SEKRET_URL is required"),
-        Command::Server(args) => server::run_server(*args).await?,
+        Command::Server(args) => server::run_server(*args, env_secrets).await?,
         Command::Admin(command) => server::run_admin(command).await?,
+        Command::Sys(command) => {
+            let resolved = cli::resolve(&cli.client)?;
+            let api = cli::client(&cli.client, &resolved, resolved.token.clone())?;
+            return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
+        }
         Command::Openapi => println!("{}", sekret_server::openapi_json()),
         Command::Login(args) => cli::run_login(&cli.client, args).await?,
         Command::Logout => cli::run_logout(&cli.client).await?,
@@ -250,14 +261,28 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Taken while the process still has one thread, so removing them from the environment is
+    // safe and nothing the server starts inherits them.
+    let env_secrets = match cli.command {
+        Command::Server(_) => settings::EnvSecrets::take(),
+        _ => settings::EnvSecrets::default(),
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+    runtime.block_on(run(cli, env_secrets))
+}
+
+async fn run(cli: Cli, env_secrets: settings::EnvSecrets) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_env("SEKRET_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
         .with_writer(std::io::stderr)
         .init();
-    let code = dispatch(Cli::parse()).await?;
+    let code = dispatch(cli, env_secrets).await?;
     if code != 0 {
         std::process::exit(code);
     }

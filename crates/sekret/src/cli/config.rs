@@ -63,29 +63,14 @@ pub fn load_credentials(path: &Path) -> anyhow::Result<Credentials> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Writes the credentials file readable only by the current user.
+/// Writes the credentials file readable only by the current user, in a directory only they can
+/// enter, through a new file under a random name that is then renamed into place.
 pub fn save_credentials(path: &Path, credentials: &Credentials) -> anyhow::Result<()> {
     let dir = path.parent().context("credentials path has no parent")?;
-    std::fs::create_dir_all(dir)?;
-    let text = toml::to_string(credentials)?;
-    let tmp = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    sekret_server::files::create_private_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let text = zeroize::Zeroizing::new(toml::to_string(credentials)?);
+    sekret_server::files::write_private_atomic(path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Everything a client command needs, after flags, environment and project file are merged.
@@ -236,7 +221,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).context("meta")?.permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            let parent = path.parent().context("parent")?;
+            let dir_mode = std::fs::metadata(parent).context("meta")?.permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
         }
+        // A file planted at the old fixed temporary name is neither followed nor left behind.
+        let planted = path.with_extension("tmp");
+        std::fs::write(&planted, "planted").context("plant")?;
+        save_credentials(&path, &stored("def", 6)).context("save again")?;
+        assert_eq!(load_credentials(&path).context("load")?, stored("def", 6));
+        assert_eq!(std::fs::read_to_string(&planted).context("read")?, "planted");
         Ok(())
     }
 }

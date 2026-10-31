@@ -45,6 +45,8 @@ pub enum Subject {
     /// The organisation-wide audit log. Separate from `AuditLog` so an org grant cannot open
     /// every project's log.
     OrgAuditLog,
+    /// Encrypted database backups; `read` downloads one.
+    Backups,
 }
 
 impl Subject {
@@ -59,12 +61,13 @@ impl Subject {
         Subject::AuditLog,
         Subject::Settings,
     ];
-    pub const ORG: [Subject; 5] = [
+    pub const ORG: [Subject; 6] = [
         Subject::Projects,
         Subject::Identities,
         Subject::OrgMembers,
         Subject::OrgRoles,
         Subject::OrgAuditLog,
+        Subject::Backups,
     ];
 }
 
@@ -250,6 +253,7 @@ pub fn dropped_rules(before: &[Rule], after: &[Rule]) -> Vec<Rule> {
 pub enum BuiltinRole {
     OrgAdmin,
     OrgMember,
+    BackupReader,
     ProjectAdmin,
     Developer,
     Viewer,
@@ -257,9 +261,10 @@ pub enum BuiltinRole {
 }
 
 impl BuiltinRole {
-    pub const ALL: [BuiltinRole; 6] = [
+    pub const ALL: [BuiltinRole; 7] = [
         BuiltinRole::OrgAdmin,
         BuiltinRole::OrgMember,
+        BuiltinRole::BackupReader,
         BuiltinRole::ProjectAdmin,
         BuiltinRole::Developer,
         BuiltinRole::Viewer,
@@ -270,6 +275,7 @@ impl BuiltinRole {
         match self {
             BuiltinRole::OrgAdmin => "org-admin",
             BuiltinRole::OrgMember => "org-member",
+            BuiltinRole::BackupReader => "backup-reader",
             BuiltinRole::ProjectAdmin => "admin",
             BuiltinRole::Developer => "developer",
             BuiltinRole::Viewer => "viewer",
@@ -282,7 +288,10 @@ impl BuiltinRole {
     }
 
     pub fn is_org_scope(self) -> bool {
-        matches!(self, BuiltinRole::OrgAdmin | BuiltinRole::OrgMember)
+        matches!(
+            self,
+            BuiltinRole::OrgAdmin | BuiltinRole::OrgMember | BuiltinRole::BackupReader
+        )
     }
 
     pub fn rules(self) -> Vec<Rule> {
@@ -300,6 +309,7 @@ impl BuiltinRole {
                 Rule::allow(OrgMembers, &[Read]),
                 Rule::allow(OrgRoles, &[Read]),
             ],
+            BuiltinRole::BackupReader => vec![Rule::allow(Backups, &[Read])],
             BuiltinRole::ProjectAdmin => Subject::PROJECT
                 .into_iter()
                 .map(|s| Rule::allow(s, &Action::ALL))

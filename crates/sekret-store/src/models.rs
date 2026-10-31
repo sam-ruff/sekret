@@ -1,5 +1,43 @@
 use sekret_core::permissions::Rule;
+use sekret_core::seal::{SealMode, UnlockPolicy, WrappedRootKey};
 use serde::{Deserialize, Serialize};
+
+/// How the root key is protected. `wrapped` is set only in passphrase mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealConfig {
+    pub mode: SealMode,
+    pub wrapped: Option<WrappedRootKey>,
+    pub unlock_policy: UnlockPolicy,
+    /// The root key wrapped under the device key in the remember file.
+    pub remembered: Option<Vec<u8>>,
+    /// Goes up with every change, and is covered by `mac`.
+    pub epoch: i64,
+    /// Authenticates the row under a key derived from the root key; absent on databases from
+    /// before it existed.
+    pub mac: Option<Vec<u8>>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One stored secret value, as written under its project's data key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedValue {
+    pub secret_id: String,
+    pub version: i64,
+    pub value: Vec<u8>,
+}
+
+/// Everything that changes when the root key is replaced, written in one transaction.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Rekey {
+    /// `(project id, wrapped data key)`.
+    pub keys: Vec<(String, Vec<u8>)>,
+    /// Values re-encrypted under the projects' new data keys.
+    pub values: Vec<EncryptedValue>,
+    pub auth_methods: Vec<AuthMethod>,
+    pub fingerprint: String,
+    pub seal: Option<SealConfig>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
@@ -101,6 +139,8 @@ pub struct AccessToken {
     pub max_expires_at: i64,
     pub revoked: bool,
     pub last_used_at: Option<i64>,
+    /// When the person last authenticated with the identity provider, for browser sessions.
+    pub auth_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +327,8 @@ pub struct LoginState {
     pub pkce_verifier: String,
     pub return_to: String,
     pub created_at: i64,
+    /// Set when the sign-in asked the provider for a fresh authentication within this many seconds.
+    pub max_age: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

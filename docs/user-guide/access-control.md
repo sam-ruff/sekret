@@ -10,6 +10,7 @@ There are two scopes. Organisation roles cover projects in general, machine iden
 |---|---|---|
 | `org-admin` | organisation | Everything, in the organisation and in every project. |
 | `org-member` | organisation | Create projects, and read identities, users and organisation roles. Everyone who signs in gets this unless `--default-org-role` says otherwise. |
+| `backup-reader` | organisation | Download encrypted backups and nothing else. Meant for a machine identity on a backup host; see [Deployment](../deployment.md#pulling-backups-from-another-host). |
 | `admin` | project | Everything in the project. |
 | `developer` | project | Read, write and delete secrets, read history, restore snapshots and manage folders. |
 | `viewer` | project | Read secrets and their values, and read the rest of the project's metadata. |
@@ -23,7 +24,7 @@ A rule has an effect (`allow` or `deny`), a subject, a list of actions and optio
 
 The actions are `read`, `read-value`, `create`, `edit` and `delete`. `read` on secrets shows key names and metadata; `read-value` is needed to see values.
 
-Project subjects are `secrets`, `secret-versions`, `snapshots`, `folders`, `environments`, `members`, `roles`, `audit-log` and `settings`. Organisation subjects are `projects`, `identities`, `org-members`, `org-roles` and `org-audit-log`.
+Project subjects are `secrets`, `secret-versions`, `snapshots`, `folders`, `environments`, `members`, `roles`, `audit-log` and `settings`. Organisation subjects are `projects`, `identities`, `org-members`, `org-roles`, `org-audit-log` and `backups`, where `read` on `backups` allows downloading an encrypted backup.
 
 Conditions narrow a rule to some secrets:
 

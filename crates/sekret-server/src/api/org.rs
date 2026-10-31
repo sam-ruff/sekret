@@ -51,6 +51,10 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[utoipa::path(get, path = "/api/v1/me", tag = "organisation", responses((status = 200, body = Me)), security(("bearer" = [])))]
 async fn me(State(state): State<AppState>, principal: Principal) -> ApiResult<Json<Me>> {
     let org_rules = org_rules(&state, &principal).await?;
+    let org_roles = crate::authz::org_role_slugs(&state, &principal).await?;
+    let is_org_admin = org_roles
+        .iter()
+        .any(|s| s == sekret_core::permissions::BuiltinRole::OrgAdmin.slug());
     Ok(Json(Me {
         kind: to_api_kind(principal.kind),
         id: principal.id,
@@ -58,6 +62,8 @@ async fn me(State(state): State<AppState>, principal: Principal) -> ApiResult<Js
         email: principal.email,
         groups: principal.groups,
         org_rules,
+        org_roles,
+        is_org_admin,
     }))
 }
 
@@ -394,7 +400,7 @@ async fn put_auth_method(
         ),
         None => None,
     };
-    let config = seal_for_storage(&state.root_key, &id, config, stored.as_ref())?;
+    let config = seal_for_storage(state.keyring.root()?.as_ref(), &id, config, stored.as_ref())?;
     let value = serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
     state
         .store

@@ -66,6 +66,14 @@ export function authorise(rules: readonly Rule[], subject: Subject, action: Acti
   return relevant.some((r) => r.effect === "allow" && allowApplies(conditionsOf(r), resource));
 }
 
+/**
+ * Whether the rules grant every action on every subject listed, as the built-in organisation admin role does.
+ * The server checks the role itself, so a custom role this generous still gets 403 from admin-only routes.
+ */
+export function grantsEverything(rules: readonly Rule[], subjects: readonly Subject[], actions: readonly Action[]): boolean {
+  return subjects.every((subject) => actions.every((action) => authorise(rules, subject, action)));
+}
+
 function conditionsEmpty(conditions: Conditions | undefined): boolean {
   if (!conditions) return true;
   return (

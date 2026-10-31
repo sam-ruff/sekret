@@ -8,6 +8,7 @@ import {
   LayoutGrid,
   Layers,
   ScrollText,
+  Server,
   Settings,
   ShieldCheck,
   Users,
@@ -38,7 +39,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useProjects } from "@/hooks/queries";
-import { useOrgPermissions } from "@/hooks/use-permissions";
+import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
 import { DOCS_URL } from "@/lib/links";
 
 interface NavItem {
@@ -133,6 +134,7 @@ function ProjectSwitcher({ current }: { current?: string }) {
 export function AppSidebar() {
   const { project } = useParams();
   const org = useOrgPermissions();
+  const orgAdmin = useIsOrgAdmin();
 
   const projectItems: NavItem[] = project
     ? [
@@ -157,6 +159,9 @@ export function AppSidebar() {
       : []),
     ...(org.can("org-audit-log", "read")
       ? [{ to: "/org/audit", label: "Audit log", icon: ScrollText, testId: "nav-org-audit" }]
+      : []),
+    ...(orgAdmin || org.can("backups", "read")
+      ? [{ to: "/org/server", label: "Server", icon: Server, testId: "nav-server" }]
       : []),
   ];
 

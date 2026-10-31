@@ -73,7 +73,7 @@ async fn create_project(
     validate::name(&request.name)?;
     let now = state.clock.now();
     let id = uuid::Uuid::new_v4().to_string();
-    let wrapped_key = wrap_data_key(&state.root_key, &DataKey::generate()?, &id)?;
+    let wrapped_key = wrap_data_key(state.keyring.root()?.as_ref(), &DataKey::generate()?, &id)?;
     let requested = request.environments.unwrap_or_else(|| {
         DEFAULT_ENVIRONMENTS
             .iter()
@@ -707,6 +707,7 @@ fn builtin_role_description(role: BuiltinRole) -> &'static str {
     match role {
         BuiltinRole::OrgAdmin => "Full control of the organisation and every project",
         BuiltinRole::OrgMember => "Can create projects",
+        BuiltinRole::BackupReader => "Download encrypted backups and nothing else",
         BuiltinRole::ProjectAdmin => "Full control of the project",
         BuiltinRole::Developer => "Read and write secrets, manage folders and restore snapshots",
         BuiltinRole::Viewer => "Read secrets and their metadata",

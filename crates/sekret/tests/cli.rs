@@ -66,7 +66,109 @@ fn ok(output: Output) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("utf8")
 }
 
-async fn start_server() -> anyhow::Result<Server> {
+/// How the round-trip server keeps its root key.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    KeyFile,
+    /// Set up unattended, then sealed and unsealed again before the test uses it.
+    Passphrase,
+}
+
+/// Runs each `async fn name(mode: Mode) -> anyhow::Result<()>` as `name::key_file` and `name::passphrase`.
+macro_rules! in_both_seal_modes {
+    ($($name:ident),* $(,)?) => {
+        $(
+            mod $name {
+                #[tokio::test]
+                async fn key_file() -> anyhow::Result<()> {
+                    super::$name(super::Mode::KeyFile).await
+                }
+
+                #[tokio::test]
+                async fn passphrase() -> anyhow::Result<()> {
+                    super::$name(super::Mode::Passphrase).await
+                }
+            }
+        )*
+    };
+}
+
+in_both_seal_modes!(
+    cli_end_to_end,
+    machine_login_saves_and_uses_a_token,
+    shell_switches_between_environments,
+    generate_and_policy_commands,
+);
+
+const PASSPHRASE: &str = "violet tractor sings beneath";
+
+async fn wait_for_health(url: &str) {
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client.get(format!("{url}/api/v1/health")).send().await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn start_server(mode: Mode) -> anyhow::Result<Server> {
+    match mode {
+        Mode::KeyFile => start_key_file_server().await,
+        Mode::Passphrase => start_passphrase_server().await,
+    }
+}
+
+async fn start_passphrase_server() -> anyhow::Result<Server> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().context("dir")?;
+    let d = dir.path();
+    std::fs::write(d.join("pass"), format!("{PASSPHRASE}\n")).context("passphrase file")?;
+    let db = format!("sqlite://{}?mode=rwc", d.join("sekret.db").display());
+    let port = free_port()?;
+    let url = format!("http://127.0.0.1:{port}");
+    let token_file = d.join("admin-token").display().to_string();
+    let child = Command::new(BIN)
+        .args(["server", "--listen", &format!("127.0.0.1:{port}"), "--public-url", &url])
+        .args(["--database-url", &db, "--seal-mode", "passphrase", "--auto-init"])
+        .args([
+            "--setup-passphrase-file",
+            "pass",
+            "--setup-admin-token-file",
+            &token_file,
+        ])
+        .current_dir(d)
+        .env_clear()
+        .env("SEKRET_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("server")?;
+    wait_for_health(&url).await;
+    let admin = std::fs::read_to_string(&token_file)
+        .context("admin token")?
+        .trim()
+        .to_string();
+    let env = [("SEKRET_URL", url.as_str()), ("SEKRET_TOKEN", admin.as_str())];
+    let sealed = ok(run(&["sys", "seal"], &env, d, None)?)?;
+    assert!(sealed.contains("state: sealed"), "{sealed}");
+    assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(2));
+    ok(run(
+        &["sys", "unseal", "--passphrase-file", "-"],
+        &env,
+        d,
+        Some(PASSPHRASE),
+    )?)?;
+    assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(0));
+    Ok(Server {
+        child,
+        url,
+        admin,
+        _dir: dir,
+    })
+}
+
+async fn start_key_file_server() -> anyhow::Result<Server> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().context("dir")?;
     let key_file = dir.path().join("root.key");
@@ -93,13 +195,7 @@ async fn start_server() -> anyhow::Result<Server> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("server")?;
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client.get(format!("{url}/api/v1/health")).send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_health(&url).await;
     let admin = ok(run(
         &[
             "admin",
@@ -135,9 +231,8 @@ async fn api(server: &Server, method: reqwest::Method, path: &str, body: Value) 
     Ok(response.json().await.unwrap_or(Value::Null))
 }
 
-#[tokio::test]
-async fn cli_end_to_end() -> anyhow::Result<()> {
-    let server = start_server().await?;
+async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
+    let server = start_server(mode).await?;
     api(
         &server,
         reqwest::Method::POST,
@@ -237,9 +332,8 @@ async fn cli_end_to_end() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn machine_login_saves_and_uses_a_token() -> anyhow::Result<()> {
-    let server = start_server().await?;
+async fn machine_login_saves_and_uses_a_token(mode: Mode) -> anyhow::Result<()> {
+    let server = start_server(mode).await?;
     api(
         &server,
         reqwest::Method::POST,
@@ -312,9 +406,8 @@ async fn machine_login_saves_and_uses_a_token() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn shell_switches_between_environments() -> anyhow::Result<()> {
-    let server = start_server().await?;
+async fn shell_switches_between_environments(mode: Mode) -> anyhow::Result<()> {
+    let server = start_server(mode).await?;
     api(
         &server,
         reqwest::Method::POST,
@@ -539,9 +632,8 @@ async fn mutual_tls_end_to_end() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn generate_and_policy_commands() -> anyhow::Result<()> {
-    let server = start_server().await?;
+async fn generate_and_policy_commands(mode: Mode) -> anyhow::Result<()> {
+    let server = start_server(mode).await?;
     api(
         &server,
         reqwest::Method::POST,
@@ -599,5 +691,415 @@ async fn generate_and_policy_commands() -> anyhow::Result<()> {
     assert!(pin.contains("created"));
     let pin = ok(run(&["secrets", "get", "PIN"], &env, h, None)?)?;
     assert!(pin.trim().len() == 8 && pin.trim().chars().all(|c| c.is_ascii_digit()));
+    Ok(())
+}
+
+/// A server process that is stopped when dropped.
+struct Process {
+    child: Child,
+    url: String,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn spawn(args: &[&str], dir: &Path) -> anyhow::Result<Process> {
+    spawn_with_env(args, &[], dir).await
+}
+
+async fn spawn_with_env(args: &[&str], env: &[(&str, &str)], dir: &Path) -> anyhow::Result<Process> {
+    let port = free_port()?;
+    let url = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
+    let mut full = vec!["server", "--listen", &listen, "--public-url", &url];
+    full.extend_from_slice(args);
+    let child = Command::new(BIN)
+        .args(&full)
+        .current_dir(dir)
+        .env_clear()
+        .env("SEKRET_LOG", "warn")
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("server")?;
+    let process = Process { child, url };
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("{}/api/v1/health", process.url))
+            .send()
+            .await
+            .is_ok()
+        {
+            return Ok(process);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("server did not start")
+}
+
+#[tokio::test]
+async fn passphrase_setup_backup_and_restore_round_trip() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().context("dir")?;
+    let d = dir.path();
+    let db = format!("sqlite://{}?mode=rwc", d.join("sekret.db").display());
+    let code_file = d.join("setup-code").display().to_string();
+    std::fs::write(d.join("pass"), "violet tractor sings beneath\n").context("passphrase file")?;
+
+    let server = spawn(&["--database-url", &db, "--setup-code-file", &code_file], d).await?;
+    let anonymous = [("SEKRET_URL", server.url.as_str())];
+    let status = run(&["sys", "status"], &anonymous, d, None)?;
+    assert_eq!(status.status.code(), Some(3), "uninitialised");
+    let code = std::fs::read_to_string(&code_file).context("setup code")?;
+    let token = ok(run(
+        &["sys", "init", "--setup-code", code.trim(), "--passphrase-file", "pass"],
+        &anonymous,
+        d,
+        None,
+    )?)?
+    .trim()
+    .to_string();
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    ok(run(&["projects", "create", "app"], &env, d, None)?)?;
+    ok(run(&["secrets", "set", "A=round-trip"], &env, d, None)?)?;
+    ok(run(&["sys", "backup", "-o", "nightly.skb"], &env, d, None)?)?;
+    let backup = std::fs::read(d.join("nightly.skb")).context("backup")?;
+    assert!(backup.starts_with(b"SKB1"));
+    assert!(!backup.windows(10).any(|w| w == b"round-trip"));
+    drop(server);
+
+    // A restart comes up sealed; the config file stands in for the flags.
+    std::fs::write(
+        d.join("sekret.yaml"),
+        format!("database:\n  url: {db}\nseal:\n  mode: passphrase\n"),
+    )
+    .context("config")?;
+    let server = spawn(&["--config", "sekret.yaml"], d).await?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(2));
+    assert!(!run(&["secrets", "get", "A"], &env, d, None)?.status.success());
+    let unsealed = ok(run(
+        &["sys", "unseal", "--passphrase-file", "-"],
+        &env,
+        d,
+        Some("violet tractor sings beneath\n"),
+    )?)?;
+    assert!(unsealed.contains("state: unsealed"), "{unsealed}");
+    assert_eq!(ok(run(&["secrets", "get", "A"], &env, d, None)?)?, "round-trip\n");
+    drop(server);
+
+    let restored = format!("sqlite://{}", d.join("restored.db").display());
+    let wrong = run(
+        &[
+            "admin",
+            "restore",
+            "--backup",
+            "nightly.skb",
+            "--database-url",
+            &restored,
+            "--passphrase-file",
+            "-",
+        ],
+        &[],
+        d,
+        Some("not the passphrase at all\n"),
+    )?;
+    assert!(!wrong.status.success());
+    assert!(!d.join("restored.db").exists());
+    ok(run(
+        &[
+            "admin",
+            "restore",
+            "--backup",
+            "nightly.skb",
+            "--database-url",
+            &restored,
+            "--passphrase-file",
+            "pass",
+        ],
+        &[],
+        d,
+        None,
+    )?)?;
+    let again = run(
+        &[
+            "admin",
+            "restore",
+            "--backup",
+            "nightly.skb",
+            "--database-url",
+            &restored,
+            "--passphrase-file",
+            "pass",
+        ],
+        &[],
+        d,
+        None,
+    )?;
+    assert!(!again.status.success(), "restore never overwrites");
+
+    let server = spawn(&["--database-url", &restored], d).await?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(2));
+    ok(run(&["sys", "unseal", "--passphrase-file", "pass"], &env, d, None)?)?;
+    assert_eq!(ok(run(&["secrets", "get", "A"], &env, d, None)?)?, "round-trip\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_side_setup_rotation_and_mode_changes() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().context("dir")?;
+    let d = dir.path();
+    let db = format!("sqlite://{}?mode=rwc", d.join("sekret.db").display());
+    std::fs::write(d.join("pass"), "violet tractor sings beneath\n").context("passphrase file")?;
+
+    let server = spawn(&["--database-url", &db, "--web-setup=false"], d).await?;
+    let anonymous = [("SEKRET_URL", server.url.as_str())];
+    let status = run(&["sys", "status", "--json"], &anonymous, d, None)?;
+    assert_eq!(status.status.code(), Some(3));
+    let status: Value = serde_json::from_slice(&status.stdout).context("json")?;
+    assert_eq!(status["web_setup"], false);
+    let refused = run(
+        &[
+            "sys",
+            "init",
+            "--setup-code",
+            "AAAA-AAAA-AAAA",
+            "--passphrase-file",
+            "pass",
+        ],
+        &anonymous,
+        d,
+        None,
+    )?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("admin init"));
+    drop(server);
+
+    let token = ok(run(
+        &["admin", "init", "--database-url", &db, "--passphrase-file", "pass"],
+        &[],
+        d,
+        None,
+    )?)?
+    .trim()
+    .to_string();
+    let server = spawn(&["--database-url", &db], d).await?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    ok(run(&["sys", "unseal", "--passphrase-file", "pass"], &env, d, None)?)?;
+    ok(run(&["projects", "create", "app"], &env, d, None)?)?;
+    ok(run(&["secrets", "set", "A=kept"], &env, d, None)?)?;
+    drop(server);
+
+    // Rotation keeps the passphrase; switching to key-file mode writes the key out.
+    ok(run(
+        &[
+            "admin",
+            "rotate-root-key",
+            "--database-url",
+            &db,
+            "--passphrase-file",
+            "pass",
+        ],
+        &[],
+        d,
+        None,
+    )?)?;
+    let key = d.join("root.key").display().to_string();
+    ok(run(
+        &[
+            "admin",
+            "set-seal-mode",
+            "key-file",
+            "--database-url",
+            &db,
+            "--root-key-file",
+            &key,
+            "--passphrase-file",
+            "pass",
+        ],
+        &[],
+        d,
+        None,
+    )?)?;
+    let conflicting = Command::new(BIN)
+        .args([
+            "server",
+            "--public-url",
+            "http://x",
+            "--database-url",
+            &db,
+            "--seal-mode",
+            "passphrase",
+            "--root-key-file",
+            &key,
+        ])
+        .current_dir(d)
+        .env_clear()
+        .output()
+        .context("conflicting start")?;
+    assert!(!conflicting.status.success());
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("set-seal-mode"));
+    let server = spawn(&["--database-url", &db, "--root-key-file", &key], d).await?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    assert_eq!(run(&["sys", "status"], &env, d, None)?.status.code(), Some(0));
+    assert_eq!(ok(run(&["secrets", "get", "A"], &env, d, None)?)?, "kept\n");
+    drop(server);
+
+    // Unattended first boot in key-file mode, with a break-glass token on disk.
+    let auto_db = format!("sqlite://{}?mode=rwc", d.join("auto.db").display());
+    let auto_key = d.join("auto.key").display().to_string();
+    let token_file = d.join("admin-token");
+    let server = spawn(
+        &[
+            "--database-url",
+            &auto_db,
+            "--seal-mode",
+            "key-file",
+            "--root-key-file",
+            &auto_key,
+            "--auto-init",
+            "--setup-admin-token-file",
+            &token_file.display().to_string(),
+        ],
+        d,
+    )
+    .await?;
+    let auto_token = std::fs::read_to_string(&token_file).context("token file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token_file).context("meta")?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let env = [("SEKRET_URL", server.url.as_str()), ("SEKRET_TOKEN", auto_token.trim())];
+    assert!(ok(run(&["whoami"], &env, d, None)?)?.contains("bootstrap-admin"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlock_policies_across_restarts() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().context("dir")?;
+    let d = dir.path();
+    let db = format!("sqlite://{}?mode=rwc", d.join("sekret.db").display());
+    std::fs::write(d.join("pass"), "violet tractor sings beneath\n").context("passphrase file")?;
+    ok(run(
+        &["admin", "init", "--database-url", &db, "--passphrase-file", "pass"],
+        &[],
+        d,
+        None,
+    )?)?;
+    let state = |server: &Process| -> anyhow::Result<Option<i32>> {
+        Ok(
+            run(&["sys", "status"], &[("SEKRET_URL", server.url.as_str())], d, None)?
+                .status
+                .code(),
+        )
+    };
+
+    let from_env = spawn_with_env(
+        &["--database-url", &db, "--unlock", "passphrase-file"],
+        &[("SEKRET_UNLOCK_PASSPHRASE", "violet tractor sings beneath")],
+        d,
+    )
+    .await?;
+    assert_eq!(state(&from_env)?, Some(0));
+    drop(from_env);
+    let from_file = spawn(
+        &[
+            "--database-url",
+            &db,
+            "--unlock",
+            "passphrase-file",
+            "--unlock-passphrase-file",
+            "pass",
+        ],
+        d,
+    )
+    .await?;
+    assert_eq!(state(&from_file)?, Some(0));
+    drop(from_file);
+    let wrong = spawn_with_env(
+        &["--database-url", &db, "--unlock", "passphrase-file"],
+        &[("SEKRET_UNLOCK_PASSPHRASE", "not the passphrase at all")],
+        d,
+    )
+    .await?;
+    assert_eq!(state(&wrong)?, Some(2));
+    drop(wrong);
+
+    // Remember: the first manual unlock writes the device key to the configured remember file.
+    let remember_flags = [
+        "--database-url",
+        &db,
+        "--unlock",
+        "remember",
+        "--remember-file",
+        "sekret.unlock-key",
+    ];
+    let remember = spawn(&remember_flags, d).await?;
+    assert_eq!(state(&remember)?, Some(2));
+    ok(run(
+        &["sys", "unseal", "--passphrase-file", "pass"],
+        &[("SEKRET_URL", remember.url.as_str())],
+        d,
+        None,
+    )?)?;
+    assert!(d.join("sekret.unlock-key").exists());
+    drop(remember);
+    let remembered = spawn(&remember_flags, d).await?;
+    assert_eq!(state(&remembered)?, Some(0));
+    Ok(())
+}
+
+#[test]
+fn version_output_is_the_release_version() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let printed = ok(run(&["--version"], &[], dir.path(), None)?)?;
+    // Release tooling checks this exact form.
+    assert_eq!(printed, format!("sekret {}\n", sekret_core::VERSION));
+    Ok(())
+}
+
+#[tokio::test]
+async fn print_config_matches_the_docs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let printed = ok(run(&["server", "--print-config"], &[], dir.path(), None)?)?;
+    let docs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/sekret.example.yaml"))
+        .context("docs")?;
+    assert_eq!(printed, docs);
     Ok(())
 }

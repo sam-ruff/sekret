@@ -12,6 +12,7 @@ export type AuthMethodConfig = Schemas["AuthMethodConfig"];
 export type AuthMethodKind = Schemas["AuthMethodKind"];
 export type BatchResult = Schemas["BatchResult"];
 export type BatchWrite = Schemas["BatchWrite"];
+export type ChangePassphrase = Schemas["ChangePassphrase"];
 export type Charset = Schemas["Charset"];
 export type ClaimBindings = Schemas["ClaimBindings"];
 export type ClientSecret = Schemas["ClientSecret"];
@@ -28,6 +29,8 @@ export type Folder = Schemas["Folder"];
 export type GenerateSecret = Schemas["GenerateSecret"];
 export type Generator = Schemas["Generator"];
 export type Identity = Schemas["Identity"];
+export type InitRequest = Schemas["InitRequest"];
+export type InitResponse = Schemas["InitResponse"];
 export type IdentityPage = Schemas["IdentityPage"];
 export type IdentitySort = Schemas["IdentitySort"];
 export type KubernetesAuthConfig = Schemas["KubernetesAuthConfig"];
@@ -39,6 +42,8 @@ export type OidcAuthConfig = Schemas["OidcAuthConfig"];
 export type OrgBinding = Schemas["OrgBinding"];
 export type Overview = Schemas["Overview"];
 export type OverviewRow = Schemas["OverviewRow"];
+export type PassphraseCheck = Schemas["PassphraseCheck"];
+export type PassphraseStrength = Schemas["PassphraseStrength"];
 export type PolicyOverride = Schemas["PolicyOverride"];
 export type PrincipalKind = Schemas["PrincipalKind"];
 export type Project = Schemas["Project"];
@@ -46,6 +51,8 @@ export type ProjectPermissions = Schemas["ProjectPermissions"];
 export type PutRole = Schemas["PutRole"];
 export type Role = Schemas["Role"];
 export type Rule = Schemas["Rule"];
+export type SealMode = Schemas["SealMode"];
+export type SealState = Schemas["SealState"];
 export type Secret = Schemas["Secret"];
 export type SecretList = Schemas["SecretList"];
 export type SecretPolicy = Schemas["SecretPolicy"];
@@ -53,12 +60,16 @@ export type SecretPolicyView = Schemas["SecretPolicyView"];
 export type SecretUpsert = Schemas["SecretUpsert"];
 export type SecretVersion = Schemas["SecretVersion"];
 export type SetSecret = Schemas["SetSecret"];
+export type SetUnlockPolicy = Schemas["SetUnlockPolicy"];
 export type Snapshot = Schemas["Snapshot"];
 export type SnapshotChange = Schemas["SnapshotChange"];
 export type SnapshotDetail = Schemas["SnapshotDetail"];
 export type SortOrder = Schemas["SortOrder"];
 export type Status = Schemas["Status"];
 export type Subject = Schemas["Subject"];
+export type SysStatus = Schemas["SysStatus"];
+export type UnlockPolicy = Schemas["UnlockPolicy"];
+export type UnsealRequest = Schemas["UnsealRequest"];
 export type UpdateEnvironment = Schemas["UpdateEnvironment"];
 export type UpdateIdentity = Schemas["UpdateIdentity"];
 export type UpdateProject = Schemas["UpdateProject"];
@@ -68,6 +79,8 @@ export type UserSort = Schemas["UserSort"];
 
 /** Returned in place of a stored write-only credential; sending it back keeps the stored value. */
 export const REDACTED_CREDENTIAL = "[redacted]";
+
+export const UNLOCK_POLICIES: readonly UnlockPolicy[] = ["manual", "remember", "passphrase-file"];
 
 export const ACTIONS: readonly Action[] = ["read", "read-value", "create", "edit", "delete"];
 
@@ -89,4 +102,5 @@ export const ORG_SUBJECTS: readonly Subject[] = [
   "org-members",
   "org-roles",
   "org-audit-log",
+  "backups",
 ];

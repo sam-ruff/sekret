@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use ipnet::IpNet;
+use sekret_core::seal::{RememberSecret, SealMode, UnlockPolicy};
 
 /// Human sign-in through an OIDC provider such as Keycloak.
 #[derive(Debug, Clone)]
@@ -28,6 +30,11 @@ pub struct ServerConfig {
     pub default_org_role: String,
     pub session_ttl: i64,
     pub cli_token_ttl: i64,
+    /// Approving a CLI login needs a browser session that signed in with the identity provider
+    /// within this many seconds; otherwise the browser is sent to sign in again.
+    pub cli_login_max_auth_age: Option<i64>,
+    /// Where backups are staged; a private directory beside the SQLite database when absent.
+    pub backup_temp_dir: Option<PathBuf>,
     /// Proxies whose `X-Forwarded-For` header is trusted for the client address.
     pub trusted_proxies: Vec<IpNet>,
     /// Permit `http://` issuer and JWKS URLs. Only for development and tests.
@@ -36,6 +43,39 @@ pub struct ServerConfig {
     pub login_rate_per_minute: u32,
     /// Serve HTTPS directly; plain HTTP behind a TLS-terminating proxy when absent.
     pub tls: Option<TlsSettings>,
+    pub seal: SealSettings,
+}
+
+/// How the root key is protected and how first-boot setup is offered.
+#[derive(Debug, Clone)]
+pub struct SealSettings {
+    /// The mode set in configuration; a database initialised in another mode is refused.
+    pub mode: Option<SealMode>,
+    /// The unlock policy set in configuration, which wins over the one chosen at setup.
+    pub unlock: Option<UnlockPolicy>,
+    pub root_key_file: Option<PathBuf>,
+    /// Device key file for the `remember` unlock policy. There is no default: it must be chosen.
+    pub remember_file: Option<PathBuf>,
+    /// Mixed into the remember key, so the remember file and database alone cannot unlock.
+    pub remember_secret: Option<RememberSecret>,
+    /// Offer first-boot setup through the API and web interface.
+    pub web_setup: bool,
+    /// Where the one-time setup code was written; removed once setup succeeds.
+    pub setup_code_file: Option<PathBuf>,
+}
+
+impl Default for SealSettings {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            unlock: None,
+            root_key_file: None,
+            remember_file: None,
+            remember_secret: None,
+            web_setup: true,
+            setup_code_file: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -77,11 +117,14 @@ impl ServerConfig {
             default_org_role: "org-member".into(),
             session_ttl: 12 * 3600,
             cli_token_ttl: 24 * 3600,
+            cli_login_max_auth_age: None,
+            backup_temp_dir: None,
             trusted_proxies: Vec::new(),
             allow_insecure_http: true,
             snapshots_to_keep: 200,
             login_rate_per_minute: 1000,
             tls: None,
+            seal: SealSettings::default(),
         }
     }
 }

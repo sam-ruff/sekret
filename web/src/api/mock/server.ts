@@ -4,21 +4,26 @@ import type {
   AuthMethodConfig,
   AuthMethodKind,
   BatchWrite,
+  ChangePassphrase,
   CreateClientSecret,
   CreateEnvironment,
   CreateIdentity,
   CreateProject,
   GenerateSecret,
   IdentitySort,
+  InitRequest,
+  PassphraseCheck,
   PolicyOverride,
   PrincipalKind,
   PutRole,
   SecretPolicy,
   SetSecret,
+  SetUnlockPolicy,
   SortOrder,
   Status,
   UpdateEnvironment,
   UpdateIdentity,
+  UnsealRequest,
   UpdateProject,
   UserSort,
 } from "../types";
@@ -30,9 +35,11 @@ import { HOSTILE_SEED, HOSTILE_SEED_FLAG } from "./hostile-values";
 import { seededState } from "./seed";
 import { hostileState } from "./seed-hostile";
 import type { MockState } from "./state";
+import { hasControls, takeControls } from "./controls";
+import { loadStrengthChecker } from "@/lib/passphrase";
 
 // Bumped whenever the stored shape changes, so an old session reseeds instead of breaking.
-const STORAGE_KEY = "sekret-mock-state-v2";
+const STORAGE_KEY = "sekret-mock-state-v3";
 const LATENCY_MS = 80;
 
 function loadState(): MockState {
@@ -61,16 +68,21 @@ function backend(): { backend: MockBackend; save: () => void } {
   state ??= loadState();
   const current = state;
   lastNow = Math.max(lastNow, ...current.audit.slice(0, 1).map((a) => a.created_at));
-  return {
-    backend: new MockBackend(current, now),
-    save: () => {
-      try {
-        window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(current));
-      } catch {
-        // Persistence is best effort.
-      }
-    },
+  const b = new MockBackend(current, now);
+  const save = () => {
+    try {
+      window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+    } catch {
+      // Persistence is best effort.
+    }
   };
+  // `?mock-state=sealed` and friends apply once and then persist for the session.
+  const controls = takeControls();
+  if (hasControls(controls)) {
+    b.applyControls(controls);
+    save();
+  }
+  return { backend: b, save };
 }
 
 interface Ctx {
@@ -102,10 +114,19 @@ function route(method: string, path: string, handler: Handler, status?: number, 
 class Binary {
   readonly bytes: Uint8Array;
   readonly contentType: string;
+  /** Sent as an attachment with this name. */
+  readonly filename?: string;
 
-  constructor(bytes: Uint8Array, contentType: string) {
+  constructor(bytes: Uint8Array, contentType: string, filename?: string) {
     this.bytes = bytes;
     this.contentType = contentType;
+    this.filename = filename;
+  }
+
+  headers(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": this.contentType };
+    if (this.filename) headers["Content-Disposition"] = `attachment; filename="${this.filename}"`;
+    return headers;
   }
 }
 
@@ -168,6 +189,21 @@ const identityQuery = (ctx: Ctx): IdentityQuery => ({
 
 const P = "/api/v1/projects/{project}";
 const E = `${P}/environments/{env}`;
+
+route("GET", "/api/v1/sys/status", (b) => b.sysStatus());
+route("POST", "/api/v1/sys/init", async (b, c) => b.init(body<InitRequest>(c), await loadStrengthChecker()));
+route("POST", "/api/v1/sys/unseal", (b, c) => b.unseal(body<UnsealRequest>(c).passphrase));
+route("POST", "/api/v1/sys/passphrase-strength", async (b, c) =>
+  b.checkPassphrase(body<PassphraseCheck>(c).passphrase, await loadStrengthChecker()),
+);
+route("POST", "/api/v1/sys/seal", (b) => b.seal());
+route("POST", "/api/v1/sys/passphrase", async (b, c) => b.changePassphrase(body<ChangePassphrase>(c), await loadStrengthChecker()), 204);
+route("PUT", "/api/v1/sys/unlock-policy", (b, c) => b.setUnlockPolicy(body<SetUnlockPolicy>(c).policy));
+route("POST", "/api/v1/sys/forget-unlock", (b) => b.forgetUnlock());
+route("GET", "/api/v1/sys/backup", (b) => {
+  const file = b.backup();
+  return new Binary(file.bytes, "application/octet-stream", file.filename);
+});
 
 route("GET", "/api/v1/auth/config", () => ({ oidc_enabled: true, login_url: "/auth/login" }));
 route("POST", "/api/v1/auth/cli/approve", (b, c) => b.approveCli(body<{ user_code: string }>(c).user_code), 204);
@@ -262,7 +298,14 @@ function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
 }
 
-const PUBLIC = new Set(["/api/v1/auth/config"]);
+/** Routes the server answers while sealed or not set up, all without a session. */
+const OPEN_WHILE_SEALED = new Set([
+  "/api/v1/sys/status",
+  "/api/v1/sys/init",
+  "/api/v1/sys/unseal",
+  "/api/v1/sys/passphrase-strength",
+]);
+const PUBLIC = new Set(["/api/v1/auth/config", ...OPEN_WHILE_SEALED]);
 
 /** Answers a request the way the real server would, against in-memory state. */
 export async function mockFetch(request: Request): Promise<Response> {
@@ -277,6 +320,7 @@ export async function mockFetch(request: Request): Promise<Response> {
 
   const { backend: b, save } = backend();
   try {
+    if (!OPEN_WHILE_SEALED.has(url.pathname)) b.requireUnsealed();
     if (!PUBLIC.has(url.pathname)) b.requireSession();
     if (method !== "GET" && request.headers.get(CSRF_HEADER) !== "1") {
       throw new MockError(403, "csrf", "missing CSRF header");
@@ -295,11 +339,15 @@ export async function mockFetch(request: Request): Promise<Response> {
     const status = match.r.status ?? 200;
     if (status === 204) return new Response(null, { status });
     if (result instanceof Binary) {
-      return new Response(result.bytes.slice().buffer, { status, headers: { "Content-Type": result.contentType } });
+      return new Response(result.bytes.slice().buffer, { status, headers: result.headers() });
     }
     return json(status, result ?? null);
   } catch (error) {
-    if (error instanceof MockError) return json(error.status, { error: error.code, message: error.message });
+    // A failed call can still change state, such as counting a wrong passphrase.
+    save();
+    if (error instanceof MockError) {
+      return json(error.status, { ...error.extra, error: error.code, message: error.message });
+    }
     return json(500, { error: "internal", message: error instanceof Error ? error.message : "mock failure" });
   }
 }
@@ -307,5 +355,12 @@ export async function mockFetch(request: Request): Promise<Response> {
 export function mockSignIn(): void {
   const { backend: b, save } = backend();
   b.signIn();
+  save();
+}
+
+/** Seals the fake server as if someone else had, for trying what an open tab does next. */
+export function mockSealServer(): void {
+  const { backend: b, save } = backend();
+  b.applyControls({ state: "sealed" });
   save();
 }

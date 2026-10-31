@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.92"
+libc = "0.2.191"
 mockall = { version = "0.15.0", optional = true }
 sekret-core = { version = "0.1.0", path = "../sekret-core" }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -12,11 +13,13 @@ serde_json = "1.0.154"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres", "migrate", "tls-rustls-ring-webpki", "macros"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "macros"] }
+tracing = "0.1.44"
 uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"
 mockall = "0.15.0"
+tempfile = "3.27.0"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1.29.0", features = ["v4"] }

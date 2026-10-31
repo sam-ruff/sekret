@@ -15,6 +15,13 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# Argon2 at its production cost is far too slow unoptimised, which makes every test that unseals crawl.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

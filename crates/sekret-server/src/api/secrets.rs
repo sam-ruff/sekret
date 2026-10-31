@@ -108,7 +108,7 @@ async fn list_secrets(
         .list_secrets(&scope.env.id, &path, params.recursive, false)
         .await?;
     let key = if params.values {
-        Some(data_key(&state.root_key, &scope.project)?)
+        Some(data_key(state.keyring.root()?.as_ref(), &scope.project)?)
     } else {
         None
     };
@@ -180,7 +180,7 @@ async fn write(
     upserts: Vec<SecretUpsert>,
     deletes: Vec<String>,
 ) -> ApiResult<BatchResult> {
-    let ctx = secret_ctx(state, principal);
+    let ctx = secret_ctx(state, principal)?;
     let planned = plan_batch(&ctx, &scope.rules, &scope.project, &scope.env, path, upserts, deletes).await?;
     let result = apply(&ctx, planned).await?;
     let normalised = validate::folder_path(path)?;
@@ -243,7 +243,7 @@ async fn get_secret(
 ) -> ApiResult<Json<Secret>> {
     let scope = scope(&state, &principal, &project, &env).await?;
     let (path, s) = load_secret(&state, &scope, &params.path, &key).await?;
-    let dk = data_key(&state.root_key, &scope.project)?;
+    let dk = data_key(state.keyring.root()?.as_ref(), &scope.project)?;
     let secret = to_api(Some(&dk), &scope.project, &scope.env.slug, &s, &scope.rules, true)?;
     if secret.value.is_some() {
         audit(
@@ -328,7 +328,7 @@ async fn list_versions(
             && allowed(&scope.rules, Subject::Secrets, Action::ReadValue, resource)
     };
     let reveal_current = params.values && may_reveal(&resource);
-    let dk = data_key(&state.root_key, &scope.project)?;
+    let dk = data_key(state.keyring.root()?.as_ref(), &scope.project)?;
     let mut versions = Vec::new();
     let mut revealed_any = false;
     for v in state.store.list_versions(&s.secret.id).await? {
@@ -388,7 +388,7 @@ async fn rollback(
         .get_secret(&scope.env.id, &path, &key)
         .await?
         .ok_or_else(|| ApiError::not_found("secret"))?;
-    let ctx = secret_ctx(&state, &principal);
+    let ctx = secret_ctx(&state, &principal)?;
     let planned = plan_rollback(
         &ctx,
         &scope.rules,
@@ -429,7 +429,7 @@ async fn generate_secret(
 ) -> ApiResult<Json<BatchResult>> {
     let scope = scope(&state, &principal, &project, &env).await?;
     let path = validate::folder_path(&params.path)?;
-    let mut ctx = secret_ctx(&state, &principal);
+    let mut ctx = secret_ctx(&state, &principal)?;
     ctx.generated = true;
     let target = Target {
         project: &scope.project,
@@ -648,7 +648,7 @@ async fn restore_snapshot(
     };
     require(&scope.rules, Subject::Snapshots, Action::Edit, &env_resource)?;
     let snapshot = load_snapshot(&state, &scope, &id).await?;
-    let ctx = secret_ctx(&state, &principal);
+    let ctx = secret_ctx(&state, &principal)?;
     let planned = plan_restore(&ctx, &scope.rules, &scope.project, &scope.env, &snapshot, &path).await?;
     let result = apply(&ctx, planned).await?;
     audit(
@@ -689,7 +689,7 @@ async fn raw_secrets(
 ) -> ApiResult<Json<RawSecrets>> {
     let scope = scope(&state, &principal, &params.project, &params.environment).await?;
     let path = validate::folder_path(&params.path)?;
-    let dk = data_key(&state.root_key, &scope.project)?;
+    let dk = data_key(state.keyring.root()?.as_ref(), &scope.project)?;
     let mut secrets = Vec::new();
     for s in state
         .store

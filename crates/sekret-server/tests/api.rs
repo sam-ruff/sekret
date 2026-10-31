@@ -171,7 +171,223 @@ on_both_backends!(
     hostile_text_is_inert,
     root_key_rotation_keeps_secrets_readable,
     kubernetes_reviewer_tokens_are_write_only_and_survive_rotation,
+    backups_permission_and_the_backup_reader_role,
+    system_actions_are_audited,
 );
+
+/// A key-file server set up through the production start path, so a seal configuration exists.
+async fn key_file_server(db: &common::Persistent) -> anyhow::Result<Harness> {
+    use sekret_core::seal::SealMode;
+    use sekret_server::config::SealSettings;
+    use sekret_server::seal::{AutoInit, StartupSecrets};
+    let settings = SealSettings {
+        mode: Some(SealMode::KeyFile),
+        root_key_file: Some(db.dir.path().join("root.key")),
+        ..SealSettings::default()
+    };
+    let secrets = StartupSecrets {
+        unlock_passphrase: None,
+        auto_init: Some(AutoInit { passphrase: None }),
+    };
+    start(common::opened(&db.url, settings, secrets)).await
+}
+
+async fn backups_permission_and_the_backup_reader_role(db: String) -> anyhow::Result<()> {
+    let postgres = db.starts_with("postgres");
+    let db = common::persistent(&db)?;
+    let h = key_file_server(&db).await?;
+    h.create_project("app").await?;
+    h.set_secrets("app", "dev", "/", &[("A", "b")]).await?;
+
+    let backups = json!({"name": "Backups", "rules": [{"effect": "allow", "subject": "backups", "actions": ["read"]}]});
+    let (status, _) = h
+        .put("/api/v1/projects/app/roles/backups", &h.admin, backups.clone())
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "backups is an organisation subject");
+    let (status, body) = h.put("/api/v1/org/roles/backup-puller", &h.admin, backups).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let denied = json!({"name": "No backups", "rules": [
+        {"effect": "allow", "subject": "backups", "actions": ["read"]},
+        {"effect": "deny", "subject": "backups", "actions": ["read"]}
+    ]});
+    h.put("/api/v1/org/roles/no-backups", &h.admin, denied).await?;
+
+    let custom = h.org_identity_as("puller", "backup-puller", &h.admin).await?;
+    let reader = h.org_identity_as("reader", "backup-reader", &h.admin).await?;
+    let member = h.org_identity_as("member", "org-member", &h.admin).await?;
+    let blocked = h.org_identity_as("blocked", "no-backups", &h.admin).await?;
+    let (_, project_viewer) = h.machine("viewer", "app", "viewer").await?;
+    let allowed = if postgres {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::OK
+    };
+    for (who, token, expected) in [
+        ("org-admin", h.admin.as_str(), allowed),
+        ("custom role", custom.as_str(), allowed),
+        ("backup-reader", reader.as_str(), allowed),
+        ("org-member", member.as_str(), StatusCode::FORBIDDEN),
+        ("deny wins", blocked.as_str(), StatusCode::FORBIDDEN),
+        ("project viewer", project_viewer.as_str(), StatusCode::FORBIDDEN),
+    ] {
+        let (status, _) = h.post("/api/v1/sys/backup", token, json!({})).await?;
+        assert_eq!(status, expected, "{who}");
+    }
+
+    let (_, me) = h.get("/api/v1/me", &reader).await?;
+    assert_eq!(
+        me["org_rules"],
+        json!([{"effect": "allow", "subject": "backups", "actions": ["read"]}])
+    );
+    let forbidden = [
+        (Method::GET, "/api/v1/users", None),
+        (Method::GET, "/api/v1/identities", None),
+        (Method::GET, "/api/v1/audit", None),
+        (Method::GET, "/api/v1/org/bindings", None),
+        (Method::GET, "/api/v1/org/roles", None),
+        (
+            Method::POST,
+            "/api/v1/projects",
+            Some(json!({"slug": "nope", "name": "nope"})),
+        ),
+        (Method::POST, "/api/v1/identities", Some(json!({"name": "nope"}))),
+        (
+            Method::POST,
+            "/api/v1/org/bindings",
+            Some(json!({"principal_kind": "group", "principal_id": "g", "role": "org-admin"})),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/org/roles/mine",
+            Some(json!({"name": "Mine", "rules": []})),
+        ),
+        (Method::POST, "/api/v1/sys/seal", Some(json!({}))),
+        (
+            Method::POST,
+            "/api/v1/sys/passphrase",
+            Some(json!({"current": "a", "new": "b"})),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/sys/unlock-policy",
+            Some(json!({"policy": "manual"})),
+        ),
+        (Method::POST, "/api/v1/sys/forget-unlock", Some(json!({}))),
+        (
+            Method::POST,
+            "/api/v1/sys/passphrase-strength",
+            Some(json!({"passphrase": "x"})),
+        ),
+    ];
+    for (method, path, body) in forbidden {
+        let (status, _) = h.call(method.clone(), path, Some(&reader), body).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "backup-reader {method} {path}");
+    }
+    for path in [
+        "/api/v1/projects/app",
+        "/api/v1/projects/app/environments/dev/secrets",
+        "/api/v1/projects/app/environments/dev/secrets/A",
+        "/api/v1/projects/app/audit",
+    ] {
+        let (status, _) = h.get(path, &reader).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "backup-reader {path}");
+    }
+    let (status, projects) = h.get("/api/v1/projects", &reader).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!projects.to_string().contains("\"app\""), "{projects}");
+    Ok(())
+}
+
+async fn system_actions_are_audited(db: String) -> anyhow::Result<()> {
+    use sekret_server::config::SealSettings;
+    use sekret_server::seal::StartupSecrets;
+
+    let postgres = db.starts_with("postgres");
+    let db = common::persistent(&db)?;
+    let settings = SealSettings {
+        remember_file: Some(db.dir.path().join("unlock.key")),
+        ..SealSettings::default()
+    };
+    let h = start(common::opened(&db.url, settings, StartupSecrets::default())).await?;
+    let first = "violet tractor sings beneath";
+    let second = "copper lantern drifts at dawn";
+    let code = h.state.keyring.setup_code().context("setup code")?;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/sys/init",
+            None,
+            Some(json!({"setup_code": code.as_str(), "mode": "passphrase", "passphrase": first})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let admin = body["admin_token"].as_str().context("token")?.to_string();
+
+    let steps = [
+        (
+            Method::PUT,
+            "/api/v1/sys/unlock-policy",
+            json!({"policy": "remember", "passphrase": first}),
+        ),
+        (Method::POST, "/api/v1/sys/forget-unlock", json!({})),
+        (
+            Method::POST,
+            "/api/v1/sys/passphrase",
+            json!({"current": first, "new": second}),
+        ),
+        (Method::POST, "/api/v1/sys/seal", json!({})),
+    ];
+    for (method, path, body) in steps {
+        let (status, response) = h.call(method, path, Some(&admin), Some(body)).await?;
+        assert!(status.is_success(), "{path}: {status} {response}");
+    }
+    for (passphrase, expected) in [(first, StatusCode::UNAUTHORIZED), (second, StatusCode::OK)] {
+        let (status, _) = h
+            .call(
+                Method::POST,
+                "/api/v1/sys/unseal",
+                None,
+                Some(json!({"passphrase": passphrase})),
+            )
+            .await?;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = h.post("/api/v1/sys/backup", &admin, json!({})).await?;
+    assert_eq!(status.is_success(), !postgres);
+
+    let (_, audit) = h.get("/api/v1/audit?limit=100&order=asc", &admin).await?;
+    let entries = audit["entries"].as_array().context("entries")?;
+    let sys: Vec<(&str, &str)> = entries
+        .iter()
+        .filter_map(|e| Some((e["action"].as_str()?, e["actor_name"].as_str()?)))
+        .filter(|(action, _)| action.starts_with("sys."))
+        .collect();
+    let mut expected = vec![
+        ("sys.init", "identity:setup"),
+        ("sys.unlock_policy", "user:bootstrap-admin"),
+        ("sys.forget_unlock", "user:bootstrap-admin"),
+        ("sys.passphrase", "user:bootstrap-admin"),
+        ("sys.seal", "user:bootstrap-admin"),
+        ("sys.unseal.failed", "identity:unseal"),
+        ("sys.unseal", "identity:unseal"),
+    ];
+    if !postgres {
+        expected.push(("sys.backup", "user:bootstrap-admin"));
+    }
+    assert_eq!(sys, expected);
+    let policy = entries
+        .iter()
+        .find(|e| e["action"] == "sys.unlock_policy")
+        .context("policy entry")?;
+    assert_eq!(policy["detail"]["policy"], "remember");
+    assert!(entries.iter().all(|e| e["ip"] == "127.0.0.1"));
+    let text = audit.to_string();
+    assert!(
+        !text.contains(first) && !text.contains(second),
+        "no passphrases in the audit log"
+    );
+    Ok(())
+}
 
 async fn secrets_history_rollback_and_snapshots(db: String) -> anyhow::Result<()> {
     let h = start(options(db)).await?;
@@ -1397,7 +1613,8 @@ async fn root_key_rotation_keeps_secrets_readable(db: String) -> anyhow::Result<
     h.create_project("app").await?;
     h.set_secrets("app", "dev", "/", &[("A", "before")]).await?;
     let new_root = RootKey::generate().context("key")?;
-    let count = sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &h.state.root_key, &new_root)
+    let old_root = h.state.keyring.root().map_err(api_error("root"))?;
+    let count = sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &old_root, &new_root, None)
         .await
         .map_err(api_error("rotate"))?;
     assert_eq!(count, 1);
@@ -1422,7 +1639,7 @@ async fn root_key_rotation_keeps_secrets_readable(db: String) -> anyhow::Result<
         .map_err(api_error("decrypt"))?
         .context("value")?;
     assert_eq!(value.as_str(), "before");
-    assert!(sekret_server::secrets::data_key(&h.state.root_key, &project).is_err());
+    assert!(sekret_server::secrets::data_key(&old_root, &project).is_err());
     Ok(())
 }
 
@@ -1462,14 +1679,15 @@ async fn kubernetes_reviewer_tokens_are_write_only_and_survive_rotation(db: Stri
     assert_eq!(stored_config().await?, first);
 
     let new_root = RootKey::generate().context("key")?;
-    sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &h.state.root_key, &new_root)
+    let old_root = h.state.keyring.root().map_err(api_error("root"))?;
+    sekret_server::admin::rotate_root_key(h.state.store.as_ref(), &old_root, &new_root, None)
         .await
         .map_err(api_error("rotate"))?;
     let rotated: sekret_api::AuthMethodConfig = serde_json::from_value(stored_config().await?).context("config")?;
     let sekret_api::AuthMethodConfig::Kubernetes(mut k8s) = rotated else {
         anyhow::bail!("kubernetes config expected");
     };
-    assert!(sekret_server::machine::unseal_reviewer(&h.state.root_key, id, &mut k8s.clone()).is_err());
+    assert!(sekret_server::machine::unseal_reviewer(&old_root, id, &mut k8s.clone()).is_err());
     sekret_server::machine::unseal_reviewer(&new_root, id, &mut k8s).map_err(api_error("unseal"))?;
     assert_eq!(k8s.reviewer_jwt.as_deref(), Some("reviewer-plaintext"));
     Ok(())

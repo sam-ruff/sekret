@@ -758,6 +758,155 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sys/backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description POST, so a browser session needs the CSRF header like any other change. */
+        post: operations["backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/forget-unlock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["forget_unlock"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/init": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["init"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/passphrase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase. */
+        post: operations["change_passphrase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/passphrase-strength": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Open while uninitialised; afterwards only for organisation admins. */
+        post: operations["check_passphrase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/seal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Drops the root key from memory. A remembered unlock is kept, so the next restart unlocks itself; forget the unlock as well to stop that. */
+        post: operations["seal_now"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/unlock-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** @description `remember` and `passphrase-file` need the current passphrase in the body; `manual` does not. */
+        put: operations["set_unlock_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sys/unseal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["unseal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/users": {
         parameters: {
             query?: never;
@@ -875,6 +1024,10 @@ export interface components {
             deletes?: string[];
             path?: string;
             upserts?: components["schemas"]["SecretUpsert"][];
+        };
+        ChangePassphrase: {
+            current: string;
+            new: string;
         };
         /** @enum {string} */
         Charset: "alphanumeric" | "symbols" | "hex" | "base64url" | "numeric";
@@ -1000,6 +1153,7 @@ export interface components {
         ErrorBody: {
             error: string;
             message: string;
+            strength?: components["schemas"]["PassphraseStrength"] | null;
         };
         Folder: {
             /** Format: int64 */
@@ -1037,6 +1191,24 @@ export interface components {
         };
         /** @enum {string} */
         IdentitySort: "name" | "created";
+        InitRequest: {
+            mode: components["schemas"]["SealMode"];
+            /** @description Required in passphrase mode; at least 12 characters. */
+            passphrase?: string | null;
+            /** @description The one-time code from the server log. */
+            setup_code: string;
+            unlock_policy?: components["schemas"]["UnlockPolicy"] | null;
+        };
+        InitResponse: {
+            /** @description A short-lived organisation admin token, shown once. */
+            admin_token: string;
+            /**
+             * Format: int64
+             * @description Unix seconds when `admin_token` stops working.
+             */
+            admin_token_expires_at?: number;
+            status: components["schemas"]["SysStatus"];
+        };
         JwtLoginRequest: {
             identity_id: string;
             /** @description The OIDC or Kubernetes service account token. */
@@ -1076,8 +1248,12 @@ export interface components {
             email: string;
             groups: string[];
             id: string;
+            /** @description Holds `org-admin`, the same check the system routes make. */
+            is_org_admin?: boolean;
             kind: components["schemas"]["PrincipalKind"];
             name: string;
+            /** @description Organisation role slugs held, including those implied by configuration. */
+            org_roles?: string[];
             /** @description Organisation-level rules, so clients can hide actions that would be refused. */
             org_rules: components["schemas"]["Rule"][];
         };
@@ -1114,6 +1290,18 @@ export interface components {
             };
             key: string;
             path: string;
+        };
+        PassphraseCheck: {
+            passphrase: string;
+        };
+        /** @description zxcvbn's verdict on a passphrase, from 0 (guessable) to 4. */
+        PassphraseStrength: {
+            /** @description Long enough, free of control characters and scores 4. */
+            acceptable: boolean;
+            /** Format: int32 */
+            score: number;
+            suggestions: string[];
+            warning?: string | null;
         };
         /** @description A secret's own setting: follow the project, or use `policy` (which may switch everything off). */
         PolicyOverride: {
@@ -1174,6 +1362,16 @@ export interface components {
             effect: components["schemas"]["Effect"];
             subject: components["schemas"]["Subject"];
         };
+        /**
+         * @description How the root key is kept between restarts.
+         * @enum {string}
+         */
+        SealMode: "passphrase" | "key-file";
+        /**
+         * @description Whether the server can reach its secrets.
+         * @enum {string}
+         */
+        SealState: "uninitialised" | "sealed" | "unsealed";
         Secret: {
             comment: string;
             environment: string;
@@ -1241,6 +1439,14 @@ export interface components {
             tags?: string[] | null;
             value: string;
         };
+        SetUnlockPolicy: {
+            /**
+             * @description The current passphrase; required for `remember` and `passphrase-file`, which weaken how
+             *     the server is unlocked.
+             */
+            passphrase?: string | null;
+            policy: components["schemas"]["UnlockPolicy"];
+        };
         Snapshot: {
             actor: string;
             /** Format: int64 */
@@ -1271,7 +1477,24 @@ export interface components {
         /** @enum {string} */
         Status: "active" | "disabled";
         /** @enum {string} */
-        Subject: "secrets" | "secret-versions" | "snapshots" | "folders" | "environments" | "members" | "roles" | "audit-log" | "settings" | "projects" | "identities" | "org-members" | "org-roles" | "org-audit-log";
+        Subject: "secrets" | "secret-versions" | "snapshots" | "folders" | "environments" | "members" | "roles" | "audit-log" | "settings" | "projects" | "identities" | "org-members" | "org-roles" | "org-audit-log" | "backups";
+        /** @description Always answered without authentication, so monitoring can alert on a sealed server. */
+        SysStatus: {
+            /** @description The unlock policy comes from server configuration and cannot be changed through the API. */
+            configured: boolean;
+            /**
+             * @description A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not
+             *     clear it; forget the unlock for that.
+             */
+            remembered: boolean;
+            seal_mode?: components["schemas"]["SealMode"] | null;
+            state: components["schemas"]["SealState"];
+            unlock_policy?: components["schemas"]["UnlockPolicy"] | null;
+            unsealed_by?: components["schemas"]["UnsealedBy"] | null;
+            version: string;
+            /** @description First-boot setup is offered through the API and web interface. */
+            web_setup: boolean;
+        };
         TokenResponse: {
             access_token: string;
             /**
@@ -1285,6 +1508,19 @@ export interface components {
             client_id: string;
             client_secret: string;
         };
+        /**
+         * @description How a passphrase-mode server gets unlocked after it starts.
+         * @enum {string}
+         */
+        UnlockPolicy: "manual" | "remember" | "passphrase-file";
+        UnsealRequest: {
+            passphrase: string;
+        };
+        /**
+         * @description How the root key got into memory this time.
+         * @enum {string}
+         */
+        UnsealedBy: "passphrase" | "remember" | "key-file" | "passphrase-file";
         UpdateEnvironment: {
             name: string;
             /** Format: int64 */
@@ -3005,6 +3241,439 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RawSecrets"];
+                };
+            };
+        };
+    };
+    backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An encrypted `.skb` backup */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": components["schemas"]["LogoFile"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Another backup is running */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Postgres; use pg_dump */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Too large to back up through the API */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    forget_unlock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    init: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InitRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InitResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    change_passphrase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePassphrase"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_passphrase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PassphraseCheck"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassphraseStrength"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    seal_now: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+        };
+    };
+    set_unlock_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetUnlockPolicy"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unseal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnsealRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SysStatus"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
         };

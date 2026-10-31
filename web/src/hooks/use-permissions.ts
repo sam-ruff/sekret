@@ -2,7 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "@/api/endpoints";
 import type { Action, Subject } from "@/api/types";
-import { authorise, maySomewhere, type Resource, type Rule } from "@/lib/permissions";
+import { ACTIONS, ORG_SUBJECTS } from "@/api/types";
+import { authorise, grantsEverything, maySomewhere, type Resource, type Rule } from "@/lib/permissions";
 import { keys, useMe } from "./queries";
 
 export interface Permissions {
@@ -35,4 +36,11 @@ export function useOrgPermissions(): Permissions {
   const { data } = useMe();
   const rules = data?.org_rules;
   return useMemo(() => permissionsFrom(rules), [rules]);
+}
+
+/** True for organisation admins, who alone may seal the server or change how it unlocks. */
+export function useIsOrgAdmin(): boolean {
+  const { data } = useMe();
+  const rules = data?.org_rules;
+  return useMemo(() => (rules ? grantsEverything(rules, ORG_SUBJECTS, ACTIONS) : false), [rules]);
 }

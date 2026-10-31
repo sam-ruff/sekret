@@ -14,29 +14,32 @@ The binary is statically linked, so it runs on any x86-64 Linux distribution. Th
 
 ## Start a server
 
-Every server needs a root key. It wraps the per-project keys that encrypt your secrets, so losing it means losing the data.
-
 ```sh
 mkdir -p ~/sekret-demo && cd ~/sekret-demo
-sekret admin generate-root-key > root.key
-chmod 600 root.key
-
-sekret server \
-  --public-url http://localhost:8080 \
-  --root-key-file root.key \
-  --database-url 'sqlite://sekret.db?mode=rwc'
+sekret server --public-url http://localhost:8080 --database-url 'sqlite://sekret.db?mode=rwc'
 ```
 
-Open <http://localhost:8080>. Without an OIDC provider nobody can sign in through the browser yet, so get a one-hour admin token from a second terminal instead:
+The first start prints a one-time setup code in the log, such as `setup code: K7QM-3XRA-WH9P`. Open <http://localhost:8080> and enter it, or finish from a second terminal:
 
 ```sh
-cd ~/sekret-demo
-export SEKRET_TOKEN=$(sekret admin bootstrap --root-key-file root.key --database-url 'sqlite://sekret.db?mode=rwc')
 export SEKRET_URL=http://localhost:8080
+export SEKRET_TOKEN=$(sekret sys init)
 sekret whoami
 ```
 
-`sekret admin bootstrap` talks to the database directly, so it only works on the server host. The token it prints belongs to a built-in break-glass admin; use it to set things up, then sign in properly through your OIDC provider (see [Configuration](configuration.md#signing-in-with-oidc)).
+Setup asks for the code, then for a passphrase twice. The passphrase protects the root key, which wraps the per-project keys that encrypt your secrets. It needs to be at least 12 characters and hard to guess; a few unrelated words works well. There is no recovery key, so if you lose the passphrase you lose the data.
+
+Setup prints an admin token valid for an hour. It belongs to a built-in break-glass admin; use it to set things up, then sign in properly through your OIDC provider (see [Configuration](configuration.md#signing-in-with-oidc)).
+
+Stop the server and start it again, and it comes back sealed. Unlock it with `sekret sys unseal` or on the web page; [Unlocking](unlocking.md) covers the other ways to do this.
+
+If you would rather keep the root key in a file and never unlock anything, generate one and pass it in; the server then starts unlocked every time, and `sekret admin bootstrap` prints an admin token:
+
+```sh
+sekret admin generate-root-key > root.key && chmod 600 root.key
+sekret server --public-url http://localhost:8080 --root-key-file root.key &
+export SEKRET_TOKEN=$(sekret admin bootstrap --root-key-file root.key)
+```
 
 ## Store and use a secret
 

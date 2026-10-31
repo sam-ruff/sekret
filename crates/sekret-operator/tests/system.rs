@@ -14,21 +14,23 @@ use kube::api::{Api, ObjectMeta, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config, CustomResourceExt};
 use sekret_client::ClientOptions;
-use sekret_core::crypto::RootKey;
 use sekret_operator::{
     AuthSpec, Context, HttpSekretFactory, KubeClient, SekretSecret, SekretSecretSpec, TargetSpec, run_controller,
 };
-use sekret_server::clock::SystemClock;
+use sekret_server::clock::{Clock, SystemClock};
 use sekret_server::config::ServerConfig;
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
+use sekret_server::seal::{AutoInit, StartupSecrets, open_keyring};
 use sekret_server::state::{Dependencies, build_state};
 use sekret_store::SqlStore;
 use serde_json::{Value, json};
 use testcontainers_modules::k3s::{K3s, KUBE_SECURE_PORT};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use zeroize::Zeroizing;
 
 const K3S_TAG: &str = "v1.33.5-k3s1";
+const PASSPHRASE: &str = "violet tractor sings beneath";
 const NAMESPACE: &str = "apps";
 const SERVICE_ACCOUNT: &str = "reader";
 
@@ -99,19 +101,25 @@ struct Sekret {
 }
 
 impl Sekret {
+    /// A passphrase-mode server set up through the production start path, so it can be sealed.
     async fn start() -> anyhow::Result<Self> {
         let store = Arc::new(SqlStore::connect("sqlite::memory:").await.context("store")?);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let addr = listener.local_addr().context("addr")?;
         let mut config = ServerConfig::for_tests("sqlite::memory:");
         config.public_url = format!("http://{addr}");
-        let root_key = RootKey::generate().context("root key")?;
-        sekret_server::check_root_key(store.as_ref(), &root_key.fingerprint())
+        let secrets = StartupSecrets {
+            unlock_passphrase: None,
+            auto_init: Some(AutoInit {
+                passphrase: Some(Zeroizing::new(PASSPHRASE.to_string())),
+            }),
+        };
+        let opened = open_keyring(store.as_ref(), SystemClock.now(), &config.seal, secrets)
             .await
-            .context("root key check")?;
+            .context("open keyring")?;
         let state = build_state(Dependencies {
             store,
-            root_key,
+            keyring: opened.keyring,
             config,
             clock: Arc::new(SystemClock),
             http: Arc::new(ReqwestOidcHttp::new(true).context("http")?),
@@ -146,6 +154,20 @@ impl Sekret {
         let text = response.text().await.context("body")?;
         assert!(status.is_success(), "{path}: {status} {text}");
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    async fn unseal(&self) -> anyhow::Result<Value> {
+        let response = self
+            .http
+            .post(format!("{}/api/v1/sys/unseal", self.base))
+            .json(&json!({"passphrase": PASSPHRASE}))
+            .send()
+            .await
+            .context("unseal")?;
+        let status = response.status();
+        let body: Value = response.json().await.context("json")?;
+        assert!(status.is_success(), "unseal: {status} {body}");
+        Ok(body)
     }
 
     async fn set_secrets(&self, pairs: &[(&str, &str)]) -> anyhow::Result<()> {
@@ -429,6 +451,36 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
     wait_for("the refreshed value", Duration::from_secs(60), || async {
         let secret = secrets.get_opt("app-env").await.ok().flatten()?;
         (secret_value(&secret, "API_KEY").as_deref() == Some("k2")).then_some(())
+    })
+    .await;
+
+    // Sealing the server fails every sync, so the resource goes not-ready and the Secret keeps
+    // its last values; unsealing brings it back without restarting anything.
+    let sealed = sekret
+        .send(reqwest::Method::POST, "/api/v1/sys/seal", json!({}))
+        .await?;
+    assert_eq!(sealed["state"], "sealed");
+    let ready_is = |wanted: &'static str| {
+        let resources = resources.clone();
+        move || {
+            let resources = resources.clone();
+            async move {
+                let status = resources.get("app-config").await.ok()?.status?;
+                status.ready().is_some_and(|c| c.status == wanted).then_some(status)
+            }
+        }
+    };
+    let not_ready = wait_for("Ready=False while sealed", Duration::from_secs(60), ready_is("False")).await;
+    assert!(not_ready.ready().is_some_and(|c| c.reason != "Synced"));
+    let kept = secrets.get("app-env").await.context("secret while sealed")?;
+    assert_eq!(secret_value(&kept, "API_KEY").as_deref(), Some("k2"));
+
+    assert_eq!(sekret.unseal().await?["state"], "unsealed");
+    wait_for("Ready=True after unsealing", Duration::from_secs(60), ready_is("True")).await;
+    sekret.set_secrets(&[("API_KEY", "k3")]).await?;
+    wait_for("a value written after unsealing", Duration::from_secs(60), || async {
+        let secret = secrets.get_opt("app-env").await.ok().flatten()?;
+        (secret_value(&secret, "API_KEY").as_deref() == Some("k3")).then_some(())
     })
     .await;
 

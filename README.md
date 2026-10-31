@@ -45,10 +45,9 @@ The script installs the latest release for x86-64 Linux after checking its SHA-2
 ## Try it
 
 ```sh
-sekret admin generate-root-key > root.key
-sekret server --public-url http://localhost:8080 --root-key-file root.key &
+sekret server --public-url http://localhost:8080 &   # prints a one-time setup code
 export SEKRET_URL=http://localhost:8080
-export SEKRET_TOKEN=$(sekret admin bootstrap --root-key-file root.key)
+export SEKRET_TOKEN=$(sekret sys init)                # asks for the code and a passphrase
 
 sekret projects create demo
 sekret secrets set -p demo -e dev DATABASE_URL=postgres://localhost/demo

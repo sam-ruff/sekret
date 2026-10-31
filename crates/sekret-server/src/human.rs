@@ -106,17 +106,52 @@ pub async fn auth_config(State(state): State<AppState>) -> Json<AuthConfig> {
 #[derive(Deserialize)]
 pub struct LoginQuery {
     return_to: Option<String>,
+    /// Ask the provider to authenticate the person again, for approving a CLI login.
+    #[serde(default)]
+    reauth: Option<String>,
+}
+
+/// When the browser's current session last authenticated with the provider, if it has one.
+async fn session_auth_time(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<i64>> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    Ok(state
+        .store
+        .find_token(&hash_token(token))
+        .await?
+        .and_then(|record| record.auth_time))
+}
+
+/// Whether an authentication at `auth_time` is recent enough under `max_age`, allowing a minute
+/// of clock difference with the provider.
+pub fn fresh_enough(auth_time: Option<i64>, max_age: i64, now: i64) -> bool {
+    auth_time.is_some_and(|at| at <= now + 60 && now - at <= max_age + 60)
+}
+
+/// The sign-in URL that asks the provider for a fresh authentication, then returns to `return_to`.
+pub fn reauth_url(return_to: &str) -> String {
+    format!(
+        "/auth/login?reauth=1&return_to={}",
+        url::form_urlencoded::byte_serialize(return_to.as_bytes()).collect::<String>()
+    )
 }
 
 pub async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> ApiResult<Response> {
     let config = oidc(&state)?;
-    if !state.login_limiter.allow(&ip) {
+    if !state.login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
+    let max_age = state.config.cli_login_max_auth_age.filter(|_| query.reauth.is_some());
+    let prompt_login = match max_age {
+        Some(max_age) => !fresh_enough(session_auth_time(&state, &headers).await?, max_age, state.clock.now()),
+        None => false,
+    };
     let discovery = state
         .jwt
         .discover(&config.issuer)
@@ -136,6 +171,7 @@ pub async fn login(
             pkce_verifier: verifier.to_string(),
             return_to: safe_return_to(query.return_to.as_deref()),
             created_at: state.clock.now(),
+            max_age,
         })
         .await?;
     let mut url = url::Url::parse(endpoint).map_err(|e| ApiError::internal("authorization endpoint", e))?;
@@ -148,6 +184,12 @@ pub async fn login(
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", &pkce_challenge(&verifier))
         .append_pair("code_challenge_method", "S256");
+    if let Some(max_age) = max_age {
+        url.query_pairs_mut().append_pair("max_age", &max_age.to_string());
+    }
+    if prompt_login {
+        url.query_pairs_mut().append_pair("prompt", "login");
+    }
     let mut response = Redirect::to(url.as_str()).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -250,6 +292,15 @@ async fn finish_login(
     if claims["nonce"].as_str() != Some(saved.nonce.as_str()) {
         return Err(ApiError::login_failed());
     }
+    let auth_time = claims["auth_time"].as_i64();
+    if let Some(max_age) = saved.max_age
+        && !fresh_enough(auth_time, max_age, now)
+    {
+        tracing::warn!("the identity provider did not authenticate the person again as asked");
+        return Ok(login_error(
+            "The identity provider did not ask you to sign in again. Please try again.",
+        ));
+    }
     let subject = claims["sub"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -287,6 +338,7 @@ async fn finish_login(
             max_ttl: state.config.session_ttl,
             description: "browser session".into(),
             source: String::new(),
+            auth_time,
         },
     )
     .await?;
@@ -340,7 +392,7 @@ pub async fn logout(State(state): State<AppState>, principal: Principal, headers
 
 #[utoipa::path(post, path = "/api/v1/auth/cli/start", tag = "auth", responses((status = 200, body = CliStartResponse)))]
 pub async fn cli_start(State(state): State<AppState>, ClientIp(ip): ClientIp) -> ApiResult<Json<CliStartResponse>> {
-    if !state.login_limiter.allow(&ip) {
+    if !state.login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let now = state.clock.now();
@@ -381,6 +433,21 @@ pub async fn cli_approve(
         return Err(ApiError::forbidden());
     }
     let code = request.user_code.trim().to_ascii_uppercase();
+    if let Some(max_age) = state.config.cli_login_max_auth_age {
+        let auth_time = state
+            .store
+            .list_principal_tokens(PrincipalKind::User, &principal.id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == principal.token_id)
+            .and_then(|t| t.auth_time);
+        if !fresh_enough(auth_time, max_age, state.clock.now()) {
+            let encoded = url::form_urlencoded::byte_serialize(code.as_bytes()).collect::<String>();
+            return Err(ApiError::reauthentication_required(&reauth_url(&format!(
+                "/cli-login?code={encoded}"
+            ))));
+        }
+    }
     if !state
         .store
         .approve_cli_login(&code, &principal.id, state.clock.now())
@@ -437,9 +504,15 @@ pub async fn cli_poll(
                     principal_kind: PrincipalKind::User,
                     principal_id: &user.id,
                     ttl: state.config.cli_token_ttl,
-                    max_ttl: state.config.cli_token_ttl * 7,
+                    // With re-authentication on, renewing must not outlive the TTL; a new
+                    // browser sign-in is the only way to extend access.
+                    max_ttl: match state.config.cli_login_max_auth_age {
+                        Some(_) => state.config.cli_token_ttl,
+                        None => state.config.cli_token_ttl * 7,
+                    },
                     description: "CLI login".into(),
                     source: String::new(),
+                    auth_time: None,
                 },
             )
             .await?;
@@ -484,6 +557,22 @@ mod tests {
         assert_eq!(safe_return_to(Some("/\n/evil.test")), "/");
         assert_eq!(safe_return_to(Some("/ /evil.test")), "/");
         assert_eq!(safe_return_to(None), "/");
+    }
+
+    #[test]
+    fn recent_enough_sign_ins_allow_a_minute_of_skew() {
+        assert!(fresh_enough(Some(1000), 900, 1000));
+        assert!(fresh_enough(Some(1000), 900, 1960));
+        assert!(!fresh_enough(Some(1000), 900, 1961));
+        assert!(!fresh_enough(None, 900, 1000));
+        assert!(
+            !fresh_enough(Some(5000), 900, 1000),
+            "a time far in the future is not trusted"
+        );
+        assert_eq!(
+            reauth_url("/cli-login?code=AB-CD"),
+            "/auth/login?reauth=1&return_to=%2Fcli-login%3Fcode%3DAB-CD"
+        );
     }
 
     #[test]

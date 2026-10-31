@@ -93,4 +93,5 @@ export const SUBJECT_LABELS: Record<Subject, string> = {
   "org-members": "Organisation members",
   "org-roles": "Organisation roles",
   "org-audit-log": "Organisation audit log",
+  backups: "Backups",
 };

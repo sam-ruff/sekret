@@ -1,9 +1,11 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient, type QueryKey } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { isSealError } from "@/api/client";
 import { api, type IdentityQuery, type UserQuery } from "@/api/endpoints";
 import { errorMessage } from "@/lib/errors";
 
 export const keys = {
+  sysStatus: ["sys-status"] as const,
   authConfig: ["auth-config"] as const,
   me: ["me"] as const,
   projects: ["projects"] as const,
@@ -33,6 +35,11 @@ export const keys = {
   orgRoles: ["org", "roles"] as const,
   orgAudit: ["org", "audit"] as const,
 };
+
+/** The gate keeps the status until a request finds the server sealed; `fresh` refetches it on mount. */
+export function useSysStatus(fresh = false) {
+  return useQuery({ queryKey: keys.sysStatus, queryFn: api.sysStatus, staleTime: fresh ? 0 : Infinity });
+}
 
 export function useMe() {
   return useQuery({ queryKey: keys.me, queryFn: api.me, staleTime: 60_000 });
@@ -110,6 +117,8 @@ export function useApiMutation<TVars = void, TResult = unknown>(options: Mutatio
     },
     onError: (error) => {
       if (options.onError?.(error)) return;
+      // The status gate takes over and moves to the setup or unlock page.
+      if (isSealError(error)) return;
       toast.error(errorMessage(error));
     },
   });

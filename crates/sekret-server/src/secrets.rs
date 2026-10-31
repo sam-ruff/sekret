@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use sekret_api::{BatchResult, SecretUpsert, SnapshotChange, SnapshotChangeKind};
 use sekret_core::crypto::{DataKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key};
@@ -17,7 +18,7 @@ use crate::error::{ApiError, ApiResult};
 /// Everything a secret operation needs, injected so the logic is testable with a mock store.
 pub struct SecretCtx<'a> {
     pub store: &'a dyn Store,
-    pub root_key: &'a RootKey,
+    pub root_key: Arc<RootKey>,
     pub now: i64,
     pub actor: String,
     pub snapshots_to_keep: i64,
@@ -157,7 +158,7 @@ pub async fn plan_batch(
             )));
         }
     }
-    let key = data_key(ctx.root_key, project)?;
+    let key = data_key(&ctx.root_key, project)?;
     let mut result = BatchResult {
         created: vec![],
         updated: vec![],
@@ -394,7 +395,7 @@ pub async fn plan_rollback(
         action,
         &secret_resource(&env.slug, &s.path, &s.key, &target.tags),
     )?;
-    let key = data_key(ctx.root_key, project)?;
+    let key = data_key(&ctx.root_key, project)?;
     let change = restore_change(
         &key,
         project,
@@ -471,7 +472,7 @@ pub async fn plan_restore(
         .iter()
         .map(|s| ((s.secret.path.as_str(), s.secret.key.as_str()), s))
         .collect();
-    let key = data_key(ctx.root_key, project)?;
+    let key = data_key(&ctx.root_key, project)?;
     let mut result = BatchResult {
         created: vec![],
         updated: vec![],
@@ -609,7 +610,7 @@ mod tests {
         result.map_err(|e| anyhow::anyhow!("{what}: {e:?}"))
     }
 
-    fn fixture() -> anyhow::Result<(RootKey, Project, Environment)> {
+    fn fixture() -> anyhow::Result<(Arc<RootKey>, Project, Environment)> {
         let root = RootKey::generate().context("root")?;
         let dk = DataKey::generate().context("dk")?;
         let project = Project {
@@ -630,7 +631,7 @@ mod tests {
             position: 0,
             created_at: 0,
         };
-        Ok((root, project, env))
+        Ok((Arc::new(root), project, env))
     }
 
     fn stored(
@@ -680,10 +681,10 @@ mod tests {
         })
     }
 
-    fn ctx<'a>(store: &'a MockStore, root: &'a RootKey) -> SecretCtx<'a> {
+    fn ctx<'a>(store: &'a MockStore, root: &Arc<RootKey>) -> SecretCtx<'a> {
         SecretCtx {
             store,
-            root_key: root,
+            root_key: root.clone(),
             now: 10,
             actor: "user:test".into(),
             snapshots_to_keep: 10,

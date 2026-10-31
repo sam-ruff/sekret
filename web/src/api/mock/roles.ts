@@ -33,6 +33,13 @@ export function builtinRoles(orgScope: boolean): Role[] {
           allow("org-roles", ["read"]),
         ],
       },
+      {
+        slug: "backup-reader",
+        name: "backup reader",
+        description: "Download encrypted backups and nothing else",
+        builtin: true,
+        rules: [allow("backups", ["read"])],
+      },
     ];
   }
   return [

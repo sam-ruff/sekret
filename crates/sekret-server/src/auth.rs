@@ -58,20 +58,39 @@ impl Principal {
 pub struct ClientIp(pub IpAddr);
 
 /// Resolves the client address, trusting `X-Forwarded-For` only from configured proxies.
+///
+/// Every header line counts, read right to left. Trusted proxies are skipped; the first
+/// untrusted address is the client. An entry that does not parse stops the walk at the peer,
+/// so a garbled value cannot be used to reach further left.
 pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+    let peer = peer.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|net| net.contains(ip));
     if !is_trusted(&peer) {
         return peer;
     }
-    let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-        return peer;
-    };
-    forwarded
-        .split(',')
-        .rev()
-        .filter_map(|part| part.trim().parse::<IpAddr>().ok())
-        .find(|ip| !is_trusted(ip))
-        .unwrap_or(peer)
+    let mut lines = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(text) = value.to_str() else {
+            return peer;
+        };
+        lines.push(text);
+    }
+    let joined = lines.join(",");
+    for part in joined.split(',').rev() {
+        let Ok(ip) = part.trim().parse::<IpAddr>() else {
+            return peer;
+        };
+        let ip = ip.to_canonical();
+        if !is_trusted(&ip) {
+            return ip;
+        }
+    }
+    peer
+}
+
+/// Proxy ranges wide enough to let most of the internet set its own client address.
+pub fn broad_proxy_ranges(trusted: &[IpNet]) -> Vec<IpNet> {
+    trusted.iter().copied().filter(|net| net.prefix_len() < 8).collect()
 }
 
 impl FromRequestParts<AppState> for ClientIp {
@@ -208,6 +227,8 @@ pub struct TokenRequest<'a> {
     pub description: String,
     /// The credential the token comes from, so revoking that credential revokes the token.
     pub source: String,
+    /// When the person last authenticated with the identity provider, for browser sessions.
+    pub auth_time: Option<i64>,
 }
 
 pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResult<MintedToken> {
@@ -227,6 +248,7 @@ pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResul
         max_expires_at,
         revoked: false,
         last_used_at: None,
+        auth_time: request.auth_time,
     };
     state.store.create_token(record.clone()).await?;
     Ok(MintedToken { token, record })
@@ -257,6 +279,50 @@ mod tests {
         let outsider: IpAddr = "198.51.100.1".parse().context("ip")?;
         assert_eq!(client_ip(outsider, &h, &[proxy]), outsider);
         assert_eq!(client_ip(peer, &HeaderMap::new(), &[proxy]), peer);
+        Ok(())
+    }
+
+    #[test]
+    fn every_forwarded_for_line_is_read_and_garbage_stops_the_walk() -> anyhow::Result<()> {
+        let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
+        let peer: IpAddr = "10.0.0.2".parse().context("ip")?;
+        let ip = |s: &str| s.parse::<IpAddr>().context("ip");
+        // The proxy appended the real client on a second line; the first came from the client.
+        let two_lines = headers(&[("x-forwarded-for", "1.2.3.4"), ("x-forwarded-for", "203.0.113.9")])?;
+        assert_eq!(client_ip(peer, &two_lines, &[proxy]), ip("203.0.113.9")?);
+        // A spoofed address hiding behind a value that does not parse is never reached.
+        let garbled = headers(&[("x-forwarded-for", "1.2.3.4, not-an-ip, 10.0.0.5")])?;
+        assert_eq!(client_ip(peer, &garbled, &[proxy]), peer);
+        let all_trusted = headers(&[("x-forwarded-for", "10.0.0.7, 10.0.0.5")])?;
+        assert_eq!(client_ip(peer, &all_trusted, &[proxy]), peer);
+        Ok(())
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_match_ipv4_proxies() -> anyhow::Result<()> {
+        let proxy: IpNet = "10.0.0.0/24".parse().context("net")?;
+        let mapped_peer: IpAddr = "::ffff:10.0.0.2".parse().context("ip")?;
+        let h = headers(&[("x-forwarded-for", "::ffff:203.0.113.9")])?;
+        assert_eq!(
+            client_ip(mapped_peer, &h, &[proxy]),
+            "203.0.113.9".parse::<IpAddr>().context("ip")?
+        );
+        let spoof = headers(&[("x-forwarded-for", "203.0.113.9, ::ffff:10.0.0.9")])?;
+        assert_eq!(
+            client_ip(mapped_peer, &spoof, &[proxy]),
+            "203.0.113.9".parse::<IpAddr>().context("ip")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn broad_proxy_ranges_are_flagged() -> anyhow::Result<()> {
+        let nets: Vec<IpNet> = ["0.0.0.0/0", "10.0.0.0/8", "4.0.0.0/7", "::/0", "fd00::/8"]
+            .iter()
+            .map(|n| n.parse().context("net"))
+            .collect::<anyhow::Result<_>>()?;
+        let broad: Vec<String> = broad_proxy_ranges(&nets).iter().map(ToString::to_string).collect();
+        assert_eq!(broad, vec!["0.0.0.0/0", "4.0.0.0/7", "::/0"]);
         Ok(())
     }
 

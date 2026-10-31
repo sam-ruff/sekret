@@ -6,9 +6,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use reqwest::{Method, StatusCode};
 use sekret_core::crypto::RootKey;
-use sekret_server::clock::SystemClock;
-use sekret_server::config::{HumanOidcConfig, ServerConfig};
+use sekret_core::seal::{SealMode, SealState};
+use sekret_server::clock::{Clock, SystemClock};
+use sekret_server::config::{HumanOidcConfig, SealSettings, ServerConfig};
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
+use sekret_server::seal::{Keyring, StartupSecrets};
 use sekret_server::state::{AppState, Dependencies, build_state};
 use sekret_store::SqlStore;
 use serde_json::{Value, json};
@@ -25,6 +27,18 @@ pub struct Options {
     pub oidc: Option<HumanOidcConfig>,
     /// A clock the test can move; the system clock when absent.
     pub clock: Option<Arc<sekret_server::clock::FixedClock>>,
+    pub keys: Keys,
+}
+
+/// Where the test server's root key comes from.
+pub enum Keys {
+    /// A fresh key, unsealed, without any seal configuration in the database.
+    Generated,
+    /// The production startup path, as the binary runs it.
+    Open {
+        settings: SealSettings,
+        secrets: StartupSecrets,
+    },
 }
 
 impl Default for Options {
@@ -33,7 +47,33 @@ impl Default for Options {
             database_url: SQLITE.into(),
             oidc: None,
             clock: None,
+            keys: Keys::Generated,
         }
+    }
+}
+
+/// A database that outlives one server, so a test can restart on it. SQLite in memory
+/// becomes a file in a temporary directory.
+pub struct Persistent {
+    pub url: String,
+    pub dir: tempfile::TempDir,
+}
+
+pub fn persistent(database_url: &str) -> anyhow::Result<Persistent> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let url = if database_url == SQLITE {
+        format!("sqlite://{}?mode=rwc", dir.path().join("sekret.db").display())
+    } else {
+        database_url.to_string()
+    };
+    Ok(Persistent { url, dir })
+}
+
+pub fn opened(database_url: &str, settings: SealSettings, secrets: StartupSecrets) -> Options {
+    Options {
+        database_url: database_url.to_string(),
+        keys: Keys::Open { settings, secrets },
+        ..Options::default()
     }
 }
 
@@ -105,13 +145,26 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
     let mut config = ServerConfig::for_tests(&options.database_url);
     config.public_url = format!("http://{addr}");
     config.oidc = options.oidc;
-    let root_key = RootKey::generate().context("root key")?;
-    sekret_server::check_root_key(store.as_ref(), &root_key.fingerprint())
-        .await
-        .context("root key check")?;
+    let keyring = match options.keys {
+        Keys::Generated => {
+            let root_key = RootKey::generate().context("root key")?;
+            sekret_server::check_root_key(store.as_ref(), &root_key.fingerprint())
+                .await
+                .context("root key check")?;
+            Keyring::unsealed(root_key, SealMode::KeyFile)
+        }
+        Keys::Open { settings, secrets } => {
+            let now = SystemClock.now();
+            config.seal = settings;
+            sekret_server::seal::open_keyring(store.as_ref(), now, &config.seal, secrets)
+                .await
+                .context("open keyring")?
+                .keyring
+        }
+    };
     let state = build_state(Dependencies {
         store,
-        root_key,
+        keyring,
         config,
         clock: match &options.clock {
             Some(clock) => clock.clone(),
@@ -126,9 +179,12 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
             eprintln!("test server stopped: {error}");
         }
     });
-    let admin = sekret_server::admin::bootstrap_admin(&state, 3600)
-        .await
-        .map_err(api_error("bootstrap"))?;
+    let admin = match state.keyring.state() {
+        SealState::Unsealed => sekret_server::admin::bootstrap_admin(&state, 3600)
+            .await
+            .map_err(api_error("bootstrap"))?,
+        _ => String::new(),
+    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -183,8 +239,12 @@ impl Harness {
     }
 
     pub async fn create_project(&self, slug: &str) -> anyhow::Result<Value> {
+        self.create_project_as(slug, &self.admin).await
+    }
+
+    pub async fn create_project_as(&self, slug: &str, admin: &str) -> anyhow::Result<Value> {
         let (status, body) = self
-            .post("/api/v1/projects", &self.admin, json!({"slug": slug, "name": slug}))
+            .post("/api/v1/projects", admin, json!({"slug": slug, "name": slug}))
             .await?;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         Ok(body)
@@ -197,11 +257,22 @@ impl Harness {
         path: &str,
         pairs: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        self.set_secrets_as(project, env, path, pairs, &self.admin).await
+    }
+
+    pub async fn set_secrets_as(
+        &self,
+        project: &str,
+        env: &str,
+        path: &str,
+        pairs: &[(&str, &str)],
+        admin: &str,
+    ) -> anyhow::Result<Value> {
         let upserts: Vec<Value> = pairs.iter().map(|(k, v)| json!({"key": k, "value": v})).collect();
         let (status, body) = self
             .post(
                 &format!("/api/v1/projects/{project}/environments/{env}/secrets/batch"),
-                &self.admin,
+                admin,
                 json!({"path": path, "upserts": upserts}),
             )
             .await?;
@@ -209,33 +280,74 @@ impl Harness {
         Ok(body)
     }
 
-    /// Creates an identity with universal auth, a client secret and the given project role.
-    pub async fn machine(&self, name: &str, project: &str, role: &str) -> anyhow::Result<(String, String)> {
-        let (status, identity) = self
-            .post("/api/v1/identities", &self.admin, json!({"name": name}))
-            .await?;
+    /// A machine identity holding only the given organisation role, and its token.
+    pub async fn org_identity_as(&self, name: &str, role: &str, admin: &str) -> anyhow::Result<String> {
+        let (status, identity) = self.post("/api/v1/identities", admin, json!({"name": name})).await?;
         assert_eq!(status, StatusCode::CREATED, "{identity}");
         let id = identity["id"].as_str().context("id")?.to_string();
         let (status, body) = self
             .put(
                 &format!("/api/v1/identities/{id}/auth/universal"),
-                &self.admin,
+                admin,
                 json!({"kind": "universal"}),
             )
             .await?;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         let (status, secret) = self
+            .post(&format!("/api/v1/identities/{id}/client-secrets"), admin, json!({}))
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{secret}");
+        let (status, body) = self
             .post(
-                &format!("/api/v1/identities/{id}/client-secrets"),
-                &self.admin,
-                json!({}),
+                "/api/v1/org/bindings",
+                admin,
+                json!({"principal_kind": "identity", "principal_id": id, "role": role}),
             )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, token) = self
+            .call(
+                Method::POST,
+                "/api/v1/auth/universal/login",
+                None,
+                Some(json!({"client_id": id, "client_secret": secret["client_secret"]})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{token}");
+        Ok(token["access_token"].as_str().context("token")?.to_string())
+    }
+
+    /// Creates an identity with universal auth, a client secret and the given project role.
+    pub async fn machine(&self, name: &str, project: &str, role: &str) -> anyhow::Result<(String, String)> {
+        self.machine_as(name, project, role, &self.admin).await
+    }
+
+    pub async fn machine_as(
+        &self,
+        name: &str,
+        project: &str,
+        role: &str,
+        admin: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let (status, identity) = self.post("/api/v1/identities", admin, json!({"name": name})).await?;
+        assert_eq!(status, StatusCode::CREATED, "{identity}");
+        let id = identity["id"].as_str().context("id")?.to_string();
+        let (status, body) = self
+            .put(
+                &format!("/api/v1/identities/{id}/auth/universal"),
+                admin,
+                json!({"kind": "universal"}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, secret) = self
+            .post(&format!("/api/v1/identities/{id}/client-secrets"), admin, json!({}))
             .await?;
         assert_eq!(status, StatusCode::CREATED, "{secret}");
         let (status, body) = self
             .post(
                 &format!("/api/v1/projects/{project}/members"),
-                &self.admin,
+                admin,
                 json!({"principal_kind": "identity", "principal_id": id, "role": role}),
             )
             .await?;

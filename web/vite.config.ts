@@ -21,7 +21,8 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    chunkSizeWarningLimit: 1000,
+    // The zxcvbn dictionaries are one large chunk, loaded only on passphrase forms.
+    chunkSizeWarningLimit: 1300,
   },
   test: {
     environment: "jsdom",

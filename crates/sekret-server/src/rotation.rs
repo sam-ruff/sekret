@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use sekret_api::SecretUpsert;
 use sekret_core::permissions::{BuiltinRole, Rule};
 use sekret_core::rotation::{Generator, PolicyOverride, SecretPolicy, effective, generate, is_due};
+use sekret_core::seal::SealState;
 use sekret_store::{Environment, PrincipalKind, Project, Secret};
 use serde_json::json;
 
@@ -100,6 +101,10 @@ fn rotation_principal() -> Principal {
 /// Rotates every generated secret whose policy says it is due, returning the labels rotated.
 /// One failure is logged and does not stop the others.
 pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
+    if state.keyring.state() != SealState::Unsealed {
+        return Ok(Vec::new());
+    }
+    let _writing = state.keyring.writing().await;
     let principal = rotation_principal();
     let now = state.clock.now();
     let rules = BuiltinRole::ProjectAdmin.rules();
@@ -124,9 +129,9 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
                     s.secret.path.trim_end_matches('/'),
                     s.secret.key
                 );
-                let mut ctx = secret_ctx(state, &principal);
-                ctx.generated = true;
                 let outcome = async {
+                    let mut ctx = secret_ctx(state, &principal)?;
+                    ctx.generated = true;
                     let target = Target {
                         project: &project,
                         env: &env,

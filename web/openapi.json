@@ -3051,6 +3051,529 @@
         ]
       }
     },
+    "/api/v1/sys/backup": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "description": "POST, so a browser session needs the CSRF header like any other change.",
+        "operationId": "backup",
+        "responses": {
+          "200": {
+            "description": "An encrypted `.skb` backup",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogoFile"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Another backup is running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Postgres; use pg_dump",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Too large to back up through the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/forget-unlock": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "forget_unlock",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/init": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "init",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sys/passphrase": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "description": "Replaces the root key and re-encrypts every value under it, so the old passphrase opens nothing in the live database. Backups taken earlier still open with the old passphrase.",
+        "operationId": "change_passphrase",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePassphrase"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {},
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/passphrase-strength": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "description": "Open while uninitialised; afterwards only for organisation admins.",
+        "operationId": "check_passphrase",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PassphraseCheck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassphraseStrength"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/seal": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "description": "Drops the root key from memory. A remembered unlock is kept, so the next restart unlocks itself; forget the unlock as well to stop that.",
+        "operationId": "seal_now",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/status": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sys/unlock-policy": {
+      "put": {
+        "tags": [
+          "system"
+        ],
+        "description": "`remember` and `passphrase-file` need the current passphrase in the body; `manual` does not.",
+        "operationId": "set_unlock_policy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetUnlockPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sys/unseal": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "unseal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnsealRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SysStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users": {
       "get": {
         "tags": [
@@ -3474,6 +3997,21 @@
           }
         }
       },
+      "ChangePassphrase": {
+        "type": "object",
+        "required": [
+          "current",
+          "new"
+        ],
+        "properties": {
+          "current": {
+            "type": "string"
+          },
+          "new": {
+            "type": "string"
+          }
+        }
+      },
       "Charset": {
         "type": "string",
         "enum": [
@@ -3838,6 +4376,17 @@
           },
           "message": {
             "type": "string"
+          },
+          "strength": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PassphraseStrength",
+                "description": "zxcvbn's feedback, with `weak_passphrase`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -3971,6 +4520,61 @@
           "created"
         ]
       },
+      "InitRequest": {
+        "type": "object",
+        "required": [
+          "setup_code",
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/SealMode"
+          },
+          "passphrase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required in passphrase mode; at least 12 characters."
+          },
+          "setup_code": {
+            "type": "string",
+            "description": "The one-time code from the server log."
+          },
+          "unlock_policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UnlockPolicy",
+                "description": "Passphrase mode only; `manual` when absent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "InitResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "admin_token"
+        ],
+        "properties": {
+          "admin_token": {
+            "type": "string",
+            "description": "A short-lived organisation admin token, shown once."
+          },
+          "admin_token_expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds when `admin_token` stops working."
+          },
+          "status": {
+            "$ref": "#/components/schemas/SysStatus"
+          }
+        }
+      },
       "JwtLoginRequest": {
         "type": "object",
         "required": [
@@ -4103,11 +4707,22 @@
           "id": {
             "type": "string"
           },
+          "is_org_admin": {
+            "type": "boolean",
+            "description": "Holds `org-admin`, the same check the system routes make."
+          },
           "kind": {
             "$ref": "#/components/schemas/PrincipalKind"
           },
           "name": {
             "type": "string"
+          },
+          "org_roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Organisation role slugs held, including those implied by configuration."
           },
           "org_rules": {
             "type": "array",
@@ -4238,6 +4853,49 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "PassphraseCheck": {
+        "type": "object",
+        "required": [
+          "passphrase"
+        ],
+        "properties": {
+          "passphrase": {
+            "type": "string"
+          }
+        }
+      },
+      "PassphraseStrength": {
+        "type": "object",
+        "description": "zxcvbn's verdict on a passphrase, from 0 (guessable) to 4.",
+        "required": [
+          "score",
+          "acceptable",
+          "suggestions"
+        ],
+        "properties": {
+          "acceptable": {
+            "type": "boolean",
+            "description": "Long enough, free of control characters and scores 4."
+          },
+          "score": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "suggestions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -4475,6 +5133,23 @@
             "$ref": "#/components/schemas/Subject"
           }
         }
+      },
+      "SealMode": {
+        "type": "string",
+        "description": "How the root key is kept between restarts.",
+        "enum": [
+          "passphrase",
+          "key-file"
+        ]
+      },
+      "SealState": {
+        "type": "string",
+        "description": "Whether the server can reach its secrets.",
+        "enum": [
+          "uninitialised",
+          "sealed",
+          "unsealed"
+        ]
       },
       "Secret": {
         "type": "object",
@@ -4717,6 +5392,24 @@
           }
         }
       },
+      "SetUnlockPolicy": {
+        "type": "object",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "passphrase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The current passphrase; required for `remember` and `passphrase-file`, which weaken how\nthe server is unlocked."
+          },
+          "policy": {
+            "$ref": "#/components/schemas/UnlockPolicy"
+          }
+        }
+      },
       "Snapshot": {
         "type": "object",
         "required": [
@@ -4836,8 +5529,73 @@
           "identities",
           "org-members",
           "org-roles",
-          "org-audit-log"
+          "org-audit-log",
+          "backups"
         ]
+      },
+      "SysStatus": {
+        "type": "object",
+        "description": "Always answered without authentication, so monitoring can alert on a sealed server.",
+        "required": [
+          "state",
+          "configured",
+          "remembered",
+          "web_setup",
+          "version"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "The unlock policy comes from server configuration and cannot be changed through the API."
+          },
+          "remembered": {
+            "type": "boolean",
+            "description": "A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not\nclear it; forget the unlock for that."
+          },
+          "seal_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SealMode",
+                "description": "Once initialised, the stored mode. Before that, the mode the configuration requires, if any."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/SealState"
+          },
+          "unlock_policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UnlockPolicy",
+                "description": "How the server is unlocked after a start; passphrase mode only. Before setup, the policy\nthe configuration sets, if any."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unsealed_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UnsealedBy",
+                "description": "How the root key got into memory, while unsealed. `key-file` with a passphrase `seal_mode`\nmeans a root key file overrode the passphrase."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "version": {
+            "type": "string"
+          },
+          "web_setup": {
+            "type": "boolean",
+            "description": "First-boot setup is offered through the API and web interface."
+          }
+        }
       },
       "TokenResponse": {
         "type": "object",
@@ -4874,6 +5632,36 @@
             "type": "string"
           }
         }
+      },
+      "UnlockPolicy": {
+        "type": "string",
+        "description": "How a passphrase-mode server gets unlocked after it starts.",
+        "enum": [
+          "manual",
+          "remember",
+          "passphrase-file"
+        ]
+      },
+      "UnsealRequest": {
+        "type": "object",
+        "required": [
+          "passphrase"
+        ],
+        "properties": {
+          "passphrase": {
+            "type": "string"
+          }
+        }
+      },
+      "UnsealedBy": {
+        "type": "string",
+        "description": "How the root key got into memory this time.",
+        "enum": [
+          "passphrase",
+          "remember",
+          "key-file",
+          "passphrase-file"
+        ]
       },
       "UpdateEnvironment": {
         "type": "object",
@@ -5026,6 +5814,9 @@
     }
   },
   "tags": [
+    {
+      "name": "system"
+    },
     {
       "name": "auth"
     },

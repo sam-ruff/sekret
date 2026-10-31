@@ -10,9 +10,25 @@ import type {
   PolicyOverride,
   Project,
   Role,
+  SealMode,
+  SealState,
   SecretPolicy,
+  UnlockPolicy,
   User,
 } from "../types";
+
+/** The fake server's seal state. The passphrase is kept in plain text because nothing here is real. */
+export interface MockSys {
+  state: SealState;
+  mode: SealMode | null;
+  unlockPolicy: UnlockPolicy | null;
+  /** The policy comes from configuration and cannot be changed through the API. */
+  configured: boolean;
+  remembered: boolean;
+  webSetup: boolean;
+  passphrase: string;
+  failedUnseals: number;
+}
 
 export interface StoredVersion {
   version: number;
@@ -90,6 +106,7 @@ export interface MockState {
   logos: Record<string, StoredLogo>;
   /** Keyed by project id; absent means off. */
   projectPolicies: Record<string, SecretPolicy>;
+  sys: MockSys;
 }
 
 export function isDeleted(secret: StoredSecret): boolean {

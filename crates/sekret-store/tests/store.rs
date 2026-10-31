@@ -324,6 +324,7 @@ async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> 
         max_expires_at: 20,
         revoked: false,
         last_used_at: None,
+        auth_time: Some(1),
     };
     store
         .create_token(AccessToken {
@@ -391,10 +392,18 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
             pkce_verifier: "v".into(),
             return_to: "/".into(),
             created_at: 1,
+            max_age: Some(900),
         })
         .await
         .context("state")?;
-    assert!(store.take_login_state("st").await.context("take")?.is_some());
+    assert_eq!(
+        store
+            .take_login_state("st")
+            .await
+            .context("take")?
+            .and_then(|s| s.max_age),
+        Some(900)
+    );
     assert!(store.take_login_state("st").await.context("take twice")?.is_none());
 
     store
@@ -561,10 +570,137 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn seal_config(remembered: Option<Vec<u8>>) -> SealConfig {
+    SealConfig {
+        mode: sekret_core::seal::SealMode::Passphrase,
+        wrapped: Some(sekret_core::seal::WrappedRootKey {
+            salt: vec![1; 16],
+            params: sekret_core::seal::KdfParams::default(),
+            ciphertext: vec![2; 57],
+        }),
+        unlock_policy: sekret_core::seal::UnlockPolicy::Remember,
+        remembered,
+        epoch: 4,
+        mac: Some(vec![6; 32]),
+        created_at: 10,
+        updated_at: 10,
+    }
+}
+
+async fn exercise_seal_config(store: &SqlStore) -> anyhow::Result<()> {
+    assert_eq!(store.get_seal_config().await.context("get")?, None);
+    assert!(matches!(
+        store.update_seal_config(seal_config(None)).await,
+        Err(StoreError::NotFound)
+    ));
+    store
+        .init_seal_config(seal_config(Some(vec![3; 57])), "fp1")
+        .await
+        .context("init")?;
+    assert_eq!(
+        store.get_meta("root_key_fingerprint").await.context("meta")?,
+        Some("fp1".into())
+    );
+    assert_eq!(
+        store.get_seal_config().await.context("get")?,
+        Some(seal_config(Some(vec![3; 57])))
+    );
+    assert!(matches!(
+        store.init_seal_config(seal_config(None), "fp2").await,
+        Err(StoreError::Conflict)
+    ));
+    let key_file = SealConfig {
+        mode: sekret_core::seal::SealMode::KeyFile,
+        wrapped: None,
+        unlock_policy: sekret_core::seal::UnlockPolicy::Manual,
+        remembered: None,
+        epoch: 5,
+        mac: None,
+        created_at: 10,
+        updated_at: 20,
+    };
+    store.update_seal_config(key_file.clone()).await.context("update")?;
+    assert_eq!(store.get_seal_config().await.context("get")?, Some(key_file));
+    use sekret_core::seal::UnlockPolicy;
+    for (policy, remembered) in [
+        (UnlockPolicy::Remember, Some(vec![5; 57])),
+        (UnlockPolicy::PassphraseFile, None),
+        (UnlockPolicy::Manual, None),
+    ] {
+        let config = SealConfig {
+            unlock_policy: policy,
+            updated_at: 30,
+            ..seal_config(remembered)
+        };
+        store.update_seal_config(config.clone()).await.context("policy")?;
+        assert_eq!(
+            store.get_seal_config().await.context("get")?,
+            Some(config),
+            "{policy:?}"
+        );
+    }
+    assert_eq!(
+        store.get_meta("root_key_fingerprint").await.context("meta")?,
+        Some("fp1".into()),
+        "updating the seal configuration leaves the fingerprint alone"
+    );
+    store
+        .replace_wrapped_keys(Rekey {
+            fingerprint: "fp3".into(),
+            seal: Some(seal_config(Some(vec![4; 57]))),
+            ..Rekey::default()
+        })
+        .await
+        .context("replace")?;
+    assert_eq!(
+        store.get_meta("root_key_fingerprint").await.context("meta")?,
+        Some("fp3".into())
+    );
+    assert_eq!(
+        store.get_seal_config().await.context("get")?,
+        Some(seal_config(Some(vec![4; 57])))
+    );
+    Ok(())
+}
+
 async fn exercise(store: SqlStore) -> anyhow::Result<()> {
     exercise_projects_and_secrets(&store).await?;
     exercise_identities_and_tokens(&store).await?;
     exercise_logins_and_audit(&store).await?;
+    exercise_seal_config(&store).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_snapshot_drops_the_remembered_unlock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let store = SqlStore::connect(&format!("sqlite://{}?mode=rwc", dir.path().join("live.db").display()))
+        .await
+        .context("connect")?;
+    store
+        .init_seal_config(seal_config(Some(vec![9; 57])), "fp")
+        .await
+        .context("init")?;
+    seed_project(&store).await?;
+    let copy = dir.path().join("copy.db");
+    let rewritten = SealConfig {
+        mac: Some(vec![8; 32]),
+        ..seal_config(None)
+    };
+    store
+        .snapshot_to(&copy.display().to_string(), rewritten.clone())
+        .await
+        .context("snapshot")?;
+    let raw = std::fs::read(&copy).context("read")?;
+    assert!(raw.starts_with(b"SQLite format 3\0"));
+    assert!(!raw.windows(57).any(|w| w == [9u8; 57].as_slice()));
+    let reopened = SqlStore::connect(&format!("sqlite://{}", copy.display()))
+        .await
+        .context("reopen")?;
+    let config = reopened.get_seal_config().await.context("get")?.context("config")?;
+    assert_eq!(config, rewritten);
+    assert_eq!(config.wrapped, seal_config(None).wrapped);
+    assert!(reopened.get_project("app").await.context("project")?.is_some());
     Ok(())
 }
 
@@ -600,5 +736,10 @@ async fn postgres_store() -> anyhow::Result<()> {
     };
     let port = container.get_host_port_ipv4(5432).await.context("port")?;
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    exercise(SqlStore::connect(&url).await.context("connect")?).await
+    let store = SqlStore::connect(&url).await.context("connect")?;
+    assert!(matches!(
+        store.snapshot_to("/tmp/never-written.db", seal_config(None)).await,
+        Err(StoreError::Unsupported(_))
+    ));
+    exercise(store).await
 }

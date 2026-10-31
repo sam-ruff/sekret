@@ -1,4 +1,4 @@
-import { client, unwrap } from "./client";
+import { client, fetchDownload, unwrap } from "./client";
 import type { operations } from "./schema";
 import type {
   AddMembership,
@@ -6,6 +6,9 @@ import type {
   AuthMethodConfig,
   AuthMethodKind,
   BatchWrite,
+  ChangePassphrase,
+  InitRequest,
+  UnlockPolicy,
   CreateClientSecret,
   CreateEnvironment,
   CreateIdentity,
@@ -38,6 +41,15 @@ function secretParams(at: SecretLocation, key: string) {
 }
 
 export const api = {
+  sysStatus: () => unwrap(client.GET("/api/v1/sys/status")),
+  init: (body: InitRequest) => unwrap(client.POST("/api/v1/sys/init", { body })),
+  unseal: (passphrase: string) => unwrap(client.POST("/api/v1/sys/unseal", { body: { passphrase } })),
+  seal: () => unwrap(client.POST("/api/v1/sys/seal")),
+  changePassphrase: (body: ChangePassphrase) => unwrap(client.POST("/api/v1/sys/passphrase", { body })),
+  setUnlockPolicy: (policy: UnlockPolicy) => unwrap(client.PUT("/api/v1/sys/unlock-policy", { body: { policy } })),
+  forgetUnlock: () => unwrap(client.POST("/api/v1/sys/forget-unlock")),
+  backup: () => fetchDownload("/api/v1/sys/backup", "sekret-backup.skb"),
+
   authConfig: () => unwrap(client.GET("/api/v1/auth/config")),
   me: () => unwrap(client.GET("/api/v1/me")),
   logout: () => unwrap(client.POST("/auth/logout")),

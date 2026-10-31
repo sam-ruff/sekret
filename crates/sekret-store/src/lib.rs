@@ -5,7 +5,7 @@ mod sql;
 
 use async_trait::async_trait;
 pub use models::*;
-pub use sql::SqlStore;
+pub use sql::{SqlStore, sqlite_file};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -17,6 +17,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error("database error: {0}")]
     Database(String),
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -26,6 +28,15 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub trait Store: Send + Sync {
     async fn get_meta(&self, key: &str) -> StoreResult<Option<String>>;
     async fn set_meta(&self, key: &str, value: &str) -> StoreResult<()>;
+
+    async fn get_seal_config(&self) -> StoreResult<Option<SealConfig>>;
+    /// Records the seal configuration and root key fingerprint together. `Conflict` if already initialised.
+    async fn init_seal_config(&self, config: SealConfig, fingerprint: &str) -> StoreResult<()>;
+    /// `NotFound` before initialisation.
+    async fn update_seal_config(&self, config: SealConfig) -> StoreResult<()>;
+    /// Writes a consistent copy of the database to `path` with `seal` as its seal configuration,
+    /// never carrying a remembered unlock. SQLite only; `Unsupported` on Postgres.
+    async fn snapshot_to(&self, path: &str, seal: SealConfig) -> StoreResult<()>;
 
     async fn upsert_user(&self, login: UserLogin) -> StoreResult<User>;
     async fn get_user(&self, id: &str) -> StoreResult<Option<User>>;
@@ -74,13 +85,11 @@ pub trait Store: Send + Sync {
     async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
     async fn delete_project(&self, id: &str) -> StoreResult<()>;
-    /// Swaps every root-key-dependent value in one transaction: project keys and re-sealed auth method configs.
-    async fn replace_wrapped_keys(
-        &self,
-        keys: Vec<(String, Vec<u8>)>,
-        auth_methods: Vec<AuthMethod>,
-        fingerprint: &str,
-    ) -> StoreResult<()>;
+    /// Every stored secret value in the project, history included.
+    async fn list_encrypted_values(&self, project_id: &str) -> StoreResult<Vec<EncryptedValue>>;
+    /// Swaps every root-key-dependent value in one transaction: project keys, secret values,
+    /// re-sealed auth method configs, the fingerprint and, when given, the seal configuration.
+    async fn replace_wrapped_keys(&self, rekey: Rekey) -> StoreResult<()>;
 
     async fn list_roles(&self, project_id: &str) -> StoreResult<Vec<Role>>;
     async fn upsert_role(&self, role: Role) -> StoreResult<()>;

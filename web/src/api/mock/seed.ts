@@ -1,6 +1,7 @@
 import type { Me, User } from "../types";
 import { fromBase64, MockBackend } from "./backend";
 import type { MockState } from "./state";
+import { mockSys } from "./sys";
 
 const DAY = 24 * 3600;
 
@@ -97,6 +98,7 @@ export function emptyState(start: number): MockState {
     audit: [],
     logos: {},
     projectPolicies: {},
+    sys: mockSys(),
   };
 }
 

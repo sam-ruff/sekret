@@ -1,0 +1,100 @@
+# sekret server configuration.
+#
+# Pass it with `sekret server --config FILE` or SEKRET_CONFIG. Flags and environment
+# variables override anything set here, and unknown keys are an error. Every value below
+# is the default, apart from server.public_url, which has none. `null` means unset.
+
+server:
+  # Address and port to listen on.
+  listen: 0.0.0.0:8080
+  # External URL people and machines use. Required.
+  public_url: https://sekret.example.com
+  # Reverse proxies allowed to set X-Forwarded-For, as CIDRs, e.g. [10.0.0.0/8].
+  trusted_proxies: []
+  # Allow http:// OIDC issuers and Kubernetes hosts. Development only.
+  allow_insecure_http: false
+
+database:
+  # sqlite://path?mode=rwc or postgres://user:pass@host/db.
+  url: sqlite://sekret.db?mode=rwc
+  # Environment snapshots kept per environment.
+  snapshots_to_keep: 200
+
+auth:
+  # Organisation role every signed-in person receives; empty for none.
+  default_org_role: org-member
+  # Browser session lifetime, in seconds.
+  session_ttl: 43200
+  # Lifetime of tokens from `sekret login`, in seconds.
+  cli_token_ttl: 86400
+  # Seconds. When set, approving a `sekret login` needs a browser sign-in with the identity
+  # provider at most this old, or the browser is sent to sign in again; CLI tokens then
+  # cannot be renewed past cli_token_ttl.
+  cli_login_max_auth_age: null
+  # Per client address. Also limits setup, unlock and passphrase attempts.
+  login_rate_per_minute: 30
+
+oidc:
+  # Human sign-in. Leave the issuer unset to turn it off.
+  issuer: null
+  client_id: sekret
+  # File holding the OIDC client secret. Required with an issuer.
+  client_secret_file: null
+  scopes: [openid, profile, email]
+  # Token claims whose values become the user's groups.
+  group_claims: [roles, groups]
+  # Groups that make someone an organisation admin.
+  admin_groups: [sekret-admin]
+  # When not empty, only members of one of these groups may sign in.
+  required_groups: []
+
+tls:
+  # PEM certificate chain and key, to serve HTTPS directly instead of behind a proxy.
+  cert_file: null
+  key_file: null
+  # PEM CA that client certificates must chain to. Setting it turns on mutual TLS.
+  client_ca_file: null
+  # With a client CA: required refuses connections without a certificate, optional only
+  # checks certificates that are offered.
+  client_auth: required
+
+seal:
+  # passphrase or key-file. Unset, setup offers passphrase mode and a database in either
+  # mode starts. Set, a database initialised in the other mode is refused.
+  mode: null
+  # The root key file in key-file mode. In passphrase mode it is an emergency way in,
+  # used only when the key in it matches the database.
+  root_key_file: null
+  # Passphrase mode only: manual, remember or passphrase-file. Unset, the choice made at
+  # setup applies and an admin can change it; set, it wins and cannot be changed in the UI.
+  unlock: null
+  # Device key file for the remember policy, which needs it set. Keep it off the database's
+  # disk; it may not be the database, root key or a passphrase file.
+  remember_file: null
+  # File with a secret of at least 32 characters mixed into the remember key, so the
+  # remember file and database alone cannot unlock. SEKRET_REMEMBER_SECRET also works.
+  remember_secret_file: null
+  # Passphrase for the passphrase-file policy, read only under that policy.
+  # SEKRET_UNLOCK_PASSPHRASE also works, but a file is better.
+  passphrase_file: null
+
+setup:
+  # Offer first-boot setup through the API and web interface. When false, set up with
+  # auto_init or `sekret admin init` on the host instead.
+  web: true
+  # Initialise an empty database at start, in seal.mode, without a person.
+  auto_init: false
+  # First passphrase for auto_init in passphrase mode, read once. Falls back to
+  # seal.passphrase_file. Delete it afterwards: a passphrase on disk defeats sealing.
+  passphrase_file: null
+  # Where auto_init writes a break-glass admin token, mode 0600. Unset, no token is
+  # issued and admins sign in through the OIDC admin groups.
+  admin_token_file: null
+  # Where to write the one-time setup code, mode 0600, as well as the log and stderr.
+  # Removed once setup succeeds. No code is made when web is false.
+  code_file: null
+
+backup:
+  # Private directory where API backups are staged. Unset, a 0700 directory is made
+  # beside the SQLite database.
+  temp_dir: null

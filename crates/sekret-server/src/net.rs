@@ -72,7 +72,7 @@ fn client_builder() -> reqwest::ClientBuilder {
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("sekret/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("sekret/{}", sekret_core::VERSION))
 }
 
 async fn read_json(mut response: reqwest::Response) -> Result<Value, NetError> {

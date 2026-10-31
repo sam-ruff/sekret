@@ -1,0 +1,37 @@
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { PassphraseMeter } from "./passphrase-meter";
+
+describe("PassphraseMeter", () => {
+  it("shows the length hint before anything is typed", () => {
+    render(<PassphraseMeter strength={null} />);
+    expect(screen.getByTestId("passphrase-meter")).toHaveTextContent("At least 12 characters");
+  });
+
+  it("shows the score with zxcvbn's warning and suggestions", () => {
+    render(
+      <PassphraseMeter
+        strength={{
+          score: 1,
+          acceptable: false,
+          warning: "This is similar to a commonly used password.",
+          suggestions: ["Add more words that are less common."],
+        }}
+      />,
+    );
+    const meter = screen.getByTestId("passphrase-meter");
+    expect(meter).toHaveAttribute("data-score", "1");
+    expect(meter).toHaveAttribute("data-acceptable", "false");
+    expect(screen.getByTestId("passphrase-meter-label")).toHaveTextContent("Weak");
+    expect(screen.getByTestId("passphrase-meter-feedback")).toHaveTextContent("commonly used password");
+    expect(screen.getByRole("listitem")).toHaveTextContent("Add more words that are less common.");
+    expect(meter).not.toHaveTextContent("Strong enough");
+  });
+
+  it("says when a passphrase is strong enough", () => {
+    render(<PassphraseMeter strength={{ score: 4, acceptable: true, warning: null, suggestions: [] }} />);
+    expect(screen.getByTestId("passphrase-meter-label")).toHaveTextContent("Strong");
+    expect(screen.getByTestId("passphrase-meter")).toHaveTextContent("Strong enough");
+    expect(screen.queryByTestId("passphrase-meter-feedback")).toBeNull();
+  });
+});

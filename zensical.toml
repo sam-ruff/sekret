@@ -12,6 +12,7 @@ nav = [
   { "Overview" = "index.md" },
   { "Getting started" = "getting-started.md" },
   { "Configuration" = "configuration.md" },
+  { "Unlocking" = "unlocking.md" },
   { "Deployment" = "deployment.md" },
   { "User guide" = [
     { "Projects and environments" = "user-guide/projects.md" },

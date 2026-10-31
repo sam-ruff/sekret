@@ -5,9 +5,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use sekret_api::{
-    BatchResult, BatchWrite, CliPollRequest, CliStartResponse, CreateProject, Environment, ErrorBody, GenerateSecret,
-    JwtLoginRequest, Me, PolicyOverride, Project, RawSecrets, RestoreRequest, RollbackRequest, Secret, SecretList,
-    SecretPolicy, SecretPolicyView, SecretVersion, Snapshot, TokenResponse, UniversalLoginRequest,
+    BatchResult, BatchWrite, ChangePassphrase, CliPollRequest, CliStartResponse, CreateProject, Environment, ErrorBody,
+    GenerateSecret, InitRequest, InitResponse, JwtLoginRequest, Me, PolicyOverride, Project, RawSecrets,
+    RestoreRequest, RollbackRequest, Secret, SecretList, SecretPolicy, SecretPolicyView, SecretVersion,
+    SetUnlockPolicy, Snapshot, SysStatus, TokenResponse, UniversalLoginRequest, UnsealRequest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -82,6 +83,16 @@ pub trait SekretApi: Send + Sync {
     async fn raw(&self, at: Location, recursive: bool) -> ClientResult<RawSecrets>;
     async fn snapshots(&self, project: String, environment: String) -> ClientResult<Vec<Snapshot>>;
     async fn restore(&self, at: Location, snapshot: String) -> ClientResult<BatchResult>;
+    async fn sys_status(&self) -> ClientResult<SysStatus>;
+    async fn sys_init(&self, request: InitRequest) -> ClientResult<InitResponse>;
+    async fn sys_unseal(&self, request: UnsealRequest) -> ClientResult<SysStatus>;
+    async fn sys_seal(&self) -> ClientResult<SysStatus>;
+    async fn sys_change_passphrase(&self, request: ChangePassphrase) -> ClientResult<()>;
+    /// `remember` and `passphrase-file` need the current passphrase.
+    async fn sys_set_unlock_policy(&self, request: SetUnlockPolicy) -> ClientResult<SysStatus>;
+    async fn sys_forget_unlock(&self) -> ClientResult<SysStatus>;
+    /// The encrypted `.skb` file.
+    async fn sys_backup(&self) -> ClientResult<Vec<u8>>;
 }
 
 pub struct HttpClient {
@@ -132,7 +143,7 @@ impl HttpClient {
         let mut builder = reqwest::Client::builder()
             .timeout(options.timeout.unwrap_or(Duration::from_secs(30)))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("sekret-client/", env!("CARGO_PKG_VERSION")));
+            .user_agent(format!("sekret-client/{}", sekret_api::VERSION));
         if let Some(pem) = options.ca_pem {
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| ClientError::Config(format!("CA bundle: {e}")))?;
@@ -171,6 +182,22 @@ impl HttpClient {
         url: url::Url,
         body: Option<&dyn ErasedBody>,
     ) -> ClientResult<T> {
+        let (status, bytes) = self.send_raw(method, url, body).await?;
+        let bytes = if status == StatusCode::NO_CONTENT || bytes.is_empty() {
+            &b"null"[..]
+        } else {
+            &bytes[..]
+        };
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// The status and body of a successful response, or the API error.
+    async fn send_raw(
+        &self,
+        method: Method,
+        url: url::Url,
+        body: Option<&dyn ErasedBody>,
+    ) -> ClientResult<(StatusCode, Vec<u8>)> {
         let mut request = self.http.request(method, url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -194,12 +221,11 @@ impl HttpClient {
                     .unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into()),
             });
         }
-        let bytes = if status == StatusCode::NO_CONTENT || bytes.is_empty() {
-            &b"null"[..]
-        } else {
-            &bytes[..]
-        };
-        serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))
+        Ok((status, bytes.to_vec()))
+    }
+
+    fn sys_url(&self, action: &str) -> ClientResult<url::Url> {
+        self.url(&["api", "v1", "sys", action], &[])
     }
 
     fn secrets_url(&self, at: &Location, tail: &[&str], query: &[(&str, String)]) -> ClientResult<url::Url> {
@@ -413,6 +439,41 @@ impl SekretApi for HttpClient {
         )
         .await
     }
+
+    async fn sys_status(&self) -> ClientResult<SysStatus> {
+        self.send(Method::GET, self.sys_url("status")?, None).await
+    }
+
+    async fn sys_init(&self, request: InitRequest) -> ClientResult<InitResponse> {
+        self.send(Method::POST, self.sys_url("init")?, Some(&request)).await
+    }
+
+    async fn sys_unseal(&self, request: UnsealRequest) -> ClientResult<SysStatus> {
+        self.send(Method::POST, self.sys_url("unseal")?, Some(&request)).await
+    }
+
+    async fn sys_seal(&self) -> ClientResult<SysStatus> {
+        self.send(Method::POST, self.sys_url("seal")?, None).await
+    }
+
+    async fn sys_change_passphrase(&self, request: ChangePassphrase) -> ClientResult<()> {
+        self.send(Method::POST, self.sys_url("passphrase")?, Some(&request))
+            .await
+    }
+
+    async fn sys_set_unlock_policy(&self, request: SetUnlockPolicy) -> ClientResult<SysStatus> {
+        self.send(Method::PUT, self.sys_url("unlock-policy")?, Some(&request))
+            .await
+    }
+
+    async fn sys_forget_unlock(&self) -> ClientResult<SysStatus> {
+        self.send(Method::POST, self.sys_url("forget-unlock")?, None).await
+    }
+
+    async fn sys_backup(&self) -> ClientResult<Vec<u8>> {
+        let (_, bytes) = self.send_raw(Method::POST, self.sys_url("backup")?, None).await?;
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +539,43 @@ mod tests {
         };
         let result = client(&server, None)?.write(at(), batch).await.context("write")?;
         assert_eq!(result.created, vec!["A".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backups_come_back_as_raw_bytes() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/sys/backup"))
+            .and(header("authorization", "Bearer skt_x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SKB1\x00\x01".to_vec()))
+            .mount(&server)
+            .await;
+        let bytes = client(&server, Some("skt_x"))?.sys_backup().await.context("backup")?;
+        assert_eq!(bytes, b"SKB1\x00\x01");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unseal_sends_the_passphrase_and_reads_the_status() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/sys/unseal"))
+            .and(body_json(json!({"passphrase": "violet tractor sings"})))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": "invalid_passphrase", "message": "the passphrase is wrong"
+            })))
+            .mount(&server)
+            .await;
+        let error = client(&server, None)?
+            .sys_unseal(UnsealRequest {
+                passphrase: "violet tractor sings".to_string().into(),
+            })
+            .await
+            .err()
+            .context("expected an error")?;
+        assert_eq!(error.code(), Some("invalid_passphrase"));
+        assert_eq!(error.status(), Some(401));
         Ok(())
     }
 

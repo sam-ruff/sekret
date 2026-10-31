@@ -20,6 +20,8 @@ pub enum CryptoError {
     Decrypt,
     #[error("system random source failed")]
     Random,
+    #[error("key derivation failed")]
+    Kdf,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -71,6 +73,14 @@ impl RootKey {
     pub fn to_base64(&self) -> Zeroizing<String> {
         Zeroizing::new(STANDARD.encode(self.0))
     }
+
+    pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl DataKey {
@@ -85,7 +95,7 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     getrandom::fill(buf).map_err(|_| CryptoError::Random)
 }
 
-fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::InvalidKey)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     fill_random(&mut nonce_bytes)?;
@@ -100,7 +110,7 @@ fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Cr
     Ok(blob)
 }
 
-fn open(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+pub(crate) fn open(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let Some((&version, rest)) = blob.split_first() else {
         return Err(CryptoError::Malformed);
     };

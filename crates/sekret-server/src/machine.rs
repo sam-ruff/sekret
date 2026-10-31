@@ -253,7 +253,7 @@ pub async fn verify_kubernetes(
 }
 
 async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAddr) -> ApiResult<Identity> {
-    if !state.login_limiter.allow(&ip) {
+    if !state.login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let identity = state
@@ -304,6 +304,7 @@ async fn issue(
             max_ttl: identity.token_max_ttl,
             description: format!("{} login", method.as_str()),
             source,
+            auth_time: None,
         },
     )
     .await?;
@@ -369,7 +370,7 @@ pub async fn kubernetes_login(
     else {
         return Err(ApiError::login_failed());
     };
-    unseal_reviewer(&state.root_key, &identity.id, &mut config)?;
+    unseal_reviewer(state.keyring.root()?.as_ref(), &identity.id, &mut config)?;
     let detail = verify_kubernetes(&state.jwt, state.token_reviewer.as_ref(), &config, &request.token)
         .await
         .map_err(|e| rejected(&identity, e))?;

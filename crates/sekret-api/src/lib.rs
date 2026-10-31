@@ -2,16 +2,22 @@
 
 use std::collections::BTreeMap;
 
+pub use sekret_core::VERSION;
 pub use sekret_core::claims::ClaimBindings;
 pub use sekret_core::permissions::{Action, Conditions, Effect, Rule, Subject};
 pub use sekret_core::rotation::{Charset, Generator, PolicyOverride, SecretPolicy};
+pub use sekret_core::seal::{PassphraseStrength, SealMode, SealState, UnlockPolicy, UnsealedBy};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ErrorBody {
     pub error: String,
     pub message: String,
+    /// zxcvbn's feedback, with `weak_passphrase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<PassphraseStrength>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -43,6 +49,12 @@ pub struct Me {
     pub groups: Vec<String>,
     /// Organisation-level rules, so clients can hide actions that would be refused.
     pub org_rules: Vec<Rule>,
+    /// Organisation role slugs held, including those implied by configuration.
+    #[serde(default)]
+    pub org_roles: Vec<String>,
+    /// Holds `org-admin`, the same check the system routes make.
+    #[serde(default)]
+    pub is_org_admin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -605,4 +617,124 @@ pub struct AuditEntry {
     pub secret_key: Option<String>,
     pub detail: serde_json::Value,
     pub ip: String,
+}
+
+/// Always answered without authentication, so monitoring can alert on a sealed server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SysStatus {
+    pub state: SealState,
+    /// Once initialised, the stored mode. Before that, the mode the configuration requires, if any.
+    pub seal_mode: Option<SealMode>,
+    /// How the server is unlocked after a start; passphrase mode only. Before setup, the policy
+    /// the configuration sets, if any.
+    pub unlock_policy: Option<UnlockPolicy>,
+    /// The unlock policy comes from server configuration and cannot be changed through the API.
+    pub configured: bool,
+    /// A remembered unlock is in place, so the next start unlocks itself. Sealing by hand does not
+    /// clear it; forget the unlock for that.
+    pub remembered: bool,
+    /// How the root key got into memory, while unsealed. `key-file` with a passphrase `seal_mode`
+    /// means a root key file overrode the passphrase.
+    #[serde(default)]
+    pub unsealed_by: Option<UnsealedBy>,
+    /// First-boot setup is offered through the API and web interface.
+    pub web_setup: bool,
+    pub version: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InitRequest {
+    /// The one-time code from the server log.
+    #[schema(value_type = String)]
+    pub setup_code: Zeroizing<String>,
+    pub mode: SealMode,
+    /// Required in passphrase mode; at least 12 characters.
+    #[schema(value_type = Option<String>)]
+    pub passphrase: Option<Zeroizing<String>>,
+    /// Passphrase mode only; `manual` when absent.
+    #[serde(default)]
+    pub unlock_policy: Option<UnlockPolicy>,
+}
+
+impl std::fmt::Debug for InitRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitRequest")
+            .field("mode", &self.mode)
+            .field("unlock_policy", &self.unlock_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InitResponse {
+    pub status: SysStatus,
+    /// A short-lived organisation admin token, shown once.
+    pub admin_token: String,
+    /// Unix seconds when `admin_token` stops working.
+    #[serde(default)]
+    pub admin_token_expires_at: i64,
+}
+
+impl std::fmt::Debug for InitResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitResponse")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UnsealRequest {
+    #[schema(value_type = String)]
+    pub passphrase: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for UnsealRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnsealRequest").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangePassphrase {
+    #[schema(value_type = String)]
+    pub current: Zeroizing<String>,
+    #[schema(value_type = String)]
+    pub new: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for ChangePassphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePassphrase").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SetUnlockPolicy {
+    pub policy: UnlockPolicy,
+    /// The current passphrase; required for `remember` and `passphrase-file`, which weaken how
+    /// the server is unlocked.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub passphrase: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for SetUnlockPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetUnlockPolicy")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PassphraseCheck {
+    #[schema(value_type = String)]
+    pub passphrase: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for PassphraseCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseCheck").finish_non_exhaustive()
+    }
 }

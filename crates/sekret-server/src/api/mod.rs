@@ -3,6 +3,7 @@ pub mod logo;
 mod org;
 mod projects;
 mod secrets;
+mod sys;
 
 use std::net::IpAddr;
 
@@ -85,15 +86,15 @@ pub async fn find_env(state: &AppState, project: &Project, slug: &str) -> ApiRes
         .ok_or_else(|| ApiError::not_found("environment"))
 }
 
-pub fn secret_ctx<'a>(state: &'a AppState, principal: &Principal) -> SecretCtx<'a> {
-    SecretCtx {
+pub fn secret_ctx<'a>(state: &'a AppState, principal: &Principal) -> ApiResult<SecretCtx<'a>> {
+    Ok(SecretCtx {
         store: state.store.as_ref(),
-        root_key: &state.root_key,
+        root_key: state.keyring.root()?,
         now: state.clock.now(),
         actor: principal.actor(),
         snapshots_to_keep: state.config.snapshots_to_keep,
         generated: false,
-    }
+    })
 }
 
 pub fn api_project(p: &Project) -> sekret_api::Project {
@@ -146,7 +147,7 @@ pub fn from_api_kind(kind: sekret_api::PrincipalKind) -> sekret_store::Principal
         logo::LogoFile,
     )),
     modifiers(&BearerAuth),
-    tags((name = "auth"), (name = "projects"), (name = "secrets"), (name = "organisation"))
+    tags((name = "system"), (name = "auth"), (name = "projects"), (name = "secrets"), (name = "organisation"))
 )]
 pub struct ApiDoc;
 
@@ -154,6 +155,7 @@ struct BearerAuth;
 
 impl utoipa::Modify for BearerAuth {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi.info.version = sekret_core::VERSION.to_string();
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "bearer",
@@ -179,4 +181,5 @@ pub fn router() -> OpenApiRouter<AppState> {
         .merge(projects::router())
         .merge(logo::router())
         .merge(secrets::router())
+        .merge(sys::router())
 }

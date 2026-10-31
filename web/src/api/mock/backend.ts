@@ -12,6 +12,7 @@ import type {
   AuthMethodKind,
   BatchResult,
   BatchWrite,
+  ChangePassphrase,
   ClientSecret,
   CreateClientSecret,
   CreatedClientSecret,
@@ -24,10 +25,13 @@ import type {
   Generator,
   Identity,
   IdentityPage,
+  InitRequest,
+  InitResponse,
   Me,
   Membership,
   OrgBinding,
   Overview,
+  PassphraseStrength,
   PolicyOverride,
   PrincipalKind,
   Project,
@@ -46,16 +50,28 @@ import type {
   SnapshotDetail,
   SortOrder,
   Subject,
+  SysStatus,
+  UnlockPolicy,
   UpdateEnvironment,
   UpdateIdentity,
   UpdateProject,
   User,
   UserPage,
 } from "../types";
+import type { StrengthChecker } from "@/lib/passphrase";
 import { ORG_SUBJECTS, PROJECT_SUBJECTS, REDACTED_CREDENTIAL } from "../types";
 import type { AuditQuery, IdentityQuery, UserQuery } from "../endpoints";
 import { generateValue } from "./generate";
 import { builtinRoles, covers } from "./roles";
+import {
+  compactUtc,
+  MAX_FAILED_UNSEALS,
+  MOCK_SETUP_CODE,
+  MOCK_VERSION,
+  statusOf,
+  sysFromControls,
+} from "./sys";
+import type { MockControls } from "./controls";
 import {
   currentVersion,
   isDeleted,
@@ -148,11 +164,14 @@ function normalisePolicy(policy: SecretPolicy): SecretPolicy {
 export class MockError extends Error {
   readonly status: number;
   readonly code: string;
+  /** Extra fields of the error body, such as zxcvbn's feedback. */
+  readonly extra: Record<string, unknown>;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, extra: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
     this.code = code;
+    this.extra = extra;
   }
 }
 
@@ -302,6 +321,17 @@ export class MockBackend {
 
   me(): Me {
     return { ...this.state.me, org_rules: this.orgRules() };
+  }
+
+  /** Replaces the caller's organisation roles with one, to try the interface as someone else. */
+  setMyOrgRole(role: string): void {
+    const others = this.state.orgBindings.filter((b) => !this.principalIsMe(b.principal_kind, b.principal_id));
+    this.state.orgBindings = [...others, { principal_kind: "user", principal_id: this.state.me.id, role }];
+  }
+
+  applyControls(controls: MockControls): void {
+    this.state.sys = sysFromControls(this.state.sys, controls);
+    if (controls.orgRole) this.setMyOrgRole(controls.orgRole);
   }
 
   // Projects
@@ -1479,6 +1509,158 @@ export class MockBackend {
     this.requireOrg("org-roles", "delete");
     this.state.roles[""] = (this.state.roles[""] ?? []).filter((r) => r.slug !== slug);
     this.audit("org.role-delete", {}, { role: slug });
+  }
+
+  // Setup, sealing and backups
+
+  sysStatus(): SysStatus {
+    return statusOf(this.state.sys);
+  }
+
+  /** Mirrors the server's gate: everything but the open routes answers 503 until set up and unlocked. */
+  requireUnsealed(): void {
+    const { state } = this.state.sys;
+    if (state === "sealed") throw new MockError(503, "sealed", "the server is sealed; unlock it to continue");
+    if (state === "uninitialised") throw new MockError(503, "uninitialised", "the server has not been set up yet");
+  }
+
+  private isOrgAdmin(): boolean {
+    return this.state.orgBindings.some((b) => b.role === "org-admin" && this.principalIsMe(b.principal_kind, b.principal_id));
+  }
+
+  private requireOrgAdmin(): void {
+    if (!this.isOrgAdmin()) throw forbidden();
+  }
+
+  private requirePassphraseMode(): void {
+    if (this.state.sys.mode !== "passphrase") throw new MockError(409, "conflict", "only a server in passphrase mode can do that");
+  }
+
+  private systemAudit(action: string, name: string): void {
+    this.recordAudit(action, { kind: "identity", id: name, name });
+  }
+
+  /** Open while uninitialised; afterwards only organisation admins may ask. */
+  checkPassphrase(passphrase: string, check: StrengthChecker): PassphraseStrength {
+    if (this.state.sys.state === "sealed") this.requireUnsealed();
+    if (this.state.sys.state === "unsealed") {
+      this.requireSession();
+      this.requireOrgAdmin();
+    }
+    return check(passphrase);
+  }
+
+  private requireStrong(passphrase: string, check: StrengthChecker): void {
+    const strength = check(passphrase);
+    if (strength.acceptable) return;
+    throw new MockError(400, "weak_passphrase", "the passphrase is too easy to guess", { strength });
+  }
+
+  init(request: InitRequest, check: StrengthChecker): InitResponse {
+    const sys = this.state.sys;
+    if (!sys.webSetup) {
+      throw new MockError(403, "setup_disabled", "setup through the API is turned off; run `sekret admin init` on the host");
+    }
+    if (sys.state !== "uninitialised") throw new MockError(409, "conflict", "the server is already initialised");
+    if (request.setup_code !== MOCK_SETUP_CODE) {
+      throw new MockError(401, "invalid_setup_code", "the setup code is wrong; it is in the server log");
+    }
+    if (request.mode !== "passphrase") {
+      throw badRequest("key-file mode needs a root key file path; start the server with --root-key-file");
+    }
+    if (!request.passphrase) throw badRequest("passphrase mode needs a passphrase");
+    this.requireStrong(request.passphrase, check);
+    const policy = sys.configured ? (sys.unlockPolicy ?? "manual") : (request.unlock_policy ?? "manual");
+    this.state.sys = {
+      ...sys,
+      state: "unsealed",
+      mode: "passphrase",
+      unlockPolicy: policy,
+      remembered: policy === "remember",
+      passphrase: request.passphrase,
+      failedUnseals: 0,
+    };
+    this.systemAudit("sys.init", "setup");
+    const raw = Array.from(crypto.getRandomValues(new Uint8Array(24)), (b) => b.toString(16).padStart(2, "0")).join("");
+    return { status: this.sysStatus(), admin_token: `skt_${raw}` };
+  }
+
+  unseal(passphrase: string): SysStatus {
+    const sys = this.state.sys;
+    if (sys.state === "unsealed") return this.sysStatus();
+    this.requireUnsealedOrSealed();
+    if (sys.failedUnseals >= MAX_FAILED_UNSEALS) {
+      sys.failedUnseals = 0;
+      throw new MockError(429, "rate_limited", "too many requests, slow down");
+    }
+    if (passphrase !== sys.passphrase) {
+      sys.failedUnseals += 1;
+      this.systemAudit("sys.unseal.failed", "unseal");
+      throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");
+    }
+    sys.state = "unsealed";
+    sys.failedUnseals = 0;
+    if (sys.unlockPolicy === "remember") sys.remembered = true;
+    this.systemAudit("sys.unseal", "unseal");
+    return this.sysStatus();
+  }
+
+  private requireUnsealedOrSealed(): void {
+    if (this.state.sys.state === "uninitialised") this.requireUnsealed();
+  }
+
+  seal(): SysStatus {
+    this.requireOrgAdmin();
+    this.requirePassphraseMode();
+    this.state.sys.state = "sealed";
+    this.audit("sys.seal", {});
+    return this.sysStatus();
+  }
+
+  changePassphrase(request: ChangePassphrase, check: StrengthChecker): void {
+    this.requireOrgAdmin();
+    this.requirePassphraseMode();
+    this.requireStrong(request.new, check);
+    if (request.current !== this.state.sys.passphrase) {
+      throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");
+    }
+    this.state.sys.passphrase = request.new;
+    this.audit("sys.passphrase", {});
+  }
+
+  setUnlockPolicy(policy: UnlockPolicy): SysStatus {
+    this.requireOrgAdmin();
+    this.requirePassphraseMode();
+    if (this.state.sys.configured) {
+      throw new MockError(409, "conflict", "the unlock policy is set in the server configuration; change it there");
+    }
+    this.state.sys.unlockPolicy = policy;
+    this.state.sys.remembered = policy === "remember";
+    this.audit("sys.unlock_policy", {}, { policy });
+    return this.sysStatus();
+  }
+
+  forgetUnlock(): SysStatus {
+    this.requireOrgAdmin();
+    this.requirePassphraseMode();
+    this.state.sys.remembered = false;
+    this.audit("sys.forget_unlock", {});
+    return this.sysStatus();
+  }
+
+  /** A stand-in `.skb` file: the real magic and header shape, with random bytes for the ciphertext. */
+  backup(): { bytes: Uint8Array; filename: string } {
+    this.requireOrg("backups", "read");
+    const now = this.now();
+    const header = new TextEncoder().encode(
+      JSON.stringify({ mode: this.state.sys.mode, created_at: now, version: MOCK_VERSION }),
+    );
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, header.length, true);
+    const body = crypto.getRandomValues(new Uint8Array(256));
+    const bytes = new Uint8Array([...new TextEncoder().encode("SKB1"), ...length, ...header, ...body]);
+    this.audit("sys.backup", {}, { bytes: bytes.length });
+    return { bytes, filename: `sekret-backup-${compactUtc(now)}.skb` };
   }
 
   // CLI device login
