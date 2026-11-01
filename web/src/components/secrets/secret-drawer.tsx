@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useSealWatch } from "@/hooks/queries";
+import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useOptionalQuery, useSealWatch } from "@/hooks/queries";
 import { useIdle } from "@/hooks/use-idle";
 import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
@@ -226,12 +226,12 @@ export function SecretDrawer({
     enabled: secretKey !== null,
     gcTime: SECRET_VALUE_GC_TIME,
   });
-  const withValues = useQuery({
-    queryKey: [...historyKey, "values"],
-    queryFn: () => loadVersions(true),
-    enabled: showValues,
-    gcTime: SECRET_VALUE_GC_TIME,
-  });
+  // Every reveal asks the server, so each one is audited and a revoked reader sees nothing stale.
+  const withValues = useOptionalQuery(
+    showValues
+      ? { queryKey: [...historyKey, "values"], queryFn: () => loadVersions(true), staleTime: 0, gcTime: SECRET_VALUE_GC_TIME }
+      : null,
+  );
   useSealWatch(showValues);
   useIdle(showValues, () => setValuesFor(null));
 
@@ -246,7 +246,7 @@ export function SecretDrawer({
     success: (_, version) => `Rolled ${secretKey} back to version ${version}`,
   });
 
-  const revealed = showValues ? withValues.data : undefined;
+  const revealed = showValues ? withValues?.data : undefined;
   const list = revealed ?? versions.data ?? [];
   const currentVersion = list[0]?.version;
 
@@ -291,10 +291,8 @@ export function SecretDrawer({
                       Values are hidden. Showing them is recorded in the audit log.
                     </p>
                   )}
-                  {showValues && withValues.isPending && <ListSkeleton rows={1} />}
-                  {showValues && withValues.error && (
-                    <ErrorState error={withValues.error} onRetry={() => void withValues.refetch()} />
-                  )}
+                  {withValues?.isPending && <ListSkeleton rows={1} />}
+                  {withValues?.error && <ErrorState error={withValues.error} onRetry={() => void withValues.refetch()} />}
                   {revealed && <VersionDiff key={currentVersion} versions={revealed} />}
                 </section>
                 <section className="space-y-3">

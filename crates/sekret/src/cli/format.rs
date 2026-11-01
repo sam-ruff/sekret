@@ -18,7 +18,7 @@ pub fn flatten(secrets: &[RawSecret]) -> anyhow::Result<BTreeMap<String, String>
         if out.insert(secret.key.clone(), secret.value.clone()).is_some() {
             bail!(
                 "{} exists in more than one folder; narrow --path or drop --recursive",
-                secret.key
+                one_line(&secret.key)
             );
         }
     }

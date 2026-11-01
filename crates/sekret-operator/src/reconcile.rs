@@ -672,6 +672,7 @@ mod tests {
                     status: 401,
                     code: "unauthorized".into(),
                     message: "kubernetes rejected the token".into(),
+                    retry_after: None,
                 })
             });
             Ok(Box::new(api))
@@ -962,6 +963,7 @@ mod tests {
             status: 403,
             code: "forbidden".into(),
             message: "no access to app".into(),
+            retry_after: None,
         });
         assert!(api.to_string().contains("no access to app"));
     }

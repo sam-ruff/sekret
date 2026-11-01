@@ -7,6 +7,7 @@ import { api } from "@/api/endpoints";
 import type { Project, PutRole } from "@/api/types";
 import { PROJECT_SUBJECTS } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { LinkTabs } from "@/components/link-tabs";
 import { PageHeader } from "@/components/page-header";
 import { RolesPanel } from "@/components/roles/roles-panel";
@@ -221,11 +222,13 @@ export function SettingsPage() {
           destructive: t.id === "danger",
         }))}
       />
-      {active === "general" && <GeneralSection project={project} perms={perms} />}
-      {active === "environments" && <EnvironmentsSection project={project} perms={perms} />}
-      {active === "members" && <MembersSection project={project} perms={perms} />}
-      {active === "roles" && <RolesSection project={project} perms={perms} />}
-      {active === "danger" && <DangerSection project={project} perms={perms} />}
+      <ErrorBoundary variant="section" resetKey={active}>
+        {active === "general" && <GeneralSection project={project} perms={perms} />}
+        {active === "environments" && <EnvironmentsSection project={project} perms={perms} />}
+        {active === "members" && <MembersSection project={project} perms={perms} />}
+        {active === "roles" && <RolesSection project={project} perms={perms} />}
+        {active === "danger" && <DangerSection project={project} perms={perms} />}
+      </ErrorBoundary>
     </div>
   );
 }

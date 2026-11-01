@@ -227,6 +227,43 @@ test.describe("revealed values", () => {
     expect(await page.evaluate(() => document.body.innerHTML)).not.toContain(DEV_DATABASE_URL);
   });
 
+  test("hide at once when the page is seen again after the machine slept", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    const row = secretRow(page, "DATABASE_URL");
+    await row.getByTestId("secret-reveal").click();
+    await expect(row.getByTestId("secret-value")).toHaveText(DEV_DATABASE_URL);
+    // The wall clock moves on an hour while no timer runs, as during sleep.
+    await page.clock.setSystemTime(Date.now() + 3_600_000);
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(row.getByTestId("secret-value")).not.toContainText(DEV_DATABASE_URL);
+  });
+
+  test("typed into the new secret form are dropped after three idle minutes", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await page.getByTestId("add-secret").click();
+    const form = page.getByTestId("new-secret-form");
+    await form.getByTestId("secret-key-input").fill("TYPED_KEY");
+    await form.getByTestId("secret-value-input").fill("typed-plaintext-value");
+    await page.clock.fastForward(181_000);
+    await expect(form).toHaveCount(0);
+    await expectToast(page, "Closed the new secret form after three idle minutes");
+    expect(await page.evaluate(() => document.body.innerHTML)).not.toContain("typed-plaintext-value");
+  });
+
+  test("pasted into the import dialog are dropped after three idle minutes", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await page.getByTestId("secrets-more").click();
+    await page.getByTestId("import-env").click();
+    await page.getByTestId("import-env-text").fill("PASTED=pasted-plaintext-value");
+    await page.clock.fastForward(181_000);
+    await expect(page.getByTestId("import-env-dialog")).toHaveCount(0);
+    await expectToast(page, "Closed the import after three idle minutes");
+    expect(await page.evaluate(() => document.body.innerHTML)).not.toContain("pasted-plaintext-value");
+  });
+
   test("in the edit form go when the session ends, with nothing else revealed", async ({ page }) => {
     await page.clock.install();
     await openProject(page);

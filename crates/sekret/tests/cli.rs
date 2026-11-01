@@ -56,19 +56,18 @@ fn ok(output: Output) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("utf8")
 }
 
-/// Records the yes a person gives at a terminal to a project file's `allow` list.
-fn confirm_allow(home: &Path, project_file: &Path, names: &[&str]) -> anyhow::Result<()> {
+/// Records the yes a person gives at a terminal to a project file's `allow` list, for loading
+/// from `server`, `project`, `environment` and `path`.
+fn confirm_allow(home: &Path, project_file: &Path, at: [&str; 4], names: &[&str]) -> anyhow::Result<()> {
     let dir = home.join("config").join("sekret");
     std::fs::create_dir_all(&dir).context("config dir")?;
     let path = dir.join("credentials.toml");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let key = std::fs::canonicalize(project_file).context("canonical")?;
+    let file = std::fs::canonicalize(project_file).context("canonical")?;
+    let [server, project, environment, folder] = at;
+    let key = json!([file.display().to_string(), server, project, environment, folder]).to_string();
     let list: Vec<String> = names.iter().map(|n| format!("{n:?}")).collect();
-    let text = format!(
-        "{existing}\n[confirmed_allow]\n{:?} = [{}]\n",
-        key.display().to_string(),
-        list.join(", ")
-    );
+    let text = format!("{existing}\n[confirmed_allow]\n{key:?} = [{}]\n", list.join(", "));
     std::fs::write(&path, text).context("write credentials")?;
     #[cfg(unix)]
     {
@@ -233,6 +232,18 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
 
     assert!(ok(run(&["projects"], &env, h, None)?)?.contains("app"));
     assert!(ok(run(&["whoami"], &env, h, None)?)?.contains("bootstrap-admin"));
+    // A token in argv is readable by every local user, so the flag form is warned about.
+    let from_env = run(&["whoami"], &env, h, None)?;
+    assert!(!String::from_utf8_lossy(&from_env.stderr).contains("process list"));
+    let no_token: Vec<(&str, &str)> = env.iter().copied().filter(|(k, _)| *k != "SEKRET_TOKEN").collect();
+    let from_flag = run(&["--token", &server.admin, "whoami"], &no_token, h, None)?;
+    let stderr = String::from_utf8_lossy(&from_flag.stderr).into_owned();
+    assert!(ok(from_flag)?.contains("bootstrap-admin"));
+    assert!(
+        stderr.contains("--token") && stderr.contains("process list"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&server.admin), "{stderr}");
 
     std::fs::write(h.join("import.env"), "FROM_FILE=imported\n# comment\n").context("env file")?;
     let set = ok(run(
@@ -276,6 +287,15 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
     let exported = ok(run(&["export", "--format", "json"], &env, h, None)?)?;
     let parsed: Value = serde_json::from_str(&exported).context("json")?;
     assert_eq!(parsed["PASSWORD"], "s3cret");
+
+    // Only a terminal is protected from escape sequences; a pipe or file gets the value exactly,
+    // with or without --raw.
+    ok(run(&["secrets", "set", "TRAP=-"], &env, h, Some("x\u{1b}[2Jy\n"))?)?;
+    for args in [vec!["export"], vec!["export", "--raw"]] {
+        let piped = ok(run(&args, &env, h, None)?)?;
+        assert!(piped.contains("TRAP=\"x\u{1b}[2Jy\""), "{args:?}: {piped:?}");
+    }
+    ok(run(&["secrets", "delete", "TRAP"], &env, h, None)?)?;
 
     let status = run(
         &["run", "--", "sh", "-c", "test \"$DB_URL\" = postgres://one && exit 3"],
@@ -370,9 +390,25 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
     let notes = String::from_utf8_lossy(&unconfirmed.stderr).into_owned();
     assert!(!ok(unconfirmed)?.contains("GIT_EXTERNAL_DIFF"));
     assert!(notes.contains("confirm"), "{notes}");
-    confirm_allow(h, &h.join(".sekret.toml"), &["GIT_EXTERNAL_DIFF"])?;
-    let from_file = ok(run(&["export", "--format", "shell"], &env, h, None)?)?;
+    confirm_allow(
+        h,
+        &h.join(".sekret.toml"),
+        [server.url.as_str(), "app", "dev", "/"],
+        &["GIT_EXTERNAL_DIFF"],
+    )?;
+    let from_file = run(&["export", "--format", "shell"], &env, h, None)?;
+    let notes = String::from_utf8_lossy(&from_file.stderr).into_owned();
+    let from_file = ok(from_file)?;
     assert!(from_file.contains("export GIT_EXTERNAL_DIFF="), "{from_file}");
+    assert!(!notes.contains("confirm"), "{notes}");
+    // The yes was for app/dev; loading from another environment asks again.
+    let mut staging = env.to_vec();
+    staging.retain(|(k, _)| *k != "SEKRET_ENVIRONMENT");
+    staging.push(("SEKRET_ENVIRONMENT", "staging"));
+    let elsewhere = run(&["export", "--format", "shell"], &staging, h, None)?;
+    let notes = String::from_utf8_lossy(&elsewhere.stderr).into_owned();
+    ok(elsewhere)?;
+    assert!(notes.contains("confirm") && notes.contains("app/staging"), "{notes}");
     std::fs::write(
         h.join(".sekret.toml"),
         "allow = [\"GIT_EXTERNAL_DIFF\", \"LD_PRELOAD\"]\n",

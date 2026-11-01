@@ -2,7 +2,7 @@
 
 A machine identity is an account for software: a CI pipeline, a pod, an Ansible run. It holds roles like a person does, and it logs in by presenting a credential to one of its auth methods. A successful login returns a short-lived access token, one hour by default, that the machine uses like a person's token.
 
-Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. An identity can also have trusted CIDRs, which limit where it can log in from and where its tokens can be used.
+Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. An identity can also have trusted CIDRs, shown as *Allowed networks* in the web interface, which limit where it can log in from and where its tokens can be used.
 
 Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Disabling an identity revokes its tokens straight away.
 
@@ -38,7 +38,7 @@ In TokenReview mode, sekret asks the cluster's API server whether the token is v
 
 Either way, the binding lists which namespaces and service account names are allowed, with `*` patterns.
 
-Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to `exp`, are refused, as are tokens with no `iat`. The default is 3600, so a cluster admin cannot mint a year-long token for the service account and keep using it after the account is deleted. The operator asks for ten-minute tokens. If a pod projects its own token, keep its `expirationSeconds` at or under the limit, or raise the limit. In TokenReview mode the limit applies too: a token whose claims cannot be read is refused even when the API server accepts it. Every service account token Kubernetes issues is a readable JWT. In the web interface it is the "Longest Kubernetes token accepted" field on the identity's Kubernetes form.
+Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to `exp`, are refused, as are tokens with no `iat`. The default is 3600, so a cluster admin cannot mint a year-long token for the service account and keep using it after the account is deleted, and the limit can be raised to at most ten years. The operator asks for ten-minute tokens. If a pod projects its own token, keep its `expirationSeconds` at or under the limit, or raise the limit. In TokenReview mode the limit applies too: a token whose claims cannot be read is refused even when the API server accepts it. Every service account token Kubernetes issues is a readable JWT. In the web interface it is the "Longest Kubernetes token accepted" field on the identity's Kubernetes form.
 
 ```json
 {
@@ -55,7 +55,7 @@ Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to
 
 ## Universal auth
 
-A client id (the identity's id) and a client secret, for machines with no token of their own, such as a host running Ansible. Client secrets start with `sks_`, are shown once at creation, and are stored only as a hash. Each can have a lifetime and a maximum number of uses.
+A client id (the identity's id) and a client secret, for machines with no token of their own, such as a host running Ansible. Client secrets start with `sks_`, are shown once at creation, and are stored only as a hash. Each can have a lifetime of up to ten years and a maximum number of uses; leave the lifetime out for a secret that never expires.
 
 ```sh
 sekret login --client-id "$IDENTITY_ID" --client-secret-file /etc/app/sekret-secret

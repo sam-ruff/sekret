@@ -120,6 +120,43 @@ describe("ServerPage", () => {
     expect(card).toBeInTheDocument();
   });
 
+  it("treats a stale seal mark after a passphrase change as done, asking for a repair rather than a retry", async () => {
+    mocked.changePassphrase.mockRejectedValue(
+      new ApiError("the passphrase was changed, but a seal epoch mark could not be moved", 500, "epoch_mark_stale"),
+    );
+    renderServer();
+    await userEvent.type(await screen.findByTestId("current-passphrase"), "correct horse battery staple");
+    await userEvent.type(screen.getByTestId("change-passphrase"), "plum orbit gravel lantern");
+    await userEvent.type(screen.getByTestId("change-confirm"), "plum orbit gravel lantern");
+    await waitFor(() => expect(screen.getByTestId("change-submit")).toBeEnabled());
+    await userEvent.click(screen.getByTestId("change-submit"));
+    await userEvent.click(within(await screen.findByTestId("change-passphrase-dialog")).getByTestId("confirm-action"));
+
+    const alert = await screen.findByTestId("change-mark-stale");
+    expect(alert).toHaveTextContent("The new passphrase was saved, but the host needs a repair");
+    expect(alert).toHaveTextContent("sekret admin reset-epoch");
+    expect(alert).toHaveTextContent("There is no need to try again");
+    expect(screen.queryByTestId("change-error")).toBeNull();
+    expect(screen.getByTestId("current-passphrase")).toHaveValue("");
+    expect(screen.getByTestId("change-passphrase")).toHaveValue("");
+  });
+
+  it("treats a stale seal mark after a policy change as saved and closes the dialog", async () => {
+    mocked.setUnlockPolicy.mockRejectedValue(new ApiError("the unlock policy was changed", 500, "epoch_mark_stale"));
+    renderServer();
+    await userEvent.click(await screen.findByTestId("server-policy-card-remember"));
+    await userEvent.click(screen.getByTestId("policy-save"));
+    const dialog = await screen.findByTestId("policy-dialog");
+    await userEvent.type(within(dialog).getByTestId("policy-passphrase"), "the right one");
+    // The server kept the change, so the status read afterwards has the new policy.
+    mocked.sysStatusDetail.mockResolvedValue({ ...unlocked, unlock_policy: "remember", remembered: true });
+    await userEvent.click(within(dialog).getByTestId("confirm-action"));
+    await waitFor(() => expect(screen.queryByTestId("policy-dialog")).toBeNull());
+    expect(await screen.findByTestId("server-remembered")).toHaveTextContent("Remembered: yes");
+    // The note outlives the card starting afresh on the new policy.
+    expect(screen.getByTestId("policy-mark-stale")).toHaveTextContent("The unlock policy was saved");
+  });
+
   it("warns when a key file unlocked a passphrase server", async () => {
     renderServer({ ...unlocked, unsealed_by: "key-file" });
     expect(await screen.findByTestId("server-key-file-override")).toHaveTextContent("A key file unlocked this server");

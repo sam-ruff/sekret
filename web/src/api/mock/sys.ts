@@ -13,6 +13,11 @@ export const MOCK_BACKOFF_SECONDS = 3;
 export const MOCK_KDF_BUSY_PASSPHRASE = "mock kdf busy";
 /** Unlocking with this plays a server whose database was replaced, so the key it opens is not recognised. */
 export const MOCK_FOREIGN_KEY_PASSPHRASE = "mock restored database";
+/**
+ * While this is the passphrase, passphrase and unlock policy changes are saved but answer
+ * `epoch_mark_stale`, as when the seal mark file outside the database cannot be written.
+ */
+export const MOCK_STALE_MARK_PASSPHRASE = "stale mark copper lantern harbour ferry";
 /** CLI login codes starting with this need a fresh sign-in before they can be approved. */
 export const MOCK_REAUTH_CODE_PREFIX = "AUTH";
 /** Where every pending CLI login in the fake says it came from. */

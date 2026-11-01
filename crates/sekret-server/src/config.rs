@@ -121,22 +121,27 @@ fn sidecar(path: &std::path::Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Where the epoch high-water mark is kept: beside the SQLite database, the remember file and the
-/// root key file, whichever there are, each by its canonical path so that every way of naming
-/// a file finds the same mark. A Postgres server with none of the files has nowhere.
+/// Where the epoch high-water mark is kept: at `epoch_file` when set, and beside the SQLite
+/// database, the remember file and the root key file, whichever there are, each by its canonical
+/// path so that every way of naming a file finds the same mark. A Postgres server with none of
+/// these has nowhere, which the server refuses.
 pub fn epoch_files(
     database_url: &str,
     remember_file: Option<&std::path::Path>,
     root_key_file: Option<&std::path::Path>,
+    epoch_file: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = sekret_store::sqlite_file(database_url)
-        .as_deref()
+    let beside = sekret_store::sqlite_file(database_url)
         .into_iter()
-        .chain(remember_file)
-        .chain(root_key_file)
-        .map(|path| sidecar(&sekret_store::canonical_path(path), ".epoch"))
-        .collect();
-    files.dedup();
+        .chain(remember_file.map(std::path::Path::to_path_buf))
+        .chain(root_key_file.map(std::path::Path::to_path_buf))
+        .map(|path| sidecar(&sekret_store::canonical_path(&path), ".epoch"));
+    let mut files: Vec<PathBuf> = Vec::new();
+    for path in epoch_file.map(sekret_store::canonical_path).into_iter().chain(beside) {
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
     files
 }
 
@@ -220,6 +225,7 @@ mod tests {
             "sqlite:///var/lib/sekret/sekret.db?mode=rwc",
             Some(std::path::Path::new("/run/sekret/unlock.key")),
             None,
+            None,
         );
         assert_eq!(
             files,
@@ -228,7 +234,21 @@ mod tests {
                 PathBuf::from("/run/sekret/unlock.key.epoch")
             ]
         );
-        assert!(epoch_files("postgres://db/sekret", None, None).is_empty());
+        assert!(epoch_files("postgres://db/sekret", None, None, None).is_empty());
+    }
+
+    #[test]
+    fn an_epoch_file_is_a_mark_of_its_own_and_counted_once() {
+        let mark = std::path::Path::new("/var/lib/sekret/seal.epoch");
+        assert_eq!(
+            epoch_files("postgres://db/sekret", None, None, Some(mark)),
+            vec![mark.to_path_buf()]
+        );
+        let beside_db = std::path::Path::new("/var/lib/sekret/sekret.db.epoch");
+        assert_eq!(
+            epoch_files("sqlite:///var/lib/sekret/sekret.db", None, None, Some(beside_db)),
+            vec![beside_db.to_path_buf()]
+        );
     }
 
     #[cfg(unix)]
@@ -239,8 +259,8 @@ mod tests {
         std::fs::write(&real, b"")?;
         let link = dir.path().join("link.db");
         std::os::unix::fs::symlink(&real, &link)?;
-        let through_link = epoch_files(&format!("sqlite://{}", link.display()), None, None);
-        let direct = epoch_files(&format!("sqlite://{}", real.display()), None, None);
+        let through_link = epoch_files(&format!("sqlite://{}", link.display()), None, None, None);
+        let direct = epoch_files(&format!("sqlite://{}", real.display()), None, None, None);
         assert_eq!(through_link, direct);
         Ok(())
     }

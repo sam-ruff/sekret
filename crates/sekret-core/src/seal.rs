@@ -509,34 +509,62 @@ pub enum RememberSecretError {
 /// Fewer distinct bytes than this in a decoded key means it was not drawn at random.
 const MIN_DISTINCT_KEY_BYTES: usize = 16;
 
-/// Whether `text` decodes, as hex or base64, to at least [`KEY_LEN`] bytes that look random.
-fn is_random_key_text(text: &str) -> bool {
+/// Consecutive key bytes stepping by the same amount this many times means a pattern, not chance.
+const MAX_KEY_STEP_RUN: usize = 4;
+/// The same for the characters of the encoded text, such as `ABCDEFGHI`. Higher, as hex has only
+/// 16 characters to step through.
+const MAX_TEXT_STEP_RUN: usize = 8;
+
+/// Whether `values` has `limit` steps in a row of the same size.
+fn has_step_run(values: &[u8], limit: usize) -> bool {
+    let mut run = 0;
+    let mut previous_step = None;
+    for pair in values.windows(2) {
+        let step = pair[1].wrapping_sub(pair[0]);
+        run = if previous_step == Some(step) { run + 1 } else { 0 };
+        if run + 1 >= limit {
+            return true;
+        }
+        previous_step = Some(step);
+    }
+    false
+}
+
+/// The bytes `text` decodes to as hex or base64, when that is at least [`KEY_LEN`] of them.
+fn decoded_key(text: &str) -> Option<Zeroizing<Vec<u8>>> {
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-    let decoded = hex::decode(text)
+    hex::decode(text)
         .ok()
         .or_else(|| {
             [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
                 .iter()
                 .find_map(|engine| engine.decode(text).ok())
         })
-        .map(Zeroizing::new);
-    let Some(bytes) = decoded else {
-        return false;
-    };
-    if bytes.len() < KEY_LEN {
-        return false;
-    }
+        .map(Zeroizing::new)
+        .filter(|bytes| bytes.len() >= KEY_LEN)
+}
+
+/// Whether an encoded key could have been drawn at random: enough distinct byte values, no run
+/// stepping by a fixed amount in the bytes or the text, and not printable text underneath.
+fn looks_random(text: &str, bytes: &[u8]) -> bool {
     let mut seen = [false; 256];
-    for byte in bytes.iter() {
+    for byte in bytes {
         seen[usize::from(*byte)] = true;
     }
     seen.iter().filter(|s| **s).count() >= MIN_DISTINCT_KEY_BYTES
+        && !has_step_run(bytes, MAX_KEY_STEP_RUN)
+        && !has_step_run(text.as_bytes(), MAX_TEXT_STEP_RUN)
+        && !bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
+}
+
+fn scores_as_passphrase(text: &str) -> bool {
+    text.len() <= MAX_PASSPHRASE_BYTES && u8::from(zxcvbn::zxcvbn(text, &["sekret"]).score()) >= MIN_PASSPHRASE_SCORE
 }
 
 impl RememberSecret {
     /// Drops one trailing line ending, then checks length, characters and that it cannot be
-    /// guessed: an encoded random key of at least 32 bytes, or text with the score a passphrase
-    /// needs.
+    /// guessed: text with the score a passphrase needs and, when it decodes to a key, key bytes
+    /// with no obvious pattern. A key too long to score is judged on its bytes alone.
     pub fn new(text: &str) -> Result<Self, RememberSecretError> {
         let text = trim_input(text);
         if has_control_characters(text) {
@@ -545,9 +573,12 @@ impl RememberSecret {
         if text.chars().count() < MIN_REMEMBER_SECRET_LEN {
             return Err(RememberSecretError::TooShort);
         }
-        let strong = is_random_key_text(text)
-            || (text.len() <= MAX_PASSPHRASE_BYTES
-                && u8::from(zxcvbn::zxcvbn(text, &["sekret"]).score()) >= MIN_PASSPHRASE_SCORE);
+        let strong = match decoded_key(text) {
+            Some(bytes) => {
+                looks_random(text, &bytes) && (text.len() > MAX_PASSPHRASE_BYTES || scores_as_passphrase(text))
+            }
+            None => scores_as_passphrase(text),
+        };
         if !strong {
             return Err(RememberSecretError::Guessable);
         }
@@ -609,11 +640,15 @@ pub struct SealFlags {
     /// The remembered wrap was made with a remember secret, so one without it is never written
     /// in its place. Only forgetting the unlock clears it.
     pub remember_secret: bool,
+    /// The wrap's passphrase form marker is part of the signed message. Configurations signed
+    /// before this leave it out.
+    pub wrap_form_signed: bool,
 }
 
 impl SealFlags {
     const REVIEWER_TOKENS_MIGRATED: i64 = 1;
     const REMEMBER_SECRET: i64 = 2;
+    const WRAP_FORM_SIGNED: i64 = 4;
 
     /// The flags as stored in the database.
     pub fn bits(self) -> i64 {
@@ -624,18 +659,22 @@ impl SealFlags {
         if self.remember_secret {
             bits |= Self::REMEMBER_SECRET;
         }
+        if self.wrap_form_signed {
+            bits |= Self::WRAP_FORM_SIGNED;
+        }
         bits
     }
 
     /// Unknown bits are refused, so a flag this version does not understand is never dropped.
     pub fn from_bits(bits: i64) -> Option<Self> {
-        let known = Self::REVIEWER_TOKENS_MIGRATED | Self::REMEMBER_SECRET;
+        let known = Self::REVIEWER_TOKENS_MIGRATED | Self::REMEMBER_SECRET | Self::WRAP_FORM_SIGNED;
         if bits & !known != 0 {
             return None;
         }
         Some(Self {
             reviewer_tokens_migrated: bits & Self::REVIEWER_TOKENS_MIGRATED != 0,
             remember_secret: bits & Self::REMEMBER_SECRET != 0,
+            wrap_form_signed: bits & Self::WRAP_FORM_SIGNED != 0,
         })
     }
 }
@@ -675,10 +714,9 @@ impl SealBinding<'_> {
         let wrap = self
             .wrapped
             .map(|w| {
-                // The form marker is left out, so versions from before it still verify. Clearing
-                // it only costs the server extra derivations.
+                // Configurations signed before the flag left the marker out, and still verify.
                 let signed = KdfParams {
-                    normalised: false,
+                    normalised: w.params.normalised && self.flags.wrap_form_signed,
                     ..w.params
                 };
                 let params = serde_json::to_vec(&signed).map_err(|_| CryptoError::Malformed)?;
@@ -1143,6 +1181,13 @@ mod tests {
                 },
                 ..binding
             },
+            SealBinding {
+                flags: SealFlags {
+                    wrap_form_signed: true,
+                    ..SealFlags::default()
+                },
+                ..binding
+            },
         ];
         for tampered in changed {
             assert_eq!(
@@ -1187,6 +1232,7 @@ mod tests {
             flags: SealFlags {
                 reviewer_tokens_migrated: true,
                 remember_secret: true,
+                wrap_form_signed: true,
             },
             ..binding
         };
@@ -1195,10 +1241,10 @@ mod tests {
             verify_seal_config(&root, &binding, &mac).is_err(),
             "clearing the flags breaks the signature"
         );
-        for bits in 0..4 {
+        for bits in 0..8 {
             assert_eq!(SealFlags::from_bits(bits).map(SealFlags::bits), Some(bits));
         }
-        assert_eq!(SealFlags::from_bits(4), None, "unknown flags are refused");
+        assert_eq!(SealFlags::from_bits(8), None, "unknown flags are refused");
         Ok(())
     }
 
@@ -1290,7 +1336,40 @@ mod tests {
     }
 
     #[test]
-    fn the_form_marker_is_stored_but_not_signed() -> anyhow::Result<()> {
+    fn the_form_marker_is_signed_once_the_flag_says_so() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let wrapped = wrap_root_key_with(&root, "correct horse battery", CHEAP).context("wrap")?;
+        let mut unmarked = wrapped.clone();
+        unmarked.params.normalised = false;
+        let fingerprint = root.fingerprint();
+        let flags = SealFlags {
+            wrap_form_signed: true,
+            ..SealFlags::default()
+        };
+        let binding = |w| SealBinding {
+            mode: SealMode::Passphrase,
+            policy: UnlockPolicy::Manual,
+            fingerprint: &fingerprint,
+            epoch: 1,
+            wrapped: Some(w),
+            remembered: None,
+            flags,
+        };
+        let marked_mac = seal_config_mac(&root, &binding(&wrapped)).context("mac")?;
+        assert!(
+            verify_seal_config(&root, &binding(&unmarked), &marked_mac).is_err(),
+            "clearing the marker breaks the signature"
+        );
+        let unmarked_mac = seal_config_mac(&root, &binding(&unmarked)).context("mac")?;
+        assert!(
+            verify_seal_config(&root, &binding(&wrapped), &unmarked_mac).is_err(),
+            "setting the marker breaks the signature"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_form_marker_is_stored_but_not_signed_without_the_flag() -> anyhow::Result<()> {
         let json = serde_json::to_string(&LEGACY).context("json")?;
         assert!(!json.contains("normalised"), "{json}");
         let back: KdfParams = serde_json::from_str(&json).context("parse")?;
@@ -1455,6 +1534,12 @@ mod tests {
         ] {
             assert!(RememberSecret::new(&strong).is_ok(), "{strong}");
         }
+        for _ in 0..200 {
+            fill_random(&mut key)?;
+            for strong in [STANDARD.encode(key), hex::encode(key)] {
+                assert!(RememberSecret::new(&strong).is_ok(), "{strong}");
+            }
+        }
         for weak in [
             "a".repeat(32),
             "a".repeat(44),
@@ -1463,6 +1548,11 @@ mod tests {
             hex::encode([7u8; 32]),
             "passwordpasswordpasswordpassword".to_string(),
             "abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            // Pass a distinct-byte count, but are a counting run and the base64 alphabet.
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string(),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_string(),
+            hex::encode((0u8..32).map(|i| i.wrapping_mul(37)).collect::<Vec<_>>()),
+            STANDARD.encode("Quietly Typed Words, Base64 Encoded!"),
         ] {
             assert_eq!(
                 RememberSecret::new(&weak).err(),

@@ -76,7 +76,11 @@ test("without a code in the link, typing one looks the request up", async ({ pag
   await page.goto("/cli-login");
   await expect(page.getByTestId("cli-request")).toHaveCount(0);
   await expect(page.getByTestId("cli-approve")).toBeDisabled();
+  // Nothing is shown below yet, so the warning does not point at it.
+  await expect(page.getByTestId("cli-warning-text")).toContainText("check the address and program that appear");
+  await expect(page.getByTestId("cli-warning-text")).not.toContainText("below");
   await typeCode(page, SAME);
+  await expect(page.getByTestId("cli-warning-text")).toContainText("below are yours");
   await expect(page.getByTestId("cli-request-ip")).toHaveText(MOCK_ADDRESS);
   await page.getByTestId("cli-approve").click();
   await expect(page.getByTestId("cli-approved")).toBeVisible();

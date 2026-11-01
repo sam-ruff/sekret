@@ -44,7 +44,7 @@ logLevel: info
 
 serviceAccount:
   create: true
-  # Defaults to the release full name.
+  # Defaults to the release full name. Required when create is false, and never "default".
   name: ""
   annotations: {}
 

@@ -119,5 +119,7 @@ test("hides history values until asked, then diffs versions and rolls back", asy
   await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-value")).toHaveText("debug");
 
   await page.goto("/org/audit");
-  await expect(page.getByTestId("audit-action").filter({ hasText: "secret.history-read" }).first()).toBeVisible();
+  await expect(page.locator('[data-testid="audit-action"][data-action="secret.history-read"]').first()).toHaveText(
+    "Viewed history values",
+  );
 });

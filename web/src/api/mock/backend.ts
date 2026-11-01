@@ -71,6 +71,7 @@ import {
   MAX_FAILED_UNSEALS,
   MOCK_BACKOFF_SECONDS,
   MOCK_FOREIGN_KEY_PASSPHRASE,
+  MOCK_STALE_MARK_PASSPHRASE,
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_CLI_ADDRESS,
   MOCK_CLI_USER_AGENT,
@@ -1738,6 +1739,17 @@ export class MockBackend {
     this.state.sys.passphrase = request.new;
     this.state.sys.remembered = false;
     this.audit("sys.passphrase", {});
+    this.failIfMarkStale("the passphrase was changed");
+  }
+
+  /** The change above is kept; only the mark outside the database is behind, as on the server. */
+  private failIfMarkStale(what: string): void {
+    if (this.state.sys.passphrase !== MOCK_STALE_MARK_PASSPHRASE) return;
+    throw new MockError(
+      500,
+      "epoch_mark_stale",
+      `${what}, but a seal epoch mark could not be updated; see the server log, make the mark writable, then run \`sekret admin reset-epoch\` with the server stopped`,
+    );
   }
 
   setUnlockPolicy(policy: UnlockPolicy, passphrase?: string | null): SysStatus {
@@ -1759,6 +1771,7 @@ export class MockBackend {
     this.state.sys.unlockPolicy = policy;
     this.state.sys.remembered = policy === "remember";
     this.audit("sys.unlock_policy", {}, { policy });
+    this.failIfMarkStale("the unlock policy was changed");
     return this.sysStatus();
   }
 

@@ -11,7 +11,9 @@ import { ttlProblem, type IdentityDraft } from "@/components/identities/identity
 import { LinkTabs } from "@/components/link-tabs";
 import { UsageSnippets } from "@/components/identities/usage-snippets";
 import { PageHeader } from "@/components/page-header";
-import { ErrorState, ListSkeleton } from "@/components/states";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { ErrorState, ListSkeleton, MissingState } from "@/components/states";
+import { isNotFound } from "@/lib/errors";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -19,6 +21,7 @@ import { Field, FieldLabel } from "@/components/ui/field";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { keys, useApiMutation } from "@/hooks/queries";
+import { usePageTitle } from "@/hooks/use-page-title";
 import { useOrgPermissions } from "@/hooks/use-permissions";
 import { formatDateTime } from "@/lib/format";
 
@@ -87,7 +90,7 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
               <Field orientation="horizontal">
                 <Switch id="identity-disabled" checked={disabled} onCheckedChange={setDisabled} data-testid="identity-disabled" />
                 <FieldLabel htmlFor="identity-disabled" className="font-normal">
-                  Disabled: refuse new logins for this identity
+                  Disabled: refuse new sign-ins for this identity
                 </FieldLabel>
               </Field>
             </fieldset>
@@ -158,6 +161,19 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
   );
 }
 
+function MissingIdentity() {
+  usePageTitle("Identity not found");
+  return (
+    <MissingState
+      title="Identity not found"
+      description="There is no machine identity at this address. It may have been deleted."
+      backTo="/org/identities"
+      backLabel="Back to machine identities"
+      testId="identity-missing"
+    />
+  );
+}
+
 export function IdentityPage() {
   const { id = "", tab } = useParams();
   const org = useOrgPermissions();
@@ -176,7 +192,10 @@ export function IdentityPage() {
           Machine identities
         </Link>
       </Button>
-      {identity.error && <ErrorState error={identity.error} onRetry={() => void identity.refetch()} />}
+      {isNotFound(identity.error) && <MissingIdentity />}
+      {identity.error && !isNotFound(identity.error) && (
+        <ErrorState error={identity.error} onRetry={() => void identity.refetch()} />
+      )}
       {identity.isPending && <ListSkeleton rows={3} />}
       {identity.data && (
         <>
@@ -200,11 +219,13 @@ export function IdentityPage() {
               { value: "usage", label: "Usage", to: `/org/identities/${id}/usage`, testId: "identity-tab-usage" },
             ]}
           />
-          {current === "details" && (
-            <DetailsTab key={JSON.stringify(identity.data)} identity={identity.data} canEdit={canEdit} canDelete={canDelete} />
-          )}
-          {current === "auth" && <AuthMethods identityId={id} canEdit={canEdit} />}
-          {current === "usage" && <UsageSnippets identity={identity.data} />}
+          <ErrorBoundary variant="section" resetKey={current}>
+            {current === "details" && (
+              <DetailsTab key={JSON.stringify(identity.data)} identity={identity.data} canEdit={canEdit} canDelete={canDelete} />
+            )}
+            {current === "auth" && <AuthMethods identityId={id} canEdit={canEdit} />}
+            {current === "usage" && <UsageSnippets identity={identity.data} />}
+          </ErrorBoundary>
         </>
       )}
     </div>

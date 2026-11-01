@@ -21,6 +21,20 @@ async function choose(page: Page, trigger: string, option: string, url: RegExp):
   await settled(page);
 }
 
+test("rows name actions in plain words and describe details without raw JSON", async ({ page }) => {
+  await page.goto("/org/audit");
+  await settled(page);
+  const actions = page.getByTestId("audit-action");
+  await expect(actions.first()).toBeVisible();
+  const labels = await actions.allTextContents();
+  // Labels are words, with the raw code kept beside them for searching.
+  expect(labels.every((label) => !/^[a-z]+\.[a-z_.-]+$/.test(label))).toBe(true);
+  const codes = await page.getByTestId("audit-action-code").allTextContents();
+  expect(codes.every((code) => /^[a-z]+\.[a-z_.-]+$/.test(code))).toBe(true);
+  const details = await page.getByTestId("audit-detail").allTextContents();
+  expect(details.some((detail) => detail.includes('{"'))).toBe(false);
+});
+
 test("pages through the organisation log with the cursor", async ({ page }) => {
   await page.goto("/org/audit");
   await expect(page.getByTestId("audit-total")).toHaveText(/\d+ entries/);
@@ -47,7 +61,7 @@ test("filters by category, actor kind and search, keeping them in the URL", asyn
 
   await choose(page, "audit-action-filter", "audit-action-secret", /action=secret\./);
   await expect.poll(() => total(page)).toBeLessThan(all);
-  const actions = await page.getByTestId("audit-action").allTextContents();
+  const actions = await page.getByTestId("audit-action").evaluateAll((els) => els.map((el) => el.getAttribute("data-action") ?? ""));
   expect(actions.every((a) => a.startsWith("secret."))).toBe(true);
 
   await choose(page, "audit-actor-kind", "audit-actor-kind-identity", /actor_kind=identity/);

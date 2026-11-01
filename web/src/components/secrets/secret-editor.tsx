@@ -1,6 +1,7 @@
 import { Info, Sparkles } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { Charset } from "@/api/types";
+import { FormBlocker } from "@/components/form-blocker";
 import { ListInput } from "@/components/list-input";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
@@ -41,10 +42,17 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
     : undefined;
   const generatorProblem = draft.generator ? lengthProblem(draft.generator.length) : undefined;
   const id = isNew ? "new" : initial.key;
+  const blocker = !draft.key
+    ? "Enter a key to continue."
+    : keyProblem
+      ? "Fix the key to continue."
+      : generatorProblem
+        ? "Fix the length to continue."
+        : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!draft.key || keyProblem || generatorProblem) return;
+    if (blocker) return;
     onSave(draft);
   };
 
@@ -169,11 +177,21 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
           </Field>
         </div>
       </FieldGroup>
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {blocker && (
+          <FormBlocker id={`blocker-${id}`} testId="secret-blocker" className="mr-auto">
+            {blocker}
+          </FormBlocker>
+        )}
         <Button type="button" variant="outline" onClick={onCancel} disabled={busy}>
           Cancel
         </Button>
-        <Button type="submit" disabled={busy || !draft.key || !!keyProblem || !!generatorProblem} data-testid="secret-save">
+        <Button
+          type="submit"
+          disabled={busy || !!blocker}
+          aria-describedby={blocker ? `blocker-${id}` : undefined}
+          data-testid="secret-save"
+        >
           {busy && <Spinner />}
           {draft.generator ? (isNew ? "Generate secret" : "Generate new value") : isNew ? "Add secret" : "Save"}
         </Button>

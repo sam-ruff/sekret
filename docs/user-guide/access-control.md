@@ -26,7 +26,24 @@ The actions are `read`, `read-value`, `create`, `edit` and `delete`. `read` on s
 
 Project subjects are `secrets`, `secret-versions`, `snapshots`, `folders`, `environments`, `members`, `roles`, `audit-log` and `settings`. Organisation subjects are `projects`, `identities`, `org-members`, `org-roles`, `org-audit-log` and `backups`, where `read` on `backups` allows downloading an encrypted backup.
 
-A secret's history and rollback also need `read` on the secret itself; a secret someone cannot read answers as not found, the same as one that does not exist. Snapshot descriptions leave out the folder when the reader cannot read that folder.
+Not every action means something for every subject. The role editor in the web interface only offers the ones sekret checks:
+
+| Subject | Actions that do something |
+|---|---|
+| `secrets` | `read`, `read-value`, `create`, `edit`, `delete` |
+| `secret-versions` | `read`, `read-value` (old values also need `read-value` on `secrets`) |
+| `snapshots` | `read`, `edit` (restoring a snapshot) |
+| `folders`, `members` | `read`, `create`, `delete` |
+| `environments`, `roles`, `identities`, `org-members`, `org-roles` | `read`, `create`, `edit`, `delete` |
+| `settings` | `read`, `edit`, `delete` (deleting the project) |
+| `audit-log`, `org-audit-log`, `backups` | `read` |
+| `projects` | `create` |
+
+A role saved earlier with another action keeps it, and the editor shows it so it can be removed.
+
+A secret's history and rollback also need `read` on the secret itself; a secret someone cannot read answers as not found, the same as one that does not exist. In the history, a version whose own tags the reader may not read keeps its number and date, but its comment, tags and author are left blank. Snapshot descriptions leave out the folder when the reader cannot read that folder. Someone who cannot read every secret in the environment sees "secrets changed" in place of the counts of created, updated and deleted secrets, and a snapshot's secret count only includes the secrets they can read.
+
+`read` on `environments` lists an environment in the interface. A deny on it hides the environment completely: its secrets, folders and snapshots answer as not found, even where `secrets` rules would allow them, and its entries in the audit log are redacted. Without a deny, `secrets` rules alone decide who reaches secrets, so a role for a machine that only fetches values need not grant `environments` as well.
 
 Conditions narrow a rule to some secrets:
 

@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api/endpoints";
 import type { Membership, PrincipalKind } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { FormBlocker } from "@/components/form-blocker";
 import { PrincipalPicker, type PrincipalOption } from "@/components/principal-picker";
 import { ResponsiveTable } from "@/components/responsive-table";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
@@ -40,6 +41,13 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
   const [problem, setProblem] = useState<{ escalation: boolean; message: string }>();
   const roles = useRoles(project);
   const principal = kind === "group" ? group : (chosen?.id ?? "");
+  const blocker = !principal.trim()
+    ? kind === "group"
+      ? "Enter a group name to continue."
+      : `Choose a ${kind === "user" ? "user" : "machine identity"} to continue.`
+    : !role
+      ? "Choose a role to continue."
+      : null;
 
   const add = useApiMutation({
     mutationFn: () => api.addMember(project, { principal_kind: kind, principal_id: principal.trim(), role }),
@@ -144,11 +152,22 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
               </AlertDescription>
             </Alert>
           )}
-          <DialogFooter>
+          <DialogFooter className="sm:items-center">
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!principal.trim() || !role || add.isPending} data-testid="member-add-submit">
+            {/* Under the submit button on phones, at the left on wider screens. */}
+            {blocker && (
+              <FormBlocker id="member-blocker" testId="member-blocker" className="sm:order-first sm:mr-auto">
+                {blocker}
+              </FormBlocker>
+            )}
+            <Button
+              type="submit"
+              disabled={!!blocker || add.isPending}
+              aria-describedby={blocker ? "member-blocker" : undefined}
+              data-testid="member-add-submit"
+            >
               {add.isPending && <Spinner />}
               Add member
             </Button>
@@ -173,7 +192,10 @@ export function MembersSection({ project, perms }: { project: string; perms: Per
   return (
     <div className="space-y-4">
       <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-muted-foreground">Organisation admins can always manage this project.</p>
+        <p className="text-sm text-muted-foreground" data-testid="members-help">
+          Organisation admins can always manage this project. To change someone&apos;s role, add them again with the new
+          role, then remove the old one.
+        </p>
         {perms.can("members", "create") && (
           <Button onClick={() => setAdding(true)} data-testid="add-member">
             <UserPlus />

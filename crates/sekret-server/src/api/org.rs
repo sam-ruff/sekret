@@ -3,8 +3,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use sekret_api::{
     AddOrgBinding, AuditPage, AuthMethodConfig, AuthMethodKind, ClientSecret, CreateClientSecret, CreateIdentity,
-    CreatedClientSecret, Identity, IdentityPage, Me, OrgBinding, PutRole, Role, UpdateIdentity, UpdateUser, User,
-    UserPage,
+    CreatedClientSecret, Identity, IdentityPage, MAX_CLIENT_SECRET_USES, MAX_LIFETIME, Me, OrgBinding, PutRole, Role,
+    UpdateIdentity, UpdateUser, User, UserPage,
 };
 use sekret_core::crypto::{generate_token, hash_token};
 use sekret_core::permissions::{Action, Subject, covers, dropped_rules, may_remove};
@@ -512,10 +512,25 @@ async fn create_client_secret(
     require_any(&org_rules(&state, &principal).await?, Subject::Identities, Action::Edit)?;
     let identity = load_identity(&state, &id).await?;
     ensure_covers_identity(&state, &principal, &identity).await?;
-    if request.ttl.is_some_and(|t| t <= 0) || request.max_uses.is_some_and(|u| u <= 0) {
-        return Err(ApiError::bad_request("ttl and max_uses must be positive"));
+    if request.ttl.is_some_and(|t| !(1..=MAX_LIFETIME).contains(&t)) {
+        return Err(ApiError::bad_request(
+            "ttl must be between 1 second and 10 years; leave it out for a secret that never expires",
+        ));
+    }
+    if request
+        .max_uses
+        .is_some_and(|u| !(1..=MAX_CLIENT_SECRET_USES).contains(&u))
+    {
+        return Err(ApiError::bad_request("max_uses must be between 1 and 1,000,000,000"));
     }
     let now = state.clock.now();
+    let expires_at = match request.ttl {
+        Some(ttl) => Some(
+            now.checked_add(ttl)
+                .ok_or_else(|| ApiError::bad_request("ttl is too long"))?,
+        ),
+        None => None,
+    };
     let secret = generate_token(CLIENT_SECRET_PREFIX)?;
     let record = sekret_store::ClientSecret {
         id: uuid::Uuid::new_v4().to_string(),
@@ -524,7 +539,7 @@ async fn create_client_secret(
         secret_hash: hash_token(&secret),
         prefix: secret.chars().take(8).collect(),
         created_at: now,
-        expires_at: request.ttl.map(|t| now + t),
+        expires_at,
         uses_remaining: request.max_uses,
         revoked: false,
         last_used_at: None,

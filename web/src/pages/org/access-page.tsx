@@ -7,6 +7,7 @@ import { api } from "@/api/endpoints";
 import type { OrgBinding, PrincipalKind } from "@/api/types";
 import { ORG_SUBJECTS } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { LinkTabs } from "@/components/link-tabs";
 import { PageHeader } from "@/components/page-header";
 import { PrincipalPicker, type PrincipalOption } from "@/components/principal-picker";
@@ -208,7 +209,7 @@ function BindingsTab() {
           rowTestId={(b) => `binding-row-${b.principal_kind}-${b.principal_name}-${b.role}`}
           columns={[
             {
-              header: "Principal",
+              header: "Person, group or machine",
               primary: true,
               cell: (b) => {
                 const Icon = KIND_ICONS[b.principal_kind];
@@ -310,11 +311,13 @@ export function AccessPage() {
         label="Access sections"
         current={current}
         tabs={[
-          { value: "bindings", label: "Role bindings", to: "/org/access", testId: "access-tab-bindings" },
+          { value: "bindings", label: "Who has which role", to: "/org/access", testId: "access-tab-bindings" },
           { value: "roles", label: "Roles", to: "/org/access/roles", testId: "access-tab-roles" },
         ]}
       />
-      {current === "bindings" ? <BindingsTab /> : <RolesTab />}
+      <ErrorBoundary variant="section" resetKey={current}>
+        {current === "bindings" ? <BindingsTab /> : <RolesTab />}
+      </ErrorBoundary>
     </div>
   );
 }

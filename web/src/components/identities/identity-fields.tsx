@@ -71,17 +71,20 @@ export function IdentityFields({
       </Field>
       {problem && <p className="text-sm text-destructive md:col-span-2">{problem}</p>}
       <Field className="md:col-span-2">
-        <FieldLabel htmlFor={`${idPrefix}-cidrs`}>Trusted CIDRs</FieldLabel>
+        <FieldLabel htmlFor={`${idPrefix}-cidrs`}>Allowed networks (CIDR ranges)</FieldLabel>
         <ListInput
           id={`${idPrefix}-cidrs`}
           value={draft.trustedCidrs}
           onChange={(trustedCidrs) => onChange({ ...draft, trustedCidrs })}
-          placeholder="10.0.0.0/8 then Enter"
+          placeholder="Such as 10.0.0.0/8, then Enter"
           mono
-          validate={(c) => (CIDR.test(c) ? undefined : "Use CIDR notation such as 10.0.0.0/8")}
+          validate={(c) => (CIDR.test(c) ? undefined : "Use a range such as 10.0.0.0/8 or 192.168.1.5/32")}
           testId="identity-cidrs"
         />
-        <FieldDescription>Logins are only accepted from these networks. Leave empty to allow any.</FieldDescription>
+        <FieldDescription>
+          Sign-ins are only accepted from these networks, for example 10.0.0.0/8 for a private network or 203.0.113.7/32
+          for one address. Leave empty to allow any.
+        </FieldDescription>
       </Field>
     </div>
   );

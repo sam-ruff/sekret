@@ -23,7 +23,9 @@ import { SecretTextarea } from "@/components/secret-field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
-import { keys, useApiMutation } from "@/hooks/queries";
+import { toast } from "sonner";
+import { keys, useApiMutation, useSealWatch } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
 import { formatDateTime, formatDuration, formatRelative } from "@/lib/format";
 
 function positiveOrNull(text: string): number | null | "invalid" {
@@ -144,6 +146,12 @@ function CreateSecretDialog({
 }
 
 function CreatedSecretDialog({ created, onClose }: { created: CreatedClientSecret | null; onClose: () => void }) {
+  const showing = created !== null;
+  useSealWatch(showing);
+  useIdle(showing, () => {
+    onClose();
+    toast.info("Closed the new client secret after three idle minutes. If you did not store it, revoke it and create another.");
+  });
   return (
     <Dialog open={created !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-lg" data-testid="client-secret-once-dialog">

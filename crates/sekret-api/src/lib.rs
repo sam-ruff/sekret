@@ -543,10 +543,10 @@ pub struct KubernetesAuthConfig {
     #[serde(default = "default_k8s_audiences")]
     pub audiences: Vec<String>,
     /// Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left
-    /// out. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose
-    /// claims can be read.
+    /// out, and at most ten years. Tokens without `iat` are refused. In TokenReview mode it
+    /// applies to tokens whose claims can be read.
     #[serde(default = "default_max_token_lifetime")]
-    #[schema(minimum = 1)]
+    #[schema(minimum = 1, maximum = 315_360_000)]
     pub max_token_lifetime: i64,
 }
 
@@ -583,14 +583,22 @@ impl AuthMethodConfig {
     }
 }
 
+/// The longest lifetime, in seconds, that a client secret or a Kubernetes token limit may be
+/// given: ten years.
+pub const MAX_LIFETIME: i64 = 10 * 365 * 86_400;
+/// The most uses a client secret may be limited to.
+pub const MAX_CLIENT_SECRET_USES: i64 = 1_000_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CreateClientSecret {
     #[serde(default)]
     pub description: String,
-    /// Seconds until the secret stops working; never when absent.
+    /// Seconds until the secret stops working, at most ten years; never when absent.
     #[serde(default)]
+    #[schema(minimum = 1, maximum = 315_360_000)]
     pub ttl: Option<i64>,
     #[serde(default)]
+    #[schema(minimum = 1, maximum = 1_000_000_000)]
     pub max_uses: Option<i64>,
 }
 

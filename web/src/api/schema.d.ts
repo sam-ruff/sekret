@@ -1171,7 +1171,7 @@ export interface components {
             max_uses?: number | null;
             /**
              * Format: int64
-             * @description Seconds until the secret stops working; never when absent.
+             * @description Seconds until the secret stops working, at most ten years; never when absent.
              */
             ttl?: number | null;
         };
@@ -1293,8 +1293,8 @@ export interface components {
             /**
              * Format: int64
              * @description Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left
-             *     out. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose
-             *     claims can be read.
+             *     out, and at most ten years. Tokens without `iat` are refused. In TokenReview mode it
+             *     applies to tokens whose claims can be read.
              */
             max_token_lifetime?: number;
             mode: components["schemas"]["KubernetesMode"];
@@ -1873,6 +1873,14 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

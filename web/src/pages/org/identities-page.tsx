@@ -4,6 +4,7 @@ import { Link, useNavigate } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Identity, IdentitySort } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { FormBlocker } from "@/components/form-blocker";
 import { IdentityFields } from "@/components/identities/identity-fields";
 import { ttlProblem, type IdentityDraft } from "@/components/identities/identity-model";
 import { ListToolbar } from "@/components/list-toolbar";
@@ -62,10 +63,11 @@ function CreateIdentityDialog({ open, onOpenChange }: { open: boolean; onOpenCha
       navigate(`/org/identities/${i.id}/auth`);
     },
   });
-  const valid = draft.name.trim() !== "" && !ttlProblem(draft);
+  const blocker =
+    draft.name.trim() === "" ? "Give the identity a name to continue." : ttlProblem(draft) ? "Fix the lifetimes to continue." : null;
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (valid) create.mutate();
+    if (!blocker) create.mutate();
   };
 
   return (
@@ -79,11 +81,22 @@ function CreateIdentityDialog({ open, onOpenChange }: { open: boolean; onOpenCha
             </DialogDescription>
           </DialogHeader>
           <IdentityFields draft={draft} onChange={setDraft} idPrefix="new-identity" />
-          <DialogFooter>
+          <DialogFooter className="sm:items-center">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!valid || create.isPending} data-testid="identity-create-submit">
+            {/* Under the submit button on phones, at the left on wider screens. */}
+            {blocker && (
+              <FormBlocker id="identity-blocker" testId="identity-blocker" className="sm:order-first sm:mr-auto">
+                {blocker}
+              </FormBlocker>
+            )}
+            <Button
+              type="submit"
+              disabled={!!blocker || create.isPending}
+              aria-describedby={blocker ? "identity-blocker" : undefined}
+              data-testid="identity-create-submit"
+            >
               {create.isPending && <Spinner />}
               Create identity
             </Button>

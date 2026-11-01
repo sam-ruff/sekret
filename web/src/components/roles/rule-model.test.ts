@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Rule } from "@/api/types";
-import { describeConditions, toEditable, toRules } from "./rule-model";
+import { actionsFor, describeConditions, SUBJECT_ACTIONS, toEditable, toRules } from "./rule-model";
 
 describe("rule model", () => {
   it("creates one empty row per subject without rules", () => {
@@ -30,6 +30,27 @@ describe("rule model", () => {
   it("orders actions canonically", () => {
     const rows = toEditable([{ effect: "allow", subject: "roles", actions: ["delete", "read"] }], ["roles"]);
     expect(rows[0].actions).toEqual(["read", "delete"]);
+  });
+
+  it("offers only the actions the server checks for each subject", () => {
+    expect(actionsFor({ subject: "secrets", actions: [] })).toEqual(["read", "read-value", "create", "edit", "delete"]);
+    expect(actionsFor({ subject: "secret-versions", actions: [] })).toEqual(["read", "read-value"]);
+    expect(actionsFor({ subject: "audit-log", actions: [] })).toEqual(["read"]);
+    expect(actionsFor({ subject: "snapshots", actions: [] })).toEqual(["read", "edit"]);
+    expect(actionsFor({ subject: "folders", actions: [] })).toEqual(["read", "create", "delete"]);
+    expect(actionsFor({ subject: "projects", actions: [] })).toEqual(["create"]);
+    expect(actionsFor({ subject: "backups", actions: [] })).toEqual(["read"]);
+    // Only secrets and their history have values to read.
+    for (const subject of Object.keys(SUBJECT_ACTIONS) as (keyof typeof SUBJECT_ACTIONS)[]) {
+      if (subject === "secrets" || subject === "secret-versions") continue;
+      expect(SUBJECT_ACTIONS[subject]).not.toContain("read-value");
+    }
+  });
+
+  it("keeps an action an older role already holds so it can be seen and removed", () => {
+    expect(actionsFor({ subject: "folders", actions: ["edit"] })).toEqual(["read", "create", "edit", "delete"]);
+    const rows = toEditable([{ effect: "allow", subject: "folders", actions: ["read", "edit"] }], ["folders"]);
+    expect(toRules(rows)).toEqual([{ effect: "allow", subject: "folders", actions: ["read", "edit"] }]);
   });
 
   it("summarises conditions in plain words", () => {

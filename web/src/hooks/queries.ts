@@ -1,11 +1,14 @@
 import {
   keepPreviousData,
   useMutation,
+  useQueries,
   useQuery,
   useQueryClient,
   type Query,
   type QueryClient,
   type QueryKey,
+  type UseQueryOptions,
+  type UseQueryResult,
 } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { toast } from "sonner";
@@ -57,6 +60,17 @@ export function useSysStatus(fresh = false) {
 
 /** Revealed values and history leave the cache as soon as nothing shows them. */
 export const SECRET_VALUE_GC_TIME = 0;
+
+/**
+ * A query that exists only while `options` is set. A disabled `useQuery` still observes its
+ * query and keeps its data, so values hidden again would stay in memory; with no observer at
+ * all, a zero `gcTime` drops them at once and the next reveal asks the server again.
+ */
+export function useOptionalQuery<T>(options: UseQueryOptions<T, Error, T, QueryKey> | null): UseQueryResult<T> | undefined {
+  const queries: UseQueryOptions<T, Error, T, QueryKey>[] = options ? [options] : [];
+  const [result] = useQueries({ queries });
+  return options ? (result as UseQueryResult<T> | undefined) : undefined;
+}
 
 /**
  * Drops everything cached but the server status, so no secret outlives a sealed server. Mutations

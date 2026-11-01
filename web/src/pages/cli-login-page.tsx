@@ -218,9 +218,19 @@ export function CliLoginPage() {
               <Alert className="border-warning/50 bg-warning/10" data-testid="cli-warning">
                 <ShieldAlert className="text-warning" />
                 <AlertTitle>Only approve a sign-in you started</AlertTitle>
-                <AlertDescription>
-                  Someone who sends you this link gets access as you if you approve it. Check the address and program
-                  below are yours, then type the code your <code className="font-mono">sekret login</code> printed.
+                <AlertDescription data-testid="cli-warning-text">
+                  {lookupCode === "" ? (
+                    <>
+                      Someone who sends you this link gets access as you if you approve it. Type the code your{" "}
+                      <code className="font-mono">sekret login</code> printed, then check the address and program that
+                      appear are yours.
+                    </>
+                  ) : (
+                    <>
+                      Someone who sends you this link gets access as you if you approve it. Check the address and program
+                      below are yours, then type the code your <code className="font-mono">sekret login</code> printed.
+                    </>
+                  )}
                 </AlertDescription>
               </Alert>
             )}

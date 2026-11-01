@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, formatDurationWords, formatExpiry, formatRelative, initials, slugify } from "./format";
+import {
+  formatDateTime,
+  formatDuration,
+  formatDurationWords,
+  formatExpiry,
+  formatRelative,
+  initials,
+  slugify,
+  UNKNOWN_DATE,
+} from "./format";
 import { crumbs, folderLabel, isValidFolderName, joinPath, normalisePath, parentPath } from "./paths";
 
 describe("formatDuration", () => {
@@ -41,6 +50,25 @@ describe("formatRelative", () => {
     expect(formatRelative(1000, 1010)).toBe("just now");
     expect(formatRelative(0, 7200)).toBe("2 hours ago");
     expect(formatRelative(0, 86400)).toBe("yesterday");
+  });
+});
+
+describe("dates the browser cannot hold", () => {
+  // About three million years ahead, past the largest date `Date` can represent.
+  const huge = 1e14;
+  const now = 1_800_000_000;
+
+  it("shows a placeholder instead of throwing", () => {
+    for (const seconds of [huge, -huge, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(formatDateTime(seconds)).toBe(UNKNOWN_DATE);
+      expect(formatRelative(seconds, now)).toBe(UNKNOWN_DATE);
+      expect(formatExpiry(seconds, now)).toBe(UNKNOWN_DATE);
+    }
+  });
+
+  it("still formats the far edge of the valid range", () => {
+    expect(formatDateTime(8.64e12)).not.toBe(UNKNOWN_DATE);
+    expect(formatRelative(8.64e12, now)).toMatch(/^in /);
   });
 });
 

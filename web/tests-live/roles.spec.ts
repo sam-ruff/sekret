@@ -8,7 +8,14 @@ test("saves a custom role with a conditional deny and reloads it", async ({ page
 
   await page.getByTestId("new-role").click();
   const editor = page.getByTestId("role-editor");
+  // Only the actions the server checks for each subject are offered.
+  await expect(editor.getByTestId("rule-audit-log-read")).toBeVisible();
+  await expect(editor.getByTestId("rule-audit-log-create")).toHaveCount(0);
+  await expect(editor.getByTestId("rule-members-read-value")).toHaveCount(0);
+  await expect(editor.getByTestId("rule-secrets-hint")).toContainText("Read value shows the secret itself");
+  await expect(editor.getByTestId("role-blocker")).toBeVisible();
   await editor.getByTestId("role-name").fill("Live reader");
+  await expect(editor.getByTestId("role-blocker")).toHaveCount(0);
   await editor.getByTestId("rule-secrets-read").click();
   await editor.getByTestId("rule-secrets-read-value").click();
   await editor.getByTestId("add-rule").click();

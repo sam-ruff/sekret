@@ -33,10 +33,47 @@ pub struct StoredToken {
 pub struct Credentials {
     #[serde(default)]
     pub servers: BTreeMap<String, StoredToken>,
-    /// `allow` lists the person confirmed, keyed by the project file's path. A changed list needs
-    /// confirming again.
+    /// `allow` lists the person confirmed, keyed by [`AllowScope::key`]. A changed list, or the
+    /// same list loading from another server, project, environment or path, needs confirming again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub confirmed_allow: BTreeMap<String, Vec<String>>,
+}
+
+/// What a project file's `allow` list is confirmed for: the file, and where secrets load from.
+/// Who can write secrets differs between projects and environments, so so does the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowScope {
+    pub file: PathBuf,
+    pub server: String,
+    pub project: String,
+    pub environment: String,
+    pub path: String,
+}
+
+impl AllowScope {
+    /// A JSON array, so no value can be crafted to collide with another scope.
+    pub fn key(&self) -> String {
+        serde_json::json!([
+            self.file.display().to_string(),
+            self.server,
+            self.project,
+            self.environment,
+            self.path
+        ])
+        .to_string()
+    }
+
+    /// `project/environment` at `path` on `server`, safe to show at a terminal.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}/{} (path {}) on {}",
+            sekret_client::terminal_safe(&self.project),
+            sekret_client::terminal_safe(&self.environment),
+            sekret_client::terminal_safe(&self.path),
+            sekret_client::terminal_safe(&self.server)
+        )
+        .replace(['\n', '\t'], " ")
+    }
 }
 
 /// The sorted, de-duplicated form an `allow` list is confirmed and compared in.
@@ -46,15 +83,14 @@ pub fn normalised_allow(names: &[String]) -> Vec<String> {
 }
 
 impl Credentials {
-    pub fn allow_confirmed(&self, file: &Path, names: &[String]) -> bool {
+    pub fn allow_confirmed(&self, scope: &AllowScope, names: &[String]) -> bool {
         self.confirmed_allow
-            .get(&file.display().to_string())
+            .get(&scope.key())
             .is_some_and(|confirmed| *confirmed == normalised_allow(names))
     }
 
-    pub fn confirm_allow(&mut self, file: &Path, names: &[String]) {
-        self.confirmed_allow
-            .insert(file.display().to_string(), normalised_allow(names));
+    pub fn confirm_allow(&mut self, scope: &AllowScope, names: &[String]) {
+        self.confirmed_allow.insert(scope.key(), normalised_allow(names));
     }
 }
 
@@ -315,8 +351,8 @@ pub struct Resolved {
     pub source: ServerSource,
     /// Blocked variable names the project file allows, once confirmed.
     pub allow: Vec<String>,
-    /// The project file's `allow` list while it is not yet confirmed, with the file's path.
-    pub unconfirmed_allow: Option<(PathBuf, Vec<String>)>,
+    /// The project file's `allow` list while it is not yet confirmed for where secrets load from.
+    pub unconfirmed_allow: Option<(AllowScope, Vec<String>)>,
     /// The project file chose the project or environment, rather than a flag or variable.
     pub chosen_by_file: Option<PathBuf>,
 }
@@ -368,24 +404,30 @@ pub fn resolve(
     let chosen_by_file = ((overrides.project.is_none() && file.project.is_some())
         || (overrides.environment.is_none() && file.environment.is_some()))
     .then(|| file.location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)));
+    let project = overrides.project.or(file.project);
+    let environment = overrides.environment.or(file.environment);
+    let path = overrides.path.or(file.path).unwrap_or_else(|| "/".into());
     // A cloned repository's file must not unblock names on its own say-so.
-    let (allow, unconfirmed_allow) = match &file.location {
-        _ if file.allow.is_empty() => (Vec::new(), None),
-        Some(location) if credentials.allow_confirmed(location, &file.allow) => (file.allow, None),
-        location => (
-            Vec::new(),
-            Some((
-                location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)),
-                normalised_allow(&file.allow),
-            )),
-        ),
+    let scope = AllowScope {
+        file: file.location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)),
+        server: server.clone(),
+        project: project.clone().unwrap_or_default(),
+        environment: environment.clone().unwrap_or_default(),
+        path: path.clone(),
+    };
+    let (allow, unconfirmed_allow) = if file.allow.is_empty() {
+        (Vec::new(), None)
+    } else if file.location.is_some() && credentials.allow_confirmed(&scope, &file.allow) {
+        (file.allow, None)
+    } else {
+        (Vec::new(), Some((scope, normalised_allow(&file.allow))))
     };
     Ok(Resolved {
         server,
         token,
-        project: overrides.project.or(file.project),
-        environment: overrides.environment.or(file.environment),
-        path: overrides.path.or(file.path).unwrap_or_else(|| "/".into()),
+        project,
+        environment,
+        path,
         source,
         allow,
         unconfirmed_allow,
@@ -755,10 +797,18 @@ mod tests {
 
     #[test]
     fn the_project_file_allows_blocked_names_only_once_confirmed() -> anyhow::Result<()> {
-        let mut file: ProjectFile =
-            toml::from_str("server = \"https://s\"\nallow = [\"KUBECONFIG\", \"GIT_PAGER\"]\n")?;
+        let mut file: ProjectFile = toml::from_str(
+            "server = \"https://s\"\nproject = \"app\"\nenvironment = \"dev\"\nallow = [\"KUBECONFIG\", \"GIT_PAGER\"]\n",
+        )?;
         let location = PathBuf::from("/repo/.sekret.toml");
         file.location = Some(location.clone());
+        let scope = AllowScope {
+            file: location.clone(),
+            server: "https://s".into(),
+            project: "app".into(),
+            environment: "dev".into(),
+            path: "/".into(),
+        };
         let resolved = resolve(Overrides::default(), file.clone(), &Credentials::default(), 0)?;
         assert!(
             resolved.allow.is_empty(),
@@ -766,14 +816,11 @@ mod tests {
         );
         assert_eq!(
             resolved.unconfirmed_allow,
-            Some((location.clone(), vec!["GIT_PAGER".into(), "KUBECONFIG".into()]))
+            Some((scope.clone(), vec!["GIT_PAGER".into(), "KUBECONFIG".into()]))
         );
 
         let mut credentials = Credentials::default();
-        credentials.confirm_allow(
-            &location,
-            &["KUBECONFIG".into(), "GIT_PAGER".into(), "KUBECONFIG".into()],
-        );
+        credentials.confirm_allow(&scope, &["KUBECONFIG".into(), "GIT_PAGER".into(), "KUBECONFIG".into()]);
         let resolved = resolve(Overrides::default(), file.clone(), &credentials, 0)?;
         assert_eq!(resolved.allow, ["KUBECONFIG", "GIT_PAGER"]);
         assert_eq!(resolved.unconfirmed_allow, None);
@@ -782,7 +829,7 @@ mod tests {
         let mut grown = file.clone();
         grown.allow.push("LD_PRELOAD".into());
         assert!(resolve(Overrides::default(), grown, &credentials, 0)?.allow.is_empty());
-        let mut elsewhere = file;
+        let mut elsewhere = file.clone();
         elsewhere.location = Some("/other/.sekret.toml".into());
         assert!(
             resolve(Overrides::default(), elsewhere, &credentials, 0)?
@@ -792,9 +839,58 @@ mod tests {
 
         let text = toml::to_string(&credentials)?;
         let read: Credentials = toml::from_str(&text)?;
-        assert!(read.allow_confirmed(&location, &["GIT_PAGER".into(), "KUBECONFIG".into()]));
+        assert!(read.allow_confirmed(&scope, &["GIT_PAGER".into(), "KUBECONFIG".into()]));
         let old: Credentials = toml::from_str("[servers]\n")?;
         assert!(old.confirmed_allow.is_empty(), "older credentials files still load");
+        let path_keyed: Credentials =
+            toml::from_str("[confirmed_allow]\n\"/repo/.sekret.toml\" = [\"GIT_PAGER\", \"KUBECONFIG\"]\n")?;
+        assert!(
+            resolve(Overrides::default(), file, &path_keyed, 0)?.allow.is_empty(),
+            "a yes saved before scopes were recorded is asked again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_confirmed_allow_list_does_not_follow_a_change_of_project_environment_path_or_server() -> anyhow::Result<()> {
+        let mut file: ProjectFile = toml::from_str(
+            "server = \"https://s\"\nproject = \"app\"\nenvironment = \"dev\"\nallow = [\"NODE_OPTIONS\"]\n",
+        )?;
+        file.location = Some("/repo/.sekret.toml".into());
+        let mut credentials = Credentials::default();
+        let confirmed = resolve(Overrides::default(), file.clone(), &credentials, 0)?
+            .unconfirmed_allow
+            .context("unconfirmed at first")?;
+        credentials.confirm_allow(&confirmed.0, &confirmed.1);
+        assert_eq!(
+            resolve(Overrides::default(), file.clone(), &credentials, 0)?.allow,
+            ["NODE_OPTIONS"]
+        );
+
+        let edited = |text: &str| -> anyhow::Result<ProjectFile> {
+            let mut changed: ProjectFile = toml::from_str(text)?;
+            changed.location = file.location.clone();
+            Ok(changed)
+        };
+        let changed_files = [
+            "server = \"https://s\"\nproject = \"sandbox\"\nenvironment = \"dev\"\nallow = [\"NODE_OPTIONS\"]\n",
+            "server = \"https://s\"\nproject = \"app\"\nenvironment = \"prod\"\nallow = [\"NODE_OPTIONS\"]\n",
+            "server = \"https://s\"\nproject = \"app\"\nenvironment = \"dev\"\npath = \"/open\"\nallow = [\"NODE_OPTIONS\"]\n",
+            "server = \"https://other\"\nproject = \"app\"\nenvironment = \"dev\"\nallow = [\"NODE_OPTIONS\"]\n",
+        ];
+        for text in changed_files {
+            let resolved = resolve(Overrides::default(), edited(text)?, &credentials, 0)?;
+            assert!(resolved.allow.is_empty(), "{text}");
+            assert!(resolved.unconfirmed_allow.is_some(), "{text}");
+        }
+        let switched = Overrides {
+            environment: Some("staging".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve(switched, file, &credentials, 0)?.allow.is_empty(),
+            "a flag or variable choosing another environment asks again too"
+        );
         Ok(())
     }
 

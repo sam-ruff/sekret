@@ -96,20 +96,31 @@ pub async fn device_login(
     if !open_browser(&start.verification_url) {
         writeln!(out, "Open {shown_url} to continue.")?;
     }
-    let interval = Duration::from_secs(start.interval.max(1) as u64).min(max_interval);
-    let attempts = (start.expires_in / start.interval.max(1)).max(1);
-    for _ in 0..attempts {
-        match api.cli_poll(start.device_code.clone()).await {
+    let mut interval = Duration::from_secs(start.interval.max(1) as u64).min(max_interval);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(start.expires_in.max(1) as u64);
+    loop {
+        let wait = match api.cli_poll(start.device_code.clone()).await {
             Ok(token) => return Ok(token),
-            Err(error) if error.code() == Some("authorization_pending") => tokio::time::sleep(interval).await,
+            Err(error) if error.code() == Some("authorization_pending") => interval,
+            // RFC 8628: slow down by five seconds for this and every later poll.
+            Err(error) if error.code() == Some("slow_down") => {
+                interval += SLOW_DOWN_STEP;
+                error.retry_after().map_or(interval, |asked| asked.max(interval))
+            }
             Err(error) if error.code() == Some("expired_token") => {
                 bail!("the login code expired; run `sekret login` again")
             }
             Err(error) => return Err(error).context("waiting for approval"),
+        };
+        if tokio::time::Instant::now() + wait >= deadline {
+            bail!("timed out waiting for approval")
         }
+        tokio::time::sleep(wait).await;
     }
-    bail!("timed out waiting for approval")
 }
+
+/// How much longer to wait between polls each time the server answers `slow_down`.
+const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
 pub fn open_in_browser(url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
@@ -145,6 +156,7 @@ mod tests {
             status: 400,
             code: "authorization_pending".into(),
             message: "waiting".into(),
+            retry_after: None,
         }
     }
 
@@ -179,6 +191,93 @@ mod tests {
         Ok(())
     }
 
+    fn slow_down(retry_after: Option<u64>) -> ClientError {
+        ClientError::Api {
+            status: 429,
+            code: "slow_down".into(),
+            message: "too many polls".into(),
+            retry_after,
+        }
+    }
+
+    /// Records how long after the start each poll arrived, in whole seconds of paused time.
+    fn timed_polls(
+        api: &mut MockSekretApi,
+        answers: Vec<Result<TokenResponse, ClientError>>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<u64>>> {
+        let begun = tokio::time::Instant::now();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        api.expect_cli_poll().returning(move |_| {
+            if let Ok(mut seen) = record.lock() {
+                seen.push(begun.elapsed().as_secs());
+            }
+            answers
+                .lock()
+                .ok()
+                .and_then(|mut answers| answers.next())
+                .unwrap_or_else(|| Err(slow_down(None)))
+        });
+        seen
+    }
+
+    fn polled_at(seen: &std::sync::Arc<std::sync::Mutex<Vec<u64>>>) -> Vec<u64> {
+        seen.lock().map(|seen| seen.clone()).unwrap_or_default()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_down_adds_five_seconds_to_every_later_poll() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| Ok(start()));
+        let seen = timed_polls(
+            &mut api,
+            vec![Err(pending()), Err(slow_down(None)), Err(pending()), Ok(token())],
+        );
+        let result = device_login(&api, SERVER, &mut Vec::new(), &|_| false, Duration::from_secs(10))
+            .await
+            .context("a slow_down is not fatal")?;
+        assert_eq!(result.access_token, "skt_t");
+        // Two seconds, then seven from the slow_down on.
+        assert_eq!(polled_at(&seen), [0, 2, 9, 16]);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_honoured_when_longer() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| Ok(start()));
+        let seen = timed_polls(
+            &mut api,
+            vec![Err(slow_down(Some(30))), Err(slow_down(Some(1))), Ok(token())],
+        );
+        device_login(&api, SERVER, &mut Vec::new(), &|_| false, Duration::from_secs(10))
+            .await
+            .context("login")?;
+        // Thirty seconds as asked, then the interval of 12 beats the shorter Retry-After.
+        assert_eq!(polled_at(&seen), [0, 30, 42]);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slowing_down_never_outlasts_the_login_code() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| {
+            Ok(CliStartResponse {
+                expires_in: 40,
+                ..start()
+            })
+        });
+        let seen = timed_polls(&mut api, Vec::new());
+        let Err(error) = device_login(&api, SERVER, &mut Vec::new(), &|_| false, Duration::from_secs(10)).await else {
+            anyhow::bail!("endless slow_down answers must end the login");
+        };
+        assert!(error.to_string().contains("timed out"), "{error}");
+        // 0, then +7, +12, +17 would reach 36; the next wait of 22 would pass 40.
+        assert_eq!(polled_at(&seen), [0, 7, 19, 36]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn device_login_stops_on_expiry_and_errors() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
@@ -188,6 +287,7 @@ mod tests {
                 status: 400,
                 code: "expired_token".into(),
                 message: String::new(),
+                retry_after: None,
             })
         });
         let Err(err) = device_login(&api, SERVER, &mut Vec::new(), &|_| true, Duration::ZERO).await else {

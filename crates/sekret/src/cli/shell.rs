@@ -83,6 +83,23 @@ const BLOCKED_EXACT: &[&str] = &[
     "GOPATH",
     "GOENV",
     "GOTOOLCHAIN",
+    "GOPROXY",
+    "GONOPROXY",
+    "GOSUMDB",
+    "GONOSUMDB",
+    "GOPRIVATE",
+    "GOINSECURE",
+    "GOVCS",
+    "GOAUTH",
+    "GOBIN",
+    "GOCACHE",
+    "GOCACHEPROG",
+    "GOMODCACHE",
+    "GOWORK",
+    "GOEXPERIMENT",
+    "GODEBUG",
+    "CC_FOR_TARGET",
+    "CXX_FOR_TARGET",
     "RUSTFLAGS",
     "RUSTDOCFLAGS",
     "CC",
@@ -90,9 +107,31 @@ const BLOCKED_EXACT: &[&str] = &[
     "CPP",
     "LD",
     "AR",
+    "AS",
+    "NM",
+    "RANLIB",
+    "STRIP",
+    "OBJCOPY",
+    "OBJDUMP",
+    "FC",
+    "F77",
+    "YACC",
+    "LEX",
+    "M4",
+    "RM",
+    "INSTALL",
     "MAKE",
+    "MAKEFILES",
     "MAKEFLAGS",
+    "GNUMAKEFLAGS",
     "MFLAGS",
+    "GCC_EXEC_PREFIX",
+    "COMPILER_PATH",
+    "LIBRARY_PATH",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "OBJC_INCLUDE_PATH",
     "CFLAGS",
     "CXXFLAGS",
     "CPPFLAGS",
@@ -170,12 +209,38 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "UV_",
     "POETRY_",
     "PHP",
+    "CGO_",
+    "CMAKE_",
+    "NIX_",
+    "CCACHE_",
+    "SCCACHE_",
+    "DISTCC_",
+    "PKG_CONFIG",
+    "LESS",
+    "DENO_",
+    "BUN_",
+    "HELM_",
+    "ELECTRON_",
 ];
 
 /// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
-/// `IRBRC`, `PHPRC` and `WGETRC`.
+/// `IRBRC`, `PHPRC` and `WGETRC`. `FLAGS` covers `GNUMAKEFLAGS` and `CGO_LDFLAGS` as well as
+/// `_FLAGS` names.
 const BLOCKED_SUFFIXES: &[&str] = &[
-    "PAGER", "EDITOR", "ASKPASS", "_COMMAND", "_OPTIONS", "_OPTS", "_FLAGS", "_PROXY", "_HOOK", "_HOOKS", "INIT", "RC",
+    "PAGER",
+    "EDITOR",
+    "ASKPASS",
+    "_COMMAND",
+    "_OPTIONS",
+    "_OPTS",
+    "FLAGS",
+    "_PROXY",
+    "_HOOK",
+    "_HOOKS",
+    "_LAUNCHER",
+    "_WRAPPER",
+    "INIT",
+    "RC",
 ];
 
 /// `PS1`, `RPS2` and the like.
@@ -653,6 +718,90 @@ mod tests {
         for fine in ["DATABASE_URL", "PSQL_HOST", "AWS_REGION", "SENTRY_DSN", "OPTS_URL"] {
             assert_eq!(policy.check(fine), Ok(()), "{fine}");
         }
+    }
+
+    /// Build tool settings that run a command or swap the toolchain, from the round 5 audit.
+    const BUILD_TOOL_RUNNERS: &[&str] = &[
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "CGO_CFLAGS",
+        "CGO_CPPFLAGS",
+        "CGO_CXXFLAGS",
+        "CGO_LDFLAGS",
+        "CGO_ENABLED",
+        "CMAKE_C_COMPILER_LAUNCHER",
+        "CMAKE_CXX_COMPILER_LAUNCHER",
+        "CMAKE_TOOLCHAIN_FILE",
+        "SOME_LINKER_LAUNCHER",
+        "RUSTC_WRAPPER",
+        "SOME_WRAPPER",
+        "NIX_PATH",
+        "NIX_CONFIG",
+        "GOPROXY",
+        "GONOPROXY",
+        "GOSUMDB",
+        "GONOSUMDB",
+        "GOPRIVATE",
+        "GOINSECURE",
+        "GOAUTH",
+        "GOCACHEPROG",
+        "GOEXPERIMENT",
+        "CCACHE_PREFIX",
+        "CCACHE_CONFIGPATH",
+        "SCCACHE_DIR",
+        "DISTCC_HOSTS",
+        "GCC_EXEC_PREFIX",
+        "COMPILER_PATH",
+        "LIBRARY_PATH",
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "PKG_CONFIG",
+        "PKG_CONFIG_PATH",
+        "LESS",
+        "LESSKEY",
+        "ELECTRON_RUN_AS_NODE",
+        "HELM_PLUGINS",
+        "AS",
+        "RANLIB",
+        "gnumakeflags",
+    ];
+
+    #[test]
+    fn build_tool_settings_that_run_code_are_refused() {
+        let policy = strict();
+        for name in BUILD_TOOL_RUNNERS {
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(policy.check(name), Err(SkipReason::Blocked), "{name}");
+        }
+        for fine in [
+            "GOOGLE_API_KEY",
+            "GO_SERVICE_URL",
+            "NIXIE_COUNT",
+            "CC_EMAIL",
+            "FLAG_COLOUR",
+        ] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
+    }
+
+    #[test]
+    fn gnumakeflags_from_a_secret_is_not_exported() -> anyhow::Result<()> {
+        let switch = switch_script(
+            Shell::Bash,
+            &[],
+            vars(&[
+                ("GNUMAKEFLAGS", "--eval=$(shell touch /tmp/pwned)"),
+                ("CGO_CFLAGS", "-wrapper /bin/sh,-c,id"),
+                ("API_KEY", "k"),
+            ]),
+            &strict(),
+            &origin("dev"),
+        );
+        assert_eq!(switch.loaded, ["API_KEY"]);
+        assert_eq!(skipped_keys(&switch.skipped), ["CGO_CFLAGS", "GNUMAKEFLAGS"]);
+        let after = bash_after(&switch.script, &["GNUMAKEFLAGS", "CGO_CFLAGS", "API_KEY"])?;
+        assert_eq!(after, ["<unset>", "<unset>", "k"]);
+        Ok(())
     }
 
     #[test]

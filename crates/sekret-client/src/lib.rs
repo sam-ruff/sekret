@@ -16,7 +16,13 @@ use serde::de::DeserializeOwned;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ClientError {
     #[error("{message} ({status} {code})")]
-    Api { status: u16, code: String, message: String },
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+        /// Seconds from the response's `Retry-After` header, when it had one.
+        retry_after: Option<u64>,
+    },
     #[error("could not reach the server: {0}")]
     Network(String),
     #[error("unexpected response: {0}")]
@@ -46,6 +52,19 @@ impl ClientError {
             _ => None,
         }
     }
+
+    /// How long the server asked the client to wait before trying again.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            ClientError::Api { retry_after, .. } => retry_after.map(Duration::from_secs),
+            _ => None,
+        }
+    }
+}
+
+/// `Retry-After` in its delta-seconds form; an HTTP date is ignored.
+fn parse_retry_after(value: &str) -> Option<u64> {
+    value.trim().parse().ok()
 }
 
 pub type ClientResult<T> = Result<T, ClientError>;
@@ -427,7 +446,7 @@ impl HttpClient {
         body: Option<&dyn ErasedBody>,
         limit: usize,
     ) -> ClientResult<(StatusCode, Vec<u8>)> {
-        let (status, bytes) = match &self.transport {
+        let (status, retry_after, bytes) = match &self.transport {
             Transport::Reqwest(http) => {
                 let mut request = http.request(method, url);
                 if let Some(token) = &self.token {
@@ -438,7 +457,12 @@ impl HttpClient {
                 }
                 let response = request.send().await.map_err(|e| ClientError::Network(e.to_string()))?;
                 let status = response.status();
-                (status, read_limited_body(response, limit).await?)
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after);
+                (status, retry_after, read_limited_body(response, limit).await?)
             }
             #[cfg(unix)]
             Transport::Stream(stream) => {
@@ -446,7 +470,9 @@ impl HttpClient {
                     .map(|b| serde_json::to_vec(&b.as_json()))
                     .transpose()
                     .map_err(|e| ClientError::Config(e.to_string()))?;
-                stream.send(method, &url, self.token.as_deref(), body, limit).await?
+                // The host socket serves only status and unseal, which it never rate limits.
+                let (status, bytes) = stream.send(method, &url, self.token.as_deref(), body, limit).await?;
+                (status, None, bytes)
             }
         };
         if !status.is_success() {
@@ -460,6 +486,7 @@ impl HttpClient {
                 message: error
                     .map(|e| terminal_safe(&e.message))
                     .unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into()),
+                retry_after,
             });
         }
         Ok((status, bytes))
@@ -869,7 +896,37 @@ mod tests {
             .context("expected a pending error")?;
         assert_eq!(error.code(), Some("authorization_pending"));
         assert_eq!(error.status(), Some(400));
+        assert_eq!(error.retry_after(), None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_carried_on_a_slow_down() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/cli/poll"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "7")
+                    .set_body_json(json!({"error": "slow_down", "message": "too many polls"})),
+            )
+            .mount(&server)
+            .await;
+        let error = client(&server, None)?
+            .cli_poll("d".into())
+            .await
+            .err()
+            .context("expected slow_down")?;
+        assert_eq!(error.code(), Some("slow_down"));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_seconds_form_of_retry_after_is_read() {
+        assert_eq!(parse_retry_after(" 12 "), Some(12));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("-1"), None);
     }
 
     #[test]

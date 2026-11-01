@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, Plus, ShieldAlert, Trash2 } from "lucide-react";
+import { Ban, Check, ChevronDown, Filter, Plus, ShieldAlert, Trash2 } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { PutRole, Role, Subject } from "@/api/types";
 import { ACTIONS } from "@/api/types";
@@ -21,7 +21,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Field, FieldLabel } from "@/components/ui/field";
+import { FormBlocker } from "@/components/form-blocker";
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
@@ -31,7 +32,9 @@ import { slugify } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
   ACTION_LABELS,
+  SUBJECT_HINTS,
   SUBJECT_LABELS,
+  actionsFor,
   blankRule,
   describeConditions,
   hasConditions,
@@ -152,7 +155,7 @@ function RuleRow({
       className={cn("space-y-3 border-b p-3 last:border-b-0 md:px-4", rule.effect === "deny" && "bg-destructive/5")}
       data-testid={testBase}
     >
-      <div className="grid gap-3 md:grid-cols-[12rem_7.5rem_minmax(0,1fr)_auto] md:items-center">
+      <div className="grid gap-3 md:grid-cols-[12rem_9rem_minmax(0,1fr)_auto] md:items-center">
         <div className="min-w-0">
           <div className="truncate text-sm font-medium">{SUBJECT_LABELS[rule.subject]}</div>
           {extra && <div className="text-xs text-muted-foreground">Additional rule</div>}
@@ -161,24 +164,28 @@ function RuleRow({
           type="single"
           size="sm"
           variant="outline"
+          spacing={0}
           value={rule.effect}
           disabled={readOnly}
           onValueChange={(value) => value && onChange({ effect: value as EditableRule["effect"] })}
+          aria-label={`Allow or deny ${SUBJECT_LABELS[rule.subject]}`}
           data-testid={`${testBase}-effect`}
         >
           <ToggleGroupItem value="allow" className="px-2.5 text-xs" data-testid={`${testBase}-allow`}>
+            {rule.effect === "allow" && <Check />}
             Allow
           </ToggleGroupItem>
           <ToggleGroupItem
             value="deny"
-            className="px-2.5 text-xs data-[state=on]:bg-destructive/15 data-[state=on]:text-destructive"
+            className="px-2.5 text-xs data-[state=on]:border-destructive/60 data-[state=on]:bg-destructive/15 data-[state=on]:text-destructive data-[state=on]:hover:bg-destructive/20"
             data-testid={`${testBase}-deny`}
           >
+            {rule.effect === "deny" && <Ban />}
             Deny
           </ToggleGroupItem>
         </ToggleGroup>
         <div className="flex flex-wrap gap-x-4 gap-y-2">
-          {ACTIONS.map((action) => (
+          {actionsFor(rule).map((action) => (
             <label key={action} className="flex items-center gap-1.5 text-sm">
               <Checkbox
                 checked={rule.actions.includes(action)}
@@ -215,6 +222,11 @@ function RuleRow({
           )}
         </div>
       </div>
+      {SUBJECT_HINTS[rule.subject] && !extra && (
+        <p className="text-xs text-muted-foreground" data-testid={`${testBase}-hint`}>
+          {SUBJECT_HINTS[rule.subject]}
+        </p>
+      )}
       {hasConditions(rule) && !showConditions && (
         <p className="text-xs text-muted-foreground">Only {describeConditions(rule)}</p>
       )}
@@ -273,6 +285,7 @@ export function RoleEditor({
 
   const firstOfSubject = new Set<string>();
   const grantCount = toRules(rows).length;
+  const blocker = !name.trim() ? "Give the role a name to save it." : !slug ? "Give the role an ID to save it." : null;
 
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
@@ -306,7 +319,7 @@ export function RoleEditor({
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="role-slug">Short name</FieldLabel>
+                  <FieldLabel htmlFor="role-slug">ID</FieldLabel>
                   <Input
                     id="role-slug"
                     value={slug}
@@ -318,6 +331,7 @@ export function RoleEditor({
                       setSlug(e.target.value.toLowerCase());
                     }}
                   />
+                  <FieldDescription>Used by the CLI and API. It cannot change later.</FieldDescription>
                 </Field>
                 <Field>
                   <FieldLabel htmlFor="role-description">Description</FieldLabel>
@@ -343,7 +357,7 @@ export function RoleEditor({
             )}
 
             <div className="overflow-hidden rounded-xl border" data-testid="permission-matrix">
-              <div className="hidden grid-cols-[12rem_7.5rem_minmax(0,1fr)_auto] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:grid">
+              <div className="hidden grid-cols-[12rem_9rem_minmax(0,1fr)_auto] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:grid">
                 <span>Subject</span>
                 <span>Effect</span>
                 <span>Actions</span>
@@ -388,14 +402,25 @@ export function RoleEditor({
             )}
           </div>
           <DialogFooter className="m-0 border-t p-4 sm:items-center">
-            <span className="mr-auto hidden text-sm text-muted-foreground sm:inline">
+            <span className="mr-auto hidden text-sm text-muted-foreground sm:order-first sm:inline">
               <Badge variant="secondary">{grantCount}</Badge> {grantCount === 1 ? "rule" : "rules"}
             </span>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
               {readOnly ? "Close" : "Cancel"}
             </Button>
+            {/* Under the save button on phones, beside the rule count on wider screens. */}
+            {!readOnly && blocker && (
+              <FormBlocker id="role-blocker" testId="role-blocker" className="sm:order-first">
+                {blocker}
+              </FormBlocker>
+            )}
             {!readOnly && (
-              <Button type="submit" disabled={busy || !name.trim() || !slug} data-testid="role-save">
+              <Button
+                type="submit"
+                disabled={busy || !!blocker}
+                aria-describedby={blocker ? "role-blocker" : undefined}
+                data-testid="role-save"
+              >
                 {busy && <Spinner />}
                 Save role
               </Button>

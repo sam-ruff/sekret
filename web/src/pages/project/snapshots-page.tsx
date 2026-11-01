@@ -7,6 +7,7 @@ import type { Snapshot, SnapshotChange } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { EnvTabs } from "@/components/project/env-tabs";
+import { MissingEnvironment } from "@/components/project/missing-environment";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -126,7 +127,10 @@ function SnapshotSheet({
                 onChange={(e) => setFolder(e.target.value || "/")}
                 data-testid="restore-path"
               />
-              <FieldDescription>Only secrets in this folder and below are compared and restored.</FieldDescription>
+              <FieldDescription>
+                Only secrets in this folder and below are compared and restored. <span className="font-mono">/</span> is
+                the root folder, so it covers everything.
+              </FieldDescription>
             </Field>
             <section className="space-y-2">
               <h3 className="text-sm font-semibold">What restoring would change</h3>
@@ -194,6 +198,9 @@ export function SnapshotsPage() {
       {environments.isPending && <ListSkeleton rows={5} />}
       {environments.isSuccess && envs.length === 0 && (
         <EmptyState icon={<Camera />} title="No environments" description="Snapshots appear once an environment has secrets." />
+      )}
+      {envParam && environments.isSuccess && !env && envs.length > 0 && (
+        <MissingEnvironment name={envParam} first={envs[0]} hrefFor={(slug) => `/projects/${project}/snapshots/${slug}`} />
       )}
       {env && (
         <>

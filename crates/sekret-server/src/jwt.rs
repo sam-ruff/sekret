@@ -170,20 +170,40 @@ fn check(
     // Time claims are checked in `check_times` against the injected clock.
     validation.validate_exp = false;
     validation.validate_nbf = false;
-    validation.set_required_spec_claims(&["exp"]);
+    // A claim the configuration names must be present, not merely consistent when present.
+    let mut required = vec!["exp"];
     match expect.issuer {
-        Some(issuer) => validation.set_issuer(&[issuer]),
+        Some(issuer) => {
+            validation.set_issuer(&[issuer]);
+            required.push("iss");
+        }
         None => validation.iss = None,
     }
     match expect.audience {
-        Some(aud) => validation.set_audience(&[aud]),
+        Some(aud) => {
+            validation.set_audience(&[aud]);
+            required.push("aud");
+        }
         None => validation.validate_aud = false,
     }
+    validation.set_required_spec_claims(&required);
     let claims = decode::<Value>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|e| JwtError::Invalid(e.to_string()))?;
+    check_issuer(&claims, expect.issuer)?;
     check_times(&claims, now)?;
     Ok(claims)
+}
+
+/// The library accepts an `iss` array that merely contains the issuer; only the exact string is.
+fn check_issuer(claims: &Value, issuer: Option<&str>) -> Result<(), JwtError> {
+    let Some(issuer) = issuer else {
+        return Ok(());
+    };
+    if claims.get("iss").and_then(Value::as_str) != Some(issuer) {
+        return Err(JwtError::Invalid("iss is not the expected issuer".into()));
+    }
+    Ok(())
 }
 
 fn time_claim(claims: &Value, name: &str) -> Result<Option<i64>, JwtError> {
@@ -307,6 +327,66 @@ mod tests {
         // Same key id but signed by a different key.
         let forged = other.sign_with_kid(json!({"aud": "client"}), "key1")?;
         assert!(matches!(v.verify(&forged, &set, &ok).await, Err(JwtError::Invalid(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_issuers_and_audiences_must_be_present_and_exact() -> anyhow::Result<()> {
+        let issuer = TestIssuer::new("https://issuer.test");
+        let set = KeySource::Inline(serde_json::from_value(issuer.jwks()).context("jwks")?);
+        let v = verifier(MockOidcHttp::new(), Arc::new(FixedClock::new(issuer.now)));
+        let both = Expectations {
+            issuer: Some("https://issuer.test"),
+            audience: Some("client"),
+        };
+        let issuer_only = Expectations {
+            issuer: Some("https://issuer.test"),
+            audience: None,
+        };
+        let neither = Expectations {
+            issuer: None,
+            audience: None,
+        };
+        let refused = [
+            (json!({"aud": "client", "iss": null}), "no iss"),
+            (
+                json!({"aud": "client", "iss": ["https://issuer.test", "https://evil.test"]}),
+                "iss array",
+            ),
+            (
+                json!({"aud": "client", "iss": ["https://issuer.test"]}),
+                "single-item iss array",
+            ),
+            (json!({"aud": "client", "iss": 7}), "numeric iss"),
+            (
+                json!({"aud": "client", "iss": "https://issuer.test/"}),
+                "a different string",
+            ),
+            (json!({"aud": null}), "no aud"),
+        ];
+        for (claims, why) in refused {
+            let token = issuer.sign(claims)?;
+            assert!(
+                matches!(v.verify(&token, &set, &both).await, Err(JwtError::Invalid(_))),
+                "{why}"
+            );
+        }
+        let no_aud = issuer.sign(json!({"aud": null}))?;
+        assert!(
+            v.verify(&no_aud, &set, &issuer_only).await.is_ok(),
+            "aud is only required when an audience is expected"
+        );
+        let no_iss = issuer.sign(json!({"iss": null}))?;
+        assert!(
+            v.verify(&no_iss, &set, &issuer_only).await.is_err(),
+            "iss is required when an issuer is named"
+        );
+        assert!(v.verify(&no_iss, &set, &neither).await.is_ok(), "and only then");
+        let good = issuer.sign(json!({"aud": ["client", "other"]}))?;
+        assert!(
+            v.verify(&good, &set, &both).await.is_ok(),
+            "aud may list several audiences"
+        );
         Ok(())
     }
 

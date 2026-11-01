@@ -343,7 +343,7 @@ async fn update_environment(
     Json(request): Json<UpdateEnvironment>,
 ) -> ApiResult<Json<Environment>> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
-    let mut env = find_env(&state, &project, &env).await?;
+    let mut env = find_env(&state, &project, &rules, &env).await?;
     require(&rules, Subject::Environments, Action::Edit, &env_resource(&env.slug))?;
     validate::name(&request.name)?;
     state
@@ -377,7 +377,7 @@ async fn delete_environment(
     Path((project, env)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
-    let env = find_env(&state, &project, &env).await?;
+    let env = find_env(&state, &project, &rules, &env).await?;
     require(&rules, Subject::Environments, Action::Delete, &env_resource(&env.slug))?;
     // Deleting an environment destroys its history, so it must be emptied through the secret routes first.
     state.store.delete_environment(&env.id).await.map_err(|e| match e {
@@ -417,7 +417,7 @@ async fn list_folders(
     Path((project, env)): Path<(String, String)>,
 ) -> ApiResult<Json<Vec<Folder>>> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
-    let env = find_env(&state, &project, &env).await?;
+    let env = find_env(&state, &project, &rules, &env).await?;
     let folders = state.store.list_folders(&env.id).await?;
     Ok(Json(
         folders
@@ -449,7 +449,7 @@ async fn create_folder(
     Json(request): Json<CreateFolder>,
 ) -> ApiResult<(StatusCode, Json<Folder>)> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
-    let env = find_env(&state, &project, &env).await?;
+    let env = find_env(&state, &project, &rules, &env).await?;
     let path = validate::folder_path(&request.path)?;
     if path == "/" {
         return Err(ApiError::bad_request("the root folder always exists"));
@@ -516,7 +516,7 @@ async fn delete_folder(
     Query(query): Query<PathQuery>,
 ) -> ApiResult<StatusCode> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
-    let env = find_env(&state, &project, &env).await?;
+    let env = find_env(&state, &project, &rules, &env).await?;
     let path = validate::folder_path(&query.path)?;
     if path == "/" {
         return Err(ApiError::bad_request("the root folder cannot be deleted"));

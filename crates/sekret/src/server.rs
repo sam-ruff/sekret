@@ -286,6 +286,44 @@ fn existing_database(database_url: &str) -> anyhow::Result<String> {
     Ok(sekret_store::without_create(database_url))
 }
 
+const NO_EPOCH_MARK: &str = "there is nowhere outside the database to keep the seal epoch mark, so someone who can \
+                             write to the database could swap in a root key of their own; set seal.epoch_file \
+                             (--epoch-file or SEKRET_EPOCH_FILE) to a path on a disk the database cannot reach, \
+                             the same for the server and the admin commands";
+
+/// The epoch marks, refusing a setup with none: a Postgres database without a remember file,
+/// root key file or `seal.epoch_file`.
+fn require_marks(paths: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    if paths.is_empty() {
+        bail!("{NO_EPOCH_MARK}");
+    }
+    Ok(paths)
+}
+
+/// A configured epoch file is the one mark chosen on purpose, so where it cannot be written is
+/// an error rather than a mark quietly skipped.
+fn check_epoch_file(path: Option<&Path>) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    match sekret_server::files::read_mark(path) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => can_create(path).with_context(|| {
+            format!(
+                "the seal epoch file {} cannot be created; its directory must exist and be writable",
+                path.display()
+            )
+        }),
+        // Read again, and replaced, by the seal checks, which treat it as a rollback.
+        Err(_) => Ok(()),
+    }
+}
+
+fn marks_of(location: &StoreLocation) -> anyhow::Result<Vec<PathBuf>> {
+    check_epoch_file(location.epoch_file.as_deref())?;
+    require_marks(location.epoch_files())
+}
+
 /// Returns only when the lock is lost: the Postgres session dropped or the database file at the
 /// path was replaced. Serving on without it could let a second writer in.
 async fn watch_lock(lock: &mut InstanceLock) -> anyhow::Error {
@@ -304,12 +342,15 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets, sources: &Sou
         return Ok(());
     }
     let file = settings::load(args.store.config.as_deref())?;
+    let epoch_file = args.store.epoch_file.clone().or(file.seal.epoch_file.clone());
     let settings::Resolved {
         mut config,
         setup,
         report,
     } = settings::resolve_with(&args, file, &env_secrets, sources)?;
     log_report(&report);
+    check_epoch_file(epoch_file.as_deref())?;
+    config.seal.epoch_files = require_marks(std::mem::take(&mut config.seal.epoch_files))?;
     // Held for the life of the server, so admin commands cannot write underneath it.
     let mut lock = InstanceLock::acquire_within(&config.database_url, LOCK_WAIT)
         .await
@@ -493,7 +534,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
             // Never migrates: a running server of another version would break under it.
             let url = existing_database(&location.database_url)?;
             let sql: Arc<dyn Store> = Arc::new(SqlStore::open(&url, Open::Exact).await.context("opening database")?);
-            let epoch_files = location.epoch_files();
+            let epoch_files = marks_of(&location)?;
             let source = RootSource {
                 key_file: location.root_key_file.as_deref(),
                 epoch_files: &epoch_files,
@@ -538,7 +579,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
                 unlock_policy: unlock,
                 key_file: location.root_key_file.clone(),
                 reuse_key_file: false,
-                epoch_files: location.epoch_files(),
+                epoch_files: marks_of(&location)?,
             };
             let (root, _) = initialise(sql.as_ref(), SystemClock.now(), plan, None).await?;
             let state = state(
@@ -645,7 +686,7 @@ async fn rotate(
     inputs: RotateInputs<'_>,
     prompter: &dyn Prompter,
 ) -> anyhow::Result<()> {
-    let epoch_files = location.epoch_files();
+    let epoch_files = marks_of(location)?;
     let marks = high_water(&epoch_files);
     let config = sql.get_seal_config().await?;
     let (old, seal) = match config.filter(|c| c.mode == SealMode::Passphrase) {
@@ -662,10 +703,10 @@ async fn rotate(
             validate_passphrase(&passphrase)?;
             check_root(sql, &epoch_files, &old).await?;
             // Only a configuration signed by the server, and not older than the marks, keeps
-            // what it grants.
-            let tampered = verify_config(&old, &config, marks).is_err();
+            // what it grants, and only a signed one keeps its flags.
+            let verdict = verify_config(&old, &config, marks);
             warn_if_tampered(&old, Some(&config), marks);
-            (old, Some((config, passphrase, tampered)))
+            (old, Some((config, passphrase, verdict)))
         }
         None => {
             let path = location
@@ -685,19 +726,19 @@ async fn rotate(
     };
     let seal_config = match &seal {
         None => None,
-        Some((config, passphrase, tampered)) => Some(SealConfig {
+        Some((config, passphrase, verdict)) => Some(SealConfig {
             wrapped: Some(wrap_root_key(&new, passphrase)?),
             // The remembered wrap holds the old key; the next manual unlock remembers again.
             remembered: None,
-            unlock_policy: if *tampered {
+            unlock_policy: if verdict.is_err() {
                 UnlockPolicy::Manual
             } else {
                 config.unlock_policy
             },
-            flags: if *tampered {
-                cautious_flags(config.flags, false)
-            } else {
+            flags: if *verdict == Ok(false) {
                 config.flags
+            } else {
+                cautious_flags(config.flags, false)
             },
             updated_at: SystemClock.now(),
             ..config.clone()
@@ -721,7 +762,15 @@ async fn rotate(
              root key file"
         ),
     }
-    Ok(())
+    stale_marks(&report)
+}
+
+/// Fails a command whose change was committed but whose epoch marks were left behind.
+fn stale_marks(report: &RotationReport) -> anyhow::Result<()> {
+    match &report.stale_marks {
+        Some(message) => bail!("{message}"),
+        None => Ok(()),
+    }
 }
 
 /// Replaces the root key with `new`, re-encrypting everything, and moves the epoch marks with it.
@@ -755,11 +804,12 @@ struct SealModeInputs<'a> {
 }
 
 /// The flags a configuration keeps when it is re-signed under a new mode: all of them when it is
-/// sound, otherwise nothing migrated again. With no configuration, marks mean one existed.
+/// signed and sound, otherwise nothing migrated again, since an unsigned configuration's flags
+/// may be a database writer's. With no configuration, marks mean one existed.
 fn carried_flags(root: &RootKey, current: Option<&SealConfig>, marks: HighWater) -> SealFlags {
     match current.map(|c| (c, verify_config(root, c, marks))) {
-        Some((c, Ok(_))) => c.flags,
-        Some((c, Err(_))) => cautious_flags(c.flags, false),
+        Some((c, Ok(false))) => c.flags,
+        Some((c, Ok(true) | Err(_))) => cautious_flags(c.flags, false),
         None if marks.highest.is_some() || marks.broken => cautious_flags(SealFlags::default(), false),
         None => SealFlags::default(),
     }
@@ -780,7 +830,7 @@ async fn set_seal_mode(
         bail!("the database is already in {} mode", mode.as_str());
     }
     let now = SystemClock.now();
-    let epoch_files = location.epoch_files();
+    let epoch_files = marks_of(location)?;
     let marks = high_water(&epoch_files);
     let new = RootKey::generate()?;
     let report = match mode {
@@ -882,16 +932,21 @@ async fn set_seal_mode(
         }),
     )
     .await;
-    Ok(())
+    stale_marks(&report)
 }
 
 /// What `reset-epoch` keeps of a configuration, given what checking it found. A sound one keeps
-/// everything. One older than the marks keeps its fields, which this root signed once, but grants
-/// nothing. One that fails its signature only keeps what the operator has just proved (the
-/// passphrase wrap, or key-file mode) and grants nothing.
+/// everything, though an unsigned one never starts a migration. One older than the marks keeps
+/// its fields, which this root signed once, but grants nothing. One that fails its signature only
+/// keeps what the operator has just proved (the passphrase wrap, or key-file mode) and grants
+/// nothing.
 fn reset_config(config: SealConfig, verdict: Result<bool, Distrust>) -> SealConfig {
     match verdict {
-        Ok(_) => config,
+        Ok(false) => config,
+        Ok(true) => SealConfig {
+            flags: cautious_flags(config.flags, false),
+            ..config
+        },
         Err(Distrust::RolledBack) => SealConfig {
             unlock_policy: UnlockPolicy::Manual,
             remembered: None,
@@ -924,7 +979,7 @@ async fn reset_epoch_marks(
     marks_check: MarkCheck,
     prompter: &dyn Prompter,
 ) -> anyhow::Result<()> {
-    let paths = location.epoch_files();
+    let paths = marks_of(location)?;
     let source = RootSource {
         key_file: location.root_key_file.as_deref(),
         epoch_files: &paths,
@@ -1215,7 +1270,7 @@ fn one_line(text: &str) -> String {
 /// Starts the restored database's own epoch mark at its configuration and root key, which the
 /// restore has just proved. A mark already there for another root key is left for the operator.
 async fn mark_restored(restored: &SqlStore, database_url: &str, root: &RootKey) {
-    let paths = sekret_server::config::epoch_files(database_url, None, None);
+    let paths = sekret_server::config::epoch_files(database_url, None, None, None);
     let fingerprint = root.fingerprint();
     if !root_recognised(&paths, &fingerprint) {
         eprintln!(

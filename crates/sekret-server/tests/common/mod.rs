@@ -29,6 +29,8 @@ pub struct Options {
     pub keys: Keys,
     /// Proxies whose `X-Forwarded-For` the server believes.
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// The address the server believes it is published at; the test listener's own when absent.
+    pub public_url: Option<String>,
 }
 
 /// Where the test server's root key comes from.
@@ -50,6 +52,7 @@ impl Default for Options {
             clock: None,
             keys: Keys::Generated,
             trusted_proxies: Vec::new(),
+            public_url: None,
         }
     }
 }
@@ -145,7 +148,7 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind")?;
     let addr = listener.local_addr().context("addr")?;
     let mut config = ServerConfig::for_tests(&options.database_url);
-    config.public_url = format!("http://{addr}");
+    config.public_url = options.public_url.unwrap_or_else(|| format!("http://{addr}"));
     config.oidc = options.oidc;
     config.trusted_proxies = options.trusted_proxies;
     let keyring = match options.keys {

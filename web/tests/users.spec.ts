@@ -102,6 +102,9 @@ test("the member picker searches users on the server", async ({ page }) => {
   await page.goto("/projects/storefront/settings/members");
   await page.getByTestId("add-member").click();
   const dialog = page.getByTestId("add-member-dialog");
+  await expect(dialog.getByTestId("member-add-submit")).toBeDisabled();
+  await expect(dialog.getByTestId("member-blocker")).toHaveText("Choose a user to continue.");
+  await expect(page.getByTestId("members-help")).toContainText("To change someone's role");
   await dialog.getByTestId("member-principal").click();
   await expect(page.getByTestId("principal-more")).toContainText("Showing 20 of");
 
@@ -109,6 +112,7 @@ test("the member picker searches users on the server", async ({ page }) => {
   await expect(page.getByTestId("principal-more")).toHaveCount(0);
   await page.getByTestId("principal-option-Zara Hughes").click();
   await expect(dialog.getByTestId("member-principal")).toHaveText(/Zara Hughes/);
+  await expect(dialog.getByTestId("member-blocker")).toHaveCount(0);
   await dialog.getByTestId("member-add-submit").click();
   await expectToast(page, "Member added");
   await expect(page.getByTestId("member-row-zara.hughes@example.com")).toBeVisible();

@@ -5,6 +5,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { ApiError, isSealError } from "@/api/client";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { AppLayout } from "@/components/layout/app-layout";
+import { ProjectRoute } from "@/components/layout/project-route";
 import { forgetAllButStatus } from "@/hooks/queries";
 import { StatusGate } from "@/components/sys/status-gate";
 import { Toaster } from "@/components/ui/sonner";
@@ -60,11 +61,13 @@ function AppRoutes() {
         <Route index element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<ProjectsPage />} />
         <Route path="/projects/:project" element={<Navigate to="secrets" replace />} />
-        <Route path="/projects/:project/secrets/:env?" element={<SecretsPage />} />
-        <Route path="/projects/:project/overview" element={<OverviewPage />} />
-        <Route path="/projects/:project/snapshots/:env?" element={<SnapshotsPage />} />
-        <Route path="/projects/:project/audit" element={<ProjectAuditPage />} />
-        <Route path="/projects/:project/settings/:tab?" element={<SettingsPage />} />
+        <Route element={<ProjectRoute />}>
+          <Route path="/projects/:project/secrets/:env?" element={<SecretsPage />} />
+          <Route path="/projects/:project/overview" element={<OverviewPage />} />
+          <Route path="/projects/:project/snapshots/:env?" element={<SnapshotsPage />} />
+          <Route path="/projects/:project/audit" element={<ProjectAuditPage />} />
+          <Route path="/projects/:project/settings/:tab?" element={<SettingsPage />} />
+        </Route>
         <Route path="/org" element={<Navigate to="/org/identities" replace />} />
         <Route path="/org/identities" element={<IdentitiesPage />} />
         <Route path="/org/identities/:id/:tab?" element={<IdentityPage />} />

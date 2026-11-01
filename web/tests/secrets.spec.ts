@@ -155,6 +155,41 @@ test("Escape closes the new secret editor, and the value field keeps password ma
   await expect(page.getByTestId("add-secret")).toBeEnabled();
 });
 
+test("the add form says why it cannot be saved yet", async ({ page }) => {
+  await page.getByTestId("add-secret").click();
+  const form = page.getByTestId("new-secret-form");
+  await expect(form.getByTestId("secret-save")).toBeDisabled();
+  await expect(form.getByTestId("secret-blocker")).toHaveText("Enter a key to continue.");
+  await form.getByTestId("secret-key-input").fill("9BAD");
+  await expect(form.getByTestId("secret-blocker")).toHaveText("Fix the key to continue.");
+  await form.getByTestId("secret-key-input").fill("GOOD_KEY");
+  await expect(form.getByTestId("secret-blocker")).toHaveCount(0);
+  await expect(form.getByTestId("secret-save")).toBeEnabled();
+});
+
+test("a huge folder is drawn a page at a time and is too big to reveal all at once", async ({ page }) => {
+  const lines = Array.from({ length: 150 }, (_, i) => `BULK_${String(i).padStart(3, "0")}=value-${i}`);
+  await page.getByTestId("secrets-more").click();
+  await page.getByTestId("import-env").click();
+  await page.getByTestId("import-env-text").fill(lines.join("\n"));
+  await page.getByTestId("import-env-submit").click();
+  await expectToast(page, /Imported: 150 added/);
+
+  const table = page.getByTestId("secrets-table");
+  await expect(table.locator('[data-testid^="secret-row-"]')).toHaveCount(100 - (await table.locator('[data-testid^="folder-row-"]').count()));
+  await expect(page.getByTestId("secrets-more-count")).toContainText("of");
+  await page.getByTestId("secrets-show-more").click();
+  await expect(page.getByTestId("secrets-show-more")).toHaveCount(0);
+  await expect(secretRow(page, "BULK_149")).toBeVisible();
+
+  await expect(page.getByTestId("reveal-all")).toBeDisabled();
+  await page.getByTestId("reveal-all-limit").focus();
+  await expect(page.getByRole("tooltip")).toContainText("too many to reveal at once");
+  // One at a time still works.
+  await secretRow(page, "BULK_007").getByTestId("secret-reveal").click();
+  await expect(secretRow(page, "BULK_007").getByTestId("secret-value")).toHaveText("value-7");
+});
+
 test("the search box fits a phone with a short placeholder", async ({ page }) => {
   const search = page.getByTestId("secret-search");
   await expect(search).toHaveAttribute("placeholder", isMobile(page) ? "Search" : "Search keys, comments, tags");

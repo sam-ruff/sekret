@@ -6,6 +6,8 @@ Each project has its own log under *Project audit log* in the project, readable 
 
 The project log only shows what the reader could see in the secrets view. If a role lets someone read the log but not a particular key, entries about that key appear with the key name, folder and details hidden. Entries for an environment the reader cannot list lose the environment as well.
 
+In the web interface each entry says what happened in plain words, such as "Viewed history values" or "2 values read", with the action's code, such as `secret.history-read`, underneath. The codes are what the action filter, the API and the CLI use.
+
 ![The audit log, filtered to secret actions](../assets/screenshots/audit-light.png)
 
 ## Searching and filtering

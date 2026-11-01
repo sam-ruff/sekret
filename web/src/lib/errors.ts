@@ -40,6 +40,11 @@ export function isEscalation(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 403 && error.code === "escalation";
 }
 
+/** The change was saved, but the seal mark file outside the database is behind and needs repair on the host. */
+export function isEpochMarkStale(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.code === "epoch_mark_stale";
+}
+
 export function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }

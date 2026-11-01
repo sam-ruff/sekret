@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::{AuditTarget, audit};
 use crate::auth::{ClientIp, Principal, TokenKind, TokenRequest, cookie_value, mint_token, session_cookie_name};
-use crate::config::HumanOidcConfig;
+use crate::config::{HumanOidcConfig, ServerConfig};
 use crate::error::{ApiError, ApiResult};
 use crate::jwt::{Expectations, KeySource};
 use crate::state::AppState;
@@ -62,12 +62,28 @@ fn same_origin_path(path: &str) -> Option<String> {
 }
 
 /// Ties a login attempt to the browser that started it, so a callback URL cannot be replayed into another browser.
-const LOGIN_STATE_COOKIE: &str = "sekret_login";
+pub const LOGIN_STATE_COOKIE: &str = "sekret_login";
+/// Used over HTTPS, where the prefix stops a sibling subdomain from planting it to force a login.
+pub const SECURE_LOGIN_STATE_COOKIE: &str = "__Host-sekret_login";
 
-fn login_state_cookie(state: &AppState, value: &str, max_age: i64) -> ApiResult<HeaderValue> {
-    let secure = if state.config.secure_cookies() { "; Secure" } else { "" };
+pub fn login_state_cookie_name(config: &ServerConfig) -> &'static str {
+    if config.secure_cookies() {
+        SECURE_LOGIN_STATE_COOKIE
+    } else {
+        LOGIN_STATE_COOKIE
+    }
+}
+
+/// `__Host-` cookies must be `Secure` with `Path=/`; the plain one stays on `/auth`.
+fn login_state_cookie(config: &ServerConfig, value: &str, max_age: i64) -> ApiResult<HeaderValue> {
+    let name = login_state_cookie_name(config);
+    let scope = if config.secure_cookies() {
+        "Path=/; Secure"
+    } else {
+        "Path=/auth"
+    };
     HeaderValue::from_str(&format!(
-        "{LOGIN_STATE_COOKIE}={value}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+        "{name}={value}; {scope}; HttpOnly; SameSite=Lax; Max-Age={max_age}"
     ))
     .map_err(|e| ApiError::internal("cookie", e))
 }
@@ -223,7 +239,7 @@ pub async fn login(
     let mut response = Redirect::to(url.as_str()).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        login_state_cookie(&state, &login_state, LOGIN_STATE_TTL)?,
+        login_state_cookie(&state.config, &login_state, LOGIN_STATE_TTL)?,
     );
     Ok(response)
 }
@@ -304,7 +320,7 @@ pub async fn callback(
     let mut response = finish_login(&state, ip, &headers, query).await?;
     response
         .headers_mut()
-        .append(header::SET_COOKIE, login_state_cookie(&state, "", 0)?);
+        .append(header::SET_COOKIE, login_state_cookie(&state.config, "", 0)?);
     Ok(response)
 }
 
@@ -355,7 +371,7 @@ async fn finish_login(
     let (Some(code), Some(state_param)) = (query.code, query.state) else {
         return Ok(login_error(LoginError::IncompleteResponse));
     };
-    let same_browser = cookie_value(headers, LOGIN_STATE_COOKIE)
+    let same_browser = cookie_value(headers, login_state_cookie_name(&state.config))
         .is_some_and(|cookie| constant_time_eq(cookie.as_bytes(), state_param.as_bytes()));
     if !same_browser {
         return Ok(login_error(LoginError::OtherBrowser));
@@ -503,16 +519,56 @@ pub async fn logout(
     Ok(response)
 }
 
-/// The first line of a user agent, cut to a length the approval page can show.
+/// The user agent, cut to a length the approval page can show. A value that is not plain ASCII
+/// is dropped whole, so lookalike letters cannot imitate a familiar one.
 fn shown_user_agent(headers: &HeaderMap) -> String {
     let raw = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
+    shown_text(raw, MAX_USER_AGENT_CHARS)
+}
+
+/// Requester-supplied text with control and invisible format characters removed, so it cannot
+/// be reordered with bidi overrides or hide characters on the approval page.
+fn shown_text(raw: &str, max_chars: usize) -> String {
     raw.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_USER_AGENT_CHARS)
+        .filter(|c| !c.is_control() && !is_format_character(*c))
+        .take(max_chars)
         .collect()
+}
+
+/// Unicode format (Cf) characters and other invisible ones: bidi controls, zero-width
+/// characters, joiners, the byte order mark, interlinear annotations and tag characters.
+fn is_format_character(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 
 /// Codes are shown grouped and read back by people, so case, spaces and dashes are ignored.
@@ -719,20 +775,33 @@ pub async fn cli_approve(
 /// may come from identity provider groups, which only refresh at the next browser sign-in, it
 /// cannot be renewed past its first TTL.
 pub(crate) fn cli_max_ttl(state: &AppState, groups: &[String]) -> i64 {
-    let ttl = state.config.cli_token_ttl;
-    if state.config.cli_login_max_auth_age.is_some() || !groups.is_empty() {
+    let fixed = state.config.cli_login_max_auth_age.is_some() || !groups.is_empty();
+    renewal_limit(state.config.cli_token_ttl, fixed)
+}
+
+fn renewal_limit(ttl: i64, fixed: bool) -> i64 {
+    if fixed {
         return ttl;
     }
-    ttl * 7
+    ttl.saturating_mul(7)
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/cli/poll", tag = "auth", request_body = CliPollRequest,
-    responses((status = 200, body = TokenResponse), (status = 400, body = sekret_api::ErrorBody)))]
+    responses((status = 200, body = TokenResponse), (status = 400, body = sekret_api::ErrorBody),
+        (status = 429, body = sekret_api::ErrorBody)))]
 pub async fn cli_poll(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     Json(request): Json<CliPollRequest>,
 ) -> ApiResult<Json<TokenResponse>> {
+    if !state.poll_limiter.allow_ip(ip) {
+        // The device flow's own answer for polling too fast (RFC 8628).
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow_down",
+            "polling too fast; wait before asking again",
+        ));
+    }
     let now = state.clock.now();
     match state
         .store
@@ -950,6 +1019,51 @@ mod tests {
             let location = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok());
             assert_eq!(location, Some(format!("/login?error={code}").as_str()));
         }
+    }
+
+    #[test]
+    fn the_login_state_cookie_is_host_only_over_https() -> anyhow::Result<()> {
+        let mut config = ServerConfig::for_tests("sqlite::memory:");
+        config.public_url = "https://sekret.example".into();
+        let cookie = login_state_cookie(&config, "abc", 600).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let cookie = cookie.to_str()?;
+        assert!(cookie.starts_with("__Host-sekret_login=abc;"), "{cookie}");
+        assert!(cookie.contains("Path=/;") && cookie.contains("Secure"), "{cookie}");
+        assert!(!cookie.contains("Domain"), "{cookie}");
+        assert_eq!(login_state_cookie_name(&config), SECURE_LOGIN_STATE_COOKIE);
+
+        config.public_url = "http://localhost:8200".into();
+        let cookie = login_state_cookie(&config, "abc", 600).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let cookie = cookie.to_str()?;
+        assert!(cookie.starts_with("sekret_login=abc;"), "{cookie}");
+        assert!(cookie.contains("Path=/auth") && !cookie.contains("Secure"), "{cookie}");
+        Ok(())
+    }
+
+    #[test]
+    fn requester_text_loses_bidi_and_invisible_characters() -> anyhow::Result<()> {
+        let spoofed = "sekret/1.0 \u{202E}xunil\u{202C} \u{2066}x\u{2069}\u{200B}\u{FEFF}\u{E0041}\u{061C}(Linux)";
+        assert_eq!(shown_text(spoofed, 200), "sekret/1.0 xunil x(Linux)");
+        assert_eq!(shown_text("a\u{0}b\nc\u{7F}", 200), "abc");
+        assert_eq!(shown_text(&"y".repeat(500), 200).len(), 200);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes("curl \u{202E}1.8".as_bytes())?,
+        );
+        assert_eq!(shown_user_agent(&headers), "", "a non-ASCII agent is not shown at all");
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("sekret/1.0 (linux)"));
+        assert_eq!(shown_user_agent(&headers), "sekret/1.0 (linux)");
+        Ok(())
+    }
+
+    #[test]
+    fn cli_renewal_limits_cannot_overflow() {
+        assert_eq!(renewal_limit(3600, false), 7 * 3600);
+        assert_eq!(renewal_limit(3600, true), 3600);
+        assert_eq!(renewal_limit(i64::MAX / 2, false), i64::MAX);
+        assert_eq!(renewal_limit(i64::MAX, true), i64::MAX);
     }
 
     #[test]

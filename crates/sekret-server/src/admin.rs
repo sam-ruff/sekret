@@ -71,9 +71,17 @@ pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(Str
 /// A stored configuration about to be signed again with a new key: kept as it is when its
 /// signature holds under `old_root` and it is not older than the recorded marks, otherwise reset
 /// to grant no unlock, so a database writer's change or rollback is never signed as it stands.
+/// An unsigned one grants nothing already, but its flags are not trusted to start a migration.
 pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater) -> SealConfig {
-    let Err(distrust) = verify_config(old_root, &config, marks) else {
-        return config;
+    let distrust = match verify_config(old_root, &config, marks) {
+        Ok(false) => return config,
+        Ok(true) => {
+            return SealConfig {
+                flags: cautious_flags(config.flags, false),
+                ..config
+            };
+        }
+        Err(distrust) => distrust,
     };
     tracing::error!(
         action = distrust.action(),
@@ -104,6 +112,8 @@ pub struct RotationReport {
     pub projects: usize,
     /// Rows that could not be read and were left as they were, by id; never their contents.
     pub skipped: Vec<String>,
+    /// Why the epoch marks could not be moved to the new key after the change was committed.
+    pub stale_marks: Option<String>,
 }
 
 /// Re-encrypts each value under a fresh data key for its project, so nothing written under the
@@ -174,11 +184,14 @@ pub async fn rotate_root_key(
     let mut rewrapped = Vec::with_capacity(projects.len());
     let mut values = Vec::new();
     for project in &projects {
+        let new_key = DataKey::generate()?;
         let Ok(old_key) = unwrap_data_key(old_root, &project.wrapped_key, &project.id) else {
             unreadable.push(format!("data key of project {}", project.id));
+            // Its values are lost with the old key either way, but a fresh key lets the project
+            // take new ones, and the new root opens every project key, as unlocking requires.
+            rewrapped.push((project.id.clone(), wrap_data_key(new_root, &new_key, &project.id)?));
             continue;
         };
-        let new_key = DataKey::generate()?;
         let stored = store.list_encrypted_values(&project.id).await?;
         values.extend(reencrypt_values(
             &project.id,
@@ -218,7 +231,7 @@ pub async fn rotate_root_key(
         .transpose()?;
     let epoch = seal.as_ref().map_or(rotation.marks.floor(), |config| config.epoch);
     let fingerprint = new_root.fingerprint();
-    crate::seal::begin_rekey(rotation.epoch_files, &old_root.fingerprint(), &fingerprint)
+    let before = crate::seal::begin_rekey(rotation.epoch_files, &old_root.fingerprint(), &fingerprint, epoch)
         .map_err(|e| ApiError::internal("preparing the seal epoch marks for the new root key", e))?;
     let replaced = store
         .replace_wrapped_keys(Rekey {
@@ -230,22 +243,26 @@ pub async fn rotate_root_key(
         })
         .await;
     if let Err(error) = replaced {
-        if let Err(error) =
-            crate::seal::record_epoch(rotation.epoch_files, rotation.marks.floor(), &old_root.fingerprint())
-        {
+        if let Err(error) = crate::seal::abort_rekey(&before) {
             tracing::warn!(%error, "could not put the seal epoch marks back to the old root key");
         }
         return Err(error.into());
     }
-    // The database has moved on; marks that still name both keys keep working until fixed.
-    if let Err(error) = crate::seal::record_epoch(rotation.epoch_files, epoch, &fingerprint) {
-        tracing::error!(
-            %error,
-            "the root key was replaced, but an epoch mark still accepts the old one; check it can be written"
-        );
-    }
+    // The database has moved on, so this is reported rather than undone. Marks that still name
+    // both keys already sit at the new epoch, so an older copy under the old key counts as a
+    // rollback meanwhile.
+    let stale_marks = crate::seal::record_epoch(rotation.epoch_files, epoch, &fingerprint)
+        .err()
+        .map(|error| {
+            tracing::error!(%error, "the root key was replaced, but an epoch mark still accepts the old one");
+            format!(
+                "the root key was replaced, but an epoch mark still accepts the old one ({error}); make it writable, \
+                 then run `sekret admin reset-epoch` with the server stopped"
+            )
+        });
     Ok(RotationReport {
         projects,
         skipped: unreadable,
+        stale_marks,
     })
 }

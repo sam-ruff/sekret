@@ -24,6 +24,8 @@ pub struct StoreArgs {
     #[arg(long, env = "SEKRET_CONFIG")]
     pub config: Option<PathBuf>,
     /// `sqlite://path?mode=rwc` or `postgres://user:pass@host/db` [default: sqlite://sekret.db?mode=rwc].
+    /// As a flag, a password in it is visible to other users in the process list; prefer
+    /// --database-url-file.
     #[arg(long, env = DATABASE_URL_ENV)]
     pub database_url: Option<String>,
     /// File holding the database URL, so a Postgres password stays out of the process list and
@@ -37,6 +39,10 @@ pub struct StoreArgs {
     /// database's disk. Admin commands read it to check and keep the seal epoch mark beside it.
     #[arg(long, env = "SEKRET_REMEMBER_FILE")]
     pub remember_file: Option<PathBuf>,
+    /// File outside the database for the seal epoch mark; required on Postgres without a
+    /// remember or root key file. Admin commands read and raise it the way the server does.
+    #[arg(long, env = "SEKRET_EPOCH_FILE")]
+    pub epoch_file: Option<PathBuf>,
 }
 
 pub const DATABASE_URL_ENV: &str = "SEKRET_DATABASE_URL";
@@ -142,6 +148,7 @@ pub struct StoreLocation {
     pub root_key_file: Option<PathBuf>,
     /// Found the way the server finds it, so the epoch mark beside it is read and kept up to date.
     pub remember_file: Option<PathBuf>,
+    pub epoch_file: Option<PathBuf>,
 }
 
 impl StoreLocation {
@@ -150,6 +157,7 @@ impl StoreLocation {
             &self.database_url,
             self.remember_file.as_deref(),
             self.root_key_file.as_deref(),
+            self.epoch_file.as_deref(),
         )
     }
 }
@@ -161,6 +169,7 @@ impl StoreArgs {
             database_url: choose_database(self, &file.database, sources)?.url,
             root_key_file: self.root_key_file.clone().or(file.seal.root_key_file),
             remember_file: self.remember_file.clone().or(file.seal.remember_file),
+            epoch_file: self.epoch_file.clone().or(file.seal.epoch_file),
         })
     }
 }
@@ -378,6 +387,7 @@ pub struct SealSection {
     pub remember_file: Option<PathBuf>,
     pub remember_secret_file: Option<PathBuf>,
     pub passphrase_file: Option<PathBuf>,
+    pub epoch_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1074,6 +1084,7 @@ pub fn resolve_with(
     };
     let shown = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
     let remember_file = args.store.remember_file.clone().or(seal.remember_file.clone());
+    let epoch_file = args.store.epoch_file.clone().or(seal.epoch_file.clone());
     fn argument<'p>(sources: &Sources, path: &'p Option<PathBuf>, flag: &str, env: &str) -> Option<(&'p Path, Origin)> {
         path.as_deref().map(|p| (p, sources.origin(flag, env, true, false)))
     }
@@ -1140,6 +1151,13 @@ pub fn resolve_with(
     }
     let session_ttl = args.session_ttl.or(auth.session_ttl).unwrap_or(12 * 3600);
     let cli_token_ttl = args.cli_token_ttl.or(auth.cli_token_ttl).unwrap_or(24 * 3600);
+    let ttl_warnings: Vec<String> = [
+        check_ttl("auth.session_ttl", session_ttl, SESSION_TTL_USUAL_DAYS)?,
+        check_ttl("auth.cli_token_ttl", cli_token_ttl, CLI_TOKEN_TTL_USUAL_DAYS)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let snapshots_to_keep = args
         .snapshots_to_keep
         .or(database.snapshots_to_keep)
@@ -1375,6 +1393,13 @@ pub fn resolve_with(
         shown(&remember_file),
         seal.remember_file.is_some(),
     );
+    notes.note(
+        "seal.epoch_file",
+        "epoch-file",
+        "SEKRET_EPOCH_FILE",
+        shown(&epoch_file),
+        seal.epoch_file.is_some(),
+    );
     let secret_shown = |choice: &SecretChoice, env: &str| {
         choice.from.as_ref().map(|from| match from {
             SecretFrom::File(path) => path.display().to_string(),
@@ -1459,12 +1484,15 @@ pub fn resolve_with(
         .chain(&remember_choice.ignored)
         .chain(&unlock_choice.ignored);
     warnings.extend(ignored.cloned());
-    if unlock == Some(UnlockPolicy::PassphraseFile) && unlock_origin == Origin::Env {
-        warnings.push(
-            "the passphrase-file unlock policy comes from SEKRET_UNLOCK in the environment; the server will unlock \
-             itself from a passphrase on disk or in the environment"
-                .into(),
-        );
+    warnings.extend(ttl_warnings);
+    if let Some(warning) = unlock_from_env_warning(unlock, unlock_origin) {
+        warnings.push(warning);
+    }
+    if let Some(warning) = database_flag_warning(&database_choice) {
+        warnings.push(warning);
+    }
+    if let Some(warning) = args.store.config.as_deref().and_then(config_writers) {
+        warnings.push(warning);
     }
     if let Some(warning) = default_role_warning(&default_org_role) {
         warnings.push(warning);
@@ -1495,6 +1523,7 @@ pub fn resolve_with(
             ("database's epoch file", db_epoch.as_deref()),
             ("remember file's epoch file", remember_epoch.as_deref()),
             ("root key file's epoch file", root_key_epoch.as_deref()),
+            ("epoch file", epoch_file.as_deref()),
         ],
         &[
             ("database", db_file.as_deref()),
@@ -1529,8 +1558,12 @@ pub fn resolve_with(
             args.store.config.as_deref().filter(|_| config_has_password),
         ),
     ]));
-    let epoch_files =
-        sekret_server::config::epoch_files(&database_url, remember_file.as_deref(), root_key_file.as_deref());
+    let epoch_files = sekret_server::config::epoch_files(
+        &database_url,
+        remember_file.as_deref(),
+        root_key_file.as_deref(),
+        epoch_file.as_deref(),
+    );
     let config = ServerConfig {
         listen,
         public_url: public_url.trim_end_matches('/').to_string(),
@@ -1605,6 +1638,109 @@ fn default_role_warning(role: &str) -> Option<String> {
     Some(format!(
         "auth.default_org_role is {role}, which {what}; use org-member unless that is really intended"
     ))
+}
+
+const DAY: i64 = 24 * 3600;
+const SESSION_TTL_USUAL_DAYS: i64 = 30;
+const CLI_TOKEN_TTL_USUAL_DAYS: i64 = 90;
+/// No token lifetime may be longer; past this it is most likely milliseconds.
+const TTL_CEILING: i64 = 365 * DAY;
+
+/// Refuses a token lifetime that is not positive or is over a year, and warns about one longer
+/// than `usual_days`, since a stolen token stays useful that long.
+fn check_ttl(name: &str, seconds: i64, usual_days: i64) -> anyhow::Result<Option<String>> {
+    if seconds <= 0 {
+        bail!("{name} must be a positive number of seconds, not {seconds}");
+    }
+    if seconds > TTL_CEILING {
+        bail!(
+            "{name} is {seconds} seconds, which is over a year; it is in seconds, not milliseconds, and may be at \
+             most {TTL_CEILING}"
+        );
+    }
+    if seconds <= usual_days * DAY {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{name} is {} days, longer than the recommended most of {usual_days}; a stolen token stays useful for \
+         that long",
+        seconds / DAY
+    )))
+}
+
+/// An unlock policy weaker than `manual` slipped in through the environment, rather than chosen
+/// in the configuration file or on the command line.
+fn unlock_from_env_warning(unlock: Option<UnlockPolicy>, origin: Origin) -> Option<String> {
+    if origin != Origin::Env {
+        return None;
+    }
+    let policy = unlock?;
+    let what = match policy {
+        UnlockPolicy::Manual => return None,
+        UnlockPolicy::Remember => {
+            "once unsealed, the server will unlock itself after every restart from the remember file"
+        }
+        UnlockPolicy::PassphraseFile => "the server will unlock itself from a passphrase on disk or in the environment",
+    };
+    Some(format!(
+        "the {} unlock policy comes from SEKRET_UNLOCK in the environment; {what}",
+        policy.as_str()
+    ))
+}
+
+/// A password in `--database-url` stays in the process list, which every local user can read,
+/// for as long as the server runs.
+fn database_flag_warning(choice: &DatabaseChoice) -> Option<String> {
+    if choice.origin != Origin::Flag || choice.file.is_some() || !has_password(&choice.url) {
+        return None;
+    }
+    Some(
+        "--database-url carries a password, which every local user can read in the process list while the server \
+         runs; use --database-url-file or SEKRET_DATABASE_URL_FILE instead"
+            .into(),
+    )
+}
+
+/// Why someone other than the server's user or root could change a file: it belongs to another
+/// user, or its mode lets its group or everyone write to it.
+pub fn writable_by_others(file: DirFacts, uid: u32, gid: u32) -> Option<&'static str> {
+    if file.uid != uid && file.uid != 0 {
+        return Some("belongs to another user");
+    }
+    if file.mode & 0o002 != 0 {
+        return Some("can be written by every user");
+    }
+    let private_group = file.gid == gid && gid == uid;
+    if file.mode & 0o020 != 0 && !private_group {
+        return Some("can be written by its group");
+    }
+    None
+}
+
+/// The configuration file decides who signs in and who is an admin, so anyone else who can
+/// change or replace it can make themselves one at the next restart.
+#[cfg(unix)]
+fn config_writers(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let facts = DirFacts {
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode(),
+    };
+    let why = writable_by_others(facts, uid, gid)
+        .map(|why| format!("{} {why}", path.display()))
+        .or_else(|| directory_exposure(path))?;
+    Some(format!(
+        "the configuration file: {why}; whoever can change it decides who signs in and who is an admin"
+    ))
+}
+
+#[cfg(not(unix))]
+fn config_writers(_path: &Path) -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -1957,6 +2093,174 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn token_lifetimes_must_be_positive_and_under_a_year() -> anyhow::Result<()> {
+        for bad in [0, -1, i64::MIN, 86_400_000, i64::MAX] {
+            assert!(check_ttl("auth.session_ttl", bad, 30).is_err(), "{bad}");
+        }
+        let error = check_ttl("auth.cli_token_ttl", 86_400_000, 90)
+            .err()
+            .context("milliseconds refused")?;
+        assert!(error.to_string().contains("milliseconds"), "{error}");
+        assert_eq!(check_ttl("auth.session_ttl", 12 * 3600, 30)?, None);
+        assert_eq!(check_ttl("auth.session_ttl", 30 * DAY, 30)?, None);
+        let long = check_ttl("auth.session_ttl", 40 * DAY, 30)?.context("a long session is warned about")?;
+        assert!(long.contains("40 days"), "{long}");
+        assert!(check_ttl("auth.cli_token_ttl", TTL_CEILING, 90)?.is_some());
+
+        let public = ["--public-url", "https://x"];
+        for flag in ["--session-ttl=0", "--cli-token-ttl=-5", "--cli-token-ttl=86400000"] {
+            let mut argv = public.to_vec();
+            argv.push(flag);
+            assert!(resolve(&args(&argv)?, FileConfig::default()).is_err(), "{flag}");
+        }
+        for yaml in ["auth:\n  session_ttl: 0\n", "auth:\n  cli_token_ttl: 86400000\n"] {
+            assert!(resolve(&args(&public)?, parse(yaml)?).is_err(), "{yaml}");
+        }
+        // Only the value that wins is judged.
+        let mut argv = public.to_vec();
+        argv.push("--session-ttl=3600");
+        let resolved = resolve(&args(&argv)?, parse("auth:\n  session_ttl: 0\n")?)?;
+        assert_eq!(resolved.config.session_ttl, 3600);
+        let resolved = resolve(&args(&public)?, parse("auth:\n  cli_token_ttl: 9000000\n")?)?;
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.cli_token_ttl")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_weaker_unlock_policy_from_the_environment_is_warned_about() {
+        for policy in [UnlockPolicy::Remember, UnlockPolicy::PassphraseFile] {
+            let warning = unlock_from_env_warning(Some(policy), Origin::Env).unwrap_or_default();
+            assert!(
+                warning.contains(policy.as_str()) && warning.contains("SEKRET_UNLOCK"),
+                "{warning}"
+            );
+            assert_eq!(unlock_from_env_warning(Some(policy), Origin::File), None);
+            assert_eq!(unlock_from_env_warning(Some(policy), Origin::Flag), None);
+        }
+        assert_eq!(unlock_from_env_warning(Some(UnlockPolicy::Manual), Origin::Env), None);
+        assert_eq!(unlock_from_env_warning(None, Origin::Env), None);
+    }
+
+    #[test]
+    fn remember_from_the_environment_is_reported_at_startup() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let mut flags = args(&["--public-url", "https://x"])?;
+        flags.unlock = Some(UnlockPolicy::Remember);
+        flags.store.remember_file = Some(dir.path().join("remember"));
+        let resolved = resolve_with(&flags, FileConfig::default(), &EnvSecrets::default(), &all_from_env())?;
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("remember unlock policy comes from SEKRET_UNLOCK")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        let resolved = resolve(&flags, FileConfig::default())?;
+        assert!(
+            !resolved.report.warnings.iter().any(|w| w.contains("SEKRET_UNLOCK")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_database_password_on_the_command_line_is_warned_about() {
+        let choice = |url: &str, origin: Origin, file: Option<&str>| DatabaseChoice {
+            url: url.into(),
+            origin,
+            key: "database.url",
+            file: file.map(PathBuf::from),
+            ignored: Vec::new(),
+        };
+        let warning = database_flag_warning(&choice("postgres://u:pw@db/s", Origin::Flag, None)).unwrap_or_default();
+        assert!(
+            warning.contains("process list") && !warning.contains("pw@"),
+            "{warning}"
+        );
+        assert_eq!(
+            database_flag_warning(&choice("postgres://u:pw@db/s", Origin::Env, None)),
+            None
+        );
+        assert_eq!(
+            database_flag_warning(&choice("postgres://u:pw@db/s", Origin::File, None)),
+            None
+        );
+        assert_eq!(
+            database_flag_warning(&choice("postgres://u:pw@db/s", Origin::Flag, Some("/run/url"))),
+            None,
+            "a URL file keeps the password out of the process list"
+        );
+        assert_eq!(
+            database_flag_warning(&choice("postgres://u@db/s", Origin::Flag, None)),
+            None
+        );
+        assert!(database_flag_warning(&choice("postgres://u@db/s?password=pw", Origin::Flag, None)).is_some());
+    }
+
+    #[test]
+    fn files_others_can_write_are_recognised() {
+        let file = |uid, gid, mode| DirFacts { uid, gid, mode };
+        assert_eq!(writable_by_others(file(990, 990, 0o100600), 990, 990), None);
+        assert_eq!(writable_by_others(file(0, 0, 0o100644), 990, 990), None, "root's file");
+        assert_eq!(
+            writable_by_others(file(990, 990, 0o100664), 990, 990),
+            None,
+            "a user private group"
+        );
+        assert!(
+            writable_by_others(file(990, 50, 0o100664), 990, 990).is_some(),
+            "a shared group"
+        );
+        assert!(writable_by_others(file(990, 990, 0o100666), 990, 990).is_some());
+        assert!(writable_by_others(file(2000, 2000, 0o100600), 990, 990).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+        let path = dir.path().join("sekret.yaml");
+        std::fs::write(&path, "server:\n  public_url: https://x\n").context("write")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        assert_eq!(config_writers(&path), None);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let warning = config_writers(&path).context("a world-writable file")?;
+        assert!(warning.contains("every user") && warning.contains("admin"), "{warning}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).context("chmod dir")?;
+        assert!(config_writers(&path).is_some(), "anyone could replace it");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+
+        let mut flags = args(&["--public-url", "https://x"])?;
+        flags.store.config = Some(path.clone());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let resolved = resolve(&flags, FileConfig::default())?;
+        assert!(
+            resolved
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("configuration file")),
+            "{:?}",
+            resolved.report.warnings
+        );
+        Ok(())
+    }
+
     /// Sources where every named variable is in the environment and nothing is a flag.
     fn all_from_env() -> Sources {
         Sources {
@@ -2239,6 +2543,7 @@ mod tests {
             database_url_file: None,
             root_key_file: None,
             remember_file: None,
+            epoch_file: None,
         };
         let located = store.locate(&Sources::none())?;
         assert_eq!(located.database_url, "sqlite://x.db");

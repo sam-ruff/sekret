@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::Context;
 use sekret_core::crypto::RootKey;
-use sekret_core::seal::{UnlockPolicy, unwrap_root_key};
+use sekret_core::seal::{SealFlags, UnlockPolicy, unwrap_root_key};
 use sekret_server::seal::{Signature, accepted_roots, check_signature, high_water, record_epoch, signed};
 use sekret_store::{SealConfig, SqlStore, Store};
 
@@ -45,7 +45,7 @@ impl Fixture {
     }
 
     fn marks(&self) -> Vec<PathBuf> {
-        sekret_server::config::epoch_files(&self.db, None, None)
+        sekret_server::config::epoch_files(&self.db, None, None, None)
     }
 
     async fn store(&self) -> anyhow::Result<SqlStore> {
@@ -253,7 +253,7 @@ async fn switching_the_seal_mode_replaces_the_root_key() -> anyhow::Result<()> {
         store.get_meta(sekret_server::ROOT_KEY_META).await?,
         Some(second.clone())
     );
-    let marks = sekret_server::config::epoch_files(&fixture.db, None, Some(&fixture.path().join("root.key")));
+    let marks = sekret_server::config::epoch_files(&fixture.db, None, Some(&fixture.path().join("root.key")), None);
     assert_eq!(accepted_roots(&marks), Some(vec![second.clone()]));
     let wrapped = unwrap_root_key(&old_wrap, PASSPHRASE).context("the old wrap still opens")?;
     assert_ne!(wrapped.fingerprint(), second, "but only the old key");
@@ -329,5 +329,45 @@ async fn only_reset_epoch_adopt_root_key_accepts_a_key_the_marks_do_not_name() -
     let config = fixture.config().await?;
     assert_eq!(high_water(&fixture.marks()).highest, Some(config.epoch));
     fixture.admin(&["bootstrap"])?;
+    Ok(())
+}
+
+/// With no mark, a stripped signature looks like a database from before signing. The offline
+/// commands sign it again, but never with a cleared migration flag a database writer chose.
+#[tokio::test]
+async fn offline_commands_never_restart_the_migration_from_an_unsigned_configuration() -> anyhow::Result<()> {
+    for command in [&["rotate-root-key"][..], &["reset-epoch"][..]] {
+        let (fixture, _) = rolled_forward().await?;
+        let stripped = SealConfig {
+            mac: None,
+            flags: SealFlags::default(),
+            ..fixture.config().await?
+        };
+        assert!(!stripped.flags.reviewer_tokens_migrated);
+        fixture.store().await?.update_seal_config(stripped).await?;
+        for mark in fixture.marks() {
+            std::fs::remove_file(&mark).context("mark")?;
+        }
+        fixture.admin(command)?;
+        let signed_again = fixture.config().await?;
+        let root = Fixture::root(&signed_again)?;
+        assert_eq!(check_signature(&root, &signed_again), Signature::Valid, "{command:?}");
+        assert!(signed_again.flags.reviewer_tokens_migrated, "{command:?}");
+    }
+    Ok(())
+}
+
+/// Postgres has no file to keep a mark beside, and the admin commands share the server's
+/// `seal.epoch_file` rule; SQLite always has one, so the option only adds a mark there.
+#[tokio::test]
+async fn an_epoch_file_is_raised_by_the_offline_commands() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let extra = fixture.path().join("seal.epoch");
+    let extra_arg = extra.display().to_string();
+    fixture.admin(&["reset-epoch", "--epoch-file", &extra_arg])?;
+    let config = fixture.config().await?;
+    assert_eq!(high_water(std::slice::from_ref(&extra)).highest, Some(config.epoch));
+    let root = Fixture::root(&config)?;
+    assert_eq!(accepted_roots(&[extra]), Some(vec![root.fingerprint()]));
     Ok(())
 }

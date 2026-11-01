@@ -1,6 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import { useEffect } from "react";
 import { Link, Outlet, useLocation, useParams } from "react-router";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { ProjectLogo } from "@/components/project-logo";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { useMe, useProjects } from "@/hooks/queries";
@@ -15,15 +16,20 @@ function TopbarTitle() {
   const { pathname } = useLocation();
   const { data: projects } = useProjects();
   const current = projects?.find((p) => p.slug === project || p.id === project);
-  const name = current?.name ?? project;
+  // Once the list has loaded, a slug that is not in it is not shown as if it were a project.
+  const name = current?.name ?? (projects ? undefined : project);
   const scope = pathname.startsWith("/org") ? "Organisation" : "Projects";
 
   return (
     <nav className="flex min-w-0 flex-1 items-center gap-1 text-sm text-muted-foreground" aria-label="Location">
-      <Link to={scope === "Projects" ? "/projects" : "/org/identities"} className="shrink-0 hover:text-foreground">
+      <Link
+        to={scope === "Projects" ? "/projects" : "/org/identities"}
+        className="-my-2 shrink-0 py-3 hover:text-foreground"
+        data-testid="topbar-scope"
+      >
         {scope}
       </Link>
-      {project && (
+      {project && name && (
         <>
           <ChevronRight className="size-3.5 shrink-0" />
           <ProjectLogo url={current?.logo_url} className="size-5 rounded" fallback={null} testId="header-logo" />
@@ -57,6 +63,7 @@ function SkipLink() {
 
 export function AppLayout() {
   useAnnounceAccount();
+  const { pathname } = useLocation();
   return (
     <SidebarProvider>
       <SkipLink />
@@ -74,7 +81,9 @@ export function AppLayout() {
           tabIndex={-1}
           className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 outline-none md:px-8 md:py-8"
         >
-          <Outlet />
+          <ErrorBoundary variant="section" resetKey={pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </SidebarInset>
     </SidebarProvider>

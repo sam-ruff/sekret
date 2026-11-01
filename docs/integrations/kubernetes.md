@@ -34,6 +34,8 @@ helm install sekret-operator deploy/helm/sekret-operator \
 | `watchNamespaces` | the release namespace | The namespaces to watch, each with its own `Role`. |
 | `clusterWide` | `false` | Watches every namespace with a `ClusterRole`. Cannot be combined with `watchNamespaces`. |
 | `tokenServiceAccounts` | all | Names of the only service accounts the operator may read and mint tokens for, in every watched namespace. |
+| `serviceAccount.create` | `true` | Creates the operator's own service account. With `false`, name an existing account in `serviceAccount.name`. |
+| `serviceAccount.name` | the release name | The operator's service account. Required when `serviceAccount.create` is `false`. The chart refuses `default`, since every pod in the namespace that names no account runs as it and would get the operator's rights. |
 | `tokenPolicy.enabled` | `true` | Installs a `ValidatingAdmissionPolicy` that lets the operator request only tokens with the `sekret` audience that expire within ten minutes, and none in `kube-system`. Needs Kubernetes 1.30 or later; set it to `false` on older clusters. |
 
 !!! warning "Cluster-wide mode is close to cluster-admin"

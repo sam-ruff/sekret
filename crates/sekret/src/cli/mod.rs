@@ -25,7 +25,8 @@ pub struct ClientArgs {
     /// Server URL, e.g. https://sekret.example.com.
     #[arg(long, global = true, env = "SEKRET_URL")]
     pub server: Option<String>,
-    /// Access token; defaults to the one saved by `sekret login`.
+    /// Access token; defaults to the one saved by `sekret login`. As a flag it is visible to
+    /// other users in the process list; prefer SEKRET_TOKEN.
     #[arg(long, global = true, env = "SEKRET_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
     #[arg(long, short = 'p', global = true, env = "SEKRET_PROJECT")]
@@ -170,6 +171,10 @@ pub struct ExportArgs {
     /// Load this blocked name anyway, for dotenv and shell output. Repeatable.
     #[arg(long = "allow", value_name = "NAME")]
     pub allow: Vec<String>,
+    /// Print to a terminal even when values hold control characters or escape sequences, which
+    /// could rewrite the screen or the clipboard. Pipes and files always get them as they are.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -300,9 +305,26 @@ fn read_credentials(path: &std::path::Path) -> anyhow::Result<Credentials> {
     Ok(credentials)
 }
 
+/// A token given as `--token` sits in the process list, which every local user can read.
+pub fn token_flag_warning(argv: &[String]) -> Option<&'static str> {
+    argv.iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--token" || arg.starts_with("--token="))
+        .then_some(
+            "--token is visible to other users on this machine in the process list; set SEKRET_TOKEN or run \
+             `sekret login` instead",
+        )
+}
+
 pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
     let cwd = std::env::current_dir()?;
     let mut warnings = Vec::new();
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if let Some(warning) = token_flag_warning(&argv) {
+        warnings.push(warning.to_string());
+    }
     let (file, _) = config::load_project_file(&cwd, &mut warnings)?;
     for warning in warnings {
         eprintln!("sekret: {warning}");
@@ -348,13 +370,17 @@ pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> 
 
 /// A client for the server's host socket that uses the one connection `socket_check` approved.
 #[cfg(unix)]
-pub async fn host_socket_client(path: &std::path::Path) -> anyhow::Result<HttpClient> {
-    let stream = crate::socket_check::connect(path).await?;
+pub async fn host_socket_client(path: &std::path::Path, owner: Option<&str>) -> anyhow::Result<HttpClient> {
+    let expected = owner
+        .map(crate::socket_check::user_id)
+        .transpose()
+        .context("--socket-owner")?;
+    let stream = crate::socket_check::connect(path, expected).await?;
     Ok(HttpClient::over_unix_stream(stream, None).await?)
 }
 
 #[cfg(not(unix))]
-pub async fn host_socket_client(_path: &std::path::Path) -> anyhow::Result<HttpClient> {
+pub async fn host_socket_client(_path: &std::path::Path, _owner: Option<&str>) -> anyhow::Result<HttpClient> {
     bail!("host sockets need a Unix host")
 }
 
@@ -863,25 +889,27 @@ pub fn load_policy(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shel
 /// Whether to honour a project file's `allow` list that has not been confirmed: asked at a
 /// terminal, and otherwise left out with a note saying how to confirm it.
 pub fn ask_project_allow(
-    file: &std::path::Path,
+    scope: &config::AllowScope,
     names: &[String],
     prompter: &dyn Prompter,
     interactive: bool,
     notes: &mut dyn Write,
 ) -> anyhow::Result<bool> {
-    let shown = format::one_line(&file.display().to_string());
+    let shown = format::one_line(&scope.file.display().to_string());
+    let target = scope.describe();
     let listed = names.iter().map(|n| format::one_line(n)).collect::<Vec<_>>().join(", ");
     if !interactive {
         writeln!(
             notes,
-            "sekret: not loading {listed} although {shown} allows them; run this once at a terminal to confirm, \
-             or pass --allow NAME"
+            "sekret: not loading {listed} from {target} although {shown} allows them; run this once at a terminal \
+             to confirm, or pass --allow NAME"
         )?;
         return Ok(false);
     }
     let answer = prompter.line(&format!(
-        "{shown} asks to load these blocked names:\n\n    {listed}\n\nThey can change what programs run or where they \
-         connect. Load them from now on, while this list is unchanged? [y/N] "
+        "{shown} asks to load these blocked names from {target}:\n\n    {listed}\n\nThey can change what programs \
+         run or where they connect, so only say yes if you trust everyone who can write secrets there. Load them \
+         from now on, while this list and this place are unchanged? [y/N] "
     ))?;
     Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
@@ -893,16 +921,16 @@ pub fn load_policy_confirming(resolved: &Resolved, flags: &[String]) -> anyhow::
     if let Some(note) = file_choice_note(resolved) {
         writeln!(stderr, "{note}")?;
     }
-    let Some((file, names)) = &resolved.unconfirmed_allow else {
+    let Some((scope, names)) = &resolved.unconfirmed_allow else {
         return load_policy(resolved, flags);
     };
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
-    if !ask_project_allow(file, names, &crate::prompt::Terminal, interactive, &mut stderr)? {
+    if !ask_project_allow(scope, names, &crate::prompt::Terminal, interactive, &mut stderr)? {
         return load_policy(resolved, flags);
     }
     let path = config::credentials_path()?;
     let mut credentials = read_credentials(&path)?;
-    credentials.confirm_allow(file, names);
+    credentials.confirm_allow(scope, names);
     config::save_credentials(&path, &credentials)?;
     shell::LoadPolicy::new(flags.iter().chain(&resolved.allow).chain(names).cloned())
 }
@@ -937,7 +965,18 @@ pub async fn export(
         }
         ExportFormat::Json | ExportFormat::Yaml => vars,
     };
-    write!(out, "{}", render(&vars, args.format)?)?;
+    let text = render(&vars, args.format)?;
+    if !args.raw && sekret_client::terminal_safe(&text) != text {
+        let key = vars
+            .iter()
+            .find(|(k, v)| sekret_client::terminal_safe(k) != **k || sekret_client::terminal_safe(v) != **v)
+            .map_or_else(|| "a secret".into(), |(k, _)| format::one_line(k));
+        bail!(
+            "the value of {key} holds control characters that could change what this terminal shows; \
+             redirect the output to a file or pass --raw to print it anyway"
+        );
+    }
+    write!(out, "{text}")?;
     Ok(())
 }
 
@@ -1296,7 +1335,97 @@ mod tests {
             format,
             recursive: false,
             allow: vec![],
+            raw: false,
         }
+    }
+
+    #[tokio::test]
+    async fn export_refuses_escape_sequences_for_a_terminal_unless_raw() -> anyhow::Result<()> {
+        const HOSTILE: &str = "x\u{1b}]52;c;cm0gLXJmIH4=\u{7}\u{1b}[2J";
+        let mut api = MockSekretApi::new();
+        api.expect_raw().returning(|_, _| {
+            Ok(RawSecrets {
+                project: "app".into(),
+                environment: "dev".into(),
+                secrets: vec![
+                    RawSecret {
+                        path: "/".into(),
+                        key: "PLAIN".into(),
+                        value: "fine".into(),
+                    },
+                    RawSecret {
+                        path: "/".into(),
+                        key: "TRAP".into(),
+                        value: HOSTILE.into(),
+                    },
+                    RawSecret {
+                        path: "/".into(),
+                        key: "BIDI".into(),
+                        value: "a\u{202e}b".into(),
+                    },
+                ],
+            })
+        });
+        for format in [
+            ExportFormat::Dotenv,
+            ExportFormat::Shell,
+            ExportFormat::Json,
+            ExportFormat::Yaml,
+        ] {
+            let mut out = Vec::new();
+            let refused = export(&api, at(), &export_args(format), &strict(), &mut out, &mut Vec::new())
+                .await
+                .err()
+                .context("expected a refusal")?;
+            assert!(refused.to_string().contains("--raw"), "{format:?}: {refused}");
+            assert!(!refused.to_string().contains('\u{1b}'), "{format:?}");
+            assert!(out.is_empty(), "{format:?}: nothing reaches the terminal");
+
+            let raw = ExportArgs {
+                raw: true,
+                ..export_args(format)
+            };
+            let mut out = Vec::new();
+            export(&api, at(), &raw, &strict(), &mut out, &mut Vec::new())
+                .await
+                .context("raw")?;
+            // JSON and YAML escape ESC themselves, but not bidi overrides.
+            let out = String::from_utf8(out)?;
+            assert!(out.contains('\u{202e}'), "{format:?}");
+            if matches!(format, ExportFormat::Dotenv | ExportFormat::Shell) {
+                assert!(out.contains("\u{1b}]52"), "{format:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_token_flag_is_warned_about_but_not_the_variable_or_a_childs_flag() {
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(token_flag_warning(&argv(&["sekret", "--token", "skt_x", "whoami"])).is_some());
+        assert!(token_flag_warning(&argv(&["sekret", "whoami", "--token=skt_x"])).is_some());
+        assert_eq!(token_flag_warning(&argv(&["sekret", "whoami"])), None);
+        assert_eq!(
+            token_flag_warning(&argv(&["sekret", "run", "--", "tool", "--token", "x"])),
+            None,
+            "the command's own arguments are not sekret's"
+        );
+        let warning = token_flag_warning(&argv(&["sekret", "--token", "skt_secret"])).unwrap_or_default();
+        assert!(warning.contains("SEKRET_TOKEN") && !warning.contains("skt_secret"));
+    }
+
+    #[test]
+    fn a_duplicate_key_is_named_without_its_escape_sequences() -> anyhow::Result<()> {
+        let secret = |path: &str| RawSecret {
+            path: path.into(),
+            key: "K\u{1b}[2J".into(),
+            value: "v".into(),
+        };
+        let error = flatten(&[secret("/"), secret("/a")])
+            .err()
+            .context("expected a clash")?;
+        assert!(!error.to_string().contains('\u{1b}'), "{error}");
+        Ok(())
     }
 
     fn run_args(script: &str) -> RunArgs {
@@ -1452,27 +1581,67 @@ mod tests {
         }
     }
 
+    fn scope() -> config::AllowScope {
+        config::AllowScope {
+            file: "/repo/.sekret.toml".into(),
+            server: "https://s.test".into(),
+            project: "payments".into(),
+            environment: "prod\u{1b}[2J".into(),
+            path: "/".into(),
+        }
+    }
+
+    /// Records what a prompt asked, so tests can check what the person was shown.
+    struct Recorded(std::cell::RefCell<String>);
+
+    impl Prompter for Recorded {
+        fn secret(&self, _: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+            anyhow::bail!("no secrets asked")
+        }
+
+        fn line(&self, prompt: &str) -> anyhow::Result<String> {
+            self.0.borrow_mut().push_str(prompt);
+            Ok("y".into())
+        }
+    }
+
     #[test]
     fn a_project_file_allow_list_needs_a_yes_at_a_terminal() -> anyhow::Result<()> {
-        let file = std::path::Path::new("/repo/.sekret.toml");
+        let scope = scope();
         let names = vec!["LD_PRELOAD".to_string()];
         let mut notes = Vec::new();
-        assert!(!ask_project_allow(file, &names, &Answer("y"), false, &mut notes)?);
+        assert!(!ask_project_allow(&scope, &names, &Answer("y"), false, &mut notes)?);
         let note = String::from_utf8(notes)?;
         assert!(
-            note.contains("LD_PRELOAD") && note.contains("/repo/.sekret.toml"),
+            note.contains("LD_PRELOAD") && note.contains("/repo/.sekret.toml") && note.contains("payments/prod"),
             "{note}"
         );
-        assert!(!ask_project_allow(file, &names, &Answer(""), true, &mut Vec::new())?);
-        assert!(!ask_project_allow(file, &names, &Answer("n"), true, &mut Vec::new())?);
-        assert!(ask_project_allow(file, &names, &Answer("yes"), true, &mut Vec::new())?);
+        assert!(!note.contains('\u{1b}'), "{note}");
+        assert!(!ask_project_allow(&scope, &names, &Answer(""), true, &mut Vec::new())?);
+        assert!(!ask_project_allow(&scope, &names, &Answer("n"), true, &mut Vec::new())?);
+        assert!(ask_project_allow(
+            &scope,
+            &names,
+            &Answer("yes"),
+            true,
+            &mut Vec::new()
+        )?);
+
+        let recorded = Recorded(std::cell::RefCell::new(String::new()));
+        assert!(ask_project_allow(&scope, &names, &recorded, true, &mut Vec::new())?);
+        let asked = recorded.0.into_inner();
+        assert!(
+            asked.contains("payments/prod") && asked.contains("https://s.test") && asked.contains("LD_PRELOAD"),
+            "the prompt says where the names would load from: {asked}"
+        );
+        assert!(!asked.contains('\u{1b}'), "{asked}");
         Ok(())
     }
 
     #[test]
     fn an_unconfirmed_allow_list_unblocks_nothing() -> anyhow::Result<()> {
         let mut resolved = resolved(config::ServerSource::Explicit);
-        resolved.unconfirmed_allow = Some(("/repo/.sekret.toml".into(), vec!["LD_PRELOAD".into()]));
+        resolved.unconfirmed_allow = Some((scope(), vec!["LD_PRELOAD".into()]));
         let policy = load_policy(&resolved, &[])?;
         assert_eq!(policy.check("LD_PRELOAD"), Err(shell::SkipReason::Blocked));
         let flagged = load_policy(&resolved, &["LD_PRELOAD".into()])?;
@@ -1650,6 +1819,7 @@ mod tests {
                 status: 403,
                 code: "forbidden".into(),
                 message: "no".into(),
+                retry_after: None,
             })
         });
         let (mut out, mut notes) = (Vec::new(), Vec::new());

@@ -497,7 +497,7 @@ async fn restore_shows_header_fields_only_once_proved_and_never_raw() -> anyhow:
     assert!(!shown.contains("\nfake line"), "{shown:?}");
 
     // The restore proved the key, so the restored database's own mark starts on it.
-    let marks = sekret_server::config::epoch_files(&sqlite(d, "restored.db"), None, None);
+    let marks = sekret_server::config::epoch_files(&sqlite(d, "restored.db"), None, None, None);
     assert_eq!(sekret_server::seal::accepted_roots(&marks), Some(vec![fingerprint]));
     Ok(())
 }

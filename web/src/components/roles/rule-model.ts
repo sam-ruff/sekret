@@ -78,6 +78,45 @@ export const ACTION_LABELS: Record<Action, string> = {
   delete: "Delete",
 };
 
+/** The actions the server checks for each subject; any other tick would do nothing. */
+export const SUBJECT_ACTIONS: Record<Subject, readonly Action[]> = {
+  secrets: ["read", "read-value", "create", "edit", "delete"],
+  "secret-versions": ["read", "read-value"],
+  snapshots: ["read", "edit"],
+  folders: ["read", "create", "delete"],
+  environments: ["read", "create", "edit", "delete"],
+  members: ["read", "create", "delete"],
+  roles: ["read", "create", "edit", "delete"],
+  "audit-log": ["read"],
+  settings: ["read", "edit", "delete"],
+  projects: ["create"],
+  identities: ["read", "create", "edit", "delete"],
+  "org-members": ["read", "create", "edit", "delete"],
+  "org-roles": ["read", "create", "edit", "delete"],
+  "org-audit-log": ["read"],
+  backups: ["read"],
+};
+
+/**
+ * The checkboxes a rule row offers: what means something for its subject, plus anything the
+ * rule already holds, so saving an older role never drops a grant without the editor seeing it.
+ */
+export function actionsFor(rule: Pick<EditableRule, "subject" | "actions">): Action[] {
+  return ACTIONS.filter((a) => SUBJECT_ACTIONS[rule.subject].includes(a) || rule.actions.includes(a));
+}
+
+/** What the less obvious actions mean for a subject. */
+export const SUBJECT_HINTS: Partial<Record<Subject, string>> = {
+  secrets: "Read shows keys and details. Read value shows the secret itself.",
+  "secret-versions": "Read lists past versions. Read value shows old values, and also needs Read value on secrets.",
+  snapshots: "Edit restores a snapshot.",
+  settings: "Delete removes the whole project.",
+  members: "Create adds people, groups and machines to the project.",
+  projects: "Create starts new projects.",
+  "org-members": "Edit turns users on and off. Create and Delete give and take organisation roles.",
+  backups: "Read downloads an encrypted backup.",
+};
+
 export const SUBJECT_LABELS: Record<Subject, string> = {
   secrets: "Secrets",
   "secret-versions": "Secret history",

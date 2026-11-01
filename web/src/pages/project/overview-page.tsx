@@ -14,6 +14,15 @@ import { keys, useEnvironments } from "@/hooks/queries";
 import { normalisePath } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
+/** A present key opens its environment; a missing one also opens the add form with the key filled in. */
+function cellHref(project: string, env: string, path: string, missingKey?: string): string {
+  const params = new URLSearchParams();
+  if (path !== "/") params.set("path", path);
+  if (missingKey) params.set("add", missingKey);
+  const query = params.toString();
+  return `/projects/${project}/secrets/${env}${query ? `?${query}` : ""}`;
+}
+
 export function OverviewPage() {
   const { project = "" } = useParams();
   const [search] = useSearchParams();
@@ -106,7 +115,7 @@ export function OverviewPage() {
       )}
 
       {shown.length > 0 && envs.length > 1 && (
-        <p className="-mb-4 text-xs text-muted-foreground md:hidden" data-testid="overview-swipe-hint">
+        <p className="-mt-3 text-xs text-muted-foreground md:hidden" data-testid="overview-swipe-hint">
           Swipe the table sideways to see every environment.
         </p>
       )}
@@ -157,9 +166,14 @@ export function OverviewPage() {
                       return (
                         <td key={env.id} className="px-4 py-2.5 text-center" data-testid={`cell-${row.key}-${env.slug}`} data-present={version !== undefined}>
                           <Link
-                            to={`/projects/${project}/secrets/${env.slug}${folderQuery(path)}`}
-                            className="inline-flex items-center justify-center"
-                            aria-label={version !== undefined ? `${row.key} in ${env.name}, version ${version}` : `${row.key} missing in ${env.name}`}
+                            to={cellHref(project, env.slug, row.path || path, version === undefined ? row.key : undefined)}
+                            className="-my-1.5 inline-flex items-center justify-center py-1.5"
+                            aria-label={
+                              version !== undefined
+                                ? `${row.key} in ${env.name}, version ${version}`
+                                : `${row.key} missing in ${env.name}. Add it there.`
+                            }
+                            data-testid={`cell-link-${row.key}-${env.slug}`}
                           >
                             {version !== undefined ? (
                               <Badge variant="outline" className="gap-1 border-success/40 text-success">

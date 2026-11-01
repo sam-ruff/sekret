@@ -62,10 +62,20 @@ rules:
     {{- end }}
 {{- end }}
 
+{{- /*
+The operator's rights would pass to every pod that runs as the account, so it is never the
+namespace's `default` one, which pods get when they name none.
+*/}}
 {{- define "sekret-operator.serviceAccountName" -}}
+{{- $name := .Values.serviceAccount.name }}
+{{- if eq $name "default" }}
+{{- fail "serviceAccount.name must not be \"default\": every pod in the namespace that names no account would get the operator's rights" }}
+{{- end }}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "sekret-operator.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "sekret-operator.fullname" .) $name }}
+{{- else if $name }}
+{{- $name }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- fail "serviceAccount.name is required when serviceAccount.create is false; name an account used only by the operator" }}
 {{- end }}
 {{- end }}

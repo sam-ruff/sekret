@@ -347,6 +347,15 @@
                 }
               }
             }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }
@@ -4429,7 +4438,9 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "maximum": 1000000000,
+            "minimum": 1
           },
           "ttl": {
             "type": [
@@ -4437,7 +4448,9 @@
               "null"
             ],
             "format": "int64",
-            "description": "Seconds until the secret stops working; never when absent."
+            "description": "Seconds until the secret stops working, at most ten years; never when absent.",
+            "maximum": 315360000,
+            "minimum": 1
           }
         }
       },
@@ -4861,7 +4874,8 @@
           "max_token_lifetime": {
             "type": "integer",
             "format": "int64",
-            "description": "Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left\nout. Tokens without `iat` are refused. In TokenReview mode it applies to tokens whose\nclaims can be read.",
+            "description": "Longest service account token accepted, from `iat` to `exp`, in seconds; 3600 when left\nout, and at most ten years. Tokens without `iat` are refused. In TokenReview mode it\napplies to tokens whose claims can be read.",
+            "maximum": 315360000,
             "minimum": 1
           },
           "mode": {

@@ -6,8 +6,19 @@ const dateTime = new Intl.DateTimeFormat("en-GB", {
   minute: "2-digit",
 });
 
+/** Shown instead of a date the browser cannot represent, such as an expiry millions of years away. */
+export const UNKNOWN_DATE = "Unknown date";
+
+/** The date for a Unix time, or null when it is outside what `Date` can hold. */
+function dateOf(seconds: number): Date | null {
+  if (!Number.isFinite(seconds)) return null;
+  const date = new Date(seconds * 1000);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
 export function formatDateTime(seconds: number): string {
-  return dateTime.format(new Date(seconds * 1000));
+  const date = dateOf(seconds);
+  return date ? dateTime.format(date) : UNKNOWN_DATE;
 }
 
 const relative = new Intl.RelativeTimeFormat("en-GB", { numeric: "auto" });
@@ -22,6 +33,7 @@ const UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
 ];
 
 export function formatRelative(seconds: number, nowSeconds = Date.now() / 1000): string {
+  if (!dateOf(seconds) || !dateOf(nowSeconds)) return UNKNOWN_DATE;
   const delta = seconds - nowSeconds;
   const abs = Math.abs(delta);
   if (abs < 45) return "just now";
@@ -38,12 +50,14 @@ const clock = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-dig
  * The date is added when it is not today.
  */
 export function formatExpiry(seconds: number, nowSeconds = Date.now() / 1000): string {
+  const at = dateOf(seconds);
+  const now = dateOf(nowSeconds);
+  if (!at || !now) return UNKNOWN_DATE;
   const delta = seconds - nowSeconds;
   // Whole minutes, so a token minted a moment ago for an hour reads "in 1 hour", not "in 60 minutes".
   const rounded = nowSeconds + Math.round(delta / 60) * 60;
   const when = delta > 0 && delta < 45 ? "in less than a minute" : formatRelative(rounded, nowSeconds);
-  const at = new Date(seconds * 1000);
-  const sameDay = at.toDateString() === new Date(nowSeconds * 1000).toDateString();
+  const sameDay = at.toDateString() === now.toDateString();
   return `${when} (${sameDay ? clock.format(at) : formatDateTime(seconds)})`;
 }
 

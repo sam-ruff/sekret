@@ -85,6 +85,9 @@ seal:
   # File with 32 random bytes, base64 or hex (openssl rand -base64 32), mixed into the remember
   # key, so the remember file and database alone cannot unlock. SEKRET_REMEMBER_SECRET also works.
   remember_secret_file: null
+  # File for the seal epoch mark, on a disk the database cannot reach. Required on Postgres
+  # without a remember or root key file. Give the admin commands the same file.
+  epoch_file: null
   # Passphrase for the passphrase-file policy, read only under that policy.
   # SEKRET_UNLOCK_PASSPHRASE also works, but a file is better.
   passphrase_file: null

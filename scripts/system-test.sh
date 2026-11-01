@@ -76,9 +76,10 @@ start_server() {
       ;;
     passphrase)
       printf '%s\n' "$passphrase" > "$work/passphrase"
-      rm -f "$work/admin-token"
+      rm -f "$work/admin-token" "$work/seal.epoch"
+      # Postgres keeps no mark beside the database, so the seal epoch lives in a file of its own.
       seal_args=(--seal-mode passphrase --auto-init --setup-passphrase-file "$work/passphrase"
-        --setup-admin-token-file "$work/admin-token")
+        --setup-admin-token-file "$work/admin-token" --epoch-file "$work/seal.epoch")
       export SEKRET_E2E_PASSPHRASE=$passphrase
       ;;
     *) echo "unknown seal mode $mode" >&2; return 1 ;;

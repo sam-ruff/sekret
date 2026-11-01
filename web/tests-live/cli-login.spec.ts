@@ -57,7 +57,9 @@ async function openApproval(page: Page, url: string): Promise<void> {
     const limited = page.getByTestId("error-state").filter({ hasText: /too many|slow down/i });
     if ((await limited.count()) === 0 || Date.now() > deadline) return;
     await page.waitForTimeout(3_000);
-    await limited.getByRole("button", { name: "Try again" }).click();
+    // The page may have retried on its own while we waited.
+    const retry = limited.getByRole("button", { name: "Try again" });
+    if ((await retry.count()) > 0) await retry.click();
   }
 }
 

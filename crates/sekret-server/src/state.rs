@@ -32,7 +32,14 @@ pub struct Inner {
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,
     /// Folds repeated refusals into one audit entry a minute per caller and source.
     pub refusals: crate::ratelimit::AuditThrottle,
+    /// Logo uploads per principal, since each one may cost a second or two of rendering.
+    pub logo_limiter: RateLimiter<String>,
+    /// CLI login polls per client address. Generous, as each waiting terminal polls every two seconds.
+    pub poll_limiter: RateLimiter<IpAddr>,
 }
+
+/// Polls allowed per address each minute: a handful of terminals waiting at once.
+pub const CLI_POLLS_PER_MINUTE: u32 = 120;
 
 pub type AppState = Arc<Inner>;
 
@@ -68,5 +75,7 @@ pub fn build_state(deps: Dependencies) -> AppState {
         kdf_queue: Arc::new(tokio::sync::Semaphore::new(KDF_QUEUE_DEPTH)),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         refusals: crate::ratelimit::AuditThrottle::default(),
+        logo_limiter: RateLimiter::new(crate::api::logo::LOGO_UPLOADS_PER_MINUTE),
+        poll_limiter: RateLimiter::new(CLI_POLLS_PER_MINUTE),
     })
 }

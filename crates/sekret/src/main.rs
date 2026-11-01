@@ -128,8 +128,11 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::Server(args) => server::run_server(*args, env_secrets, sources).await?,
         Command::Admin(command) => server::run_admin(command, sources).await?,
         Command::Sys(command) if command.socket().is_some() => {
-            let path = command.socket().map(std::path::Path::to_path_buf).unwrap_or_default();
-            let api = cli::host_socket_client(&path).await?;
+            let (path, owner) = command
+                .socket()
+                .map(|(path, owner)| (path.to_path_buf(), owner.map(String::from)))
+                .unwrap_or_default();
+            let api = cli::host_socket_client(&path, owner.as_deref()).await?;
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }
         Command::Sys(command) => {
@@ -210,7 +213,9 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
             )
             .await?;
         }
-        Command::Export(args) => {
+        Command::Export(mut args) => {
+            // Pipes and files get the values exactly; only a terminal is protected.
+            args.raw |= !std::io::IsTerminal::is_terminal(&std::io::stdout());
             let (resolved, api) = authenticated(&cli.client).await?;
             let policy = cli::load_policy_confirming(&resolved, &args.allow)?;
             let at = cli::location(&resolved)?;

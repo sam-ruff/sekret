@@ -611,6 +611,7 @@ fn seal_config(remembered: Option<Vec<u8>>) -> SealConfig {
         flags: sekret_core::seal::SealFlags {
             reviewer_tokens_migrated: true,
             remember_secret: true,
+            wrap_form_signed: true,
         },
         created_at: 10,
         updated_at: 10,

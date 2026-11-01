@@ -3,6 +3,7 @@
 //! `LOGO_SIZE` pixels. Nothing from the original file (scripts, appended data, extra frames,
 //! external references) survives.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use image::imageops::FilterType;
@@ -16,6 +17,20 @@ const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SVG_ELEMENTS: usize = 10_000;
 const MAX_SVG_USES: usize = 256;
 const MAX_SVG_DEPTH: usize = 64;
+/// Elements once every `<use>`, mask, clip path, pattern and marker is expanded in place.
+const MAX_SVG_EXPANDED: u64 = 20_000;
+/// References followed through references, such as a mask whose content is clipped.
+const MAX_REFERENCE_DEPTH: usize = 8;
+
+/// Rendering work allowed for one SVG, in units of roughly one full-canvas path fill. Masks,
+/// clip paths, patterns and gradients are charged once per use, as resvg renders them, so
+/// nesting them cannot multiply the work past this.
+const RENDER_BUDGET: u64 = 20_000;
+const PATH_COST: u64 = 1;
+const DASH_COST: u64 = 8;
+const GRADIENT_COST: u64 = 40;
+/// An offscreen canvas, composited back: isolated groups, clip paths, masks, patterns and images.
+const LAYER_COST: u64 = 30;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ImageError {
@@ -117,6 +132,9 @@ fn check_svg(text: &str) -> Result<(), ImageError> {
                 node.tag_name().name()
             )));
         }
+        if is_filter_element(node.tag_name().name()) {
+            return Err(ImageError::UnsafeSvg("filters are not allowed".into()));
+        }
         if node.ancestors().count() > MAX_SVG_DEPTH {
             return Err(ImageError::UnsafeSvg("the document is nested too deeply".into()));
         }
@@ -124,7 +142,204 @@ fn check_svg(text: &str) -> Result<(), ImageError> {
     if elements > MAX_SVG_ELEMENTS || uses > MAX_SVG_USES {
         return Err(ImageError::UnsafeSvg("the document has too many elements".into()));
     }
+    let mut ids: HashMap<&str, Vec<roxmltree::Node>> = HashMap::new();
+    for node in document.descendants().filter(|n| n.is_element()) {
+        if let Some(id) = node.attribute("id") {
+            ids.entry(id).or_default().push(node);
+        }
+    }
+    check_stylesheets(&document, &ids)?;
+    Expansion {
+        ids,
+        seen: HashMap::new(),
+    }
+    .size(root, 0)?;
     Ok(())
+}
+
+/// The ids named by `url(#id)` in an attribute or stylesheet, in any letter case of `url`.
+fn url_targets(value: &str) -> Vec<&str> {
+    let lower = value.to_ascii_lowercase();
+    lower
+        .match_indices("url(")
+        .filter_map(|(at, _)| {
+            let rest = value.get(at + 4..)?;
+            let inner = rest.split(')').next()?.trim().trim_matches(['"', '\'']);
+            inner.trim().strip_prefix('#')
+        })
+        .collect()
+}
+
+/// Everything an element draws in by reference: `href`s and `url(#id)` paints, masks, clip
+/// paths and markers, whether set as attributes or in its `style`.
+fn references<'a>(node: roxmltree::Node<'a, '_>) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for attribute in node.attributes() {
+        let value = attribute.value();
+        if attribute.name() == "href" {
+            out.extend(value.trim().strip_prefix('#'));
+            continue;
+        }
+        out.extend(url_targets(value));
+    }
+    out
+}
+
+/// Selectors cannot be matched here, so a stylesheet may only point at gradients, which draw
+/// nothing by reference themselves.
+fn check_stylesheets(
+    document: &roxmltree::Document,
+    ids: &HashMap<&str, Vec<roxmltree::Node>>,
+) -> Result<(), ImageError> {
+    let sheets = document
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "style");
+    for sheet in sheets {
+        let text: String = sheet.descendants().filter_map(|n| n.text()).collect();
+        for id in url_targets(&text) {
+            let gradients_only = ids.get(id).is_none_or(|targets| {
+                targets
+                    .iter()
+                    .all(|t| matches!(t.tag_name().name(), "linearGradient" | "radialGradient"))
+            });
+            if !gradients_only {
+                return Err(ImageError::UnsafeSvg("a stylesheet may only refer to gradients".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+enum Visit {
+    Open,
+    /// The element's size with everything it refers to, and the longest chain of references below it.
+    Done(u64, usize),
+}
+
+/// Counts the elements a renderer expands the document into, following every reference. Each
+/// element is sized once, so a reference fan-out cannot make this check itself slow.
+struct Expansion<'a, 'input> {
+    ids: HashMap<&'a str, Vec<roxmltree::Node<'a, 'input>>>,
+    seen: HashMap<roxmltree::NodeId, Visit>,
+}
+
+impl<'a, 'input> Expansion<'a, 'input> {
+    fn size(&mut self, node: roxmltree::Node<'a, 'input>, hops: usize) -> Result<(u64, usize), ImageError> {
+        let too_deep = || ImageError::UnsafeSvg("references are nested too deeply".into());
+        if hops > MAX_REFERENCE_DEPTH {
+            return Err(too_deep());
+        }
+        match self.seen.get(&node.id()) {
+            Some(Visit::Done(size, below)) if hops + below <= MAX_REFERENCE_DEPTH => return Ok((*size, *below)),
+            Some(Visit::Done(..)) => return Err(too_deep()),
+            Some(Visit::Open) => return Err(ImageError::UnsafeSvg("an element refers to itself".into())),
+            None => {}
+        }
+        self.seen.insert(node.id(), Visit::Open);
+        let mut size: u64 = 1;
+        let mut below = 0;
+        for child in node.children().filter(|c| c.is_element()) {
+            let (child_size, child_below) = self.size(child, hops)?;
+            size = size.saturating_add(child_size);
+            below = below.max(child_below);
+        }
+        for id in references(node) {
+            let targets = self.ids.get(id).cloned().unwrap_or_default();
+            for target in targets {
+                let (target_size, target_below) = self.size(target, hops + 1)?;
+                size = size.saturating_add(target_size);
+                below = below.max(target_below + 1);
+            }
+        }
+        if size > MAX_SVG_EXPANDED {
+            return Err(ImageError::UnsafeSvg(
+                "the document expands to too many elements".into(),
+            ));
+        }
+        self.seen.insert(node.id(), Visit::Done(size, below));
+        Ok((size, below))
+    }
+}
+
+/// Filters can take minutes to render from a few bytes, and a logo has no need of them.
+fn is_filter_element(name: &str) -> bool {
+    name == "filter" || name.starts_with("fe")
+}
+
+/// Walks the tree the way resvg renders it, stopping as soon as `budget` is spent. The walk
+/// uses its own stack and never costs more than the budget, however deep the nesting.
+fn within_render_budget(root: &usvg::Group, budget: u64) -> bool {
+    let mut left = budget;
+    let mut spend = |cost: u64| match left.checked_sub(cost) {
+        Some(rest) => {
+            left = rest;
+            true
+        }
+        None => false,
+    };
+    let mut groups = vec![root];
+    while let Some(group) = groups.pop() {
+        if !spend(PATH_COST) || (group.should_isolate() && !spend(LAYER_COST)) {
+            return false;
+        }
+        let mut clip = group.clip_path();
+        while let Some(c) = clip {
+            if !spend(LAYER_COST) {
+                return false;
+            }
+            groups.push(c.root());
+            clip = c.clip_path();
+        }
+        let mut mask = group.mask();
+        while let Some(m) = mask {
+            if !spend(LAYER_COST) {
+                return false;
+            }
+            groups.push(m.root());
+            mask = m.mask();
+        }
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(child) => groups.push(child),
+                usvg::Node::Path(path) => {
+                    if !spend(PATH_COST) {
+                        return false;
+                    }
+                    let paints = path
+                        .fill()
+                        .map(usvg::Fill::paint)
+                        .into_iter()
+                        .chain(path.stroke().map(usvg::Stroke::paint));
+                    for paint in paints {
+                        let cost = match paint {
+                            usvg::Paint::Color(_) => 0,
+                            usvg::Paint::LinearGradient(_) | usvg::Paint::RadialGradient(_) => GRADIENT_COST,
+                            usvg::Paint::Pattern(pattern) => {
+                                groups.push(pattern.root());
+                                LAYER_COST
+                            }
+                        };
+                        if !spend(cost) {
+                            return false;
+                        }
+                    }
+                    if path.stroke().is_some_and(|s| s.dasharray().is_some()) && !spend(DASH_COST) {
+                        return false;
+                    }
+                }
+                usvg::Node::Image(image) => {
+                    if !spend(LAYER_COST) {
+                        return false;
+                    }
+                    if let usvg::ImageKind::SVG(tree) = image.kind() {
+                        groups.push(tree.root());
+                    }
+                }
+                usvg::Node::Text(text) => groups.push(text.flattened()),
+            }
+        }
+    }
+    true
 }
 
 fn render_svg(data: &[u8]) -> Result<DynamicImage, ImageError> {
@@ -139,6 +354,13 @@ fn render_svg(data: &[u8]) -> Result<DynamicImage, ImageError> {
         ..usvg::Options::default()
     };
     let tree = usvg::Tree::from_str(text, &options).map_err(|e| ImageError::UnsafeSvg(e.to_string()))?;
+    // Also catches CSS filter functions, which need no `<filter>` element.
+    if !tree.filters().is_empty() {
+        return Err(ImageError::UnsafeSvg("filters are not allowed".into()));
+    }
+    if !within_render_budget(tree.root(), RENDER_BUDGET) {
+        return Err(ImageError::UnsafeSvg("the drawing is too complex".into()));
+    }
     let size = tree.size();
     let scale = LOGO_SIZE as f32 / size.width().max(size.height());
     let width = ((size.width() * scale).round() as u32).clamp(1, LOGO_SIZE);
@@ -284,5 +506,119 @@ mod tests {
                 &attack[..attack.len().min(80)]
             );
         }
+    }
+
+    const HEAD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#;
+
+    /// Refused, and quickly: each of these took seconds to minutes to render before.
+    fn refused_quickly(attack: &str) {
+        let started = std::time::Instant::now();
+        let result = normalise_logo(attack.as_bytes());
+        assert!(
+            matches!(result, Err(ImageError::UnsafeSvg(_))),
+            "{result:?}: {}",
+            &attack[..attack.len().min(120)]
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    fn nested_references(element: &str, attribute: &str, levels: usize, fan: usize) -> String {
+        let mut svg = format!(r#"{HEAD}<{element} id="r0"><rect width="100" height="100" fill="white"/></{element}>"#);
+        for level in 1..levels {
+            svg.push_str(&format!(r#"<{element} id="r{level}">"#));
+            for _ in 0..fan {
+                svg.push_str(&format!(
+                    r##"<rect width="100" height="100" fill="white" {attribute}="url(#r{})"/>"##,
+                    level - 1
+                ));
+            }
+            svg.push_str(&format!("</{element}>"));
+        }
+        svg.push_str(&format!(
+            r##"<rect width="100" height="100" {attribute}="url(#r{})"/></svg>"##,
+            levels - 1
+        ));
+        svg
+    }
+
+    #[test]
+    fn filters_are_refused_however_they_are_written() {
+        let morphology = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><filter id="f"><feMorphology radius="50"/></filter><rect width="100" height="100" filter="url(#f)"/></svg>"##;
+        let combined = format!(
+            r##"{HEAD}<defs><filter id="f" x="-1000%" y="-1000%" width="2100%" height="2100%"><feGaussianBlur stdDeviation="50"/><feMorphology operator="dilate" radius="50"/><feTurbulence baseFrequency="0.9" numOctaves="10"/></filter></defs><rect width="100" height="100" filter="url(#f)"/></svg>"##
+        );
+        let turbulence = format!(
+            r##"{HEAD}<filter id="f"><feTurbulence baseFrequency="0.9" numOctaves="10"/></filter><rect width="100" height="100" filter="url(#f)"/></svg>"##
+        );
+        let unused = format!(r#"{HEAD}<filter id="f"><feFlood/></filter><rect width="100" height="100"/></svg>"#);
+        let css_attribute = format!(r#"{HEAD}<rect width="100" height="100" style="filter:blur(50)"/></svg>"#);
+        let css_sheet =
+            format!(r#"{HEAD}<style>rect{{filter:blur(50px)}}</style><rect width="100" height="100"/></svg>"#);
+        let presentation = format!(r#"{HEAD}<rect width="100" height="100" filter="blur(50)"/></svg>"#);
+        for attack in [
+            morphology,
+            &combined,
+            &turbulence,
+            &unused,
+            &css_attribute,
+            &css_sheet,
+            &presentation,
+        ] {
+            refused_quickly(attack);
+        }
+    }
+
+    #[test]
+    fn nested_masks_clips_and_patterns_are_refused() {
+        refused_quickly(&nested_references("mask", "mask", 18, 2));
+        refused_quickly(&nested_references("clipPath", "clip-path", 30, 2));
+        refused_quickly(&nested_references("pattern", "fill", 30, 2));
+        refused_quickly(&nested_references("mask", "mask", 8, 3));
+        refused_quickly(&nested_references("mask", "mask", 2, 9000));
+        let through_use = format!(
+            r##"{HEAD}<mask id="a"><rect id="x" width="1" height="1" mask="url(#b)"/></mask><mask id="b"><use href="#x"/></mask><rect width="100" height="100" mask="url(#a)"/></svg>"##
+        );
+        refused_quickly(&through_use);
+        let in_a_stylesheet = format!(
+            r##"{HEAD}<style>.m{{mask:url(#m)}}</style><mask id="m"><rect class="m" width="100" height="100"/></mask><rect class="m" width="100" height="100"/></svg>"##
+        );
+        refused_quickly(&in_a_stylesheet);
+    }
+
+    #[test]
+    fn many_layers_or_gradient_fills_are_refused() {
+        let opacity = format!(
+            "{HEAD}{}</svg>",
+            r#"<g opacity="0.5"><rect width="100" height="100"/></g>"#.repeat(4500)
+        );
+        let gradients = format!(
+            r#"{HEAD}<radialGradient id="g"><stop offset="0"/><stop offset="1" stop-color="red"/></radialGradient>{}</svg>"#,
+            r##"<rect width="100" height="100" fill="url(#g)"/>"##.repeat(5000)
+        );
+        let masks = format!(
+            r#"{HEAD}<mask id="m"><rect width="100" height="100" fill="white"/></mask>{}</svg>"#,
+            r##"<rect width="100" height="100" mask="url(#m)"/>"##.repeat(9000)
+        );
+        for attack in [&opacity, &gradients, &masks] {
+            refused_quickly(attack);
+        }
+    }
+
+    #[test]
+    fn ordinary_logos_with_gradients_masks_and_stylesheets_still_render() -> anyhow::Result<()> {
+        let svg = format!(
+            r##"{HEAD}<style>.a{{fill:url(#g)}}</style>
+            <defs><linearGradient id="g"><stop offset="0" stop-color="#1E2C43"/><stop offset="1" stop-color="#2A9D8F"/></linearGradient>
+            <clipPath id="c"><circle cx="50" cy="50" r="45"/></clipPath>
+            <mask id="m"><rect width="100" height="100" fill="white"/></mask></defs>
+            <g clip-path="url(#c)" mask="url(#m)" opacity="0.9"><rect class="a" width="100" height="100"/></g></svg>"##
+        );
+        let image = decoded(&normalise_logo(svg.as_bytes()).context("logo")?)?;
+        assert_eq!((image.width(), image.height()), (LOGO_SIZE, LOGO_SIZE));
+        Ok(())
     }
 }

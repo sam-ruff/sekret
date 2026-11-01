@@ -205,6 +205,10 @@ impl FromRequestParts<AppState> for ClientIp {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        // A host socket client is local by definition, whatever headers it sends.
+        if parts.extensions.get::<crate::api::HostSocket>().is_some() {
+            return Ok(ClientIp(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        }
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
@@ -398,7 +402,7 @@ pub struct TokenRequest<'a> {
 pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResult<MintedToken> {
     let now = state.clock.now();
     let token = generate_token(TOKEN_PREFIX)?;
-    let max_expires_at = now + request.max_ttl.max(request.ttl);
+    let max_expires_at = now.saturating_add(request.max_ttl.max(request.ttl));
     let record = AccessToken {
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: hash_token(&token),
@@ -408,7 +412,7 @@ pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResul
         description: request.description,
         source: request.source,
         created_at: now,
-        expires_at: (now + request.ttl).min(max_expires_at),
+        expires_at: now.saturating_add(request.ttl).min(max_expires_at),
         max_expires_at,
         revoked: false,
         last_used_at: None,

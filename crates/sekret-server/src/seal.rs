@@ -361,6 +361,7 @@ pub fn next_epoch(epoch: i64, floor: i64) -> Result<i64, CryptoError> {
 /// Moves the configuration past its own epoch and `floor`, then signs it with `root`.
 pub fn signed(root: &RootKey, mut config: SealConfig, floor: i64) -> Result<SealConfig, CryptoError> {
     config.epoch = next_epoch(config.epoch, floor)?;
+    config.flags.wrap_form_signed = true;
     let fingerprint = root.fingerprint();
     config.mac = Some(seal_config_mac(root, &binding(&fingerprint, &config))?);
     Ok(config)
@@ -372,6 +373,7 @@ pub fn cautious_flags(flags: SealFlags, remember_secret_configured: bool) -> Sea
     SealFlags {
         reviewer_tokens_migrated: true,
         remember_secret: flags.remember_secret || remember_secret_configured,
+        wrap_form_signed: flags.wrap_form_signed,
     }
 }
 
@@ -471,19 +473,20 @@ pub fn root_recognised(paths: &[PathBuf], fingerprint: &str) -> bool {
     accepted_roots(paths).is_none_or(|roots| roots.iter().any(|r| r == fingerprint))
 }
 
-/// Whether `root` opens at least one project's data key, or there are no projects to ask.
+/// Whether `root` opens every project's data key. Planting one project under a key of their own
+/// is then not enough: a database writer would have to remove every real project too.
 async fn opens_existing_data(store: &dyn Store, root: &RootKey) -> Result<bool, StoreError> {
     let projects = store.list_projects().await?;
-    Ok(projects.is_empty()
-        || projects
-            .iter()
-            .any(|p| sekret_core::crypto::unwrap_data_key(root, &p.wrapped_key, &p.id).is_ok()))
+    Ok(projects
+        .iter()
+        .all(|p| sekret_core::crypto::unwrap_data_key(root, &p.wrapped_key, &p.id).is_ok()))
 }
 
-/// Refuses a root key the epoch marks outside the database do not name, then one that does not
-/// match the database's fingerprint or open any of its data. The fingerprint is recorded only
-/// when the database has none and the data agrees. A database writer can change everything the
-/// database holds, but not the marks, so swapping in a root key of their own fails here.
+/// Refuses a root key that does not match the database's fingerprint, then one the epoch marks
+/// outside the database do not name. Where no mark names it, every project key must open with
+/// it. The fingerprint is recorded only when the database has none and the key passed. A database
+/// writer can change everything the database holds, but not the marks, so swapping in a root key
+/// of their own fails here.
 pub async fn check_root(store: &dyn Store, epoch_files: &[PathBuf], root: &RootKey) -> Result<(), StartupError> {
     check_root_against(store, root, Some(epoch_files)).await
 }
@@ -502,7 +505,15 @@ async fn check_root_against(
 ) -> Result<(), StartupError> {
     let fingerprint = root.fingerprint();
     let stored = store.get_meta(ROOT_KEY_META).await?;
-    if stored.as_ref().is_some_and(|s| *s != fingerprint) || !opens_existing_data(store, root).await? {
+    if stored.as_ref().is_some_and(|s| *s != fingerprint) {
+        return Err(StartupError::WrongRootKey);
+    }
+    // Marks that name the key already vouch for it, and then a project key damaged since does
+    // not lock everyone out. Without them, every project key must open.
+    let vouched = epoch_files
+        .and_then(accepted_roots)
+        .is_some_and(|roots| roots.contains(&fingerprint));
+    if !vouched && !opens_existing_data(store, root).await? {
         return Err(StartupError::WrongRootKey);
     }
     if let Some(paths) = epoch_files
@@ -570,22 +581,42 @@ pub fn record_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io
 }
 
 /// Before the root key is replaced, lets each existing mark accept both keys, so a crash between
-/// the database commit and [`record_epoch`] leaves a server that still starts.
-pub fn begin_rekey(paths: &[PathBuf], old: &str, new: &str) -> std::io::Result<()> {
+/// the database commit and [`record_epoch`] leaves a server that still starts. The marks also
+/// rise to `epoch`, the new configuration's, so until they are narrowed to the new key a copy
+/// of the database from before the change counts as a rollback. Returns the marks as they were,
+/// for [`abort_rekey`].
+pub fn begin_rekey(paths: &[PathBuf], old: &str, new: &str, epoch: i64) -> std::io::Result<Vec<(PathBuf, EpochMark)>> {
+    let mut before = Vec::new();
     for path in paths {
         let existing = read_mark(path);
         // A missing or broken mark names no root, so it refuses neither key meanwhile.
         let Ok(Some(current)) = &existing else {
             continue;
         };
-        let epoch = current.epoch;
         let mark = EpochMark {
-            epoch,
+            epoch: current.epoch.max(epoch),
             roots: vec![old.to_string(), new.to_string()],
         };
-        write_or_skip(path, &existing, &mark)?;
+        before.push((path.clone(), current.clone()));
+        if let Err(error) = write_or_skip(path, &existing, &mark) {
+            if let Err(undo) = abort_rekey(&before) {
+                tracing::warn!(error = %undo, "could not put the seal epoch marks back");
+            }
+            return Err(error);
+        }
     }
-    Ok(())
+    Ok(before)
+}
+
+/// Puts back the marks [`begin_rekey`] changed, for a replacement that was not committed.
+pub fn abort_rekey(before: &[(PathBuf, EpochMark)]) -> std::io::Result<()> {
+    let mut failed = None;
+    for (path, mark) in before {
+        if let Err(error) = write_mark(path, mark) {
+            failed.get_or_insert(error);
+        }
+    }
+    failed.map_or(Ok(()), Err)
 }
 
 /// Sets every mark to `epoch` and `fingerprint`, lowering them if need be. Only for when the
@@ -705,7 +736,7 @@ pub async fn check_config(
 ) -> ApiResult<Checked> {
     let marks = high_water(&settings.epoch_files);
     let distrust = match verify_config(root, &config, marks) {
-        Ok(false) => {
+        Ok(false) if config.flags.wrap_form_signed => {
             record_epoch(&settings.epoch_files, config.epoch, &root.fingerprint()).map_err(mark_error)?;
             return Ok(Checked {
                 config,
@@ -713,7 +744,21 @@ pub async fn check_config(
                 trusted: true,
             });
         }
+        // Signed before the wrap's form marker was; signing again covers it from now on.
+        Ok(false) => {
+            return Ok(Checked {
+                config: save(store, settings, root, now, config).await?,
+                tampered: false,
+                trusted: true,
+            });
+        }
         Ok(true) => {
+            // A database writer can strip a signature as easily as a database from before
+            // signing lacks one, so nothing unsigned may start a migration.
+            let config = SealConfig {
+                flags: cautious_flags(config.flags, settings.remember_secret.is_some()),
+                ..config
+            };
             let config = save(store, settings, root, now, config).await?;
             tracing::info!("signed the seal configuration");
             return Ok(Checked {
@@ -1826,7 +1871,21 @@ pub mod ops {
         if still_unsealed {
             after_unlock_locked(state, &new_root, None, checked.tampered).await;
         }
+        if report.stale_marks.is_some() {
+            return Err(stale_marks());
+        }
         Ok(checked.tampered)
+    }
+
+    /// The change is done, but the operator has to repair a mark it could not move. Which mark,
+    /// and why, is only in the server log.
+    fn stale_marks() -> ApiError {
+        ApiError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "epoch_mark_stale",
+            "the passphrase was changed, but a seal epoch mark could not be moved to the new root key; see the \
+             server log, make the mark writable, then run `sekret admin reset-epoch` with the server stopped",
+        )
     }
 
     /// `remember` and `passphrase-file` keep the root key or passphrase reachable without a
@@ -1947,7 +2006,8 @@ pub mod ops {
         let now = state.clock.now();
         let config = store.get_seal_config().await?.ok_or_else(ApiError::uninitialised)?;
         let marks = high_water(&settings.epoch_files);
-        if let Err(distrust) = verify_config(&root, &config, marks) {
+        let verdict = verify_config(&root, &config, marks);
+        if let Err(distrust) = verdict {
             tracing::error!(
                 action = distrust.action(),
                 "refusing a backup: the seal configuration failed its integrity check, so it was changed by \
@@ -1972,6 +2032,14 @@ pub mod ops {
             .await;
             return Err(untrusted_config());
         }
+        // An unsigned configuration's flags may be a database writer's.
+        let config = match verdict {
+            Ok(true) => SealConfig {
+                flags: cautious_flags(config.flags, settings.remember_secret.is_some()),
+                ..config
+            },
+            _ => config,
+        };
         let copy = signed(
             &root,
             SealConfig {
@@ -2155,13 +2223,28 @@ mod tests {
         let dir = tempfile::tempdir().context("dir")?;
         let paths = marks(dir.path());
         record_epoch(&paths[..1], 4, OLD).context("record")?;
-        begin_rekey(&paths, OLD, NEW).context("begin")?;
+        begin_rekey(&paths, OLD, NEW, 5).context("begin")?;
         assert!(!paths[1].exists(), "a missing mark is not created halfway");
         assert!(root_recognised(&paths, OLD) && root_recognised(&paths, NEW));
-        assert_eq!(high_water(&paths).highest, Some(4));
+        // A copy from before the change, at epoch 4, already counts as a rollback.
+        assert_eq!(high_water(&paths).highest, Some(5));
+        assert!(high_water(&paths).rolled_back(4));
         record_epoch(&paths, 5, NEW).context("record")?;
         assert_eq!(accepted_roots(&paths), Some(vec![NEW.to_string()]));
         assert!(paths[1].exists());
+        Ok(())
+    }
+
+    #[test]
+    fn an_aborted_rekey_puts_the_marks_back_as_they_were() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        record_epoch(&paths[..1], 4, OLD).context("record")?;
+        let before = begin_rekey(&paths, OLD, NEW, 9).context("begin")?;
+        abort_rekey(&before).context("abort")?;
+        assert_eq!(high_water(&paths).highest, Some(4));
+        assert_eq!(accepted_roots(&paths), Some(vec![OLD.to_string()]));
+        assert!(!paths[1].exists());
         Ok(())
     }
 
@@ -2230,7 +2313,7 @@ mod tests {
         }
         assert!(stale.is_err(), "a mark left behind would go stale unnoticed");
         skipped.context("a mark that never existed, such as beside a read-only key file, is skipped")?;
-        assert!(begin_rekey(&existing, OLD, NEW).is_ok());
+        assert!(begin_rekey(&existing, OLD, NEW, 2).is_ok());
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod files;
-mod host_socket;
+pub mod host_socket;
 pub mod human;
 pub mod images;
 pub mod jwt;
@@ -212,6 +212,15 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({"status": "ready"})))
 }
 
+/// Paths only: queries carry sign-in codes, OIDC state and CLI user codes.
+fn request_span(request: &Request) -> tracing::Span {
+    tracing::debug_span!("request", method = %request.method(), path = %logged_path(request.uri()))
+}
+
+fn logged_path(uri: &axum::http::Uri) -> &str {
+    uri.path()
+}
+
 pub fn app(state: AppState) -> Router {
     let (api, openapi) = api::router().split_for_parts();
     Router::new()
@@ -225,7 +234,7 @@ pub fn app(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(), write_gate))
         .layer(middleware::from_fn_with_state(state.clone(), sys_fingerprint_gate))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         // Outside tracing, so a sealed server does not log every refused request as an error.
         .layer(middleware::from_fn_with_state(state.clone(), seal_gate))
         .layer(RequestBodyTimeoutLayer::new(BODY_TIMEOUT))
@@ -390,6 +399,15 @@ async fn serve_http(state: AppState) -> Result<(), StartupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_logs_leave_out_the_query() -> anyhow::Result<()> {
+        let callback: axum::http::Uri = "/auth/callback?code=the-code&state=the-state".parse()?;
+        assert_eq!(logged_path(&callback), "/auth/callback");
+        let pending: axum::http::Uri = "/api/v1/auth/cli/pending?code=BCDF-GHJK".parse()?;
+        assert_eq!(logged_path(&pending), "/api/v1/auth/cli/pending");
+        Ok(())
+    }
 
     #[test]
     fn detached_system_changes_are_never_cut_short() {

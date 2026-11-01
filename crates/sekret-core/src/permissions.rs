@@ -200,6 +200,16 @@ pub fn authorise(rules: &[Rule], subject: Subject, action: Action, resource: &Re
     Decision::Deny
 }
 
+/// Whether a deny rule applies to `action` on `resource`, whatever else is allowed.
+pub fn denied(rules: &[Rule], subject: Subject, action: Action, resource: &Resource<'_>) -> bool {
+    rules.iter().any(|r| {
+        r.effect == Effect::Deny
+            && r.subject == subject
+            && r.actions.contains(&action)
+            && deny_applies(&r.conditions, resource)
+    })
+}
+
 /// Whether any rule could allow `action` on `subject` somewhere, used to decide if a
 /// listing should be attempted before filtering each item.
 pub fn may_somewhere(rules: &[Rule], subject: Subject, action: Action) -> bool {
@@ -389,6 +399,48 @@ mod tests {
         assert_eq!(
             authorise(&rules, Subject::Members, Action::Create, &Resource::default()),
             Decision::Deny
+        );
+    }
+
+    #[test]
+    fn only_a_matching_deny_counts_as_denied() {
+        let env = |slug: &'static str| Resource {
+            environment: Some(slug),
+            ..Default::default()
+        };
+        let prod_only = Conditions {
+            environments: vec!["prod".into()],
+            ..Default::default()
+        };
+        let rules = vec![
+            Rule::allow(Subject::Secrets, &Action::ALL),
+            Rule::deny(Subject::Environments, &[Action::Read], prod_only),
+        ];
+        assert!(denied(&rules, Subject::Environments, Action::Read, &env("prod")));
+        assert!(!denied(&rules, Subject::Environments, Action::Read, &env("dev")));
+        assert!(
+            !denied(&rules, Subject::Environments, Action::Edit, &env("prod")),
+            "other actions are untouched"
+        );
+        assert!(
+            denied(&rules, Subject::Environments, Action::Read, &Resource::default()),
+            "an unknown environment fails closed"
+        );
+        assert!(
+            !denied(&[], Subject::Environments, Action::Read, &env("prod")),
+            "no allow is not a deny"
+        );
+        let by_tag = vec![Rule::deny(
+            Subject::Environments,
+            &[Action::Read],
+            Conditions {
+                tags: vec!["restricted".into()],
+                ..Default::default()
+            },
+        )];
+        assert!(
+            denied(&by_tag, Subject::Environments, Action::Read, &env("dev")),
+            "a whole environment never knows its tags"
         );
     }
 

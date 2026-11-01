@@ -1,7 +1,7 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
-import { useRef, useState, type FormEvent } from "react";
-import { Link, Navigate } from "react-router";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Link, Navigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api } from "@/api/endpoints";
 import type { Secret } from "@/api/types";
@@ -13,7 +13,8 @@ import { DeleteFolderDialog } from "@/components/secrets/delete-folder-dialog";
 import { ImportEnvDialog } from "@/components/secrets/import-env-dialog";
 import { SecretDrawer } from "@/components/secrets/secret-drawer";
 import { SecretEditor, type SecretDraft } from "@/components/secrets/secret-editor";
-import { SecretRow } from "@/components/secrets/secret-row";
+import { SECRET_ROW_COLUMNS, SecretRow } from "@/components/secrets/secret-row";
+import { MissingEnvironment } from "@/components/project/missing-environment";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,14 +35,18 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { folderQuery, useProjectEnv } from "@/hooks/use-project-env";
-import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useProject, useSealWatch } from "@/hooks/queries";
+import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useOptionalQuery, useProject, useSealWatch } from "@/hooks/queries";
 import { useIdle } from "@/hooks/use-idle";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useProjectPermissions } from "@/hooks/use-permissions";
+import { isValidSecretKey } from "@/lib/dotenv";
 import { generatorFromDraft } from "@/lib/generation";
 import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
 import { focusInstead } from "@/lib/return-focus";
+import { REVEAL_ALL_LIMIT, ROW_PAGE } from "@/lib/secret-limits";
+import { cn } from "@/lib/utils";
 
 function NewFolderDialog({
   open,
@@ -127,7 +132,13 @@ function SecretsView() {
   const [revealAll, setRevealAll] = useState(false);
   /** Keys hidden again by hand while everything else is revealed. */
   const [hiddenFromAll, setHiddenFromAll] = useState<Set<string>>(new Set());
-  const [adding, setAdding] = useState(false);
+  const [search, setSearch] = useSearchParams();
+  /** The key the new secret form starts with, or null while the form is closed. */
+  const [adding, setAdding] = useState<string | null>(() => {
+    const key = search.get("add");
+    return key !== null && isValidSecretKey(key) ? key : null;
+  });
+  const [shownRows, setShownRows] = useState(ROW_PAGE);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
@@ -139,6 +150,19 @@ function SecretsView() {
   const returnFocus = useRef<HTMLElement | null>(null);
   const rotateReturnFocus = useRef<HTMLElement | null>(null);
 
+  // The prefilled key has been read; a reload should not open the form again.
+  useEffect(() => {
+    if (!search.has("add")) return;
+    setSearch(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("add");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [search, setSearch]);
+
   const envSlug = env?.slug ?? "";
   const at = { project, env: envSlug, path };
   const base = `/projects/${project}/secrets/${envSlug}`;
@@ -148,17 +172,22 @@ function SecretsView() {
     queryFn: () => api.secrets(at, false),
     enabled: !!env,
   });
+  const tooManyToRevealAll = (list.data?.secrets.length ?? 0) > REVEAL_ALL_LIMIT;
   // Reveal all fetches the folder's values in one go; anything else fetches only the secret it is for.
-  const allValues = useQuery({
-    queryKey: keys.secretValues(project, envSlug, path),
-    queryFn: async () => {
-      const result = await api.secrets(at, true);
-      return new Map(result.secrets.map((s) => [s.key, s.value ?? null]));
-    },
-    enabled: !!env && revealAll,
-    staleTime: 15_000,
-    gcTime: SECRET_VALUE_GC_TIME,
-  });
+  // The query exists only while revealed, so hiding drops the values and the next reveal is audited.
+  const allValues = useOptionalQuery(
+    env && revealAll && !tooManyToRevealAll
+      ? {
+          queryKey: keys.secretValues(project, envSlug, path),
+          queryFn: async () => {
+            const result = await api.secrets(at, true);
+            return new Map(result.secrets.map((s) => [s.key, s.value ?? null]));
+          },
+          staleTime: 15_000,
+          gcTime: SECRET_VALUE_GC_TIME,
+        }
+      : null,
+  );
   const singleValue = (key: string) => ({
     queryKey: keys.secretValue(project, envSlug, path, key),
     queryFn: async () => (await api.secret(at, key)).value ?? null,
@@ -172,18 +201,25 @@ function SecretsView() {
   const singleQuery = (key: string) => singles[singleKeys.indexOf(key)];
   /** Undefined while loading or not asked for. */
   const valueOf = (key: string): string | null | undefined =>
-    revealAll && editing !== key ? allValues.data?.get(key) : singleQuery(key)?.data;
-  // The editor shows the current value in plain text, so it counts as revealed.
-  const editingValue = editing !== null && list.data?.secrets.find((s) => s.key === editing)?.value_hidden !== true;
-  const anyRevealed = revealAll || revealed.size > 0 || editingValue;
+    revealAll && editing !== key ? allValues?.data?.get(key) : singleQuery(key)?.data;
+  // Open editors and the import dialog can hold typed or pasted values, so they count as revealed.
+  const holdsTypedText = adding !== null || editing !== null || importing;
+  const anyRevealed = revealAll || revealed.size > 0 || holdsTypedText;
   useSealWatch(anyRevealed);
   useIdle(anyRevealed, () => {
     setRevealAll(false);
     setRevealed(new Set());
     setHiddenFromAll(new Set());
-    if (editing === null) return;
+    const closed = [
+      editing !== null && `the editor for ${editing}`,
+      adding !== null && "the new secret form",
+      importing && "the import",
+    ].filter(Boolean);
     setEditing(null);
-    toast.info(`Closed the editor for ${editing} after three idle minutes. Unsaved changes were dropped.`);
+    setAdding(null);
+    setImporting(false);
+    if (closed.length === 0) return;
+    toast.info(`Closed ${closed.join(" and ")} after three idle minutes. Unsaved changes were dropped.`);
   });
 
   const invalidate = [
@@ -205,7 +241,7 @@ function SecretsView() {
       return r.unchanged.length > 0 ? `${draft.key} is unchanged` : isNew ? `Added ${draft.key}` : `Saved ${draft.key}`;
     },
     onSuccess: () => {
-      setAdding(false);
+      setAdding(null);
       setEditing(null);
       // The finished mutation still holds the saved value as its variables.
       save.reset();
@@ -252,6 +288,10 @@ function SecretsView() {
       s.tags.some((t) => t.includes(needle)),
   );
   const visibleFolders = folders.filter((f) => !needle || f.toLowerCase().includes(needle));
+  // Rows are drawn a page at a time, so a folder with thousands of keys stays usable.
+  const shownFolders = visibleFolders.slice(0, shownRows);
+  const shownSecrets = visibleSecrets.slice(0, Math.max(0, shownRows - shownFolders.length));
+  const hiddenRows = visibleFolders.length + visibleSecrets.length - shownFolders.length - shownSecrets.length;
 
   const resourceFor = (s: Secret) => ({ environment: envSlug, path, key: s.key, tags: s.tags });
   const drawerSecret = secrets.find((s) => s.key === drawerKey);
@@ -297,7 +337,7 @@ function SecretsView() {
         />
       )}
       {envParam && environments.isSuccess && !env && envs.length > 0 && (
-        <ErrorState error={new Error(`There is no environment called ${envParam}.`)} />
+        <MissingEnvironment name={envParam} first={envs[0]} hrefFor={(slug) => `/projects/${project}/secrets/${slug}`} />
       )}
 
       {env && (
@@ -319,20 +359,36 @@ function SecretsView() {
                   data-testid="secret-search"
                 />
               </InputGroup>
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => {
-                  setRevealAll(!revealAll);
-                  setRevealed(new Set());
-                  setHiddenFromAll(new Set());
-                }}
-                aria-label={revealAll ? "Hide all values" : "Reveal all values"}
-                data-testid="reveal-all"
-                disabled={!perms.canSomewhere("secrets", "read-value")}
-              >
-                {revealAll ? <EyeOff /> : <Eye />}
-              </Button>
+              {tooManyToRevealAll ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    {/* A disabled button gets no pointer events, so the wrapper carries the tooltip. */}
+                    <span tabIndex={0} className="rounded-lg" data-testid="reveal-all-limit">
+                      <Button variant="outline" size="icon" aria-label="Reveal all values" data-testid="reveal-all" disabled>
+                        <Eye />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    This folder has more than {REVEAL_ALL_LIMIT} secrets, too many to reveal at once. Reveal them one at a time.
+                  </TooltipContent>
+                </Tooltip>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => {
+                    setRevealAll(!revealAll);
+                    setRevealed(new Set());
+                    setHiddenFromAll(new Set());
+                  }}
+                  aria-label={revealAll ? "Hide all values" : "Reveal all values"}
+                  data-testid="reveal-all"
+                  disabled={!perms.canSomewhere("secrets", "read-value")}
+                >
+                  {revealAll ? <EyeOff /> : <Eye />}
+                </Button>
+              )}
               {(canCreateSecret || canCreateFolder) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -357,7 +413,7 @@ function SecretsView() {
                 </DropdownMenu>
               )}
               {canCreateSecret && (
-                <Button onClick={() => setAdding(true)} disabled={adding} data-testid="add-secret">
+                <Button onClick={() => setAdding("")} disabled={adding !== null} data-testid="add-secret">
                   <Plus />
                   <span className="hidden sm:inline">Add secret</span>
                 </Button>
@@ -365,12 +421,12 @@ function SecretsView() {
             </div>
           </div>
 
-          {adding && (
+          {adding !== null && canCreateSecret && (
             <SecretEditor
               isNew
-              initial={{ key: "", value: "", comment: "", tags: [] }}
+              initial={{ key: adding, value: "", comment: "", tags: [] }}
               busy={save.isPending}
-              onCancel={() => setAdding(false)}
+              onCancel={() => setAdding(null)}
               onSave={(draft) => save.mutate({ draft, isNew: true })}
             />
           )}
@@ -378,7 +434,7 @@ function SecretsView() {
           {list.error && <ErrorState error={list.error} onRetry={() => void list.refetch()} />}
           {list.isPending && <ListSkeleton />}
 
-          {list.isSuccess && secrets.length === 0 && folders.length === 0 && !adding && (
+          {list.isSuccess && secrets.length === 0 && folders.length === 0 && (adding === null || !canCreateSecret) && (
             <EmptyState
               icon={<KeyRound />}
               title={path === "/" ? `No secrets in ${env.name} yet` : "This folder is empty"}
@@ -386,7 +442,7 @@ function SecretsView() {
               action={
                 canCreateSecret && (
                   <div className="flex flex-wrap justify-center gap-2">
-                    <Button onClick={() => setAdding(true)}>
+                    <Button onClick={() => setAdding("")}>
                       <Plus />
                       Add secret
                     </Button>
@@ -403,19 +459,24 @@ function SecretsView() {
 
           {list.isSuccess && (visibleFolders.length > 0 || visibleSecrets.length > 0) && (
             <div className="overflow-hidden rounded-xl border bg-card" data-testid="secrets-table">
-              <div className="hidden grid-cols-[minmax(0,2fr)_minmax(0,3fr)_auto] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:grid">
+              <div
+                className={cn(
+                  "hidden gap-x-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:grid",
+                  SECRET_ROW_COLUMNS,
+                )}
+              >
                 <span>Key</span>
                 <span>Value</span>
-                <span className="w-8" />
+                <span />
               </div>
-              {visibleFolders.map((name) => {
+              {shownFolders.map((name) => {
                 const folderPath = joinPath(path, name);
                 const canDelete = perms.can("folders", "delete", { environment: envSlug, path: folderPath });
                 return (
                   <div key={name} className="flex items-center gap-2 border-b px-4 py-2.5 last:border-b-0 hover:bg-muted/40" data-testid={`folder-row-${name}`}>
                     <Link
                       to={`${base}${folderQuery(folderPath)}`}
-                      className="flex min-w-0 flex-1 items-center gap-2 font-mono text-sm"
+                      className="-my-2.5 flex min-w-0 flex-1 items-center gap-2 py-2.5 font-mono text-sm"
                       data-testid={`open-folder-${name}`}
                     >
                       <Folder className="size-4 shrink-0 fill-primary/20 text-primary" />
@@ -436,7 +497,7 @@ function SecretsView() {
                   </div>
                 );
               })}
-              {visibleSecrets.map((secret) =>
+              {shownSecrets.map((secret) =>
                 editing === secret.key ? (
                   <div key={secret.key} className="border-b p-3 last:border-b-0">
                     {singleQuery(secret.key)?.isPending !== false && !secret.value_hidden ? (
@@ -495,6 +556,16 @@ function SecretsView() {
                     }}
                   />
                 ),
+              )}
+              {hiddenRows > 0 && (
+                <div className="flex flex-wrap items-center justify-center gap-3 border-t px-4 py-3 text-sm text-muted-foreground">
+                  <span data-testid="secrets-more-count">
+                    Showing {shownFolders.length + shownSecrets.length} of {visibleFolders.length + visibleSecrets.length}
+                  </span>
+                  <Button variant="outline" size="sm" onClick={() => setShownRows(shownRows + ROW_PAGE)} data-testid="secrets-show-more">
+                    Show {Math.min(ROW_PAGE, hiddenRows)} more
+                  </Button>
+                </div>
               )}
             </div>
           )}

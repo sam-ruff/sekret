@@ -3,8 +3,8 @@ use axum::extract::State;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sekret_api::{
-    AuthMethodConfig, AuthMethodKind, JwtLoginRequest, KubernetesAuthConfig, KubernetesMode, OidcAuthConfig,
-    REDACTED_CREDENTIAL, TokenResponse, UniversalLoginRequest,
+    AuthMethodConfig, AuthMethodKind, JwtLoginRequest, KubernetesAuthConfig, KubernetesMode, MAX_LIFETIME,
+    OidcAuthConfig, REDACTED_CREDENTIAL, TokenResponse, UniversalLoginRequest,
 };
 use sekret_core::crypto::{RootKey, hash_token, open_credential, seal_credential};
 use sekret_core::glob::glob_match;
@@ -55,8 +55,10 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
             if k8s.audiences.is_empty() {
                 return Err(ApiError::bad_request("at least one audience is required"));
             }
-            if k8s.max_token_lifetime < 1 {
-                return Err(ApiError::bad_request("max_token_lifetime must be at least 1 second"));
+            if !(1..=MAX_LIFETIME).contains(&k8s.max_token_lifetime) {
+                return Err(ApiError::bad_request(
+                    "max_token_lifetime must be between 1 second and 10 years",
+                ));
             }
             for list in [&k8s.namespaces, &k8s.service_accounts, &k8s.audiences] {
                 sekret_core::validate::globs(list)?;
@@ -627,10 +629,12 @@ pub async fn renew(
         .into_iter()
         .find(|t| t.id == principal.token_id)
         .ok_or_else(ApiError::unauthorised)?;
-    let mut expires_at = (now + ttl).min(record.max_expires_at);
+    let mut expires_at = now.saturating_add(ttl).min(record.max_expires_at);
     // Groups and the re-authentication setting may have changed since the token was minted.
     if record.kind == TokenKind::Cli.as_str() {
-        let cap = record.created_at + crate::human::cli_max_ttl(&state, &principal.groups);
+        let cap = record
+            .created_at
+            .saturating_add(crate::human::cli_max_ttl(&state, &principal.groups));
         expires_at = expires_at.min(cap);
     }
     state.store.extend_token(&record.id, expires_at).await?;

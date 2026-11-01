@@ -9,7 +9,7 @@ pub use sys::{HostSocket, clean_stale_staging, host_router, staging_base};
 
 use std::net::IpAddr;
 
-use sekret_core::permissions::Rule;
+use sekret_core::permissions::{Action, Resource, Rule, Subject, denied};
 use sekret_store::{AuditEntry, Environment, Project};
 use serde_json::Value;
 use utoipa::OpenApi;
@@ -117,7 +117,17 @@ pub async fn load_project(
     Ok((project, rules))
 }
 
-pub async fn find_env(state: &AppState, project: &Project, slug: &str) -> ApiResult<Environment> {
+/// Finds an environment by slug. One the caller is denied reading is answered as missing, along
+/// with its secrets, folders and snapshots. Without a deny, secrets rules alone decide access
+/// to secrets, so a role need not also grant reading environments.
+pub async fn find_env(state: &AppState, project: &Project, rules: &[Rule], slug: &str) -> ApiResult<Environment> {
+    let whole = Resource {
+        environment: Some(slug),
+        ..Default::default()
+    };
+    if denied(rules, Subject::Environments, Action::Read, &whole) {
+        return Err(ApiError::not_found("environment"));
+    }
     state
         .store
         .list_environments(&project.id)

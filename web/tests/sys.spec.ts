@@ -5,6 +5,8 @@ const SETUP_CODE = "MOCK-SETUP-CODE";
 const PASSPHRASE = "correct horse battery staple";
 const STRONG = "plum orbit gravel lantern";
 const KDF_BUSY = "mock kdf busy";
+/** The mock's stand-in for a seal mark that could not be updated. */
+const STALE_MARK = "stale mark copper lantern harbour ferry";
 
 async function fillSetup(page: Page, passphrase: string, code = SETUP_CODE): Promise<void> {
   await page.getByTestId("setup-code").fill(code);
@@ -460,6 +462,38 @@ test.describe("server page", () => {
     await unlock(page, PASSPHRASE);
     await expect(page.getByTestId("unlock-wrong")).toBeVisible();
     await unlock(page, STRONG);
+    await expect(page).toHaveURL(/\/org\/server$/);
+  });
+
+  test("says a change went through but the host needs a repair when the seal mark is stale", async ({ page }) => {
+    await page.goto("/org/server");
+    const card = page.getByTestId("server-passphrase");
+    await card.getByTestId("current-passphrase").fill(PASSPHRASE);
+    await card.getByTestId("change-passphrase").fill(STALE_MARK);
+    await card.getByTestId("change-confirm").fill(STALE_MARK);
+    await card.getByTestId("change-submit").click();
+    await page.getByTestId("change-passphrase-dialog").getByTestId("confirm-action").click();
+
+    const changed = card.getByTestId("change-mark-stale");
+    await expect(changed).toContainText("The new passphrase was saved, but the host needs a repair");
+    await expect(changed).toContainText("sekret admin reset-epoch");
+    await expect(card.getByTestId("change-error")).toHaveCount(0);
+    await expect(card.getByTestId("current-passphrase")).toHaveValue("");
+
+    // The unlock policy change is saved too, and the dialog closes rather than offering a retry.
+    await page.getByTestId("server-policy-card-remember").click();
+    await page.getByTestId("policy-save").click();
+    const dialog = page.getByTestId("policy-dialog");
+    await dialog.getByTestId("policy-passphrase").fill(STALE_MARK);
+    await dialog.getByTestId("confirm-action").click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByTestId("policy-mark-stale")).toContainText("The unlock policy was saved");
+    await expect(page.getByTestId("server-policy")).toHaveText(/Remember/);
+
+    // The passphrase really changed.
+    await page.getByTestId("seal-now").click();
+    await page.getByTestId("seal-dialog").getByTestId("confirm-action").click();
+    await unlock(page, STALE_MARK);
     await expect(page).toHaveURL(/\/org\/server$/);
   });
 

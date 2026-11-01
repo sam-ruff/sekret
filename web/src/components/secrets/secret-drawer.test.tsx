@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/api/endpoints";
@@ -82,5 +82,25 @@ describe("SecretDrawer", () => {
     view.rerender(drawer(null));
     view.rerender(drawer("OTHER"));
     expect(await screen.findByTestId("history-values-hidden")).toBeInTheDocument();
+  });
+
+  it("drops hidden values from the cache and asks the server again on the next reveal", async () => {
+    const { client } = renderWithProviders(drawer("LOG_LEVEL"));
+    const valuesKey = ["project", "app", "versions", "dev", "/", "LOG_LEVEL", "values"];
+    await userEvent.click(await screen.findByTestId("history-values-toggle"));
+    expect(await screen.findByTestId("diff-output")).toBeInTheDocument();
+    expect(client.getQueryData(valuesKey)).toBeDefined();
+
+    await userEvent.click(screen.getByTestId("history-values-toggle"));
+    await waitFor(() => expect(client.getQueryCache().find({ queryKey: valuesKey })).toBeUndefined());
+
+    // A refused second reveal shows the error, not the values from before.
+    versions.mockImplementation((_at, _key, values) =>
+      values ? Promise.reject(new Error("refused")) : Promise.resolve([version(1, "info", false), version(2, "warn", false)]),
+    );
+    await userEvent.click(screen.getByTestId("history-values-toggle"));
+    expect(await screen.findByTestId("error-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff-output")).toBeNull();
+    expect(versions.mock.calls.filter((call) => call[2] === true)).toHaveLength(2);
   });
 });

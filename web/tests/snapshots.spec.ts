@@ -11,6 +11,9 @@ test("previews and restores a snapshot", async ({ page }) => {
   // Titles leave out zero counts and wrap rather than cut off the folder.
   const titles = await list.getByTestId("snapshot-title").allTextContents();
   expect(titles.some((t) => / 0 (created|updated|deleted|added|changed)/.test(t) || /^0 /.test(t))).toBe(false);
+  // Counts say what they count, and the top folder has the same name as in the breadcrumbs.
+  expect(titles.filter((t) => /^\d/.test(t)).every((t) => /^\d+ secrets? /.test(t))).toBe(true);
+  expect(titles.some((t) => t.includes("top folder"))).toBe(false);
   // The first write in dev, before LOG_LEVEL changed and the later secrets existed.
   await list.locator("li").last().getByRole("button").click();
 

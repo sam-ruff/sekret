@@ -15,6 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { daysUntil } from "@/lib/generation";
+import { cn } from "@/lib/utils";
 
 export interface SecretRowAbilities {
   edit: boolean;
@@ -65,6 +66,12 @@ interface SecretRowProps {
 
 const MASK = "•".repeat(12);
 
+/**
+ * Column widths shared with the table header, so "Value" lines up with the values. The last
+ * column holds the actions button, plus the version and age on large screens.
+ */
+export const SECRET_ROW_COLUMNS = "md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_1.75rem] lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_9.25rem]";
+
 export function SecretRow({
   secret,
   revealed,
@@ -82,14 +89,17 @@ export function SecretRow({
 
   return (
     <div
-      className="group grid grid-cols-[minmax(0,1fr)_auto] gap-x-2 gap-y-2 border-b px-4 py-3 last:border-b-0 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_auto] md:items-center"
+      className={cn(
+        "group grid grid-cols-[minmax(0,1fr)_auto] gap-x-2 gap-y-2 border-b px-4 py-3 last:border-b-0 md:items-center",
+        SECRET_ROW_COLUMNS,
+      )}
       data-testid={`secret-row-${secret.key}`}
     >
       <div className="min-w-0">
         <button
           type="button"
           onClick={(event) => onHistory(event.currentTarget)}
-          className="block max-w-full truncate text-left font-mono text-sm font-medium hover:text-primary"
+          className="-my-1.5 block max-w-full truncate py-1.5 text-left font-mono text-sm font-medium hover:text-primary"
           data-testid="secret-key"
         >
           {secret.key}

@@ -39,6 +39,52 @@ test("creates a custom project role with a conditional deny", async ({ page }) =
   await expect(reopened.getByTestId("rule-secrets-read-value")).toBeChecked();
 });
 
+test("offers only the actions each subject uses, and explains what reading values means", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+
+  await expect(editor.getByTestId("rule-secrets-hint")).toContainText("Read value shows the secret itself");
+  for (const action of ["read", "read-value", "create", "edit", "delete"]) {
+    await expect(editor.getByTestId(`rule-secrets-${action}`)).toBeVisible();
+  }
+  const audit = editor.getByTestId("rule-audit-log");
+  await expect(audit.getByTestId("rule-audit-log-read")).toBeVisible();
+  for (const action of ["read-value", "create", "edit", "delete"]) {
+    await expect(audit.getByTestId(`rule-audit-log-${action}`)).toHaveCount(0);
+  }
+  await expect(editor.getByTestId("rule-secret-versions-create")).toHaveCount(0);
+  await expect(editor.getByTestId("rule-secret-versions-read-value")).toBeVisible();
+  await expect(editor.getByTestId("rule-members-read-value")).toHaveCount(0);
+  await expect(editor.getByTestId("rule-snapshots-delete")).toHaveCount(0);
+  await expect(editor.getByTestId("rule-snapshots-hint")).toContainText("Edit restores a snapshot");
+
+  // The save button says why it is disabled.
+  await expect(editor.getByTestId("role-save")).toBeDisabled();
+  await expect(editor.getByTestId("role-blocker")).toHaveText("Give the role a name to save it.");
+  await editor.getByTestId("role-name").fill("Auditor");
+  await expect(editor.getByTestId("role-blocker")).toHaveCount(0);
+  await expect(editor.getByTestId("role-save")).toBeEnabled();
+});
+
+test("the chosen effect stands out from the other", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  const allow = editor.getByTestId("rule-secrets-allow");
+  const deny = editor.getByTestId("rule-secrets-deny");
+  await expect(allow).toHaveAttribute("data-state", "on");
+  const background = (locator: typeof allow) => locator.evaluate((el) => getComputedStyle(el).backgroundColor);
+  const unselected = await background(deny);
+  expect(await background(allow)).not.toBe(unselected);
+  await expect(allow.locator("svg")).toHaveCount(1);
+
+  await deny.click();
+  await expect(deny).toHaveAttribute("data-state", "on");
+  expect(await background(deny)).not.toBe(await background(allow));
+  await expect(allow.locator("svg")).toHaveCount(0);
+});
+
 test("built-in roles open read-only", async ({ page }) => {
   await page.goto("/projects/storefront/settings/roles");
   await page.getByTestId("role-actions-viewer").click();

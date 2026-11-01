@@ -1,5 +1,6 @@
-import { AlertCircle, RotateCw } from "lucide-react";
+import { AlertCircle, Compass, RotateCw } from "lucide-react";
 import type { ReactNode } from "react";
+import { Link } from "react-router";
 import { ApiError } from "@/api/client";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -33,6 +34,37 @@ function errorTitle(error: unknown): string {
   if (error.status === 404) return "Not found";
   if (error.status === 403) return "You do not have access";
   return "That did not load";
+}
+
+/** A missing project, identity or environment, with a way back to somewhere that exists. */
+export function MissingState({
+  title,
+  description,
+  backTo,
+  backLabel,
+  testId = "missing",
+}: {
+  title: string;
+  description: string;
+  backTo: string;
+  backLabel: string;
+  testId?: string;
+}) {
+  return (
+    <EmptyState
+      icon={<Compass />}
+      title={title}
+      description={description}
+      action={
+        <Button asChild>
+          <Link to={backTo} data-testid={`${testId}-back`}>
+            {backLabel}
+          </Link>
+        </Button>
+      }
+      testId={testId}
+    />
+  );
 }
 
 /** Retrying cannot fix a missing resource or a refused permission. */

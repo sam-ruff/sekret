@@ -198,3 +198,40 @@ test("edits identity settings and revokes tokens", async ({ page }) => {
   await page.getByTestId("confirm-action").click();
   await expectToast(page, /revoked/i);
 });
+
+test("a client secret that expires millions of years away can still be seen and revoked", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("new-identity").click();
+  await expect(page.getByTestId("identity-blocker")).toHaveText("Give the identity a name to continue.");
+  await page.getByTestId("identity-name").fill("far-future");
+  await expect(page.getByTestId("identity-blocker")).toHaveCount(0);
+  await page.getByTestId("identity-create-submit").click();
+  await expect(page).toHaveURL(/\/auth$/);
+
+  const universal = page.getByTestId("auth-method-universal");
+  await universal.getByTestId("universal-enable").click();
+  await universal.getByTestId("new-client-secret").click();
+  await page.getByTestId("client-secret-ttl").fill("100000000000000");
+  await page.getByTestId("client-secret-create").click();
+  await page.getByTestId("client-secret-once-dialog").getByTestId("client-secret-done").click();
+
+  const secrets = universal.getByTestId("client-secrets");
+  await expect(secrets).toContainText("Unknown date");
+  await expect(page.getByTestId("app-error")).toHaveCount(0);
+  await secrets.getByTestId("client-secret-revoke").click();
+  await page.getByTestId("confirm-action").click();
+  await expectToast(page, "Client secret revoked");
+  await expect(secrets).toContainText("Revoked");
+  // The other tabs still work.
+  await page.getByTestId("identity-tab-details").click();
+  await expect(page.getByTestId("identity-details-form")).toBeVisible();
+});
+
+test("the allowed networks field is named in plain words", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  const form = page.getByTestId("identity-details-form");
+  await expect(form.getByLabel("Allowed networks (CIDR ranges)")).toBeVisible();
+  await expect(form).toContainText("refuse new sign-ins");
+  await expect(form).not.toContainText("CIDRs");
+});

@@ -26,6 +26,37 @@ describe("ErrorBoundary", () => {
     consoleError.mockRestore();
   });
 
+  it("keeps a failed section inside its box and starts again on retry or navigation", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let broken = true;
+    function Maybe() {
+      if (broken) throw new Error("bad record");
+      return <p data-testid="fine">fine</p>;
+    }
+    const ui = (resetKey: string) => (
+      <div>
+        <nav data-testid="nav">nav</nav>
+        <ErrorBoundary variant="section" resetKey={resetKey}>
+          <Maybe />
+        </ErrorBoundary>
+      </div>
+    );
+    const view = renderWithProviders(ui("/a"));
+    expect(await screen.findByTestId("section-error")).toHaveTextContent("This part of the page stopped working");
+    expect(screen.getByTestId("nav")).toBeInTheDocument();
+    expect(screen.queryByTestId("app-error")).toBeNull();
+
+    // A retry that fails again stays contained.
+    await userEvent.click(screen.getByTestId("section-error-retry"));
+    expect(await screen.findByTestId("section-error")).toBeInTheDocument();
+
+    broken = false;
+    view.rerender(ui("/b"));
+    expect(await screen.findByTestId("fine")).toBeInTheDocument();
+    expect(screen.queryByTestId("section-error")).toBeNull();
+    consoleError.mockRestore();
+  });
+
   it("renders its children when nothing fails", () => {
     renderWithProviders(
       <ErrorBoundary>

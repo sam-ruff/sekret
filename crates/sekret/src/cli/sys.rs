@@ -23,6 +23,8 @@ pub enum SysCommand {
         /// Ask the server's Unix socket on this host instead of its URL.
         #[arg(long)]
         socket: Option<PathBuf>,
+        #[command(flatten)]
+        owner: SocketOwner,
     },
     /// Set up a new server through its API with the code from its log, and print a one-time admin
     /// token. With web setup turned off, run `sekret admin init` on the host instead.
@@ -52,6 +54,8 @@ pub enum SysCommand {
         /// network's rate limits and back-off do not apply to.
         #[arg(long)]
         socket: Option<PathBuf>,
+        #[command(flatten)]
+        owner: SocketOwner,
     },
     /// Drop the root key from the server's memory until someone unseals it. Org admins only.
     Seal,
@@ -87,11 +91,30 @@ pub enum SysCommand {
     },
 }
 
+/// Who the host socket must belong to, besides root and the person running the command.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct SocketOwner {
+    /// The user sekret runs as, by name or number. The socket must belong to root, you or this
+    /// user, or nothing is sent to it.
+    #[arg(long = "socket-owner", env = "SEKRET_SOCKET_OWNER", value_name = "USER")]
+    pub name: Option<String>,
+}
+
 impl SysCommand {
-    /// The host socket the command should use instead of the server's URL, if any.
-    pub fn socket(&self) -> Option<&std::path::Path> {
+    /// The host socket the command should use instead of the server's URL, if any, and the
+    /// owner named for it.
+    pub fn socket(&self) -> Option<(&std::path::Path, Option<&str>)> {
         match self {
-            SysCommand::Status { socket, .. } | SysCommand::Unseal { socket, .. } => socket.as_deref(),
+            SysCommand::Status {
+                socket: Some(socket),
+                owner,
+                ..
+            }
+            | SysCommand::Unseal {
+                socket: Some(socket),
+                owner,
+                ..
+            } => Some((socket.as_path(), owner.name.as_deref())),
             _ => None,
         }
     }
@@ -375,7 +398,11 @@ mod tests {
     }
 
     fn plain_status(json: bool) -> SysCommand {
-        SysCommand::Status { json, socket: None }
+        SysCommand::Status {
+            json,
+            socket: None,
+            owner: SocketOwner::default(),
+        }
     }
 
     #[tokio::test]
@@ -386,6 +413,7 @@ mod tests {
                 status: 401,
                 code: "unauthorised".into(),
                 message: String::new(),
+                retry_after: None,
             })
         });
         api.expect_sys_status().times(1).returning(|| {
@@ -564,6 +592,7 @@ mod tests {
             SysCommand::Unseal {
                 passphrase_file: None,
                 socket: None,
+                owner: SocketOwner::default(),
             },
             &Scripted::new(&["\u{feff}violet tractor sings beneath\r\n"]),
             &mut out,

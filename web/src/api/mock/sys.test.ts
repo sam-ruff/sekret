@@ -12,6 +12,7 @@ import {
   MOCK_KDF_BUSY_PASSPHRASE,
   MOCK_PASSPHRASE,
   MOCK_SETUP_CODE,
+  MOCK_STALE_MARK_PASSPHRASE,
   MOCK_VERSION,
   mockSys,
   publicStatusOf,
@@ -145,6 +146,20 @@ describe("mock administration", () => {
       code: "invalid_passphrase",
     });
     expect(b.setUnlockPolicy("passphrase-file", MOCK_PASSPHRASE).unlock_policy).toBe("passphrase-file");
+    expect(b.setUnlockPolicy("manual").unlock_policy).toBe("manual");
+  });
+
+  it("saves passphrase and policy changes but answers epoch_mark_stale while the mark is behind", () => {
+    const { b, state } = backend();
+    const stale = { status: 500, code: "epoch_mark_stale" };
+    expect(failure(() => b.changePassphrase({ current: MOCK_PASSPHRASE, new: MOCK_STALE_MARK_PASSPHRASE }, check))).toMatchObject(stale);
+    expect(state.sys.passphrase).toBe(MOCK_STALE_MARK_PASSPHRASE);
+
+    expect(failure(() => b.setUnlockPolicy("remember", MOCK_STALE_MARK_PASSPHRASE))).toMatchObject(stale);
+    expect(b.sysStatus()).toMatchObject({ unlock_policy: "remember" });
+
+    // Moving to another passphrase leaves the stand-in, so later changes succeed again.
+    expect(() => b.changePassphrase({ current: MOCK_STALE_MARK_PASSPHRASE, new: MOCK_PASSPHRASE }, check)).not.toThrow();
     expect(b.setUnlockPolicy("manual").unlock_policy).toBe("manual");
   });
 

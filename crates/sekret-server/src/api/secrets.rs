@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -72,7 +72,7 @@ struct Scope {
 
 async fn scope(state: &AppState, principal: &Principal, project: &str, env: &str) -> ApiResult<Scope> {
     let (project, rules) = load_project(state, principal, project).await?;
-    let env = find_env(state, &project, env).await?;
+    let env = find_env(state, &project, &rules, env).await?;
     Ok(Scope { project, env, rules })
 }
 
@@ -349,21 +349,30 @@ async fn list_versions(
     let mut revealed_any = false;
     for v in state.store.list_versions(&s.secret.id).await? {
         // Each version is judged by its own tags as well, so retagging cannot expose old values.
-        let reveal = reveal_current && may_reveal(&secret_resource(&scope.env.slug, &path, &key, &v.tags));
+        let own = secret_resource(&scope.env.slug, &path, &key, &v.tags);
+        let reveal = reveal_current && may_reveal(&own);
         revealed_any |= reveal;
         let value = if reveal {
             decrypt(&dk, &scope.project.id, &v)?.map(|v| v.to_string())
         } else {
             None
         };
+        // A version whose own tags hide it keeps only its number, date and whether it was a deletion.
+        let described = allowed(&scope.rules, Subject::Secrets, Action::Read, &own)
+            && allowed(&scope.rules, Subject::SecretVersions, Action::Read, &own);
+        let (comment, tags, actor) = if described {
+            (v.comment, v.tags, v.actor)
+        } else {
+            (String::new(), Vec::new(), String::new())
+        };
         versions.push(SecretVersion {
             version: v.version,
             value,
             value_hidden: !reveal && !v.deleted,
             deleted: v.deleted,
-            comment: v.comment,
-            tags: v.tags,
-            actor: v.actor,
+            comment,
+            tags,
+            actor,
             created_at: v.created_at,
         });
     }
@@ -588,7 +597,47 @@ fn visible_reason(reason: &str, may_see: impl Fn(&str) -> bool) -> String {
     reason.to_string()
 }
 
-fn api_snapshot(scope: &Scope, s: &sekret_store::Snapshot) -> Snapshot {
+/// A batch reason's "N created, M updated, K deleted" counts replaced by a plain phrase.
+fn without_counts(reason: &str) -> String {
+    const END: &str = " deleted";
+    let Some(end) = reason.find(END) else {
+        return reason.to_string();
+    };
+    let is_counts = reason[..end + END.len()]
+        .split(", ")
+        .all(|part| part.split_once(' ').is_some_and(|(n, _)| n.parse::<u64>().is_ok()));
+    if !is_counts {
+        return reason.to_string();
+    }
+    format!("secrets changed{}", &reason[end + END.len()..])
+}
+
+/// The ids of secrets in the scope's environment the reader may read, or `None` when they may
+/// read all of them.
+async fn readable_secret_ids(state: &AppState, scope: &Scope) -> ApiResult<Option<HashSet<String>>> {
+    let whole = Resource {
+        environment: Some(&scope.env.slug),
+        ..Default::default()
+    };
+    if allowed(&scope.rules, Subject::Secrets, Action::Read, &whole) {
+        return Ok(None);
+    }
+    let secrets = state.store.list_secrets(&scope.env.id, "/", true, true).await?;
+    Ok(Some(
+        secrets
+            .into_iter()
+            .filter(|s| {
+                let resource = secret_resource(&scope.env.slug, &s.secret.path, &s.secret.key, &s.version.tags);
+                allowed(&scope.rules, Subject::Secrets, Action::Read, &resource)
+            })
+            .map(|s| s.secret.id)
+            .collect(),
+    ))
+}
+
+/// A reader who cannot see every secret gets counts of only the ones they can, and no change
+/// counts, so hidden secrets cannot be watched through snapshots.
+fn api_snapshot(scope: &Scope, s: &sekret_store::Snapshot, readable: Option<&HashSet<String>>) -> Snapshot {
     let may_see = |path: &str| {
         let folder = Resource {
             environment: Some(&scope.env.slug),
@@ -597,12 +646,20 @@ fn api_snapshot(scope: &Scope, s: &sekret_store::Snapshot) -> Snapshot {
         };
         allowed(&scope.rules, Subject::Folders, Action::Read, &folder)
     };
+    let reason = visible_reason(&s.reason, may_see);
+    let (reason, secret_count) = match readable {
+        None => (reason, s.entries.len()),
+        Some(ids) => (
+            without_counts(&reason),
+            s.entries.iter().filter(|e| ids.contains(&e.secret_id)).count(),
+        ),
+    };
     Snapshot {
         id: s.id.clone(),
-        reason: visible_reason(&s.reason, may_see),
+        reason,
         actor: s.actor.clone(),
         created_at: s.created_at,
-        secret_count: s.entries.len() as i64,
+        secret_count: i64::try_from(secret_count).unwrap_or(i64::MAX),
     }
 }
 
@@ -620,7 +677,13 @@ async fn list_snapshots(
     };
     require(&scope.rules, Subject::Snapshots, Action::Read, &env_resource)?;
     let snapshots = state.store.list_snapshots(&scope.env.id, 200).await?;
-    Ok(Json(snapshots.iter().map(|s| api_snapshot(&scope, s)).collect()))
+    let readable = readable_secret_ids(&state, &scope).await?;
+    Ok(Json(
+        snapshots
+            .iter()
+            .map(|s| api_snapshot(&scope, s, readable.as_ref()))
+            .collect(),
+    ))
 }
 
 async fn load_snapshot(state: &AppState, scope: &Scope, id: &str) -> ApiResult<sekret_store::Snapshot> {
@@ -657,8 +720,9 @@ async fn get_snapshot(
             allowed(&scope.rules, Subject::Secrets, Action::Read, &resource)
         })
         .collect();
+    let readable_ids = readable_secret_ids(&state, &scope).await?;
     Ok(Json(SnapshotDetail {
-        snapshot: api_snapshot(&scope, &snapshot),
+        snapshot: api_snapshot(&scope, &snapshot, readable_ids.as_ref()),
         changes: snapshot_changes(&readable, &snapshot, &path),
     }))
 }
@@ -787,6 +851,20 @@ mod tests {
         ];
         for (reason, expected) in cases {
             assert_eq!(visible_reason(reason, may_see), expected);
+        }
+    }
+
+    #[test]
+    fn change_counts_can_be_dropped_from_reasons() {
+        let cases = [
+            ("3 created, 1 updated, 0 deleted in /web", "secrets changed in /web"),
+            ("3 created, 1 updated, 0 deleted", "secrets changed"),
+            ("restored snapshot abc for /", "restored snapshot abc for /"),
+            ("rolled back a secret to version 3", "rolled back a secret to version 3"),
+            ("x created, 1 updated, 0 deleted", "x created, 1 updated, 0 deleted"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(without_counts(reason), expected);
         }
     }
 }

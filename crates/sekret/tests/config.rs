@@ -69,7 +69,7 @@ const fn list(key: &'static str, flag: &'static str, env: &'static str, separato
     }
 }
 
-const OPTIONS: [Opt; 39] = [
+const OPTIONS: [Opt; 40] = [
     scalar("server.max_connections", "max-connections", "SEKRET_MAX_CONNECTIONS"),
     scalar("server.unix_socket", "unix-socket", "SEKRET_UNIX_SOCKET"),
     scalar("server.unix_socket_mode", "unix-socket-mode", "SEKRET_UNIX_SOCKET_MODE"),
@@ -141,6 +141,7 @@ const OPTIONS: [Opt; 39] = [
     scalar("seal.root_key_file", "root-key-file", "SEKRET_ROOT_KEY_FILE"),
     scalar("seal.unlock", "unlock", "SEKRET_UNLOCK"),
     scalar("seal.remember_file", "remember-file", "SEKRET_REMEMBER_FILE"),
+    scalar("seal.epoch_file", "epoch-file", "SEKRET_EPOCH_FILE"),
     scalar(
         "seal.remember_secret_file",
         "remember-secret-file",
@@ -1458,6 +1459,57 @@ async fn cli_token_ttl_sets_the_device_login_lifetime() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A lifetime that is not positive, or over a year (most likely milliseconds), stops the server
+/// whichever way it is set; one past the recommended most starts with a warning.
+#[tokio::test]
+async fn token_lifetimes_are_bounded() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    for way in WAYS {
+        for (option, value) in [
+            ("auth.session_ttl", "0"),
+            ("auth.session_ttl", "-60"),
+            ("auth.cli_token_ttl", "0"),
+            ("auth.cli_token_ttl", "86400000"),
+        ] {
+            let log = sb.keyed(&key).set(way, option, value).refused().await?;
+            assert!(log.contains(option), "{way:?} {option}={value}: {log}");
+        }
+        let server = sb
+            .keyed(&key)
+            .set(way, "auth.session_ttl", &(40 * 86400).to_string())
+            .set(way, "auth.cli_token_ttl", &(100 * 86400).to_string())
+            .start()
+            .await?;
+        let log = server.log();
+        assert!(
+            log.contains("auth.session_ttl is 40 days") && log.contains("auth.cli_token_ttl is 100 days"),
+            "{way:?}: {log}"
+        );
+    }
+    // Only the winning value is judged: a good flag over a bad environment or file value starts.
+    let server = sb
+        .keyed(&key)
+        .set(Way::File, "auth.session_ttl", "0")
+        .set(Way::Env, "auth.session_ttl", "-1")
+        .set(Way::Flag, "auth.session_ttl", "3600")
+        .start()
+        .await?;
+    assert!(!server.log().contains("auth.session_ttl must be"), "{}", server.log());
+    drop(server);
+    let log = sb
+        .keyed(&key)
+        .set(Way::File, "auth.cli_token_ttl", "3600")
+        .set(Way::Env, "auth.cli_token_ttl", "0")
+        .refused()
+        .await?;
+    assert!(
+        log.contains("auth.cli_token_ttl must be"),
+        "the environment beats the file: {log}"
+    );
+    Ok(())
+}
+
 /// How many device-login starts in a row the limiter lets through, up to `cap`.
 async fn allowed_in_a_row(server: &Running, cap: usize) -> anyhow::Result<usize> {
     for n in 0..cap {
@@ -2195,6 +2247,15 @@ async fn unlock_remember_needs_one_manual_unlock() -> anyhow::Result<()> {
         let admin = sb.passphrase_db("manual")?;
         let server = sb.remembering().set(way, "seal.unlock", "remember").start().await?;
         assert_eq!(server.state().await?, "sealed", "{way:?}");
+        // Only a policy that slipped in through the environment is called out.
+        assert_eq!(
+            server
+                .log()
+                .contains("remember unlock policy comes from SEKRET_UNLOCK in the environment"),
+            way == Way::Env,
+            "{way:?}: {}",
+            server.log()
+        );
         assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK);
         let file = sb.path("sekret.unlock-key");
         assert!(
@@ -2233,6 +2294,154 @@ async fn remember_file_sets_where_the_device_key_goes() -> anyhow::Result<()> {
         let server = launch().start().await?;
         assert_eq!(server.state().await?, "unsealed", "{way:?}");
     }
+    Ok(())
+}
+
+/// The epoch and root key fingerprints in a seal epoch mark.
+fn mark_in(path: &Path) -> anyhow::Result<(i64, Vec<String>)> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
+    let mut words = text.split_whitespace().skip(1);
+    let epoch = words.next().context("epoch")?.parse().context("epoch")?;
+    Ok((epoch, words.map(String::from).collect()))
+}
+
+const FOREIGN_MARK: &str = "sekret-seal-epoch 1 0123456789abcdef\n";
+
+async fn unseal_error(server: &Running) -> anyhow::Result<(StatusCode, Value)> {
+    let (code, body) = server
+        .call(
+            Method::POST,
+            "/api/v1/sys/unseal",
+            Auth::None,
+            Some(json!({"passphrase": PASSPHRASE})),
+        )
+        .await?;
+    Ok((code, body["error"].clone()))
+}
+
+#[tokio::test]
+async fn epoch_file_keeps_a_mark_the_server_checks() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        let file = sb.p("marks.epoch");
+        let launch = || sb.launch().set(way, "seal.epoch_file", &file);
+        let server = launch().start().await?;
+        assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK, "{way:?}");
+        let (_, roots) = mark_in(Path::new(&file))?;
+        assert_eq!(roots.len(), 1, "{way:?}: the mark names the root key");
+        drop(server);
+        // A mark naming another key refuses this database's own.
+        std::fs::write(&file, FOREIGN_MARK).context("mark")?;
+        let server = launch().start().await?;
+        assert_eq!(
+            unseal_error(&server).await?,
+            (StatusCode::CONFLICT, json!("root_key_not_recognised")),
+            "{way:?}"
+        );
+        drop(server);
+        let missing = sb.p("missing/seal.epoch");
+        let log = sb.launch().set(way, "seal.epoch_file", &missing).refused().await?;
+        assert!(log.contains("cannot be created"), "{way:?}: {log}");
+    }
+    Ok(())
+}
+
+fn probe_epoch_file(server: &Running) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>> {
+    Box::pin(async move {
+        ensure!(server.unseal(PASSPHRASE).await? == StatusCode::OK, "unseal");
+        let written: Vec<&str> = ["flag.epoch", "env.epoch", "file.epoch"]
+            .into_iter()
+            .filter(|name| server.dir.join(name).exists())
+            .collect();
+        Ok(match written.is_empty() {
+            true => "none".into(),
+            false => written.join(","),
+        })
+    })
+}
+
+#[tokio::test]
+async fn precedence_seal_epoch_file() -> anyhow::Result<()> {
+    precedence(Chain {
+        key: "seal.epoch_file",
+        flag: "flag.epoch",
+        env: "env.epoch",
+        file: "file.epoch",
+        expect: ["flag.epoch", "env.epoch", "file.epoch", "none"],
+        base: passphrase_base,
+        probe: probe_epoch_file,
+    })
+    .await
+}
+
+/// A Postgres database has no file of its own to keep a mark beside, so without a remember file
+/// or root key file the server and the admin commands need `seal.epoch_file`.
+#[tokio::test]
+async fn a_postgres_server_needs_an_epoch_file() -> anyhow::Result<()> {
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    let container = match Postgres::default().start().await {
+        Ok(container) => container,
+        Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
+            eprintln!("skipping postgres test: {error}");
+            return Ok(());
+        }
+        Err(error) => bail!("postgres container failed: {error}"),
+    };
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let sb = Sandbox::new()?;
+    let pass = sb.passphrase_file()?;
+    let mark = sb.p("seal.epoch");
+    let admin = |command: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let mut args = vec!["admin", command, "--database-url", &url, "--passphrase-file", &pass];
+        args.extend_from_slice(extra);
+        sb.cli(&args, env, None)
+    };
+
+    let refused = admin("init", &[], &[])?;
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("seal.epoch_file"),
+        "{stderr}"
+    );
+    ok(admin("init", &["--epoch-file", &mark], &[])?)?;
+    let (epoch, roots) = mark_in(Path::new(&mark))?;
+    assert_eq!(roots.len(), 1);
+
+    // The other admin commands find it through the environment and the configuration file.
+    assert!(!admin("bootstrap", &[], &[])?.status.success());
+    ok(admin("bootstrap", &[], &[("SEKRET_EPOCH_FILE", &mark)])?)?;
+    let config = sb.write("admin.yaml", &format!("seal:\n  epoch_file: {mark}\n"))?;
+    ok(admin("reset-epoch", &["--config", &config], &[])?)?;
+    assert!(
+        mark_in(Path::new(&mark))?.0 > epoch,
+        "reset-epoch raised the configured mark"
+    );
+
+    let log = sb.launch().set(Way::Flag, "database.url", &url).refused().await?;
+    assert!(log.contains("seal.epoch_file"), "{log}");
+    for way in WAYS {
+        let server = sb
+            .launch()
+            .set(Way::Flag, "database.url", &url)
+            .set(way, "seal.epoch_file", &mark)
+            .start()
+            .await?;
+        assert_eq!(server.unseal(PASSPHRASE).await?, StatusCode::OK, "{way:?}");
+    }
+    std::fs::write(&mark, FOREIGN_MARK).context("mark")?;
+    let server = sb
+        .launch()
+        .set(Way::Flag, "database.url", &url)
+        .set(Way::Env, "seal.epoch_file", &mark)
+        .start()
+        .await?;
+    assert_eq!(
+        unseal_error(&server).await?,
+        (StatusCode::CONFLICT, json!("root_key_not_recognised"))
+    );
     Ok(())
 }
 
@@ -3882,6 +4091,72 @@ async fn database_url_file_chooses_the_database() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A password on the command line is readable by every local user for the server's whole life.
+#[tokio::test]
+async fn a_database_password_in_a_flag_is_warned_about() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    const WARNING: &str = "--database-url carries a password";
+    // Nothing listens on port 1; the settings are reported before the database is opened.
+    let with_password = "postgres://sekret:hunter2@127.0.0.1:1/sekret";
+    for way in WAYS {
+        let log = sb.keyed(&key).set(way, "database.url", with_password).refused().await?;
+        assert_eq!(log.contains(WARNING), way == Way::Flag, "{way:?}: {log}");
+        assert!(!log.contains("hunter2"), "{way:?}: the password is never logged");
+    }
+    let server = sb.keyed(&key).set(Way::Flag, "database.url", &sb.db()).start().await?;
+    assert!(!server.log().contains(WARNING), "no password, no warning");
+    drop(server);
+    let in_file = sb.write("pw-url", &format!("{with_password}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&in_file, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    }
+    let log = sb
+        .keyed(&key)
+        .without("database.url")
+        .set(Way::Flag, "database.url_file", &in_file)
+        .refused()
+        .await?;
+    assert!(!log.contains(WARNING), "a URL file is the fix: {log}");
+    Ok(())
+}
+
+/// Whoever can change the configuration file decides who signs in as an admin.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let config = sb.write("own.yaml", "auth:\n  default_org_role: org-member\n")?;
+    const WARNING: &str = "whoever can change it decides who signs in";
+    for (mode, warned) in [(0o600, false), (0o644, false), (0o666, true)] {
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).context("chmod")?;
+        let server = sb.keyed(&key).arg(&format!("--config={config}")).start().await?;
+        assert_eq!(server.log().contains(WARNING), warned, "{mode:o}: {}", server.log());
+    }
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let server = sb.keyed(&key).env("SEKRET_CONFIG", &config).start().await?;
+    assert!(!server.log().contains(WARNING), "{}", server.log());
+    drop(server);
+    // A directory anyone can write to lets them replace the file.
+    let open = sb.path("open");
+    std::fs::create_dir(&open).context("dir")?;
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+    let replaceable = open.join("sekret.yaml");
+    std::fs::write(&replaceable, "auth:\n  default_org_role: org-member\n").context("write")?;
+    std::fs::set_permissions(&replaceable, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let server = sb
+        .keyed(&key)
+        .env("SEKRET_CONFIG", &replaceable.display().to_string())
+        .start()
+        .await?;
+    assert!(server.log().contains(WARNING), "{}", server.log());
+    Ok(())
+}
+
 #[tokio::test]
 async fn database_url_and_url_file_follow_the_usual_precedence() -> anyhow::Result<()> {
     let sb = Sandbox::new()?;
@@ -4258,6 +4533,98 @@ async fn the_unseal_socket_refuses_a_group_writable_directory() -> anyhow::Resul
         assert!(stderr.contains("written by its group"), "{mode:o}: {stderr}");
         drop(planted);
     }
+    Ok(())
+}
+
+/// Someone who can rearrange a directory further up can swap in a private directory of their
+/// own, with a socket and listener that all agree on their uid.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_unseal_socket_refuses_a_directory_below_one_others_can_write() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    sb.passphrase_db("manual")?;
+    let shared = sb.path("shared");
+    let own = shared.join("sekret");
+    std::fs::create_dir_all(&own).context("dir")?;
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+    let socket = own.join("sekret.sock").display().to_string();
+    let log = sb
+        .launch()
+        .set(Way::Flag, "server.unix_socket", &socket)
+        .refused()
+        .await?;
+    assert!(log.contains("not safe") && log.contains("shared"), "{log}");
+
+    let planted = std::os::unix::net::UnixListener::bind(&socket).context("bind")?;
+    let pass = sb.passphrase_file()?;
+    let output = sb.cli(
+        &["sys", "unseal", "--socket", &socket, "--passphrase-file", &pass],
+        &[],
+        None,
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("shared") && stderr.contains("other users"), "{stderr}");
+    drop(planted);
+    Ok(())
+}
+
+/// `--socket-owner` and `SEKRET_SOCKET_OWNER` name the user the socket must belong to besides
+/// root and the caller. The flag beats the variable, and neither matters without `--socket`.
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_owner_names_whose_socket_is_trusted() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    sb.passphrase_db("manual")?;
+    let socket = sb.p("sekret.sock");
+    let server = sb
+        .launch()
+        .set(Way::Flag, "server.unix_socket", &socket)
+        .start()
+        .await?;
+    let status = |args: &[&str], env: &[(&str, &str)]| -> anyhow::Result<Output> {
+        let mut argv = vec!["sys", "status"];
+        argv.extend_from_slice(args);
+        sb.cli(&argv, env, None)
+    };
+    let unknown = "no-such-sekret-user";
+    // An owner that cannot be looked up stops the command before anything is sent.
+    for (args, env) in [
+        (vec!["--socket", &socket, "--socket-owner", unknown], vec![]),
+        (vec!["--socket", &socket], vec![("SEKRET_SOCKET_OWNER", unknown)]),
+    ] {
+        let output = status(&args, &env)?;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert_eq!(output.status.code(), Some(1), "{args:?} {env:?}: {stderr}");
+        assert!(stderr.contains("no user called"), "{stderr}");
+    }
+    // The socket is the caller's own, so naming root or the caller is accepted.
+    let output = status(&["--socket", &socket, "--socket-owner", "root"], &[])?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "sealed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = status(
+        &["--socket", &socket, "--socket-owner", "0"],
+        &[("SEKRET_SOCKET_OWNER", unknown)],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the flag wins over the variable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = status(&["--server", &server.url], &[("SEKRET_SOCKET_OWNER", unknown)])?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "without --socket the owner is not used: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 

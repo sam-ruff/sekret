@@ -19,6 +19,7 @@ import {
   parseAuditFilters,
   type AuditFilters,
 } from "@/lib/audit-filters";
+import { actionLabel, describeDetail } from "@/lib/audit-labels";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { AuditToolbar } from "./audit-toolbar";
 
@@ -39,15 +40,6 @@ interface AuditLogProps {
 function target(entry: AuditEntry): string {
   const where = entry.path && entry.secret_key ? `${entry.path.replace(/\/$/, "")}/${entry.secret_key}` : entry.path;
   return [entry.environment, where].filter(Boolean).join(" ");
-}
-
-function detailText(detail: unknown): string {
-  if (!detail || typeof detail !== "object") return "";
-  const entries = Object.entries(detail as Record<string, unknown>).filter(
-    ([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0),
-  );
-  const show = (v: unknown) => (Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v));
-  return entries.map(([k, v]) => `${k}: ${show(v)}`).join(" · ");
 }
 
 function FilterChip({ label, value, onClear, testId }: { label: string; value: string; onClear: () => void; testId: string }) {
@@ -175,9 +167,20 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
               header: "Action",
               primary: true,
               cell: (e) => (
-                <Badge variant="secondary" className="max-w-full truncate font-mono" data-testid="audit-action">
-                  {e.action}
-                </Badge>
+                <div className="flex min-w-0 flex-col items-start gap-0.5">
+                  <Badge
+                    variant="secondary"
+                    className="max-w-full truncate"
+                    title={e.action}
+                    data-testid="audit-action"
+                    data-action={e.action}
+                  >
+                    {actionLabel(e.action)}
+                  </Badge>
+                  <span className="max-w-full truncate font-mono text-[0.7rem] text-muted-foreground" data-testid="audit-action-code">
+                    {e.action}
+                  </span>
+                </div>
               ),
             },
             {
@@ -206,7 +209,11 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
             {
               header: "Detail",
               className: "md:max-w-72",
-              cell: (e) => <span className="line-clamp-2 text-xs break-all text-muted-foreground">{detailText(e.detail) || "-"}</span>,
+              cell: (e) => (
+                <span className="line-clamp-2 text-xs break-words text-muted-foreground" data-testid="audit-detail">
+                  {describeDetail(e.action, e.detail) || "-"}
+                </span>
+              ),
             },
             {
               header: "When",

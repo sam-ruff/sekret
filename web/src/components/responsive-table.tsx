@@ -64,7 +64,14 @@ export function ResponsiveTable<T>({ rows, columns, rowKey, rowTestId, onRowClic
                   {!c.primary && !c.actions && (
                     <span className="shrink-0 text-xs text-muted-foreground md:hidden">{c.header}</span>
                   )}
-                  <div className={cn("min-w-0", c.actions ? "flex items-center justify-end gap-2" : "md:contents")}>
+                  <div
+                    className={cn(
+                      "min-w-0",
+                      c.actions ? "flex items-center justify-end gap-2" : "md:contents",
+                      // Values sit against the right edge of a card, wrapped onto several lines or not.
+                      !c.primary && !c.actions && "max-md:text-right",
+                    )}
+                  >
                     {c.cell(row)}
                   </div>
                 </td>

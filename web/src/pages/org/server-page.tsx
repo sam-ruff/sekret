@@ -19,10 +19,12 @@ import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field
 import { PassphraseInput } from "@/components/secret-field";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { keys, useApiMutation, useSysStatus } from "@/hooks/queries";
+import { keys, useApiMutation, useSealWatch, useSysStatus } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
-import { errorMessage } from "@/lib/errors";
+import { EpochMarkStaleAlert } from "@/components/sys/epoch-mark-stale";
+import { errorMessage, isEpochMarkStale } from "@/lib/errors";
 import { passphraseProblem, problemText } from "@/lib/passphrase";
 import { broadcast } from "@/lib/tab-sync";
 import { keyFileOverride, POLICY_NAMES, UNSEALED_BY_NAMES } from "@/lib/sys-gate";
@@ -33,6 +35,8 @@ export function ServerPage() {
   const org = useOrgPermissions();
   const admin = useIsOrgAdmin();
   const canBackup = org.can("backups", "read");
+  // Kept here because the policy card starts afresh whenever the saved policy changes.
+  const [policyMarkStale, setPolicyMarkStale] = useState(false);
   // The public status says only whether the server is locked; admins read the rest from the detail.
   const publicStatus = useSysStatus(true);
   const detail = useQuery({
@@ -81,7 +85,14 @@ export function ServerPage() {
       {header}
       <div className="grid max-w-3xl gap-6">
         <StatusCard status={status.data} admin={admin} canLock={admin && passphraseMode} />
-        {admin && passphraseMode && <UnlockPolicyCard key={status.data.unlock_policy ?? ""} status={status.data} />}
+        {admin && passphraseMode && (
+          <UnlockPolicyCard
+            key={status.data.unlock_policy ?? ""}
+            status={status.data}
+            markStale={policyMarkStale}
+            onMarkStale={setPolicyMarkStale}
+          />
+        )}
         {admin && passphraseMode && <ChangePassphraseCard />}
         {canBackup && <BackupCard mode={status.data.seal_mode ?? null} />}
       </div>
@@ -202,7 +213,16 @@ function isPassphraseError(error: unknown): error is ApiError {
   );
 }
 
-function UnlockPolicyCard({ status }: { status: SysStatus }) {
+function UnlockPolicyCard({
+  status,
+  markStale,
+  onMarkStale,
+}: {
+  status: SysStatus;
+  /** The last policy change was saved but the seal mark outside the database is behind. */
+  markStale: boolean;
+  onMarkStale: (stale: boolean) => void;
+}) {
   const queryClient = useQueryClient();
   const current = status.unlock_policy ?? "manual";
   const [policy, setPolicy] = useState<UnlockPolicy>(current);
@@ -212,7 +232,10 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
   const [empty, setEmpty] = useState(false);
 
   const save = useApiMutation({
-    mutationFn: (confirmWith: string | undefined) => api.setUnlockPolicy(policy, confirmWith),
+    mutationFn: (confirmWith: string | undefined) => {
+      onMarkStale(false);
+      return api.setUnlockPolicy(policy, confirmWith);
+    },
     // The passphrase is the mutation's variable, so it must not linger in the mutation cache.
     gcTime: 0,
     onSuccess: (next) => {
@@ -220,7 +243,17 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
       queryClient.setQueryData(keys.sysStatusDetail, next);
       save.reset();
     },
-    onError: (error) => isPassphraseError(error),
+    onError: (error) => {
+      if (!isEpochMarkStale(error)) return isPassphraseError(error);
+      // The policy did change; only the mark outside the database is behind.
+      onMarkStale(true);
+      setPassphrase("");
+      setConfirming(false);
+      toast.warning("Unlock policy saved, but the host needs a repair");
+      void queryClient.invalidateQueries({ queryKey: keys.sysStatusDetail });
+      save.reset();
+      return true;
+    },
     success: "Unlock policy saved",
   });
   const forget = useApiMutation({
@@ -246,7 +279,13 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
       setEmpty(true);
       throw new Error("no passphrase");
     }
-    await save.mutateAsync(passphrase);
+    try {
+      await save.mutateAsync(passphrase);
+    } catch (error) {
+      // Saved, with a repair needed on the host; the card says so once the dialog closes.
+      if (isEpochMarkStale(error)) return;
+      throw error;
+    }
   };
 
   const dialogError = isPassphraseError(save.error) ? save.error : null;
@@ -259,6 +298,7 @@ function UnlockPolicyCard({ status }: { status: SysStatus }) {
         <CardDescription>How the server gets unlocked after it starts.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {markStale && <EpochMarkStaleAlert change="The unlock policy" testId="policy-mark-stale" />}
         {status.configured ? (
           <ConfiguredPolicy policy={status.unlock_policy} testId="server-policy-configured" />
         ) : (
@@ -373,16 +413,39 @@ function ChangePassphraseCard() {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const strength = usePassphraseStrength(passphrase);
+  // Typed passphrases are cleared when nobody is using the page, like revealed values.
+  const typed = current !== "" || passphrase !== "" || confirm !== "";
+  useSealWatch(typed);
+  useIdle(typed, () => {
+    setCurrent("");
+    setPassphrase("");
+    setConfirm("");
+    toast.info("Cleared the passphrase fields after three idle minutes.");
+  });
 
+  const queryClient = useQueryClient();
+  const [markStale, setMarkStale] = useState(false);
+  const done = () => {
+    setCurrent("");
+    setPassphrase("");
+    setConfirm("");
+    change.reset();
+  };
   const change = useMutation({
     mutationFn: () => api.changePassphrase({ current, new: passphrase }),
     gcTime: 0,
+    onMutate: () => setMarkStale(false),
     onSuccess: () => {
       toast.success("Passphrase changed");
-      setCurrent("");
-      setPassphrase("");
-      setConfirm("");
-      change.reset();
+      done();
+    },
+    onError: (error) => {
+      if (!isEpochMarkStale(error)) return;
+      // The passphrase did change; only the mark outside the database is behind.
+      setMarkStale(true);
+      toast.warning("Passphrase changed, but the host needs a repair");
+      void queryClient.invalidateQueries({ queryKey: keys.sysStatusDetail });
+      done();
     },
   });
 
@@ -418,6 +481,7 @@ function ChangePassphraseCard() {
       <form onSubmit={submit} noValidate>
         <CardContent>
           <FieldGroup>
+            {markStale && <EpochMarkStaleAlert change="The new passphrase" testId="change-mark-stale" />}
             <PassphraseAccountField />
             <Field data-invalid={!!wrong}>
               <FieldLabel htmlFor="current-passphrase">Current passphrase</FieldLabel>
