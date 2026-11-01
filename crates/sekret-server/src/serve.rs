@@ -28,6 +28,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long open connections get to finish once the server is stopping.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HTTP2_STREAMS: u32 = 64;
+/// Connections one client address may hold, however large the pool.
+pub const MAX_PER_CLIENT: usize = 32;
+/// Connections one IPv4 /24 or IPv6 /48 may hold, however large the pool.
+pub const MAX_PER_NETWORK: usize = 64;
+/// Once only the reserve is left, a network already holding this many gets no more.
+pub const RESERVE_SHARE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionLimits {
@@ -39,24 +45,28 @@ pub struct ConnectionLimits {
     pub max_connections: usize,
     /// Connections one client address (an IPv6 /64) may hold at once; more are closed straight away.
     pub max_per_client: usize,
-    /// Connections one IPv6 /48 may hold at once, since one party often holds a /48 and so
-    /// thousands of /64s.
+    /// Connections one IPv4 /24 or IPv6 /48 may hold at once, since one party often holds a whole
+    /// network and so many addresses.
     pub max_per_network: usize,
+    /// The last free slots, which only networks holding fewer than [`RESERVE_SHARE`] connections
+    /// may take, so a few busy networks cannot fill the server between them.
+    pub reserve: usize,
     /// Peers the per-client cap does not apply to, such as reverse proxies.
     pub exempt: Arc<[IpNet]>,
 }
 
 impl ConnectionLimits {
-    /// A quarter of the connections per client and half per IPv6 /48, with loopback exempt for a
-    /// local proxy.
+    /// [`MAX_PER_CLIENT`] per client and [`MAX_PER_NETWORK`] per network, or a quarter and a half
+    /// of a small pool, an eighth kept in reserve, and loopback exempt for a local proxy.
     pub fn new(max_connections: usize) -> Self {
         let max_connections = max_connections.max(1);
         Self {
             header_read_timeout: HEADER_READ_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
             max_connections,
-            max_per_client: (max_connections / 4).max(1),
-            max_per_network: (max_connections / 2).max(1),
+            max_per_client: (max_connections / 4).clamp(1, MAX_PER_CLIENT),
+            max_per_network: (max_connections / 2).clamp(1, MAX_PER_NETWORK),
+            reserve: max_connections / 8,
             exempt: loopback().into(),
         }
     }
@@ -83,7 +93,7 @@ fn loopback() -> Vec<IpNet> {
     .collect()
 }
 
-/// Open connections per client and per IPv6 network, each released when its slot drops.
+/// Open connections per client and per network, each released when its slot drops.
 #[derive(Default)]
 struct PerClient {
     open: Mutex<Open>,
@@ -98,31 +108,26 @@ struct Open {
 struct ClientSlot {
     owner: Arc<PerClient>,
     host: IpAddr,
-    network: Option<IpAddr>,
-}
-
-/// The IPv6 /48 a peer is in. IPv4 hosts are counted alone, as before.
-fn network_key(peer: IpAddr) -> Option<IpAddr> {
-    match peer.to_canonical() {
-        IpAddr::V4(_) => None,
-        v6 @ IpAddr::V6(_) => Some(crate::ratelimit::prefix_key(v6)),
-    }
+    network: IpAddr,
 }
 
 impl PerClient {
-    fn claim(self: &Arc<Self>, peer: IpAddr, limits: &ConnectionLimits) -> Option<ClientSlot> {
+    /// A slot for `peer`, when its address and network are under their caps. `free` is how many
+    /// connections the server could still take besides this one.
+    fn claim(self: &Arc<Self>, peer: IpAddr, limits: &ConnectionLimits, free: usize) -> Option<ClientSlot> {
         let host = crate::ratelimit::limiter_key(peer);
-        let network = network_key(peer);
+        let network = crate::ratelimit::prefix_key(peer);
         let mut open = self.open.lock().ok()?;
         let hosts = open.hosts.get(&host).copied().unwrap_or(0);
-        let networks = network.map_or(0, |n| open.networks.get(&n).copied().unwrap_or(0));
+        let networks = open.networks.get(&network).copied().unwrap_or(0);
         if hosts >= limits.max_per_client || networks >= limits.max_per_network {
             return None;
         }
-        *open.hosts.entry(host).or_insert(0) += 1;
-        if let Some(network) = network {
-            *open.networks.entry(network).or_insert(0) += 1;
+        if free < limits.reserve && networks >= RESERVE_SHARE {
+            return None;
         }
+        *open.hosts.entry(host).or_insert(0) += 1;
+        *open.networks.entry(network).or_insert(0) += 1;
         Some(ClientSlot {
             owner: self.clone(),
             host,
@@ -146,9 +151,7 @@ impl Drop for ClientSlot {
             return;
         };
         release(&mut open.hosts, &self.host);
-        if let Some(network) = &self.network {
-            release(&mut open.networks, network);
-        }
+        release(&mut open.networks, &self.network);
     }
 }
 
@@ -189,7 +192,7 @@ pub async fn serve(
             },
         };
         let slot = if limits.capped(peer.ip()) {
-            let Some(slot) = per_client.claim(peer.ip(), &limits) else {
+            let Some(slot) = per_client.claim(peer.ip(), &limits, permits.available_permits()) else {
                 tracing::debug!(%peer, "closed a connection over the per-client limit");
                 continue;
             };
@@ -211,6 +214,41 @@ pub async fn serve(
     // Every open connection holds a permit until it ends.
     let all = u32::try_from(max).unwrap_or(u32::MAX);
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, permits.acquire_many(all)).await;
+}
+
+/// Serves `app` on a Unix socket with the same connection cap, header and idle limits. The
+/// per-client caps mean nothing there, since every peer is local.
+#[cfg(unix)]
+pub async fn serve_local(listener: tokio::net::UnixListener, app: Router, limits: ConnectionLimits) {
+    let max = limits.max_connections.clamp(1, Semaphore::MAX_PERMITS);
+    let permits = Arc::new(Semaphore::new(max));
+    let (_stop, stopping) = watch::channel(false);
+    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    loop {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "accepting a local connection failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let app = app.clone();
+        let limits = limits.clone();
+        let stopping = stopping.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let activity = Arc::new(Activity::new());
+            let io = Tracked {
+                inner: stream,
+                activity: activity.clone(),
+            };
+            drive(io, local, app, limits, activity, stopping).await;
+        });
+    }
 }
 
 async fn serve_connection(
@@ -418,25 +456,32 @@ mod tests {
         // Four /64s inside one /48, as a single host with a /48 can present.
         for subnet in 1..=4 {
             let peer = ip(&format!("2001:db8:7:{subnet}::1"))?;
-            held.push(per_client.claim(peer, &limits).context("within the network's share")?);
+            held.push(
+                per_client
+                    .claim(peer, &limits, PLENTY)
+                    .context("within the network's share")?,
+            );
         }
         let fifth = ip("2001:db8:7:5::1")?;
         assert!(
-            per_client.claim(fifth, &limits).is_none(),
+            per_client.claim(fifth, &limits, PLENTY).is_none(),
             "a fifth /64 in the same /48"
         );
         let elsewhere = ip("2001:db8:8:1::1")?;
         assert!(
-            per_client.claim(elsewhere, &limits).is_some(),
+            per_client.claim(elsewhere, &limits, PLENTY).is_some(),
             "another /48 is unaffected"
         );
         held.pop();
         assert!(
-            per_client.claim(fifth, &limits).is_some(),
+            per_client.claim(fifth, &limits, PLENTY).is_some(),
             "a closed connection frees room"
         );
         Ok(())
     }
+
+    /// Free slots well outside any reserve.
+    const PLENTY: usize = 1_000;
 
     #[test]
     fn the_per_host_cap_still_applies_inside_a_network() -> anyhow::Result<()> {
@@ -444,25 +489,85 @@ mod tests {
         let per_client = Arc::new(PerClient::default());
         let host = ip("2001:db8:7:1::1")?;
         let same_64 = ip("2001:db8:7:1::2")?;
-        let _a = per_client.claim(host, &limits).context("first")?;
-        let _b = per_client.claim(same_64, &limits).context("second")?;
-        assert!(per_client.claim(host, &limits).is_none());
+        let _a = per_client.claim(host, &limits, PLENTY).context("first")?;
+        let _b = per_client.claim(same_64, &limits, PLENTY).context("second")?;
+        assert!(per_client.claim(host, &limits, PLENTY).is_none());
         Ok(())
     }
 
     #[test]
-    fn ipv4_hosts_are_counted_alone() -> anyhow::Result<()> {
+    fn ipv4_networks_share_a_cap_as_ipv6_ones_do() -> anyhow::Result<()> {
         let limits = ConnectionLimits::new(8);
         let per_client = Arc::new(PerClient::default());
         let mut held = Vec::new();
-        for host in 1..=6 {
+        for host in 1..=4 {
             let peer = ip(&format!("192.0.2.{host}"))?;
-            held.push(per_client.claim(peer, &limits).context("each host has its own share")?);
+            held.push(
+                per_client
+                    .claim(peer, &limits, PLENTY)
+                    .context("within the /24's share")?,
+            );
         }
+        let fifth = ip("192.0.2.5")?;
+        assert!(
+            per_client.claim(fifth, &limits, PLENTY).is_none(),
+            "a fifth host in the /24"
+        );
+        let other = ip("198.51.100.1")?;
+        let _other = per_client.claim(other, &limits, PLENTY).context("another /24")?;
         // An IPv4-mapped IPv6 address is the same host.
+        held.clear();
         let mapped = ip("::ffff:192.0.2.1")?;
-        let _again = per_client.claim(mapped, &limits).context("second for that host")?;
-        assert!(per_client.claim(mapped, &limits).is_none());
+        let _a = per_client
+            .claim(mapped, &limits, PLENTY)
+            .context("first for that host")?;
+        let _b = per_client.claim(ip("192.0.2.1")?, &limits, PLENTY).context("second")?;
+        assert!(per_client.claim(mapped, &limits, PLENTY).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn large_pools_still_cap_each_client_at_a_small_number() {
+        let limits = ConnectionLimits::new(512);
+        assert_eq!(limits.max_per_client, MAX_PER_CLIENT);
+        assert_eq!(limits.max_per_network, MAX_PER_NETWORK);
+        assert_eq!(limits.reserve, 64);
+        let small = ConnectionLimits::new(16);
+        assert_eq!((small.max_per_client, small.max_per_network, small.reserve), (4, 8, 2));
+    }
+
+    #[test]
+    fn the_reserve_is_kept_for_networks_holding_few_connections() -> anyhow::Result<()> {
+        let limits = ConnectionLimits::new(512);
+        let per_client = Arc::new(PerClient::default());
+        let mut held = Vec::new();
+        for host in 1..=RESERVE_SHARE {
+            let peer = ip(&format!("203.0.113.{host}"))?;
+            held.push(per_client.claim(peer, &limits, PLENTY).context("outside the reserve")?);
+        }
+        let busy = ip("203.0.113.200")?;
+        assert!(
+            per_client.claim(busy, &limits, limits.reserve).is_some(),
+            "the reserve is not reached yet"
+        );
+        let in_reserve = limits.reserve - 1;
+        assert!(
+            per_client.claim(busy, &limits, in_reserve).is_none(),
+            "a busy network cannot take reserved slots"
+        );
+        let newcomer = ip("198.51.100.7")?;
+        let mut theirs = Vec::new();
+        for _ in 0..RESERVE_SHARE {
+            theirs.push(
+                per_client
+                    .claim(newcomer, &limits, in_reserve)
+                    .context("a quiet network gets reserved slots")?,
+            );
+        }
+        assert!(
+            per_client.claim(newcomer, &limits, in_reserve).is_none(),
+            "but only a few of them"
+        );
         Ok(())
     }
 }

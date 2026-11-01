@@ -187,7 +187,7 @@ function RuleRow({
         </ToggleGroup>
         <div className="flex flex-wrap gap-x-4 gap-y-2">
           {actionsFor(rule).map((action) => (
-            <label key={action} className="flex items-center gap-1.5 text-sm">
+            <label key={action} className="flex min-h-9 items-center gap-2 text-sm sm:min-h-0 sm:gap-1.5">
               <Checkbox
                 checked={rule.actions.includes(action)}
                 disabled={readOnly}

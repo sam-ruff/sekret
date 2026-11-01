@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
-use sekret_core::crypto::RootKey;
+use sekret_core::crypto::{CryptoError, RootKey};
 use sekret_core::seal::{
     MAX_BACKUP_LEN, SealFlags, SealMode, UnlockPolicy, decrypt_backup, parse_backup, trim_input, unwrap_root_key,
     unwrap_root_key_checked, validate_passphrase, wrap_root_key,
@@ -19,8 +19,8 @@ use sekret_server::files::{
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
 use sekret_server::seal::{
     AutoInit, Distrust, HighWater, InitPlan, Keyring, StartupSecrets, audit_as, cautious_flags, check_database_root,
-    check_root, high_water, initialise, open_keyring, pending_key_file, record_epoch, reset_epoch, root_recognised,
-    signed, verify_config,
+    check_root, distrusted, high_water, initialise, kept_flags, lower_marks, migrations_done, open_keyring,
+    pending_key_file, record_config, root_recognised, signed, verify_config,
 };
 use sekret_server::state::{AppState, Dependencies, build_state};
 use sekret_store::{InstanceLock, Open, SealConfig, SqlStore, Store};
@@ -102,6 +102,11 @@ pub enum AdminCommand {
         /// drop it and fall back to key-file mode under --root-key-file.
         #[arg(long)]
         drop_passphrase_wrap: bool,
+        /// Only when the epochs have reached their limit, which takes a planted epoch mark: start
+        /// again from a low epoch and lower every mark. Configurations signed before then can be
+        /// put back undetected afterwards. Refused while the configuration fails its signature.
+        #[arg(long)]
+        lower_marks: bool,
     },
     /// Switch between passphrase and key-file mode under a new root key, re-encrypting
     /// everything, so the old key file or passphrase opens nothing. Stop the server first.
@@ -153,6 +158,15 @@ fn read_secret_bytes(path: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
 
 pub fn read_root_key(path: &Path) -> anyhow::Result<RootKey> {
     RootKey::parse(&read_secret_bytes(path)?).context("parsing root key")
+}
+
+/// A root key file named only on the admin command line, which `StoreArgs::locate` has not
+/// already checked.
+fn read_named_root_key(path: &Path) -> anyhow::Result<RootKey> {
+    if let Some(why) = settings::secret_file_exposure(path) {
+        eprintln!("sekret: warning: the root key file: {why}");
+    }
+    read_root_key(path)
 }
 
 fn state(config: ServerConfig, store: Arc<dyn Store>, keyring: Keyring) -> anyhow::Result<AppState> {
@@ -666,6 +680,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
             passphrase_file,
             adopt_root_key,
             drop_passphrase_wrap,
+            lower_marks,
         } => {
             let (location, _lock, sql) = open_locked(&store, sources).await?;
             let marks = match adopt_root_key {
@@ -676,6 +691,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
                 passphrase_file: passphrase_file.as_deref(),
                 marks,
                 drop_passphrase_wrap,
+                lower_marks,
             };
             reset_epoch_marks(&sql, &location, inputs, &prompter).await?;
         }
@@ -763,29 +779,28 @@ async fn rotate(
         }
     };
     let new = match (inputs.new_root_key_file, &seal) {
-        (Some(path), _) => read_root_key(path)?,
+        (Some(path), _) => read_named_root_key(path)?,
         (None, Some(_)) => RootKey::generate()?,
         (None, None) => bail!("key-file mode needs --new-root-key-file"),
     };
     let seal_config = match &seal {
         None => None,
-        Some((config, passphrase, verdict)) => Some(SealConfig {
-            wrapped: Some(wrap_root_key(&new, passphrase)?),
-            // The remembered wrap holds the old key; the next manual unlock remembers again.
-            remembered: None,
-            unlock_policy: if verdict.is_err() {
-                UnlockPolicy::Manual
-            } else {
-                config.unlock_policy
-            },
-            flags: if *verdict == Ok(false) {
-                config.flags
-            } else {
-                cautious_flags(config.flags)
-            },
-            updated_at: SystemClock.now(),
-            ..config.clone()
-        }),
+        Some((config, passphrase, verdict)) => {
+            let kept = match *verdict {
+                Err(distrust) => distrusted(config.clone(), distrust, marks),
+                Ok(_) => SealConfig {
+                    flags: kept_flags(config, *verdict, marks),
+                    ..config.clone()
+                },
+            };
+            Some(SealConfig {
+                wrapped: Some(wrap_root_key(&new, passphrase)?),
+                // The remembered wrap holds the old key; the next manual unlock remembers again.
+                remembered: None,
+                updated_at: SystemClock.now(),
+                ..kept
+            })
+        }
     };
     // A key file beside a passphrase is read first at start, so it has to follow the new key.
     let key_file_too = seal
@@ -891,16 +906,24 @@ struct SealModeInputs<'a> {
     skip_unreadable: bool,
 }
 
-/// The flags a configuration keeps when it is re-signed under a new mode: all of them when it is
-/// signed and sound, otherwise nothing migrated again, since an unsigned configuration's flags
-/// may be a database writer's. With no configuration, marks mean one existed.
-fn carried_flags(root: &RootKey, current: Option<&SealConfig>, marks: HighWater) -> SealFlags {
-    match current.map(|c| (c, verify_config(root, c, marks))) {
-        Some((c, Ok(false))) => c.flags,
-        Some((c, Ok(true) | Err(_))) => cautious_flags(c.flags),
-        None if marks.highest.is_some() || marks.broken => cautious_flags(SealFlags::default()),
-        None => SealFlags::default(),
-    }
+/// The flags and epoch a configuration keeps when it is re-signed under a new mode. Its flags when
+/// it is signed and sound, otherwise nothing migrated again, since an unsigned configuration's
+/// flags may be a database writer's. Its epoch unless it failed its signature, when the marks
+/// decide. With no configuration, marks mean one existed.
+fn carried(root: &RootKey, current: Option<&SealConfig>, marks: HighWater) -> (SealFlags, i64) {
+    let Some(config) = current else {
+        let flags = match marks.highest.is_some() || marks.broken {
+            true => cautious_flags(SealFlags::default()),
+            false => SealFlags::default(),
+        };
+        return (flags, 0);
+    };
+    let verdict = verify_config(root, config, marks);
+    let epoch = match verdict {
+        Err(Distrust::Tampered) => marks.floor(),
+        _ => config.epoch,
+    };
+    (kept_flags(config, verdict, marks), epoch)
 }
 
 /// Switches mode under a newly generated root key, like a passphrase change, so neither an old
@@ -935,12 +958,14 @@ async fn set_seal_mode(
             };
             let (old, config, _) = obtain_root(sql, source, prompter).await?;
             let config = config.context("no seal configuration")?;
+            let (flags, epoch) = carried(&old, Some(&config), marks);
             let seal = SealConfig {
                 mode: SealMode::KeyFile,
                 wrapped: None,
                 unlock_policy: UnlockPolicy::Manual,
                 remembered: None,
-                flags: carried_flags(&old, Some(&config), marks),
+                flags,
+                epoch,
                 updated_at: now,
                 ..config
             };
@@ -974,7 +999,7 @@ async fn set_seal_mode(
             let old = read_root_key(path)?;
             check_root(sql, &epoch_files, &old).await?;
             let passphrase = read_new_passphrase(inputs.passphrase_file, prompter)?;
-            let flags = carried_flags(&old, current.as_ref(), marks);
+            let (flags, epoch) = carried(&old, current.as_ref(), marks);
             if current.is_none() {
                 // Replacing the key re-signs the stored configuration, so there has to be one.
                 let base = SealConfig {
@@ -998,6 +1023,7 @@ async fn set_seal_mode(
                 unlock_policy: UnlockPolicy::Manual,
                 remembered: None,
                 flags,
+                epoch,
                 updated_at: now,
                 ..stored
             };
@@ -1027,34 +1053,29 @@ async fn set_seal_mode(
 }
 
 /// What `reset-epoch` keeps of a configuration, given what checking it found. A sound one keeps
-/// everything, though an unsigned one never starts a migration. One older than the marks keeps
-/// its fields, which this root signed once, but grants nothing. One that fails its signature only
-/// keeps what the operator has just proved (the passphrase wrap, or key-file mode) and grants
-/// nothing.
-fn reset_config(config: SealConfig, verdict: Result<bool, Distrust>) -> SealConfig {
+/// everything, though it never starts a migration the marks do not vouch for. One older than the
+/// marks keeps its fields, which this root signed once, but grants nothing. One that fails its
+/// signature only keeps what the operator has just proved (the passphrase wrap, or key-file mode),
+/// grants nothing and takes its epoch from the marks.
+fn reset_config(config: SealConfig, verdict: Result<bool, Distrust>, marks: HighWater) -> SealConfig {
     match verdict {
-        Ok(false) => config,
-        Ok(true) => SealConfig {
-            flags: cautious_flags(config.flags),
+        Ok(_) => SealConfig {
+            flags: kept_flags(&config, verdict, marks),
             ..config
         },
-        Err(Distrust::RolledBack) => SealConfig {
-            unlock_policy: UnlockPolicy::Manual,
-            remembered: None,
-            flags: cautious_flags(config.flags),
-            ..config
-        },
-        Err(Distrust::Tampered) => SealConfig {
-            mode: match config.wrapped {
-                Some(_) if config.mode == SealMode::Passphrase => SealMode::Passphrase,
-                _ => SealMode::KeyFile,
-            },
-            wrapped: config.wrapped.filter(|_| config.mode == SealMode::Passphrase),
-            unlock_policy: UnlockPolicy::Manual,
-            remembered: None,
-            flags: cautious_flags(config.flags),
-            ..config
-        },
+        Err(Distrust::RolledBack) => distrusted(config, Distrust::RolledBack, marks),
+        Err(Distrust::Tampered) => {
+            let passphrase = config.mode == SealMode::Passphrase;
+            let wrapped = config.wrapped.clone().filter(|_| passphrase);
+            SealConfig {
+                mode: match wrapped {
+                    Some(_) => SealMode::Passphrase,
+                    None => SealMode::KeyFile,
+                },
+                wrapped,
+                ..distrusted(config, Distrust::Tampered, marks)
+            }
+        }
     }
 }
 
@@ -1062,6 +1083,7 @@ struct ResetInputs<'a> {
     passphrase_file: Option<&'a Path>,
     marks: MarkCheck,
     drop_passphrase_wrap: bool,
+    lower_marks: bool,
 }
 
 /// Whether the configuration holds a passphrase wrap that nothing vouches for: its signature
@@ -1097,10 +1119,39 @@ fn prove_wrap(
     }
 }
 
+/// Signs the reset configuration above the marks, or with `--lower-marks` and the epochs at their
+/// limit, low again. Returns whether the marks have to be lowered to match.
+fn sign_reset(
+    root: &RootKey,
+    base: SealConfig,
+    marks: HighWater,
+    verdict: Result<bool, Distrust>,
+    lower: bool,
+) -> anyhow::Result<(SealConfig, bool)> {
+    match (signed(root, base.clone(), marks.floor()), lower) {
+        (Ok(config), false) => Ok((config, false)),
+        (Ok(_), true) => bail!("--lower-marks is only for epochs that have reached their limit; these have not"),
+        (Err(CryptoError::EpochExhausted), false) => bail!(
+            "the seal epoch has reached its limit. An honest server never gets there, so an epoch mark was planted \
+             or changed; check each mark file. Run again with --lower-marks to start the epochs again from a low \
+             value. Configurations signed before then can then be put back undetected"
+        ),
+        (Err(error), false) => Err(error.into()),
+        (Err(_), true) if verdict == Err(Distrust::Tampered) => bail!(
+            "--lower-marks is refused while the seal configuration fails its signature; run `sekret admin \
+             reset-epoch` without it once the marks have been checked"
+        ),
+        (Err(_), true) => {
+            let config = signed(root, base.clone(), 0).or_else(|_| signed(root, SealConfig { epoch: 0, ..base }, 0))?;
+            Ok((config, true))
+        }
+    }
+}
+
 /// The explicit operator command for marks that disagree with the database. The configuration is
 /// checked with the root key and the marks, reset by [`reset_config`], signed above the marks and
-/// the marks raised to it, so no configuration signed earlier can be replayed afterwards. Only
-/// when the epochs have run out are the marks lowered, starting again from the bottom. With
+/// the marks raised to it, so no configuration signed earlier can be replayed afterwards. The marks
+/// are only lowered with `--lower-marks`, when the epochs are at their limit. With
 /// `--adopt-root-key` the marks are also moved to the database's root key.
 async fn reset_epoch_marks(
     sql: &SqlStore,
@@ -1121,6 +1172,11 @@ async fn reset_epoch_marks(
     let pin = root.pin()?;
     let adopted = !root_recognised(&paths, &root);
     let marks = high_water(&paths);
+    // Marks naming another key vouch for nothing this one signed.
+    let marks = HighWater {
+        named: marks.named && !adopted,
+        ..marks
+    };
     let verdict = verify_config(&root, &config, marks);
     let unproven = wrap_unproven(&config, verdict, passphrase.is_some());
     if inputs.drop_passphrase_wrap && !unproven {
@@ -1134,16 +1190,13 @@ async fn reset_epoch_marks(
     };
     let base = SealConfig {
         updated_at: SystemClock.now(),
-        ..reset_config(config, verdict)
+        ..reset_config(config, verdict, marks)
     };
-    let (config, restarted) = match signed(&root, base.clone(), marks.floor()) {
-        Ok(config) => (config, false),
-        Err(_) => (signed(&root, SealConfig { epoch: 0, ..base }, 0)?, true),
-    };
+    let (config, lowered) = sign_reset(&root, base, marks, verdict, inputs.lower_marks)?;
     sql.update_seal_config(config.clone()).await?;
-    match restarted {
-        true => reset_epoch(&paths, config.epoch, &pin),
-        false => record_epoch(&paths, config.epoch, &pin),
+    match lowered {
+        true => lower_marks(&paths, config.epoch, &pin, migrations_done(config.flags)),
+        false => record_config(&paths, &config, &pin),
     }
     .context("writing the epoch marks")?;
     audit_admin(
@@ -1155,9 +1208,17 @@ async fn reset_epoch_marks(
             "rolled_back": verdict == Err(Distrust::RolledBack),
             "adopted_root_key": adopted,
             "dropped_passphrase_wrap": inputs.drop_passphrase_wrap,
+            "lowered_marks": lowered,
         }),
     )
     .await;
+    if lowered {
+        eprintln!(
+            "warning: lowered every epoch mark to {}; a copy of the seal configuration signed before this can now \
+             be put back without being noticed",
+            config.epoch
+        );
+    }
     let note = match verdict {
         Ok(_) => "",
         Err(Distrust::RolledBack) => {
@@ -1166,7 +1227,7 @@ async fn reset_epoch_marks(
         Err(Distrust::Tampered) => "; it had failed its signature, so the unlock policy is now manual",
     };
     eprintln!(
-        "signed the seal configuration at epoch {} and raised {} epoch mark(s) to it{note}",
+        "signed the seal configuration at epoch {} and moved {} epoch mark(s) to it{note}",
         config.epoch,
         paths.len(),
     );
@@ -1374,7 +1435,7 @@ async fn restore(
     // Nothing from the header is shown until the body has proved it, since a crafted file could
     // carry terminal escape sequences.
     let root = match (root_key_file, parsed.header.wrapped()?) {
-        (Some(path), _) => read_root_key(path)?,
+        (Some(path), _) => read_named_root_key(path)?,
         (None, Some(wrapped)) => {
             let passphrase = read_passphrase(passphrase_file, "Backup passphrase: ", prompter)?;
             unwrap_root_key(&wrapped, &passphrase).map_err(|_| anyhow::anyhow!("the passphrase is wrong"))?
@@ -1425,11 +1486,11 @@ async fn mark_restored(restored: &SqlStore, database_url: &str, root: &RootKey) 
         );
         return;
     }
-    let epoch = match restored.get_seal_config().await {
-        Ok(Some(config)) => config.epoch,
+    let config = match restored.get_seal_config().await {
+        Ok(Some(config)) => config,
         _ => return,
     };
-    if let Err(error) = sekret_server::seal::pin(root).and_then(|pin| record_epoch(&paths, epoch, &pin)) {
+    if let Err(error) = sekret_server::seal::pin(root).and_then(|pin| record_config(&paths, &config, &pin)) {
         eprintln!("warning: could not write the epoch mark beside the restored database: {error}");
     }
 }

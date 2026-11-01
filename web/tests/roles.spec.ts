@@ -99,6 +99,33 @@ test("organisation access shows role names and describes what org roles can do",
   await expect(page.getByTestId("roles-intro")).toContainText("environment, folder, key or tag");
 });
 
+test("the only org admin binding cannot be removed, and removing your own admin role says it is yours", async ({ page }) => {
+  await page.goto("/org/access");
+  const mine = page.getByTestId("binding-row-user-sam@example.com-org-admin");
+  await mine.getByTestId("binding-remove").click();
+  const dialog = page.getByTestId("binding-remove-confirm");
+  await expect(dialog).toContainText("sam@example.com is the only org admin");
+  await expect(dialog.getByTestId("binding-remove-description")).toContainText("Grant org admin to someone else first.");
+  await expect(dialog.getByTestId("confirm-action")).toHaveCount(0);
+  await dialog.getByTestId("confirm-cancel").click();
+
+  // With a second admin, removing your own is allowed but worded for you.
+  await page.getByTestId("binding-add").click();
+  const add = page.getByTestId("add-binding-dialog");
+  await add.getByTestId("binding-principal").click();
+  await page.getByTestId("binding-principal-search").fill("priya");
+  await page.getByTestId("principal-option-Priya Shah").click();
+  await add.getByTestId("binding-role").click();
+  await page.getByRole("option", { name: /org admin/i }).click();
+  await add.getByTestId("binding-submit").click();
+  await expect(page.getByTestId("binding-row-user-priya@example.com-org-admin")).toBeVisible();
+
+  await mine.getByTestId("binding-remove").click();
+  await expect(dialog).toContainText("Remove your own org admin role?");
+  await expect(dialog.getByTestId("binding-remove-description")).toContainText("You may lose access to this page");
+  await dialog.getByTestId("confirm-cancel").click();
+});
+
 test("built-in roles open read-only", async ({ page }) => {
   await page.goto("/projects/storefront/settings/roles");
   await page.getByTestId("role-actions-viewer").click();

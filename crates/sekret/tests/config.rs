@@ -1881,16 +1881,70 @@ async fn oidc_open_to_everyone_at_the_provider_is_warned_about() -> anyhow::Resu
             let stranger = sign_in(&server, &issuer, json!({"sub": "stranger"})).await?;
             assert!(stranger.session.is_none(), "{way:?} {option}: strangers are kept out");
         }
+        // No default role still leaves admin_groups, so the warning stays and is true.
         let no_role = sb
             .keyed(&key)
             .oidc(&issuer)?
             .set(way, "auth.default_org_role", "")
             .start()
             .await?;
-        assert!(!no_role.log().contains(OPEN_SIGN_IN), "{way:?}: {}", no_role.log());
+        let log = no_role.log();
+        assert!(
+            log.contains(OPEN_SIGN_IN) && log.contains("organisation admin") && !log.contains("becomes org-member"),
+            "{way:?}: {log}"
+        );
         let session = session_of(&no_role, &issuer, json!({"sub": format!("newcomer-{way:?}")})).await?;
         let (code, _) = no_role.get("/api/v1/identities", Auth::Session(&session)).await?;
         assert_eq!(code, StatusCode::FORBIDDEN, "{way:?}: a stranger gets no role");
+        let claimer = session_of(
+            &no_role,
+            &issuer,
+            json!({"sub": format!("claimer-{way:?}"), "groups": ["sekret-admin"]}),
+        )
+        .await?;
+        let (code, _) = no_role.get("/api/v1/identities", Auth::Session(&claimer)).await?;
+        assert_eq!(code, StatusCode::OK, "{way:?}: claiming the admin group is enough");
+        drop(no_role);
+
+        // Only with no default role and no group claims does nothing grant a stranger power.
+        let granting_nothing = sb
+            .keyed(&key)
+            .oidc(&issuer)?
+            .set(way, "auth.default_org_role", "")
+            .set_list(way, "oidc.group_claims", &[])
+            .start()
+            .await?;
+        assert!(
+            !granting_nothing.log().contains(OPEN_SIGN_IN),
+            "{way:?}: {}",
+            granting_nothing.log()
+        );
+        let claimer = session_of(
+            &granting_nothing,
+            &issuer,
+            json!({"sub": format!("claimer2-{way:?}"), "groups": ["sekret-admin"]}),
+        )
+        .await?;
+        let (code, _) = granting_nothing
+            .get("/api/v1/identities", Auth::Session(&claimer))
+            .await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{way:?}: group claims are ignored");
+        drop(granting_nothing);
+
+        let no_admin_groups = sb
+            .keyed(&key)
+            .oidc(&issuer)?
+            .set(way, "auth.default_org_role", "")
+            .set_list(way, "oidc.admin_groups", &[])
+            .start()
+            .await?;
+        let log = no_admin_groups.log();
+        assert!(
+            log.contains(OPEN_SIGN_IN)
+                && log.contains("any role bound to a group")
+                && !log.contains("organisation admin"),
+            "{way:?}: group bindings still grant roles: {log}"
+        );
     }
 
     // Only the winning value counts: the environment's role beats the file's empty one.
@@ -1899,6 +1953,7 @@ async fn oidc_open_to_everyone_at_the_provider_is_warned_about() -> anyhow::Resu
         .oidc(&issuer)?
         .set(Way::File, "auth.default_org_role", "")
         .set(Way::Env, "auth.default_org_role", "org-member")
+        .set_list(Way::File, "oidc.group_claims", &[])
         .start()
         .await?;
     assert!(overridden.log().contains(OPEN_SIGN_IN), "{}", overridden.log());
@@ -1908,10 +1963,21 @@ async fn oidc_open_to_everyone_at_the_provider_is_warned_about() -> anyhow::Resu
         .oidc(&issuer)?
         .set(Way::Env, "auth.default_org_role", "org-member")
         .set(Way::Flag, "auth.default_org_role", "")
+        .set_list(Way::File, "oidc.group_claims", &[])
         .start()
         .await?;
     assert!(!flag_wins.log().contains(OPEN_SIGN_IN), "{}", flag_wins.log());
     drop(flag_wins);
+    let env_claims_win = sb
+        .keyed(&key)
+        .oidc(&issuer)?
+        .set(Way::Flag, "auth.default_org_role", "")
+        .set_list(Way::File, "oidc.group_claims", &[])
+        .set_list(Way::Env, "oidc.group_claims", &["groups"])
+        .start()
+        .await?;
+    assert!(env_claims_win.log().contains(OPEN_SIGN_IN), "{}", env_claims_win.log());
+    drop(env_claims_win);
 
     let no_oidc = sb.keyed(&key).start().await?;
     assert!(!no_oidc.log().contains(OPEN_SIGN_IN), "no issuer, no warning");
@@ -2227,6 +2293,38 @@ fn passphrase_db_with_known_key(sb: &Sandbox) -> anyhow::Result<(String, String)
     Ok((key, admin))
 }
 
+/// A new root key file that others can read is warned about before it is used.
+#[cfg(unix)]
+#[test]
+fn rotate_root_key_warns_about_an_exposed_new_key_file() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new()?;
+    let pass = sb.passphrase_file()?;
+    sb.passphrase_db("manual")?;
+    let key = sb.root_key("root.key")?;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+    let output = sb.cli(
+        &[
+            "admin",
+            "rotate-root-key",
+            "--database-url",
+            &sb.db(),
+            "--new-root-key-file",
+            &key,
+            "--passphrase-file",
+            &pass,
+        ],
+        &[],
+        None,
+    )?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("sekret: warning: the root key file") && text.contains("other users can read it"),
+        "{text}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn root_key_file_is_an_emergency_way_into_passphrase_mode() -> anyhow::Result<()> {
     for way in WAYS {
@@ -2427,7 +2525,7 @@ fn mark_in(path: &Path) -> anyhow::Result<(i64, Vec<String>)> {
     let text = std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
     let mut words = text.split_whitespace().skip(1);
     let epoch = words.next().context("epoch")?.parse().context("epoch")?;
-    Ok((epoch, words.map(String::from).collect()))
+    Ok((epoch, words.filter(|w| *w != "migrated").map(String::from).collect()))
 }
 
 const FOREIGN_MARK: &str = "sekret-seal-epoch 1 0123456789abcdef\n";
@@ -3889,6 +3987,49 @@ async fn backup_temp_dir_is_where_backups_are_staged() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Another user who can swap the staging directory could read or plant the database snapshot.
+#[cfg(unix)]
+#[tokio::test]
+async fn backup_temp_dir_others_can_swap_is_refused() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        let open = sb.path("open");
+        std::fs::create_dir(&open).context("dir")?;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let below = open.join("private");
+        std::fs::create_dir(&below).context("dir")?;
+        std::fs::set_permissions(&below, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        for dir in [sb.p("open"), below.display().to_string(), sb.p("open/not-yet")] {
+            let log = sb.keyed(&key).set(way, "backup.temp_dir", &dir).refused().await?;
+            assert!(
+                log.contains("backup.temp_dir") && log.contains("not safe for staging"),
+                "{way:?} {dir}: {log}"
+            );
+        }
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).context("chmod")?;
+        let sticky = sb
+            .keyed(&key)
+            .set(way, "backup.temp_dir", &sb.p("open"))
+            .start()
+            .await?;
+        drop(sticky);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).context("chmod")?;
+        let server = sb
+            .keyed(&key)
+            .set(way, "backup.temp_dir", &below.display().to_string())
+            .start()
+            .await?;
+        let admin = sb.bootstrap(&key)?;
+        let (code, _) = server
+            .call(Method::POST, "/api/v1/sys/backup", Auth::Bearer(&admin), None)
+            .await?;
+        assert_eq!(code, StatusCode::OK, "{way:?}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn auth_cli_login_max_auth_age_must_be_positive() -> anyhow::Result<()> {
     for way in WAYS {
@@ -4297,6 +4438,22 @@ async fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Res
         .start()
         .await?;
     assert!(server.log().contains(WARNING), "{}", server.log());
+    drop(server);
+    // So does one further up, by swapping the private directory below it.
+    let nested = open.join("conf");
+    std::fs::create_dir(&nested).context("dir")?;
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+    let deep = nested.join("sekret.yaml");
+    std::fs::write(&deep, "auth:\n  default_org_role: org-member\n").context("write")?;
+    std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let deep = deep.display().to_string();
+    let server = sb.keyed(&key).arg(&format!("--config={deep}")).start().await?;
+    let log = server.log();
+    assert!(log.contains(WARNING) && log.contains("is below"), "{log}");
+    drop(server);
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).context("chmod")?;
+    let server = sb.keyed(&key).arg(&format!("--config={deep}")).start().await?;
+    assert!(!server.log().contains(WARNING), "{}", server.log());
     Ok(())
 }
 

@@ -590,6 +590,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /** @description Newest first, one page at a time. A page shorter than `limit` is the last; otherwise pass the oldest version returned as `before` for the next. */
         get: operations["list_versions"];
         put?: never;
         post?: never;
@@ -2406,6 +2407,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `last_org_admin`: nobody else holds org-admin */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     list_org_roles: {
@@ -3037,9 +3047,12 @@ export interface operations {
         parameters: {
             query?: {
                 path?: string;
-                recursive?: boolean;
                 /** @description Include decrypted values where permitted. */
                 values?: boolean;
+                /** @description Versions to return, newest first: 100 by default, at most 200. */
+                limit?: number | null;
+                /** @description Only versions older than this one, to fetch the page after one ending at `before`. */
+                before?: number | null;
             };
             header?: never;
             path: {
@@ -3506,7 +3519,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Another backup is running */
+            /** @description Another backup is running, or this caller has taken six in the last hour */
             429: {
                 headers: {
                     [name: string]: unknown;

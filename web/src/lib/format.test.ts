@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  durationText,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -7,10 +8,11 @@ import {
   formatExpiry,
   formatRelative,
   initials,
+  parseDuration,
   slugify,
   UNKNOWN_DATE,
 } from "./format";
-import { crumbs, folderLabel, isValidFolderName, joinPath, normalisePath, parentPath } from "./paths";
+import { crumbs, folderFromLink, folderLabel, isValidFolderName, joinPath, MAX_PATH_LENGTH, normalisePath, parentPath } from "./paths";
 
 describe("formatDuration", () => {
   it("formats common TTLs compactly", () => {
@@ -90,6 +92,38 @@ describe("text helpers", () => {
   });
 });
 
+describe("parseDuration", () => {
+  it.each([
+    ["3600", 3600],
+    [" 90 ", 90],
+    ["30m", 1800],
+    ["1h", 3600],
+    ["1H", 3600],
+    ["90d", 90 * 86400],
+    ["2w", 14 * 86400],
+    ["1y", 365 * 86400],
+    ["1h 30m", 5400],
+    ["1h30m", 5400],
+    ["0", 0],
+  ])("reads %j as %d seconds", (text, seconds) => {
+    expect(parseDuration(text)).toBe(seconds);
+  });
+
+  it.each(["", "soon", "1.5h", "-5", "h", "1x", "1h soon", "99999999999999999999"])("refuses %j", (text) => {
+    expect(parseDuration(text)).toBeNull();
+  });
+});
+
+describe("durationText", () => {
+  it("uses the largest unit that divides exactly, so it reads back the same", () => {
+    expect(durationText(86400)).toBe("1d");
+    expect(durationText(3600)).toBe("1h");
+    expect(durationText(5400)).toBe("90m");
+    expect(durationText(90)).toBe("90");
+    for (const seconds of [1, 59, 60, 3601, 86400 * 400]) expect(parseDuration(durationText(seconds))).toBe(seconds);
+  });
+});
+
 describe("paths", () => {
   it("normalises, joins and walks up", () => {
     expect(normalisePath("")).toBe("/");
@@ -107,6 +141,23 @@ describe("paths", () => {
       { name: "a", path: "/a" },
       { name: "b", path: "/a/b" },
     ]);
+  });
+
+  it("builds breadcrumbs for a very deep path in linear time", () => {
+    const deep = "/a".repeat(20_000);
+    const started = performance.now();
+    const trail = crumbs(deep);
+    expect(trail).toHaveLength(20_001);
+    expect(trail[trail.length - 1].path).toBe(deep);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("falls back to the top folder for a link the server would refuse", () => {
+    expect(folderFromLink(null)).toBe("/");
+    expect(folderFromLink("/app//db/")).toBe("/app/db");
+    expect(folderFromLink(`/${"a".repeat(MAX_PATH_LENGTH - 1)}`)).toBe(`/${"a".repeat(MAX_PATH_LENGTH - 1)}`);
+    expect(folderFromLink("/a".repeat(32_000))).toBe("/");
+    expect(folderFromLink(`/${"a".repeat(MAX_PATH_LENGTH)}`)).toBe("/");
   });
 
   it("names the top folder / in copy, like its subfolders", () => {

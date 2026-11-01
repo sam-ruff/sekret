@@ -1876,11 +1876,15 @@ impl Store for SqlStore {
         row.as_ref().map(secret_with_version_from).transpose()
     }
 
-    async fn list_versions(&self, secret_id: &str) -> StoreResult<Vec<SecretVersion>> {
-        let rows = sqlx::query("SELECT * FROM secret_versions WHERE secret_id = $1 ORDER BY version DESC")
-            .bind(secret_id)
-            .fetch_all(&self.pool)
-            .await?;
+    async fn list_versions(&self, secret_id: &str, before: Option<i64>, limit: i64) -> StoreResult<Vec<SecretVersion>> {
+        let rows = sqlx::query(
+            "SELECT * FROM secret_versions WHERE secret_id = $1 AND version < $2 ORDER BY version DESC LIMIT $3",
+        )
+        .bind(secret_id)
+        .bind(before.unwrap_or(i64::MAX))
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter()
             .map(|row| version_from(row, secret_id.to_string(), "deleted", "created_at"))
             .collect()

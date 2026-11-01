@@ -13,6 +13,32 @@ test("settings tabs that do not fit show an arrow that scrolls to them", async (
   await expect(page.getByTestId("tabs-scroll-right")).toHaveCount(0);
 });
 
+test("toasts sit at the bottom on pages and move to the top only while a drawer is open", async ({ page }) => {
+  test.skip(!isMobile(page), "Mobile layout only");
+  const height = page.viewportSize()?.height ?? 0;
+  const toastTop = async (text: string) => {
+    const toast = page.locator("[data-sonner-toast]").filter({ hasText: text }).first();
+    await expect(toast).toBeVisible();
+    return (await toast.boundingBox())?.y ?? -1;
+  };
+
+  await page.goto("/projects");
+  await page.getByTestId("new-project").click();
+  await page.getByTestId("project-name").fill("Toasty");
+  await page.getByTestId("create-project-submit").click();
+  await expect(page.getByTestId("page-title")).toBeVisible();
+  // Below the page title, so it never hides it.
+  expect(await toastTop("Created Toasty")).toBeGreaterThan(height / 2);
+
+  await page.goto("/projects/storefront/secrets/dev");
+  await page.getByTestId("secret-row-LOG_LEVEL").getByTestId("secret-key").click();
+  await page.getByTestId("history-values-toggle").click();
+  await page.getByTestId("rollback-1").click();
+  await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
+  // The drawer keeps its actions at the bottom, so here the toast goes above them.
+  expect(await toastTop("Rolled LOG_LEVEL back to version 1")).toBeLessThan(height / 2);
+});
+
 test("the sidebar becomes a sheet on narrow screens", async ({ page }) => {
   test.skip(!isMobile(page), "Mobile layout only");
   await page.goto("/projects/storefront/secrets/dev");

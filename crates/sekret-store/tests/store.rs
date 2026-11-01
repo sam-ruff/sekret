@@ -195,8 +195,19 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
         3
     );
 
-    let versions = store.list_versions("s1").await.context("versions")?;
+    let versions = store.list_versions("s1", None, 100).await.context("versions")?;
     assert_eq!(versions.iter().map(|v| v.version).collect::<Vec<_>>(), [2, 1]);
+    let newest = store.list_versions("s1", None, 1).await.context("first page")?;
+    assert_eq!(newest.iter().map(|v| v.version).collect::<Vec<_>>(), [2]);
+    let older = store.list_versions("s1", Some(2), 1).await.context("next page")?;
+    assert_eq!(older.iter().map(|v| v.version).collect::<Vec<_>>(), [1]);
+    assert!(
+        store
+            .list_versions("s1", Some(1), 1)
+            .await
+            .context("past the end")?
+            .is_empty()
+    );
     assert_eq!(
         versions.iter().map(|v| v.generated).collect::<Vec<_>>(),
         [true, false],

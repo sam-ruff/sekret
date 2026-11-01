@@ -87,6 +87,21 @@ pub fn terminal_safe(text: &str) -> String {
     out
 }
 
+/// JSON text with the C1 controls and bidirectional overrides serde_json leaves raw written as
+/// `\uXXXX` escapes, so it reads the same to a parser but cannot rewrite the terminal.
+pub fn terminal_safe_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && c != '\t' && c != '\r' && is_unprintable(c) {
+            // Every such character is in the Basic Multilingual Plane, so one escape is enough.
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn is_unprintable(c: char) -> bool {
     c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
@@ -307,6 +322,11 @@ pub struct ClientOptions {
 }
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Versions asked for per history request; the server allows at most 200.
+const VERSION_PAGE: usize = 200;
+/// The most history versions fetched for one secret.
+const MAX_VERSIONS: usize = 100_000;
 
 /// Joins a PEM certificate chain and a PEM private key into the form `identity_pem` expects.
 /// Both or neither must be given.
@@ -633,13 +653,35 @@ impl SekretApi for HttpClient {
     }
 
     async fn versions(&self, at: Location, key: String, values: bool) -> ClientResult<Vec<SecretVersion>> {
-        let query = [("path", at.path.clone()), ("values", values.to_string())];
-        self.send(
-            Method::GET,
-            self.secrets_url(&at, &["secrets", &key, "versions"], &query)?,
-            None,
-        )
-        .await
+        let mut all: Vec<SecretVersion> = Vec::new();
+        let mut before: Option<i64> = None;
+        loop {
+            let mut query = vec![
+                ("path", at.path.clone()),
+                ("values", values.to_string()),
+                ("limit", VERSION_PAGE.to_string()),
+            ];
+            if let Some(before) = before {
+                query.push(("before", before.to_string()));
+            }
+            let page: Vec<SecretVersion> = self
+                .send(
+                    Method::GET,
+                    self.secrets_url(&at, &["secrets", &key, "versions"], &query)?,
+                    None,
+                )
+                .await?;
+            let last = page.last().map(|v| v.version);
+            let full = page.len() == VERSION_PAGE;
+            all.extend(page);
+            // A server that keeps answering the same page would otherwise loop for ever.
+            match last {
+                Some(oldest) if full && before.is_none_or(|b| oldest < b) && all.len() < MAX_VERSIONS => {
+                    before = Some(oldest);
+                }
+                _ => return Ok(all),
+            }
+        }
     }
 
     async fn rollback(&self, at: Location, key: String, version: i64) -> ClientResult<BatchResult> {
@@ -774,6 +816,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_safe_json_escapes_c1_controls_and_bidi_overrides() -> anyhow::Result<()> {
+        let value = json!({"v": "a\u{85}b\u{9b}c\u{7f}d\u{202e}e\u{2066}f\u{200f}g é ✓", "n": 1});
+        let text = serde_json::to_string_pretty(&value)?;
+        let safe = terminal_safe_json(&text);
+        assert_eq!(terminal_safe(&safe), safe, "{safe}");
+        assert!(
+            safe.contains("\\u0085") && safe.contains("\\u202e") && safe.contains("é ✓"),
+            "{safe}"
+        );
+        assert!(safe.contains('\n'), "layout is kept");
+        let parsed: serde_json::Value = serde_json::from_str(&safe)?;
+        assert_eq!(parsed, value);
+        Ok(())
+    }
+
+    #[test]
     fn oversized_client_certificate_files_are_refused() -> anyhow::Result<()> {
         let path = std::env::temp_dir().join(format!("sekret-client-big-{}.pem", std::process::id()));
         std::fs::write(&path, vec![b'a'; (PEM_LIMIT + 1) as usize]).context("write")?;
@@ -812,6 +870,55 @@ mod tests {
             .await;
         let raw = client(&server, Some("skt_x"))?.raw(at(), true).await.context("raw")?;
         assert_eq!(raw.secrets[0].value, "1");
+        Ok(())
+    }
+
+    fn version_json(version: i64) -> serde_json::Value {
+        json!({"version": version, "value": null, "value_hidden": false, "deleted": false,
+            "comment": "", "tags": [], "actor": "a", "created_at": 0})
+    }
+
+    #[tokio::test]
+    async fn history_follows_every_page() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let versions = |range: std::ops::RangeInclusive<i64>| range.rev().map(version_json).collect::<Vec<_>>();
+        let url = "/api/v1/projects/app/environments/prod/secrets/A/versions";
+        Mock::given(method("GET"))
+            .and(path(url))
+            .and(query_param("before", "51"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(versions(1..=50)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(url))
+            .and(wiremock::matchers::query_param_is_missing("before"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(versions(51..=250)))
+            .mount(&server)
+            .await;
+        let all = client(&server, None)?
+            .versions(at(), "A".into(), false)
+            .await
+            .context("versions")?;
+        assert_eq!(all.len(), 250);
+        assert_eq!(all.first().map(|v| v.version), Some(250));
+        assert_eq!(all.last().map(|v| v.version), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_stops_when_a_server_repeats_a_page() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let page: Vec<_> = (1..=200).rev().map(version_json).collect();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let all = client(&server, None)?
+            .versions(at(), "A".into(), false)
+            .await
+            .context("versions")?;
+        assert_eq!(all.len(), 400);
         Ok(())
     }
 

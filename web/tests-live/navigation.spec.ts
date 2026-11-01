@@ -4,7 +4,7 @@ import { addSecret, createProject, unique } from "./helpers";
 test("missing projects, environments and identities offer a way back", async ({ page }) => {
   const missing = unique("no-such-project");
   await page.goto(`/projects/${missing}/secrets`);
-  await expect(page.getByTestId("project-missing")).toContainText(`There is no project called ${missing}`);
+  await expect(page.getByTestId("project-missing")).toContainText(`There is no project called "${missing}"`);
   await expect(page.getByRole("navigation", { name: "Location" })).not.toContainText(missing);
   await page.getByTestId("project-missing-back").click();
   await expect(page).toHaveURL(/\/projects$/);

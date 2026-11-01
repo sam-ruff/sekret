@@ -36,10 +36,23 @@ export function describeGenerator(generator: Generator | null | undefined): stri
   return `${g.length} ${CHARSET_NOUNS[g.charset ?? "alphanumeric"]} characters`;
 }
 
+const PLAIN_CHARSETS: Record<Charset, string> = {
+  alphanumeric: "random letters and digits",
+  symbols: "random letters, digits and symbols",
+  hex: "random hex characters",
+  base64url: "random base64url characters",
+  numeric: "random digits",
+};
+
+/** "32 random letters and digits", for copy aimed at newcomers. */
+export function plainGenerator(generator: Generator): string {
+  return `${generator.length} ${PLAIN_CHARSETS[generator.charset ?? "alphanumeric"]}`;
+}
+
 /** The drawer's generator line, which must not claim a generator is set when only the built-in default would apply. */
 export function describeEffectiveGenerator(generator: Generator | null | undefined): string {
   if (generator) return `Generates ${describeGenerator(generator)}`;
-  return `No generator set; Rotate now would use the built-in default of ${describeGenerator(null)}`;
+  return `No generator chosen. Rotating now makes ${plainGenerator(DEFAULT_GENERATOR)}.`;
 }
 
 export function describeRotation(days: number | null | undefined): string {

@@ -14,7 +14,7 @@ interface MaxLifetimeFieldProps {
   help: (seconds: number) => ReactNode;
 }
 
-/** The longest token lifetime an auth method accepts, in whole seconds. */
+/** The longest token lifetime an auth method accepts, as seconds or with a unit such as 1h. */
 export function MaxLifetimeField({ idPrefix, label, value, disabled, onChange, help }: MaxLifetimeFieldProps) {
   const id = `${idPrefix}-max-lifetime`;
   const seconds = parseLifetime(value);
@@ -23,7 +23,6 @@ export function MaxLifetimeField({ idPrefix, label, value, disabled, onChange, h
       <FieldLabel htmlFor={id}>{label}</FieldLabel>
       <Input
         id={id}
-        inputMode="numeric"
         value={value}
         disabled={disabled}
         className="w-full font-mono sm:w-40"
@@ -34,7 +33,7 @@ export function MaxLifetimeField({ idPrefix, label, value, disabled, onChange, h
       />
       {seconds === null ? (
         <FieldError id={`${id}-error`} data-testid={`${id}-error`}>
-          Enter a whole number of seconds, from 1 up to 10 years.
+          Enter a duration such as 3600, 30m, 1h or 7d, from 1 second up to 10 years.
         </FieldError>
       ) : (
         <FieldDescription id={`${id}-help`} data-testid={`${id}-help`}>

@@ -61,7 +61,15 @@ pub async fn plan_generated(
     let generator = match generator {
         Some(g) => g,
         None => {
-            let existing = ctx.store.get_secret(&env.id, path, key).await?;
+            // A hidden secret's own policy must not change the answer; the write refuses it anyway.
+            let existing = ctx.store.get_secret(&env.id, path, key).await?.filter(|s| {
+                crate::authz::allowed(
+                    rules,
+                    sekret_core::permissions::Subject::Secrets,
+                    sekret_core::permissions::Action::Read,
+                    &crate::secrets::secret_resource(&env.slug, path, key, &s.version.tags),
+                )
+            });
             let policy = match existing {
                 Some(s) => effective_policy(project, &s.secret)?,
                 None => project_policy(project)?,

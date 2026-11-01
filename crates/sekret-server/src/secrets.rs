@@ -138,7 +138,24 @@ fn normalise_tags(tags: Vec<String>) -> ApiResult<Vec<String>> {
     Ok(tags)
 }
 
+/// Whether the caller may see a secret at this place carrying `tags`.
+fn readable(rules: &[Rule], env: &Environment, path: &str, key: &str, tags: &[String]) -> bool {
+    allowed(
+        rules,
+        Subject::Secrets,
+        Action::Read,
+        &secret_resource(&env.slug, path, key, tags),
+    )
+}
+
+/// A secret the caller cannot read is answered as missing, so a write cannot confirm it exists.
+fn not_found(key: &str) -> ApiError {
+    ApiError::not_found(&format!("secret {key}"))
+}
+
 /// Works out the versions an upsert/delete batch creates, checking permissions per secret.
+/// Every write also needs `read` on its secret, and a secret that fails that answers exactly as
+/// one that does not exist.
 pub async fn plan_batch(
     ctx: &SecretCtx<'_>,
     rules: &[Rule],
@@ -170,8 +187,14 @@ pub async fn plan_batch(
 
     for upsert in upserts {
         validate::secret_value(&upsert.value)?;
+        validate::comment(&upsert.comment)?;
         let existing = ctx.store.get_secret(&env.id, &path, &upsert.key).await?;
         let live = existing.as_ref().filter(|s| !s.secret.deleted);
+        if let Some(current) = live
+            && !readable(rules, env, &path, &upsert.key, &current.version.tags)
+        {
+            return Err(not_found(&upsert.key));
+        }
         let tags = match (upsert.tags, live) {
             (Some(tags), _) => normalise_tags(tags)?,
             (None, Some(current)) => current.version.tags.clone(),
@@ -217,6 +240,10 @@ pub async fn plan_batch(
                 result.updated.push(upsert.key.clone());
             }
             None => {
+                // Refused like a hidden secret, so a folder the caller cannot read stays silent.
+                if !readable(rules, env, &path, &upsert.key, &tags) {
+                    return Err(not_found(&upsert.key));
+                }
                 require(
                     rules,
                     Subject::Secrets,
@@ -254,8 +281,10 @@ pub async fn plan_batch(
 
     for key_name in deletes {
         let existing = ctx.store.get_secret(&env.id, &path, &key_name).await?;
-        let Some(current) = existing.filter(|s| !s.secret.deleted) else {
-            return Err(ApiError::not_found(&format!("secret {key_name}")));
+        let Some(current) =
+            existing.filter(|s| !s.secret.deleted && readable(rules, env, &path, &key_name, &s.version.tags))
+        else {
+            return Err(not_found(&key_name));
         };
         require(
             rules,
@@ -465,6 +494,8 @@ pub fn snapshot_changes(current: &[SecretWithVersion], snapshot: &Snapshot, path
     changes
 }
 
+/// Plans restoring `snapshot` under `path`. `current` holds only the secrets there the caller
+/// may read, deleted ones included, so a restore never touches or names a hidden secret.
 pub async fn plan_restore(
     ctx: &SecretCtx<'_>,
     rules: &[Rule],
@@ -472,10 +503,10 @@ pub async fn plan_restore(
     env: &Environment,
     snapshot: &Snapshot,
     path: &str,
+    current: &[SecretWithVersion],
 ) -> ApiResult<PlannedWrite> {
     let path = validate::folder_path(path)?;
-    let current = ctx.store.list_secrets(&env.id, &path, true, true).await?;
-    let plan = snapshot_changes(&current, snapshot, &path);
+    let plan = snapshot_changes(current, snapshot, &path);
     let by_key: HashMap<(&str, &str), &SecretWithVersion> = current
         .iter()
         .map(|s| ((s.secret.path.as_str(), s.secret.key.as_str()), s))
@@ -493,6 +524,9 @@ pub async fn plan_restore(
         let Some(s) = by_key.get(&(change.path.as_str(), change.key.as_str())) else {
             continue;
         };
+        if !readable(rules, env, &s.secret.path, &s.secret.key, &s.version.tags) {
+            continue;
+        }
         let resource = secret_resource(&env.slug, &s.secret.path, &s.secret.key, &s.version.tags);
         // Snapshot conditions apply to every secret touched, not only the folder named in the request.
         require(rules, Subject::Snapshots, Action::Edit, &resource)?;
@@ -840,7 +874,7 @@ mod tests {
         let rules = vec![Rule {
             effect: sekret_core::permissions::Effect::Allow,
             subject: Subject::Secrets,
-            actions: vec![Action::Create],
+            actions: vec![Action::Read, Action::Create],
             conditions: Conditions {
                 paths: vec!["/app/**".into()],
                 ..Default::default()
@@ -856,6 +890,102 @@ mod tests {
             plan_batch(&c, &rules, &project, &env, "/other", vec![upsert("A", "x")], vec![])
                 .await
                 .is_err()
+        );
+        Ok(())
+    }
+
+    /// Developer, but secrets under `/payments` cannot be read.
+    fn payments_hidden() -> Vec<Rule> {
+        let mut rules = BuiltinRole::Developer.rules();
+        rules.push(Rule {
+            effect: sekret_core::permissions::Effect::Deny,
+            subject: Subject::Secrets,
+            actions: vec![Action::Read, Action::ReadValue],
+            conditions: Conditions {
+                paths: vec!["/payments/**".into()],
+                ..Default::default()
+            },
+        });
+        rules
+    }
+
+    async fn status_of(
+        existing: Option<SecretWithVersion>,
+        upserts: Vec<SecretUpsert>,
+        deletes: Vec<String>,
+    ) -> anyhow::Result<Option<axum::http::StatusCode>> {
+        let (root, project, env) = fixture()?;
+        let mut store = MockStore::new();
+        store.expect_get_secret().returning(move |_, _, _| Ok(existing.clone()));
+        store.expect_write_secrets().never();
+        let planned = plan_batch(
+            &ctx(&store, &root),
+            &payments_hidden(),
+            &project,
+            &env,
+            "/payments",
+            upserts,
+            deletes,
+        )
+        .await;
+        Ok(planned.err().map(|e| e.status))
+    }
+
+    #[tokio::test]
+    async fn hidden_secrets_answer_writes_exactly_as_missing_ones() -> anyhow::Result<()> {
+        let (root, project, _) = fixture()?;
+        let hidden = stored(&project, &root, "STRIPE_KEY", "live", 2, false)?;
+        let not_found = Some(axum::http::StatusCode::NOT_FOUND);
+        for existing in [Some(hidden), None] {
+            let present = existing.is_some();
+            assert_eq!(
+                status_of(existing.clone(), vec![upsert("STRIPE_KEY", "x")], vec![]).await?,
+                not_found,
+                "upsert, present: {present}"
+            );
+            assert_eq!(
+                status_of(existing, vec![], vec!["STRIPE_KEY".into()]).await?,
+                not_found,
+                "delete, present: {present}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restores_leave_out_secrets_the_caller_cannot_read() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut open = stored(&project, &root, "OPEN", "x", 2, false)?;
+        let mut hidden = stored(&project, &root, "STRIPE_KEY", "x", 2, false)?;
+        hidden.secret.path = "/payments".into();
+        open.secret.path = "/".into();
+        let snapshot = Snapshot {
+            id: "s".into(),
+            environment_id: "e1".into(),
+            entries: vec![],
+            reason: String::new(),
+            actor: String::new(),
+            created_at: 0,
+        };
+        let store = MockStore::new();
+        let planned = api(
+            plan_restore(
+                &ctx(&store, &root),
+                &payments_hidden(),
+                &project,
+                &env,
+                &snapshot,
+                "/",
+                &[open, hidden],
+            )
+            .await,
+            "plan",
+        )?;
+        assert_eq!(planned.result.deleted, vec!["/OPEN".to_string()]);
+        let changes = planned.batch.context("batch")?.changes;
+        assert!(
+            changes.iter().all(|c| c.key == "OPEN"),
+            "the hidden secret is untouched"
         );
         Ok(())
     }

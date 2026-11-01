@@ -249,6 +249,7 @@ async fn create_identity(
         Action::Create,
     )?;
     validate::name(&request.name)?;
+    validate::description(&request.description)?;
     let ttl = request.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
     let max_ttl = request.token_max_ttl.unwrap_or(DEFAULT_TOKEN_MAX_TTL.max(ttl));
     check_ttls(ttl, max_ttl)?;
@@ -299,6 +300,7 @@ async fn update_identity(
 ) -> ApiResult<Json<Identity>> {
     require_any(&org_rules(&state, &principal).await?, Subject::Identities, Action::Edit)?;
     validate::name(&request.name)?;
+    validate::description(&request.description)?;
     check_ttls(request.token_ttl, request.token_max_ttl)?;
     check_cidrs(&request.trusted_cidrs)?;
     let mut identity = load_identity(&state, &id).await?;
@@ -315,6 +317,8 @@ async fn update_identity(
             .store
             .revoke_principal_tokens(PrincipalKind::Identity, &id)
             .await?;
+    } else {
+        shorten_tokens(&state, &identity).await?;
     }
     audit(
         &state,
@@ -326,6 +330,31 @@ async fn update_identity(
     )
     .await;
     Ok(Json(api_identity(&state, identity).await?))
+}
+
+/// When a token would expire under the identity's lifetimes as they are now: no more than one
+/// `token_ttl` from now, and no later than `token_max_ttl` after it was minted.
+fn shortened_expiry(token: &sekret_store::AccessToken, identity: &sekret_store::Identity, now: i64) -> i64 {
+    token
+        .expires_at
+        .min(now.saturating_add(identity.token_ttl))
+        .min(token.created_at.saturating_add(identity.token_max_ttl))
+}
+
+/// Applies lowered lifetimes to tokens already issued, so they do not wait for a renewal.
+async fn shorten_tokens(state: &AppState, identity: &sekret_store::Identity) -> ApiResult<()> {
+    let now = state.clock.now();
+    let tokens = state
+        .store
+        .list_principal_tokens(PrincipalKind::Identity, &identity.id)
+        .await?;
+    for token in tokens.iter().filter(|t| !t.revoked && t.expires_at > now) {
+        let expires_at = shortened_expiry(token, identity, now);
+        if expires_at < token.expires_at {
+            state.store.extend_token(&token.id, expires_at).await?;
+        }
+    }
+    Ok(())
 }
 
 #[utoipa::path(delete, path = "/api/v1/identities/{id}", tag = "organisation", params(("id" = String, Path)),
@@ -515,6 +544,7 @@ async fn create_client_secret(
     require_any(&org_rules(&state, &principal).await?, Subject::Identities, Action::Edit)?;
     let identity = load_identity(&state, &id).await?;
     ensure_covers_identity(&state, &principal, &identity).await?;
+    validate::description(&request.description)?;
     if request.ttl.is_some_and(|t| !(1..=MAX_LIFETIME).contains(&t)) {
         return Err(ApiError::bad_request(
             "ttl must be between 1 second and 10 years; leave it out for a secret that never expires",
@@ -705,7 +735,9 @@ async fn add_binding(
 }
 
 #[utoipa::path(delete, path = "/api/v1/org/bindings/{kind}/{id}/{role}", tag = "organisation",
-    params(("kind" = String, Path), ("id" = String, Path), ("role" = String, Path)), responses((status = 204)), security(("bearer" = [])))]
+    params(("kind" = String, Path), ("id" = String, Path), ("role" = String, Path)),
+    responses((status = 204), (status = 409, description = "`last_org_admin`: nobody else holds org-admin", body = sekret_api::ErrorBody)),
+    security(("bearer" = [])))]
 async fn remove_binding(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -718,6 +750,13 @@ async fn remove_binding(
     if !may_remove(&rules, &org_role_rules(&state, &role).await.unwrap_or_default()) {
         return Err(removal_escalation());
     }
+    if leaves_no_admin(&state, kind, &id, &role).await? {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_org_admin",
+            "this is the last organisation admin; grant org-admin to someone else first",
+        ));
+    }
     state.store.remove_org_binding(kind, &id, &role).await?;
     audit(
         &state,
@@ -729,6 +768,31 @@ async fn remove_binding(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether removing this binding would leave nobody who can administer the organisation. Admins
+/// named by the identity provider's groups still count, so the binding may go when those exist.
+async fn leaves_no_admin(state: &AppState, kind: PrincipalKind, id: &str, role: &str) -> ApiResult<bool> {
+    let admin = sekret_core::permissions::BuiltinRole::OrgAdmin.slug();
+    if role != admin {
+        return Ok(false);
+    }
+    let provider_admins = state
+        .config
+        .oidc
+        .as_ref()
+        .is_some_and(|o| !o.admin_groups.is_empty() && !o.group_claims.is_empty());
+    if provider_admins {
+        return Ok(false);
+    }
+    let others = state
+        .store
+        .list_org_bindings()
+        .await?
+        .into_iter()
+        .filter(|b| b.role_slug == admin)
+        .any(|b| !(b.principal_kind == kind && b.principal_id == id));
+    Ok(!others)
 }
 
 #[utoipa::path(get, path = "/api/v1/org/roles", tag = "organisation", responses((status = 200, body = Vec<Role>)), security(("bearer" = [])))]

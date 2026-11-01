@@ -48,8 +48,16 @@ fn open_dir(dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(open)
 }
 
-/// Runs `args` with `{file}` replaced by a file holding `contents`, as it is mode 0644, mode 0600
-/// and mode 0600 in an open directory, and checks which runs warn.
+#[derive(Debug, Clone, Copy)]
+enum Place {
+    Private,
+    Open,
+    /// A private directory inside an open one, which anyone can swap.
+    BelowOpen,
+}
+
+/// Runs `args` with `{file}` replaced by a file holding `contents`, as it is mode 0644, mode 0600,
+/// and mode 0600 in or below an open directory, and checks which runs warn.
 fn check_warnings(
     args: &[&str],
     env: &[(&str, &str)],
@@ -57,17 +65,23 @@ fn check_warnings(
     prepare: &dyn Fn(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let cases = [
-        (0o644, false, Some(READABLE)),
-        (0o600, false, None),
-        (0o600, true, Some(REPLACEABLE)),
+        (0o644, Place::Private, Some(READABLE)),
+        (0o600, Place::Private, None),
+        (0o600, Place::Open, Some(REPLACEABLE)),
+        (0o600, Place::BelowOpen, Some(REPLACEABLE)),
     ];
-    for (mode, in_open_dir, expected) in cases {
+    for (mode, place, expected) in cases {
         let dir = tempfile::tempdir().context("dir")?;
         prepare(dir.path())?;
-        let home = if in_open_dir {
-            open_dir(dir.path())?
-        } else {
-            dir.path().to_path_buf()
+        let home = match place {
+            Place::Private => dir.path().to_path_buf(),
+            Place::Open => open_dir(dir.path())?,
+            Place::BelowOpen => {
+                let private = open_dir(dir.path())?.join("private");
+                std::fs::create_dir(&private).context("mkdir")?;
+                std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+                private
+            }
         };
         let file = write(&home.join("secret"), contents, mode)?;
         let args: Vec<&str> = args
@@ -82,7 +96,7 @@ fn check_warnings(
         match expected {
             Some(warning) => assert!(
                 text.contains("sekret: warning:") && text.contains(warning) && text.contains(&file),
-                "{args:?} {mode:o} {in_open_dir}: {text}"
+                "{args:?} {mode:o} {place:?}: {text}"
             ),
             None => assert!(!text.contains("sekret: warning:"), "{args:?} {mode:o}: {text}"),
         }
@@ -118,6 +132,52 @@ fn passphrase_files_others_can_read_or_replace_are_warned_about() -> anyhow::Res
         &format!("{PASSPHRASE}\n"),
         &nothing,
     )
+}
+
+/// Admin commands read the root key file the server would, so they warn about it the same way,
+/// however it is named.
+#[test]
+fn admin_commands_check_the_root_key_file() -> anyhow::Result<()> {
+    let missing_db = "sqlite://missing.db";
+    check_warnings(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            missing_db,
+            "--root-key-file",
+            "{file}",
+        ],
+        &[],
+        "not a key\n",
+        &nothing,
+    )?;
+    check_warnings(
+        &["admin", "rotate-root-key", "--database-url", missing_db],
+        &[("SEKRET_ROOT_KEY_FILE", "{file}")],
+        "not a key\n",
+        &nothing,
+    )?;
+    let dir = tempfile::tempdir().context("dir")?;
+    let key = write(&dir.path().join("root.key"), "not a key\n", 0o644)?;
+    let config = write(
+        &dir.path().join("sekret.yaml"),
+        &format!("database:\n  url: {missing_db}\nseal:\n  root_key_file: {key}\n"),
+        0o600,
+    )?;
+    let text = stderr(&run(&["admin", "bootstrap", "--config", &config], &[], dir.path())?);
+    assert!(
+        text.contains("sekret: warning:") && text.contains(READABLE) && text.contains(&key),
+        "{text}"
+    );
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+    let text = stderr(&run(&["admin", "bootstrap", "--config", &config], &[], dir.path())?);
+    assert!(
+        text.contains("sekret: warning:") && text.contains("decides who signs in"),
+        "a configuration file others can change: {text}"
+    );
+    Ok(())
 }
 
 #[test]

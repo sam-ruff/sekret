@@ -46,7 +46,14 @@ pub struct Inner {
     pub logo_limiter: RateLimiter<String>,
     /// CLI login polls per client address. Generous, as each waiting terminal polls every two seconds.
     pub poll_limiter: RateLimiter<IpAddr>,
+    /// Failed authentications per client address, keyed by [`crate::ratelimit::limiter_key`].
+    pub failed_auth_limiter: RateLimiter<IpAddr>,
+    /// Backups per principal, since each reads the whole database and saves a seal epoch.
+    pub backup_limiter: RateLimiter<String>,
 }
+
+/// Backups one principal may take each hour.
+pub const BACKUPS_PER_HOUR: u32 = 6;
 
 /// Polls allowed per address each minute: a handful of terminals waiting at once.
 pub const CLI_POLLS_PER_MINUTE: u32 = 120;
@@ -93,5 +100,7 @@ pub fn build_state(deps: Dependencies) -> AppState {
         refusals: crate::ratelimit::AuditThrottle::default(),
         logo_limiter: RateLimiter::new(crate::api::logo::LOGO_UPLOADS_PER_MINUTE),
         poll_limiter: RateLimiter::new(CLI_POLLS_PER_MINUTE),
+        failed_auth_limiter: RateLimiter::new(crate::FAILED_AUTH_PER_MINUTE),
+        backup_limiter: RateLimiter::per_hour(BACKUPS_PER_HOUR),
     })
 }

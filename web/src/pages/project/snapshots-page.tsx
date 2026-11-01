@@ -78,6 +78,14 @@ function SnapshotSheet({
   const path = normalisePath(useDebouncedValue(folder, 400));
   const id = snapshot?.id ?? "";
 
+  // Existing folders are offered as suggestions, so a typo is less likely to compare nothing.
+  const folders = useQuery({
+    queryKey: ["project", project, "folders", env],
+    queryFn: () => api.folders(project, env),
+    enabled: snapshot !== null,
+  });
+  const folderPaths = ["/", ...(folders.data ?? []).map((f) => f.path).filter((p) => p !== "/")].slice(0, 500);
+
   const detail = useQuery({
     queryKey: keys.snapshot(project, env, id, path),
     queryFn: () => api.snapshot(project, env, id, path),
@@ -110,7 +118,7 @@ function SnapshotSheet({
     >
       <SheetContent
         ref={content}
-        className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl"
+        className="w-full gap-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl"
         // Focusing the folder field first would open the on-screen keyboard over the changes.
         onOpenAutoFocus={(event) => {
           event.preventDefault();
@@ -133,17 +141,23 @@ function SnapshotSheet({
                 id="restore-path"
                 value={folder}
                 className="font-mono"
+                list="restore-path-folders"
+                autoComplete="off"
                 onChange={(e) => {
                   setFolder(e.target.value || "/");
                   setShownRows(ROW_PAGE);
                 }}
                 data-testid="restore-path"
               />
+              <datalist id="restore-path-folders" data-testid="restore-path-folders">
+                {folderPaths.map((p) => (
+                  <option key={p} value={p} />
+                ))}
+              </datalist>
               <FieldDescription>
                 Only secrets in this folder and below are compared and restored. <span className="font-mono">/</span> is
                 the top folder, so it covers everything.
-              </FieldDescription>
-            </Field>
+              </FieldDescription>            </Field>
             <section className="space-y-2">
               <h3 className="text-sm font-semibold">What restoring would change</h3>
               {detail.isPending && <ListSkeleton rows={3} />}

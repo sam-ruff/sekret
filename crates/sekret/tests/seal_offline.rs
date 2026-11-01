@@ -5,7 +5,9 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::Context;
 use sekret_core::crypto::RootKey;
-use sekret_core::seal::{SealFlags, SealMode, UnlockPolicy, unwrap_root_key, wrap_root_key};
+use sekret_core::seal::{
+    SealBinding, SealFlags, SealMode, UnlockPolicy, seal_config_mac, unwrap_root_key, wrap_root_key,
+};
 use sekret_server::seal::{Signature, accepted_roots, check_signature, high_water, record_epoch, signed};
 use sekret_store::{SealConfig, SqlStore, Store};
 
@@ -113,7 +115,7 @@ async fn rolled_forward() -> anyhow::Result<(Fixture, SealConfig)> {
         high_water(&marks).floor(),
     )?;
     fixture.store().await?.update_seal_config(manual.clone()).await?;
-    record_epoch(&marks, manual.epoch, &root.fingerprint())?;
+    record_epoch(&marks, manual.epoch, &root.pin()?)?;
     Ok((fixture, granting))
 }
 
@@ -551,6 +553,133 @@ async fn set_seal_mode_refuses_an_existing_key_file_before_changing_anything() -
     assert_eq!(config.mode, SealMode::KeyFile);
     assert!(!fixture.path().join("root.key.new").exists(), "moved into place");
     fixture.admin(&["bootstrap", "--root-key-file", "root.key"])?;
+    Ok(())
+}
+
+/// The demonstrated attack: with the stored epoch planted at the last one, `reset-epoch` could not
+/// sign above the marks, so it lowered every mark to 1, and an older signed configuration put
+/// back afterwards passed as sound.
+#[tokio::test]
+async fn reset_epoch_never_lowers_the_marks_for_a_planted_epoch() -> anyhow::Result<()> {
+    for planted in [i64::MAX, i64::MAX - 1] {
+        let (fixture, granting) = rolled_forward().await?;
+        let marks = fixture.marks();
+        let mark = high_water(&marks).highest.context("mark")?;
+        let tampered = SealConfig {
+            epoch: planted,
+            ..fixture.config().await?
+        };
+        fixture.store().await?.update_seal_config(tampered).await?;
+
+        let printed = fixture.admin(&["reset-epoch"])?;
+        assert!(printed.contains("failed its signature"), "{printed}");
+        let config = fixture.config().await?;
+        assert_eq!(config.epoch, mark + 1, "{planted}: started from the marks");
+        assert_eq!(high_water(&marks).highest, Some(mark + 1), "{planted}");
+
+        // The older copy is still a rollback afterwards, and grants nothing.
+        fixture.store().await?.update_seal_config(granting).await?;
+        let printed = fixture.admin(&["reset-epoch"])?;
+        assert!(printed.contains("older than the marks"), "{printed}");
+        assert_eq!(fixture.config().await?.unlock_policy, UnlockPolicy::Manual);
+    }
+    Ok(())
+}
+
+/// A planted mark just below the epoch limit stops every signature. Only `--lower-marks` lowers
+/// the marks, only when it has to, never for a configuration that fails its signature, and the
+/// record of the one-off migrations survives it.
+#[tokio::test]
+async fn only_lower_marks_lowers_the_marks() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let refused = fixture.admin_output(&["reset-epoch", "--lower-marks"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("have not"), "{shown}");
+
+    let marks = fixture.marks();
+    let sound = fixture.config().await?;
+    let root = Fixture::root(&sound)?;
+    let ceiling = sekret_core::seal::MAX_SEAL_EPOCH - 1;
+    std::fs::write(
+        &marks[0],
+        format!("sekret-seal-epoch {ceiling} {} migrated\n", root.pin()?),
+    )
+    .context("mark")?;
+    let refused = fixture.admin_output(&["reset-epoch"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("--lower-marks"), "{shown}");
+    assert_eq!(high_water(&marks).highest, Some(ceiling), "nothing was lowered");
+
+    let tampered = SealConfig {
+        unlock_policy: UnlockPolicy::Remember,
+        ..sound.clone()
+    };
+    fixture.store().await?.update_seal_config(tampered).await?;
+    let refused = fixture.admin_output(&["reset-epoch", "--lower-marks"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("fails its signature"), "{shown}");
+    assert_eq!(high_water(&marks).highest, Some(ceiling));
+
+    fixture.store().await?.update_seal_config(sound.clone()).await?;
+    let printed = fixture.admin(&["reset-epoch", "--lower-marks"])?;
+    assert!(printed.contains("lowered every epoch mark"), "{printed}");
+    let config = fixture.config().await?;
+    assert_eq!(config.epoch, sound.epoch + 1);
+    assert_eq!(check_signature(&root, &config), Signature::Valid);
+    assert_eq!(config.unlock_policy, UnlockPolicy::Manual);
+    let after = high_water(&marks);
+    assert_eq!(after.highest, Some(config.epoch));
+    assert!(after.migrated);
+    fixture.admin(&["bootstrap"])?;
+    Ok(())
+}
+
+/// The configuration as a version from before `wrap_form_signed` signed it, with no flags set.
+fn signed_before_the_wrap_form(root: &RootKey, config: SealConfig) -> anyhow::Result<SealConfig> {
+    let config = SealConfig {
+        flags: SealFlags::default(),
+        ..config
+    };
+    let fingerprint = root.fingerprint();
+    let binding = SealBinding {
+        mode: config.mode,
+        policy: config.unlock_policy,
+        fingerprint: &fingerprint,
+        epoch: config.epoch,
+        wrapped: config.wrapped.as_ref(),
+        remembered: config.remembered.as_deref(),
+        flags: config.flags,
+    };
+    let mac = seal_config_mac(root, &binding).context("mac")?;
+    Ok(SealConfig {
+        mac: Some(mac),
+        ..config
+    })
+}
+
+/// The demonstrated attack, offline: a configuration signed before `wrap_form_signed`, put back
+/// with the marks deleted, kept its cleared migration flags when a host command signed it again.
+#[tokio::test]
+async fn offline_commands_never_restart_the_migrations_for_a_replayed_configuration() -> anyhow::Result<()> {
+    for command in [&["rotate-root-key"][..], &["reset-epoch"][..]] {
+        let (fixture, _) = rolled_forward().await?;
+        let current = fixture.config().await?;
+        let root = Fixture::root(&current)?;
+        let replayed = signed_before_the_wrap_form(&root, current)?;
+        assert_eq!(check_signature(&root, &replayed), Signature::Valid);
+        fixture.store().await?.update_seal_config(replayed).await?;
+        for mark in fixture.marks() {
+            std::fs::remove_file(&mark).context("mark")?;
+        }
+        fixture.admin(command)?;
+        let signed_again = fixture.config().await?;
+        assert!(signed_again.flags.reviewer_tokens_migrated, "{command:?}");
+        assert!(signed_again.flags.credentials_keyed, "{command:?}");
+        assert!(high_water(&fixture.marks()).migrated, "{command:?}");
+    }
     Ok(())
 }
 

@@ -206,11 +206,6 @@ export function CliLoginPage() {
                 </AlertDescription>
               </Alert>
             )}
-            {outcome === "pending" && ended && (
-              <Button asChild variant="outline" className="w-full" data-testid="cli-go-home">
-                <Link to="/">Go to sekret</Link>
-              </Button>
-            )}
             {asking && signedInAgain && !reauthenticating && (
               <Alert data-testid="cli-signed-in-again">
                 <Info />
@@ -296,6 +291,11 @@ export function CliLoginPage() {
                     : "Nothing was approved."}
                 </AlertDescription>
               </Alert>
+            )}
+            {!asking && !reauthenticating && (
+              <Button asChild variant="outline" className="w-full" data-testid="cli-go-home">
+                <Link to="/">Go to sekret</Link>
+              </Button>
             )}
           </CardContent>
           {asking && (

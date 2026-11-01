@@ -7,7 +7,7 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
-import { formatDurationWords } from "@/lib/format";
+import { durationText, formatDurationWords } from "@/lib/format";
 import { DEFAULT_MAX_TOKEN_LIFETIME, outboundUrlProblem, parseLifetime } from "./identity-model";
 import { MaxLifetimeField } from "./max-lifetime-field";
 import { UrlField } from "./url-field";
@@ -40,7 +40,7 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
   const [audiences, setAudiences] = useState<string[]>(initial?.bindings.audiences ?? ["sekret"]);
   const [subjects, setSubjects] = useState<string[]>(initial?.bindings.subjects ?? []);
   const [claims, setClaims] = useState<ClaimRow[]>(() => claimRows(initial?.bindings.claims));
-  const [lifetime, setLifetime] = useState(String(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
+  const [lifetime, setLifetime] = useState(durationText(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
   const maxLifetime = parseLifetime(lifetime);
 
   const applyGithubPreset = () => {
@@ -150,6 +150,7 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
             <div className="min-w-0 flex-1">
               <ListInput
                 value={claim.globs}
+                ariaLabel={claim.name.trim() ? `Globs for claim ${claim.name.trim()}` : "Globs for this claim"}
                 onChange={(globs) => updateClaim(claim.id, { globs })}
                 mono
                 disabled={disabled}
@@ -183,7 +184,7 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
       </div>
       <MaxLifetimeField
         idPrefix="oidc"
-        label="Longest OIDC token accepted (seconds)"
+        label="Longest OIDC token accepted"
         value={lifetime}
         disabled={disabled}
         onChange={setLifetime}

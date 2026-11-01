@@ -20,6 +20,7 @@ import {
   parseAuditFilters,
   type AuditFilters,
 } from "@/lib/audit-filters";
+import { auditNames, useAuditDirectory } from "@/hooks/use-audit-names";
 import { actionLabel, describeDetail } from "@/lib/audit-labels";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { AuditToolbar } from "./audit-toolbar";
@@ -30,6 +31,8 @@ interface AuditLogProps {
   queryKey: readonly unknown[];
   fetchPage: (query: AuditQuery) => Promise<AuditPage>;
   scope: "project" | "org";
+  /** The project a project-scoped log belongs to, used to name members and roles. */
+  project?: string;
   environments?: Environment[];
   /**
    * Whether the reader sees every secret in the entries for this environment filter (or all of
@@ -55,7 +58,8 @@ function FilterChip({ label, value, onClear, testId }: { label: string; value: s
   );
 }
 
-export function AuditLog({ queryKey, fetchPage, scope, environments, seesEverything }: AuditLogProps) {
+export function AuditLog({ queryKey, fetchPage, scope, project, environments, seesEverything }: AuditLogProps) {
+  const directory = useAuditDirectory(scope === "project" ? project : undefined);
   const [params, setParams] = useSearchParams();
   const filters = useMemo(() => parseAuditFilters(params), [params]);
   const setFilters = useCallback(
@@ -73,6 +77,7 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
   });
 
   const entries = pages.data?.pages.flatMap((p) => p.entries) ?? [];
+  const names = auditNames(entries, directory);
   const total = pages.data?.pages[0]?.total ?? 0;
   const filtered = hasActiveFilters(filters);
   const actorName = entries.find((e) => e.actor_id === filters.actorId)?.actor_name ?? filters.actorId;
@@ -222,7 +227,7 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
               className: "md:max-w-72",
               cell: (e) => (
                 <span className="line-clamp-2 text-xs break-words text-muted-foreground" data-testid="audit-detail">
-                  {describeDetail(e.action, e.detail) || "-"}
+                  {describeDetail(e.action, e.detail, names) || "-"}
                 </span>
               ),
             },

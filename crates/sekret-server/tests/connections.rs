@@ -48,7 +48,7 @@ fn limits(header: u64, idle: u64, max: usize) -> ConnectionLimits {
 }
 
 /// Reads until the server closes the connection, or `within` passes.
-async fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+async fn closed_within(stream: &mut (impl AsyncReadExt + Unpin), within: Duration) -> bool {
     let mut buf = [0u8; 1024];
     let read_all = async {
         loop {
@@ -61,7 +61,7 @@ async fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
     tokio::time::timeout(within, read_all).await.is_ok()
 }
 
-async fn request(stream: &mut TcpStream, path: &str) -> anyhow::Result<String> {
+async fn request(stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin), path: &str) -> anyhow::Result<String> {
     let head = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     stream.write_all(head.as_bytes()).await.context("write")?;
     let mut buf = vec![0u8; 4096];
@@ -178,10 +178,52 @@ async fn one_client_cannot_hold_every_connection() -> anyhow::Result<()> {
 fn trusted_proxies_are_exempt_from_the_per_client_cap() -> anyhow::Result<()> {
     let proxy: ipnet::IpNet = "10.0.0.0/24".parse().context("net")?;
     let limits = ConnectionLimits::new(512).exempting(&[proxy]);
-    assert_eq!(limits.max_per_client, 128);
+    assert_eq!(limits.max_per_client, sekret_server::serve::MAX_PER_CLIENT);
     assert!(limits.exempt.contains(&proxy));
     let local: std::net::IpAddr = "127.0.0.1".parse().context("ip")?;
     assert!(limits.exempt.iter().any(|n| n.contains(&local)));
+    Ok(())
+}
+
+/// The host's unlock socket gets the same header timeout and a connection cap of its own.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_local_socket_has_header_and_connection_limits() -> anyhow::Result<()> {
+    use tokio::net::UnixStream;
+    let dir = tempfile::tempdir().context("dir")?;
+    let socket = |name: &str, limits: ConnectionLimits| -> anyhow::Result<std::path::PathBuf> {
+        let path = dir.path().join(name);
+        let listener = tokio::net::UnixListener::bind(&path).context("bind")?;
+        tokio::spawn(sekret_server::serve::serve_local(listener, app(), limits));
+        Ok(path)
+    };
+
+    let path = socket("strict.sock", limits(300, 5_000, 16))?;
+    let mut slow = UnixStream::connect(&path).await.context("connect")?;
+    slow.write_all(b"GET /fast HTTP/1.1\r\n").await.context("write")?;
+    assert!(
+        closed_within(&mut slow, Duration::from_secs(3)).await,
+        "headers that never finish are cut off"
+    );
+
+    let path = socket("capped.sock", limits(5_000, 5_000, 2))?;
+    let first = UnixStream::connect(&path).await.context("connect")?;
+    let mut second = UnixStream::connect(&path).await.context("connect")?;
+    assert!(request(&mut second, "/fast").await?.starts_with("HTTP/1.1 200"));
+    let mut third = UnixStream::connect(&path).await.context("connect")?;
+    third
+        .write_all(b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .context("write")?;
+    let mut buf = [0u8; 256];
+    let waited = tokio::time::timeout(Duration::from_millis(500), third.read(&mut buf)).await;
+    assert!(waited.is_err(), "a third connection waits while two are open");
+    drop(first);
+    let n = tokio::time::timeout(Duration::from_secs(5), third.read(&mut buf))
+        .await
+        .context("served once a slot frees")?
+        .context("read")?;
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
     Ok(())
 }
 

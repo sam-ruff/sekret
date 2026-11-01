@@ -54,6 +54,36 @@ struct ListParams {
     values: bool,
 }
 
+/// Versions a history page holds when the caller does not say.
+pub const DEFAULT_HISTORY_PAGE: u32 = 100;
+/// The most versions one history page may hold, so revealing values decrypts a bounded amount.
+pub const MAX_HISTORY_PAGE: u32 = 200;
+
+#[derive(Deserialize, IntoParams)]
+struct HistoryParams {
+    #[serde(default = "root")]
+    path: String,
+    /// Include decrypted values where permitted.
+    #[serde(default)]
+    values: bool,
+    /// Versions to return, newest first: 100 by default, at most 200.
+    limit: Option<u32>,
+    /// Only versions older than this one, to fetch the page after one ending at `before`.
+    before: Option<i64>,
+}
+
+impl HistoryParams {
+    fn page_size(&self) -> ApiResult<i64> {
+        match self.limit {
+            None => Ok(i64::from(DEFAULT_HISTORY_PAGE)),
+            Some(n @ 1..=MAX_HISTORY_PAGE) => Ok(i64::from(n)),
+            Some(_) => Err(ApiError::bad_request(format!(
+                "limit must be between 1 and {MAX_HISTORY_PAGE}"
+            ))),
+        }
+    }
+}
+
 #[derive(Deserialize, IntoParams)]
 struct KeyParams {
     #[serde(default = "root")]
@@ -355,15 +385,18 @@ async fn delete_secret(
 }
 
 #[utoipa::path(get, path = "/api/v1/projects/{project}/environments/{env}/secrets/{key}/versions", tag = "secrets",
-    params(("project" = String, Path), ("env" = String, Path), ("key" = String, Path), ListParams),
+    params(("project" = String, Path), ("env" = String, Path), ("key" = String, Path), HistoryParams),
+    description = "Newest first, one page at a time. A page shorter than `limit` is the last; otherwise pass the \
+        oldest version returned as `before` for the next.",
     responses((status = 200, body = Vec<SecretVersion>)), security(("bearer" = [])))]
 async fn list_versions(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     principal: Principal,
     Path((project, env, key)): Path<(String, String, String)>,
-    Query(params): Query<ListParams>,
+    Query(params): Query<HistoryParams>,
 ) -> ApiResult<Json<Vec<SecretVersion>>> {
+    let limit = params.page_size()?;
     let scope = scope(&state, &principal, &project, &env).await?;
     let (path, s) = load_history(&state, &scope, &params.path, &key).await?;
     let resource = secret_resource(&scope.env.slug, &path, &key, &s.version.tags);
@@ -376,7 +409,7 @@ async fn list_versions(
     let dk = data_key(state.keyring.root()?.as_ref(), &scope.project)?;
     let mut versions = Vec::new();
     let mut revealed_any = false;
-    for v in state.store.list_versions(&s.secret.id).await? {
+    for v in state.store.list_versions(&s.secret.id, params.before, limit).await? {
         // Each version is judged by its own tags as well, so retagging cannot expose old values.
         let own = secret_resource(&scope.env.slug, &path, &key, &v.tags);
         let reveal = reveal_current && may_reveal(&own);
@@ -759,8 +792,19 @@ async fn restore_snapshot(
     };
     require(&scope.rules, Subject::Snapshots, Action::Edit, &env_resource)?;
     let snapshot = load_snapshot(&state, &scope, &id).await?;
+    let current = state.store.list_secrets(&scope.env.id, &path, true, true).await?;
+    let readable = permitted(&scope.rules, &scope.env.slug, current, &[Action::Read]).await?;
     let ctx = secret_ctx(&state, &principal)?;
-    let planned = plan_restore(&ctx, &scope.rules, &scope.project, &scope.env, &snapshot, &path).await?;
+    let planned = plan_restore(
+        &ctx,
+        &scope.rules,
+        &scope.project,
+        &scope.env,
+        &snapshot,
+        &path,
+        &readable,
+    )
+    .await?;
     let result = apply(&ctx, planned).await?;
     audit(
         &state,

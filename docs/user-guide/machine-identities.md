@@ -2,9 +2,9 @@
 
 A machine identity is an account for software: a CI pipeline, a pod, an Ansible run. It holds roles like a person does, and it logs in by presenting a credential to one of its auth methods. A successful login returns a short-lived access token, one hour by default, that the machine uses like a person's token.
 
-Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. Renewals follow the identity's lifetimes as they are now, so lowering `token_max_ttl` also shortens tokens already issued. An identity can also have trusted CIDRs, shown as *Allowed networks* in the web interface, which limit where it can log in from and where its tokens can be used.
+Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. Renewals follow the identity's lifetimes as they are now. Lowering either lifetime also shortens tokens already issued, straight away and whether or not they are ever renewed: each then lasts at most `token_ttl` from the change and at most `token_max_ttl` from when it was issued. Raising them again does not give back the time taken off. An identity can also have trusted CIDRs, shown as *Allowed networks* in the web interface, which limit where it can log in from and where its tokens can be used.
 
-Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. The identity's *Usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. Disabling an identity revokes its tokens straight away.
+Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Lifetime fields there take a number of seconds or a unit, such as `30m`, `1h`, `7d` or `1h 30m`. The identity's *Usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. It also has example snippets, led by the ones for auth methods the identity has set up. Disabling an identity revokes its tokens straight away.
 
 There are three auth methods, and an identity can have any of them.
 
@@ -12,7 +12,7 @@ There are three auth methods, and an identity can have any of them.
 
 For anything that already has a signed token from an OIDC issuer: GitHub Actions, GitLab CI, a Keycloak service account, Forgejo Actions. sekret fetches the issuer's signing keys, checks the token's signature, issuer and lifetime, then checks the claims against the identity's bindings.
 
-Bindings need at least one audience, plus either subject patterns or claim patterns, so that a token for some other workload at the same issuer cannot get in. Patterns use `*` as a wildcard.
+Bindings need at least one audience, plus either subject patterns or claim patterns, so that a token for some other workload at the same issuer cannot get in. Patterns use `*` and `?` as wildcards, and each subject or claim pattern needs at least one ordinary character: `*` on its own would let any token from the issuer in, so it is refused when saved, and an auth method saved with one before refuses every login until it is fixed.
 
 Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to `exp`, are refused, as are tokens with no `iat`. The default is 3600, which suits CI tokens such as GitHub Actions', so a long-lived token that leaks from a build log cannot be traded for sekret tokens for days. It can be raised to at most ten years. In the web interface it is the "Longest OIDC token accepted" field on the identity's OIDC form.
 

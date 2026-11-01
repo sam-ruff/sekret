@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MockBackend, MockError } from "./backend";
+import { MAX_HISTORY_PAGE, MockBackend, MockError } from "./backend";
 import { emptyState } from "./seed";
 import { REDACTED_CREDENTIAL, type AuthMethodConfig } from "../types";
 
@@ -45,6 +45,21 @@ describe("mock backend", () => {
       [2, "2"],
       [1, "1"],
     ]);
+  });
+
+  it("pages history like the server, newest first, with a before cursor", () => {
+    const b = backend();
+    for (let i = 1; i <= 5; i++) at(b).write([{ key: "A", value: String(i) }]);
+    const page = (limit?: number, before?: number) =>
+      b.listVersions("app", "dev", "A", "/", false, { limit, before }).map((v) => v.version);
+    expect(page()).toEqual([5, 4, 3, 2, 1]);
+    expect(page(2)).toEqual([5, 4]);
+    expect(page(2, 4)).toEqual([3, 2]);
+    expect(page(2, 2)).toEqual([1]);
+    expect(page(2, 1)).toEqual([]);
+    expect(() => page(0)).toThrow(MockError);
+    expect(() => page(MAX_HISTORY_PAGE + 1)).toThrow(MockError);
+    expect(() => page(2, Number.NaN)).toThrow(MockError);
   });
 
   it("previews and restores a snapshot", () => {

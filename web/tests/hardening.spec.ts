@@ -343,6 +343,27 @@ test.describe("revealed values", () => {
   });
 });
 
+test("a link with a huge folder path opens the top folder instead of hanging the tab", async ({ page }) => {
+  // About as long as a URL the server accepts: tens of thousands of folder levels.
+  const hostile = "/a".repeat(30_000);
+  for (const where of ["overview", "secrets/dev"]) {
+    // The dev server refuses a URL this long, so it arrives the way an in-app navigation would.
+    await page.goto(`/projects/storefront/${where}`);
+    await expect(page.getByTestId("folder-breadcrumbs")).toBeVisible();
+    const started = Date.now();
+    await page.evaluate((url) => {
+      history.pushState(null, "", url);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, `/projects/storefront/${where}?path=${encodeURIComponent(hostile)}`);
+    await expect(page).toHaveURL(/path=/);
+    await expect(page.getByTestId("folder-breadcrumbs")).toBeVisible();
+    await expect(page.getByTestId("current-folder")).toHaveText("/");
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }
+  // The top folder's secrets, as if the link had named no folder.
+  await expect(secretRow(page, "DATABASE_URL")).toBeVisible();
+});
+
 test("a page restored from the back-forward cache reloads", async ({ page }) => {
   await page.goto("/projects");
   await expect(page.getByTestId("project-card-storefront")).toBeVisible();

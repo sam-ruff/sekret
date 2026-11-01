@@ -111,7 +111,7 @@ export function SecretRow({
               <TooltipTrigger asChild>
                 <span className="flex max-w-full items-center gap-1 truncate text-xs text-muted-foreground" data-testid="secret-comment">
                   <MessageSquare className="size-3 shrink-0" />
-                  <span className="truncate">{secret.comment}</span>
+                  <span className="truncate first-letter:uppercase">{secret.comment}</span>
                 </span>
               </TooltipTrigger>
               <TooltipContent>{secret.comment}</TooltipContent>

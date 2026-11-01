@@ -162,30 +162,31 @@ function SecretsView() {
   /** Keys hidden again by hand while everything else is revealed. */
   const [hiddenFromAll, setHiddenFromAll] = useState<Set<string>>(new Set());
   const [search, setSearch] = useSearchParams();
-  /** The key the new secret form starts with, or null while the form is closed. */
+  /** The key the new secret form starts with, or null while the form is closed. An empty `?add=` opens it blank. */
   const [adding, setAdding] = useState<string | null>(() => {
     const key = search.get("add");
-    return key !== null && isValidSecretKey(key) ? key : null;
+    return key !== null && (key === "" || isValidSecretKey(key)) ? key : null;
   });
   const [shownRows, setShownRows] = useState(ROW_PAGE);
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [drawerKey, setDrawerKey] = useState<string | null>(null);
-  const [importing, setImporting] = useState(false);
+  const [importing, setImporting] = useState(() => search.get("import") === "1");
   const [newFolder, setNewFolder] = useState(false);
   const [deletingFolder, setDeletingFolder] = useState<string | null>(null);
   /** What had focus before a drawer or dialog opened from a row menu, whose item is gone by the time it closes. */
   const returnFocus = useRef<HTMLElement | null>(null);
   const rotateReturnFocus = useRef<HTMLElement | null>(null);
 
-  // The prefilled key has been read; a reload should not open the form again.
+  // The prefilled key or import request has been read; a reload should not open the form again.
   useEffect(() => {
-    if (!search.has("add")) return;
+    if (!search.has("add") && !search.has("import")) return;
     setSearch(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("add");
+        next.delete("import");
         return next;
       },
       { replace: true },
@@ -649,7 +650,7 @@ function SecretsView() {
           )}
 
           <ImportEnvDialog
-            open={importing}
+            open={importing && canCreateSecret && list.isSuccess}
             onOpenChange={setImporting}
             project={project}
             env={envSlug}

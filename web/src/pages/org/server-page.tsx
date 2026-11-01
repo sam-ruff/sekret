@@ -257,6 +257,15 @@ function UnlockPolicyCard({
     },
     success: "Unlock policy saved",
   });
+  // A typed passphrase is cleared when nobody is using the page, like the change-passphrase card.
+  const typed = passphrase !== "";
+  useSealWatch(typed);
+  useIdle(confirming && typed, () => {
+    setPassphrase("");
+    setConfirming(false);
+    if (!save.isPending) save.reset();
+    toast.info("Closed the policy dialog after three idle minutes.");
+  });
   const forget = useApiMutation({
     mutationFn: api.forgetUnlock,
     onSuccess: (next) => queryClient.setQueryData(keys.sysStatusDetail, next),
@@ -606,7 +615,12 @@ const BACKUP_RESTORE_NEEDS: Record<SealMode | "unknown", string> = {
 function BackupCard({ mode }: { mode: SealMode | null }) {
   const download = useApiMutation({
     mutationFn: api.backup,
-    onSuccess: ({ blob, filename }) => saveFile(blob, filename),
+    gcTime: 0,
+    onSuccess: ({ blob, filename }) => {
+      saveFile(blob, filename);
+      // Drop the blob so a copy of the database does not sit in memory while the page is open.
+      download.reset();
+    },
   });
 
   return (

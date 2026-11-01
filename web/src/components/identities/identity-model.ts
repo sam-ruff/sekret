@@ -1,4 +1,5 @@
 import { REDACTED_CREDENTIAL } from "@/api/types";
+import { parseDuration } from "@/lib/format";
 
 export interface IdentityDraft {
   name: string;
@@ -8,10 +9,13 @@ export interface IdentityDraft {
   trustedCidrs: string[];
 }
 
+/** How a duration field explains what it accepts. */
+export const DURATION_FORMAT = "a duration such as 3600, 30m, 1h or 7d";
+
 export function ttlProblem(draft: IdentityDraft): string | undefined {
-  const ttl = Number(draft.tokenTtl);
-  const max = Number(draft.tokenMaxTtl);
-  if (!Number.isInteger(ttl) || !Number.isInteger(max)) return "Lifetimes are whole numbers of seconds";
+  const ttl = parseDuration(draft.tokenTtl);
+  const max = parseDuration(draft.tokenMaxTtl);
+  if (ttl === null || max === null) return `Enter each lifetime as ${DURATION_FORMAT}`;
   if (ttl < 60) return "The token lifetime must be at least 60 seconds";
   if (max < ttl) return "The longest renewed lifetime cannot be shorter than the token lifetime";
   if (max > 365 * 24 * 3600) return "The longest renewed lifetime can be at most a year";
@@ -24,12 +28,10 @@ export const DEFAULT_MAX_TOKEN_LIFETIME = 3600;
 /** The longest `max_token_lifetime` the server accepts: ten years. */
 export const MAX_TOKEN_LIFETIME_LIMIT = 10 * 365 * 86_400;
 
-/** Whole seconds from one up to ten years, or null when the text is not that. */
+/** A duration from one second up to ten years, or null when the text is not that. */
 export function parseLifetime(text: string): number | null {
-  const trimmed = text.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const seconds = Number(trimmed);
-  return Number.isSafeInteger(seconds) && seconds >= 1 && seconds <= MAX_TOKEN_LIFETIME_LIMIT ? seconds : null;
+  const seconds = parseDuration(text);
+  return seconds !== null && seconds >= 1 && seconds <= MAX_TOKEN_LIFETIME_LIMIT ? seconds : null;
 }
 
 /** IPv4 dotted quad from the last 32 bits of an IPv4-mapped IPv6 address, as URL parsing writes it. */

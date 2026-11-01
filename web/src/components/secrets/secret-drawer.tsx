@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueries } from "@tanstack/react-query";
 import { Eye, EyeOff, History, Lock, RotateCcw, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { api } from "@/api/endpoints";
@@ -11,13 +11,14 @@ import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useOptionalQuery, useSealWatch } from "@/hooks/queries";
+import { Spinner } from "@/components/ui/spinner";
+import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useSealWatch } from "@/hooks/queries";
 import { useIdle } from "@/hooks/use-idle";
 import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel } from "@/lib/paths";
 import { cn } from "@/lib/utils";
-import { sameContent } from "@/lib/versions";
+import { HISTORY_PAGE, mergeHistory, nextHistoryCursor, sameContent } from "@/lib/versions";
 import { PolicySection } from "./policy-section";
 
 interface SecretDrawerProps {
@@ -98,7 +99,7 @@ function VersionDiff({ versions }: { versions: SecretVersion[] }) {
               )}
               data-kind={line.kind}
             >
-              <span className="mr-2 inline-block w-3 select-none opacity-60">
+              <span className="mr-2 inline-block w-3 select-none">
                 {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
               </span>
               {line.text || " "}
@@ -173,7 +174,7 @@ function VersionItem({
           </Button>
         )}
       </div>
-      {version.comment && <p className="text-sm text-muted-foreground">{version.comment}</p>}
+      {version.comment && <p className="text-sm text-muted-foreground first-letter:uppercase">{version.comment}</p>}
       {!version.deleted && (
         <div
           className="min-w-0 truncate rounded-md bg-muted/60 px-2 py-1 font-mono text-xs"
@@ -222,22 +223,39 @@ export function SecretDrawer({
   const showValues = location !== null && valuesFor === location;
 
   const historyKey = keys.versions(project, env, path, secretKey ?? "");
-  const loadVersions = async (values: boolean) => {
-    const list = await api.versions(at, secretKey ?? "", values);
+  const loadPage = async (values: boolean, before: number | undefined) => {
+    const list = await api.versions(at, secretKey ?? "", { values, before, limit: HISTORY_PAGE });
     return [...list].sort((a, b) => b.version - a.version);
   };
-  const versions = useQuery({
+  // History is fetched a page at a time, so a secret written thousands of times stays quick to open.
+  const versions = useInfiniteQuery({
     queryKey: historyKey,
-    queryFn: () => loadVersions(false),
+    queryFn: ({ pageParam }) => loadPage(false, pageParam),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: nextHistoryCursor,
     enabled: secretKey !== null,
     gcTime: SECRET_VALUE_GC_TIME,
   });
-  // Every reveal asks the server, so each one is audited and a revoked reader sees nothing stale.
-  const withValues = useOptionalQuery(
-    showValues
-      ? { queryKey: [...historyKey, "values"], queryFn: () => loadVersions(true), staleTime: 0, gcTime: SECRET_VALUE_GC_TIME }
-      : null,
-  );
+  // Values are fetched for exactly the pages loaded. Every reveal asks the server, so each one is
+  // audited and a revoked reader sees nothing stale; hiding them drops every observer.
+  const cursors = versions.data?.pageParams ?? [];
+  const valuePages = useQueries({
+    queries: showValues
+      ? cursors.map((before) => ({
+          queryKey: [...historyKey, "values", before ?? "newest"],
+          queryFn: () => loadPage(true, before as number | undefined),
+          staleTime: 0,
+          gcTime: SECRET_VALUE_GC_TIME,
+        }))
+      : [],
+  });
+  const withValues = showValues
+    ? {
+        isPending: valuePages.some((q) => q.isPending),
+        error: valuePages.find((q) => q.error)?.error ?? null,
+        refetch: () => Promise.all(valuePages.filter((q) => q.error).map((q) => q.refetch())),
+      }
+    : undefined;
   useSealWatch(showValues);
   useIdle(showValues, () => setValuesFor(null));
 
@@ -252,14 +270,14 @@ export function SecretDrawer({
     success: (_, version) => `Rolled ${secretKey} back to version ${version}`,
   });
 
-  const revealed = showValues ? withValues?.data : undefined;
-  const list = revealed ?? versions.data ?? [];
+  const { revealed, list } = mergeHistory(versions.data?.pages ?? [], showValues ? valuePages.map((q) => q.data) : []);
   const currentVersion = list[0]?.version;
+  const loadingOlder = versions.isFetchingNextPage || (revealed !== undefined && !!withValues?.isPending);
 
   return (
     <Sheet open={secretKey !== null} onOpenChange={(open) => !open && close()}>
       <SheetContent
-        className="w-full gap-0 data-[side=right]:w-full sm:max-w-xl"
+        className="w-full gap-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl"
         onCloseAutoFocus={onCloseAutoFocus}
         data-testid="secret-drawer"
       >
@@ -275,7 +293,9 @@ export function SecretDrawer({
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
             {versions.isPending && <ListSkeleton rows={3} />}
-            {versions.error && <ErrorState error={versions.error} onRetry={() => void versions.refetch()} />}
+            {versions.error && !versions.isFetchNextPageError && (
+              <ErrorState error={versions.error} onRetry={() => void versions.refetch()} />
+            )}
             {list.length > 0 && (
               <>
                 <section className="space-y-3">
@@ -298,21 +318,39 @@ export function SecretDrawer({
                       the audit log.
                     </p>
                   )}
-                  {withValues?.isPending && <ListSkeleton rows={1} />}
+                  {withValues?.isPending && !revealed && <ListSkeleton rows={1} />}
                   {withValues?.error && <ErrorState error={withValues.error} onRetry={() => void withValues.refetch()} />}
                   <ol className="space-y-2" data-testid="version-list">
-                    {list.map((v) => (
+                    {list.map((v, index) => (
                       <VersionItem
                         key={v.version}
                         version={v}
                         current={v.version === currentVersion}
-                        shown={revealed !== undefined}
+                        shown={revealed !== undefined && index < revealed.length}
                         canRollback={canRollback}
-                        sameAsCurrent={revealed !== undefined && sameContent(v, revealed[0])}
+                        sameAsCurrent={revealed !== undefined && index < revealed.length && sameContent(v, revealed[0])}
                         onRollback={() => setTarget(v.version)}
                       />
                     ))}
                   </ol>
+                  {versions.hasNextPage && (
+                    <div className="flex flex-wrap items-center justify-center gap-3 text-sm text-muted-foreground">
+                      <span data-testid="history-shown-count">Showing the newest {list.length} versions</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={loadingOlder || versions.isFetchingNextPage}
+                        onClick={() => void versions.fetchNextPage()}
+                        data-testid="history-load-older"
+                      >
+                        {loadingOlder && <Spinner />}
+                        Load older versions
+                      </Button>
+                    </div>
+                  )}
+                  {versions.isFetchNextPageError && (
+                    <ErrorState error={versions.error} onRetry={() => void versions.fetchNextPage()} />
+                  )}
                 </section>
                 {revealed && revealed.filter((v) => !v.deleted).length > 1 && (
                   <section className="space-y-3" data-testid="compare-section">
@@ -331,7 +369,7 @@ export function SecretDrawer({
           open={target !== null}
           onOpenChange={(open) => !open && setTarget(null)}
           title={`Roll back to version ${target}?`}
-          description={`This writes a new version of ${secretKey} with the value and tags from version ${target}. Its comment becomes "rolled back to version ${target}" followed by that version's comment. Nothing is lost; the current value stays in history.`}
+          description={`This writes a new version of ${secretKey} with the value and tags from version ${target}. Its comment becomes "Rolled back to version ${target}" followed by that version's comment. Nothing is lost; the current value stays in history.`}
           confirmLabel="Roll back"
           onConfirm={() => rollback.mutateAsync(target ?? 0)}
           testId="rollback-confirm"

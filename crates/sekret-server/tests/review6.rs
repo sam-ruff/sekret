@@ -295,7 +295,7 @@ async fn auth_methods_cannot_point_at_cloud_metadata(db: String) -> anyhow::Resu
     let h = start(options(db)).await?;
     let (_, identity) = h.post("/api/v1/identities", &h.admin, json!({"name": "ssrf"})).await?;
     let id = identity["id"].as_str().context("id")?.to_string();
-    let bindings = json!({"audiences": ["sekret"], "subjects": ["*"]});
+    let bindings = json!({"audiences": ["sekret"], "subjects": ["repo:org/*"]});
     for (kind, config) in [
         (
             "oidc",

@@ -27,6 +27,8 @@ pub enum CryptoError {
     Random,
     #[error("key derivation failed")]
     Kdf,
+    #[error("the seal configuration epoch has reached its limit, which only tampering with the epoch marks can cause")]
+    EpochExhausted,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -131,6 +133,12 @@ impl RootKey {
                 .pin()
                 .is_ok_and(|pin| constant_time_eq(recorded.as_bytes(), pin.as_bytes())),
         }
+    }
+
+    /// Whether `recorded` names this key by its full-length pin. A short fingerprint from before
+    /// pins does not count, since another key with the same 64 bits can be searched for.
+    pub fn is_pinned_by(&self, recorded: &str) -> bool {
+        recorded.len() != FINGERPRINT_HEX_LEN && self.is_named_by(recorded)
     }
 
     pub fn to_base64(&self) -> Zeroizing<String> {
@@ -497,6 +505,9 @@ mod tests {
         assert!(!other.is_named_by(&pin));
         assert!(!other.is_named_by(&root.fingerprint()));
         assert!(!root.is_named_by(&pin[..32]));
+        assert!(root.is_pinned_by(&pin));
+        assert!(!root.is_pinned_by(&root.fingerprint()), "64 bits pin nothing");
+        assert!(!other.is_pinned_by(&pin));
         Ok(())
     }
 

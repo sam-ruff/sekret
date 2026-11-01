@@ -2,8 +2,8 @@ import { ArrowDown, ArrowUp, Layers, Pencil, Plus, Trash2 } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { api } from "@/api/endpoints";
 import type { Environment } from "@/api/types";
-import { ConfirmDialog } from "@/components/confirm-dialog";
 import { FormBlocker } from "@/components/form-blocker";
+import { DeleteEnvironmentDialog } from "@/components/settings/delete-environment-dialog";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Button } from "@/components/ui/button";
 import {
@@ -247,14 +247,11 @@ export function EnvironmentsSection({ project, perms }: { project: string; perms
           }
         />
       )}
-      <ConfirmDialog
-        open={deleting !== null}
-        onOpenChange={(open) => !open && setDeleting(null)}
-        title={`Delete ${deleting?.name}?`}
-        description="Every secret, version and snapshot in this environment is deleted for good. This cannot be undone."
-        confirmLabel="Delete environment"
-        destructive
-        onConfirm={() => remove.mutateAsync(deleting as Environment)}
+      <DeleteEnvironmentDialog
+        project={project}
+        env={deleting}
+        onClose={() => setDeleting(null)}
+        onDelete={(env) => remove.mutateAsync(env)}
       />
     </div>
   );

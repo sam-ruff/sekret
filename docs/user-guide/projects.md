@@ -8,7 +8,7 @@ Inside a project, every secret lives in exactly one environment and one folder. 
 sekret projects create billing --name Billing --environment dev --environment prod
 ```
 
-An environment can only be deleted once it holds no secrets, because deleting it also deletes every version and snapshot inside it. Delete or move the secrets first.
+An environment can only be deleted once it holds no secrets, because deleting it also deletes every version and snapshot inside it. Delete or move the secrets first. In the web interface, deleting an empty environment asks you to type its ID, as deleting a project does.
 
 ## Folders
 

@@ -8,8 +8,9 @@ use sekret_api::SysStatus;
 use sekret_core::crypto::{CryptoError, IntegrityKey, RootKey};
 use sekret_core::seal::{
     DeviceKey, MAX_PASSPHRASE_BYTES, PassphraseError, SealBinding, SealFlags, SealMode, SealState, UnlockPolicy,
-    UnsealedBy, Unwrapped, WrappedRootKey, generate_setup_code, recall_root_key, remember_root_key, seal_config_mac,
-    setup_code_matches, unwrap_root_key_checked, validate_passphrase, verify_seal_config, wrap_root_key,
+    UnsealedBy, Unwrapped, WrappedRootKey, generate_setup_code, plausible_epoch, recall_root_key, remember_root_key,
+    seal_config_mac, setup_code_matches, unwrap_root_key_checked, validate_passphrase, verify_seal_config,
+    wrap_root_key,
 };
 use sekret_store::{AuditEntry, INTEGRITY_KEY_META, SealConfig, Store, StoreError};
 use tokio::sync::{OwnedSemaphorePermit, RwLockReadGuard, RwLockWriteGuard, Semaphore};
@@ -18,8 +19,8 @@ use zeroize::Zeroizing;
 use crate::config::SealSettings;
 use crate::error::{ApiError, ApiResult};
 use crate::files::{
-    EpochMark, SECRET_FILE_LIMIT, read_epoch, read_limited, read_mark, read_private, remove_device_key_file,
-    write_mark, write_new_private,
+    EpochMark, SECRET_FILE_LIMIT, read_limited, read_mark, read_private, remove_device_key_file, write_mark,
+    write_new_private,
 };
 use crate::{ROOT_KEY_META, StartupError};
 
@@ -417,7 +418,11 @@ fn binding<'a>(fingerprint: &'a str, config: &'a SealConfig) -> SealBinding<'a> 
 
 /// The epoch after both `epoch` and `floor`, the highest mark recorded outside the database.
 pub fn next_epoch(epoch: i64, floor: i64) -> Result<i64, CryptoError> {
-    epoch.max(floor).checked_add(1).ok_or(CryptoError::Malformed)
+    let next = epoch.max(floor).checked_add(1).ok_or(CryptoError::EpochExhausted)?;
+    if !plausible_epoch(next) {
+        return Err(CryptoError::EpochExhausted);
+    }
+    Ok(next)
 }
 
 /// Moves the configuration past its own epoch and `floor`, then signs it with `root`.
@@ -429,6 +434,24 @@ pub fn signed(root: &RootKey, mut config: SealConfig, floor: i64) -> Result<Seal
     Ok(config)
 }
 
+/// The refusal for epochs that have reached their limit, which only a planted mark can cause.
+pub fn epoch_exhausted() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::CONFLICT,
+        "seal_epoch_exhausted",
+        "the seal epoch has reached its limit, which only tampering with an epoch mark can cause; stop the server \
+         and run `sekret admin reset-epoch --lower-marks` on the host",
+    )
+}
+
+/// [`signed`] for a request, with the epoch limit reported as such rather than as an internal error.
+pub fn sign(root: &RootKey, config: SealConfig, floor: i64) -> ApiResult<SealConfig> {
+    signed(root, config, floor).map_err(|error| match error {
+        CryptoError::EpochExhausted => epoch_exhausted(),
+        other => other.into(),
+    })
+}
+
 /// The flags for a configuration that is being reset after tampering or a rollback, or signed for
 /// the first time: whatever the stored copy says, nothing is migrated again and a remember secret
 /// stays required until `forget-unlock`, since the stored flag may have been cleared.
@@ -438,6 +461,43 @@ pub fn cautious_flags(flags: SealFlags) -> SealFlags {
         remember_secret: true,
         wrap_form_signed: flags.wrap_form_signed,
         credentials_keyed: true,
+    }
+}
+
+/// Whether every one-off migration has run, or been ruled out, under these flags.
+pub fn migrations_done(flags: SealFlags) -> bool {
+    flags.reviewer_tokens_migrated && flags.credentials_keyed
+}
+
+/// Whether a configuration that passed [`verify_config`] would start a one-off migration it must
+/// not. A mark may say they already ran. Or it was signed before the wrap's form was, when
+/// deleting the marks was not yet noticed, and no mark names a root key: it may be an old copy
+/// put back with the marks deleted.
+fn replayed_migration(config: &SealConfig, marks: HighWater) -> bool {
+    let unvouched = !config.flags.wrap_form_signed && !marks.named;
+    !migrations_done(config.flags) && (marks.migrated || unvouched)
+}
+
+/// The flags a configuration keeps when it is signed again, given what [`verify_config`] found.
+pub fn kept_flags(config: &SealConfig, verdict: Result<bool, Distrust>, marks: HighWater) -> SealFlags {
+    match verdict {
+        Ok(false) if !replayed_migration(config, marks) => config.flags,
+        _ => cautious_flags(config.flags),
+    }
+}
+
+/// A configuration that failed its checks, reset to grant no unlock and start no migration. A
+/// tampered one's epoch was chosen by whoever changed it, so it starts again from the marks.
+pub fn distrusted(config: SealConfig, distrust: Distrust, marks: HighWater) -> SealConfig {
+    SealConfig {
+        unlock_policy: UnlockPolicy::Manual,
+        remembered: None,
+        flags: cautious_flags(config.flags),
+        epoch: match distrust {
+            Distrust::Tampered => marks.floor(),
+            Distrust::RolledBack => config.epoch,
+        },
+        ..config
     }
 }
 
@@ -459,8 +519,8 @@ fn grants_unlock(config: &SealConfig) -> bool {
 /// A missing signature is only accepted from a configuration that grants nothing; otherwise
 /// clearing the signature would launder whatever a database writer put there.
 pub fn check_signature(root: &RootKey, config: &SealConfig) -> Signature {
-    // Nothing can follow the last epoch, so a configuration there could never be changed again.
-    if config.epoch == i64::MAX {
+    // This server never signs out of range, and a configuration there could never change again.
+    if !plausible_epoch(config.epoch) {
         return Signature::Invalid;
     }
     let Some(mac) = &config.mac else {
@@ -485,6 +545,10 @@ pub struct HighWater {
     /// There is no mark at all, though one could have been written, so any that existed were
     /// deleted.
     pub absent: bool,
+    /// A readable mark names a root key. [`check_root`] has already refused one naming another.
+    pub named: bool,
+    /// A readable mark says the one-off migrations have run.
+    pub migrated: bool,
 }
 
 impl HighWater {
@@ -510,8 +574,12 @@ impl HighWater {
 pub fn high_water(paths: &[PathBuf]) -> HighWater {
     let mut marks = HighWater::default();
     for path in paths {
-        match read_epoch(path) {
-            Ok(Some(epoch)) => marks.highest = Some(marks.highest.map_or(epoch, |m| m.max(epoch))),
+        match read_mark(path) {
+            Ok(Some(mark)) => {
+                marks.highest = Some(marks.highest.map_or(mark.epoch, |m| m.max(mark.epoch)));
+                marks.named |= !mark.roots.is_empty();
+                marks.migrated |= mark.migrated;
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::error!(%error, path = %path.display(), "a seal epoch mark cannot be read; treating it as a rollback");
@@ -566,6 +634,26 @@ pub fn marks_name(paths: &[PathBuf], root: &RootKey) -> Option<bool> {
 /// Whether the marks allow a database under `root`.
 pub fn root_recognised(paths: &[PathBuf], root: &RootKey) -> bool {
     marks_name(paths, root).unwrap_or(true)
+}
+
+/// Whether the marks vouch for `root`: some mark names a key, and every mark that does names this
+/// one by its full pin. A mark from before pins names it by only 64 bits, so it vouches for
+/// nothing until the next record rewrites it.
+pub fn marks_pin(paths: &[PathBuf], root: &RootKey) -> bool {
+    let mut pinned = false;
+    for path in paths {
+        let Ok(Some(mark)) = read_mark(path) else {
+            continue;
+        };
+        if mark.roots.is_empty() {
+            continue;
+        }
+        if !mark.roots.iter().any(|recorded| root.is_pinned_by(recorded)) {
+            return false;
+        }
+        pinned = true;
+    }
+    pinned
 }
 
 /// What the marks record for `root`.
@@ -634,9 +722,9 @@ async fn check_root_against(
     if stored.as_ref().is_some_and(|s| *s != fingerprint) {
         return Err(StartupError::WrongRootKey);
     }
-    // Marks that name the key already vouch for it, and then data damaged since does not lock
+    // Marks that pin the key already vouch for it, and then data damaged since does not lock
     // everyone out. Without them, everything stored must open.
-    let vouched = epoch_files.and_then(|paths| marks_name(paths, root)) == Some(true);
+    let vouched = epoch_files.is_some_and(|paths| marks_pin(paths, root));
     if !vouched && !opens_existing_data(store, root, epoch_files.is_some()).await? {
         return Err(StartupError::WrongRootKey);
     }
@@ -678,11 +766,24 @@ fn write_or_skip(path: &Path, existing: &std::io::Result<Option<EpochMark>>, mar
     }
 }
 
-/// Records `epoch` and the root key in use beside each file. Epochs are only ever raised here; a
-/// broken mark is replaced. Only `sekret admin reset-epoch` lowers them, through [`reset_epoch`].
-/// The caller has checked the root with [`check_root`], or is replacing it. Failing to update a
-/// mark that exists is an error, since it would otherwise go stale without anyone knowing.
+/// Records `epoch` and the root key in use beside each file, keeping what a mark already says
+/// about the one-off migrations. See [`record_mark`].
 pub fn record_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io::Result<()> {
+    record_mark(paths, epoch, fingerprint, false)
+}
+
+/// Records a configuration that was just signed or checked, and that its one-off migrations are
+/// done once its flags say so.
+pub fn record_config(paths: &[PathBuf], config: &SealConfig, fingerprint: &str) -> std::io::Result<()> {
+    record_mark(paths, config.epoch, fingerprint, migrations_done(config.flags))
+}
+
+/// Records `epoch` and the root key in use beside each file. Epochs are only ever raised here, and
+/// `migrated` is never cleared; a broken mark is replaced. Only `sekret admin reset-epoch
+/// --lower-marks` lowers them, through [`lower_marks`]. The caller has checked the root with
+/// [`check_root`], or is replacing it. Failing to update a mark that exists is an error, since it
+/// would otherwise go stale without anyone knowing.
+pub fn record_mark(paths: &[PathBuf], epoch: i64, fingerprint: &str, migrated: bool) -> std::io::Result<()> {
     let mut failed = None;
     for path in paths {
         let existing = read_mark(path);
@@ -692,6 +793,7 @@ pub fn record_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io
                 _ => epoch,
             },
             roots: vec![fingerprint.to_string()],
+            migrated: migrated || matches!(&existing, Ok(Some(mark)) if mark.migrated),
         };
         if matches!(&existing, Ok(Some(current)) if *current == mark) {
             continue;
@@ -720,6 +822,7 @@ pub fn begin_rekey(paths: &[PathBuf], old: &str, new: &str, epoch: i64) -> std::
         let mark = EpochMark {
             epoch: current.epoch.max(epoch),
             roots: vec![old.to_string(), new.to_string()],
+            migrated: current.migrated,
         };
         before.push((path.clone(), current.clone()));
         if let Err(error) = write_or_skip(path, &existing, &mark) {
@@ -743,13 +846,16 @@ pub fn abort_rekey(before: &[(PathBuf, EpochMark)]) -> std::io::Result<()> {
     failed.map_or(Ok(()), Err)
 }
 
-/// Sets every mark to `epoch` and `fingerprint`, lowering them if need be. Only for when the
-/// epochs have run out, through the explicit operator command.
-pub fn reset_epoch(paths: &[PathBuf], epoch: i64, fingerprint: &str) -> std::io::Result<()> {
+/// Sets every mark to `epoch` and `fingerprint`, lowering them if need be, and keeps the record of
+/// the one-off migrations. Only for epochs at their limit, through `sekret admin reset-epoch
+/// --lower-marks`: every configuration this root signed above `epoch` can be replayed afterwards.
+pub fn lower_marks(paths: &[PathBuf], epoch: i64, fingerprint: &str, migrated: bool) -> std::io::Result<()> {
+    let migrated = migrated || high_water(paths).migrated;
     for path in paths {
         let mark = EpochMark {
             epoch,
             roots: vec![fingerprint.to_string()],
+            migrated,
         };
         write_mark(path, &mark)?;
     }
@@ -770,9 +876,9 @@ async fn save(
 ) -> ApiResult<SealConfig> {
     config.updated_at = now;
     let floor = high_water(&settings.epoch_files).floor();
-    let config = signed(root, config, floor)?;
+    let config = sign(root, config, floor)?;
     store.update_seal_config(config.clone()).await?;
-    record_epoch(&settings.epoch_files, config.epoch, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
+    record_config(&settings.epoch_files, &config, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
     Ok(config)
 }
 
@@ -859,19 +965,26 @@ pub async fn check_config(
     proven: Option<&WrappedRootKey>,
 ) -> ApiResult<Checked> {
     let marks = high_water(&settings.epoch_files);
-    let distrust = match verify_config(root, &config, marks) {
-        Ok(false) if config.flags.wrap_form_signed => {
-            record_epoch(&settings.epoch_files, config.epoch, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
-            return Ok(Checked {
-                config,
-                tampered: false,
-                trusted: true,
-            });
-        }
-        // Signed before the wrap's form marker was; signing again covers it from now on.
+    let verdict = verify_config(root, &config, marks);
+    let distrust = match verdict {
         Ok(false) => {
+            let flags = kept_flags(&config, verdict, marks);
+            if flags != config.flags {
+                tracing::error!(
+                    "the seal configuration would run the one-off migrations again, though the epoch marks say they \
+                     ran or do not vouch for it; it may be an old copy put back. Not running them"
+                );
+            } else if config.flags.wrap_form_signed {
+                record_config(&settings.epoch_files, &config, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
+                return Ok(Checked {
+                    config,
+                    tampered: false,
+                    trusted: true,
+                });
+            }
+            // Signing again covers the wrap's form marker from now on, and any flags just set.
             return Ok(Checked {
-                config: save(store, settings, root, now, config).await?,
+                config: save(store, settings, root, now, SealConfig { flags, ..config }).await?,
                 tampered: false,
                 trusted: true,
             });
@@ -911,42 +1024,30 @@ pub async fn check_config(
     {
         tracing::warn!(%error, "could not remove the remember file");
     }
-    let flags = cautious_flags(config.flags);
+    let mode = config.mode;
+    let reset = distrusted(config, distrust, marks);
     let repaired = match (distrust, proven) {
         // Every field was signed by this server at some point, so a reset copy may be signed.
-        (Distrust::RolledBack, _) => Some(config.clone()),
-        (Distrust::Tampered, Some(wrap)) if config.mode == SealMode::Passphrase => Some(SealConfig {
+        (Distrust::RolledBack, _) => Some(reset.clone()),
+        (Distrust::Tampered, Some(wrap)) if mode == SealMode::Passphrase => Some(SealConfig {
             wrapped: Some(wrap.clone()),
-            ..config.clone()
+            ..reset.clone()
         }),
         (Distrust::Tampered, _) => None,
     };
     let checked = match repaired {
-        Some(clean) => {
-            let clean = SealConfig {
-                unlock_policy: UnlockPolicy::Manual,
-                remembered: None,
-                flags,
-                ..clean
-            };
-            Checked {
-                config: save(store, settings, root, now, clean).await?,
-                tampered: true,
-                trusted: true,
-            }
-        }
+        Some(clean) => Checked {
+            config: save(store, settings, root, now, clean).await?,
+            tampered: true,
+            trusted: true,
+        },
         None => {
             tracing::error!(
                 "the tampered seal configuration is left unsigned; unseal with the passphrase, or run `sekret admin \
                  reset-epoch` on the host, to repair it"
             );
             Checked {
-                config: SealConfig {
-                    unlock_policy: UnlockPolicy::Manual,
-                    remembered: None,
-                    flags,
-                    ..config
-                },
+                config: reset,
                 tampered: true,
                 trusted: false,
             }
@@ -1110,8 +1211,9 @@ pub async fn initialise(
     if marks.highest.is_some() || marks.broken {
         config.flags.reviewer_tokens_migrated = true;
     }
-    // A database with no root key yet holds no credentials to vouch for.
-    config.flags.credentials_keyed |= existing.is_none();
+    // A database with no root key yet holds no credentials to vouch for, and once a mark says the
+    // vouching ran, a deleted configuration row must not start it again.
+    config.flags.credentials_keyed |= existing.is_none() || marks.migrated;
     if !root_recognised(&plan.epoch_files, &root) {
         // Only setup, which needs the host or the setup code, may move the marks to a new key.
         tracing::warn!("the epoch marks name the root key of an earlier install; they now name the new one");
@@ -1124,7 +1226,7 @@ pub async fn initialise(
         return Err(error.into());
     }
     // The database is set up by now, so a mark that cannot be written is reported, not undone.
-    if let Err(error) = pin(&root).and_then(|pin| record_epoch(&plan.epoch_files, config.epoch, &pin)) {
+    if let Err(error) = pin(&root).and_then(|pin| record_config(&plan.epoch_files, &config, &pin)) {
         tracing::error!(%error, "setup finished, but the seal epoch marks could not be updated");
     }
     Ok((root, config))
@@ -1362,7 +1464,7 @@ pub async fn open_keyring(
         };
         let config = signed(&key, config, marks.floor()).map_err(|e| StartupError::Init(e.to_string()))?;
         match store.init_seal_config(config.clone(), &fingerprint).await {
-            Ok(()) => record_epoch(&settings.epoch_files, config.epoch, &pin(&key)?)?,
+            Ok(()) => record_config(&settings.epoch_files, &config, &pin(&key)?)?,
             Err(StoreError::Conflict) => {}
             Err(error) => return Err(error.into()),
         }
@@ -1659,7 +1761,12 @@ pub async fn migrate_once(store: &dyn Store, settings: &SealSettings, now: i64, 
     let result: ApiResult<()> = async {
         let config = load_trusted(store, settings, now, LOCAL, root).await?;
         let mut flags = config.flags;
-        if flags.reviewer_tokens_migrated && flags.credentials_keyed {
+        if migrations_done(flags) {
+            return Ok(());
+        }
+        // `check_config` has already ruled this out; it is checked again beside what it guards.
+        if high_water(&settings.epoch_files).migrated {
+            tracing::error!("an epoch mark says the one-off migrations already ran; not running them again");
             return Ok(());
         }
         let key = load_integrity_key(store, root).await?;
@@ -2242,14 +2349,11 @@ pub mod ops {
             return Err(untrusted_config());
         }
         // An unsigned configuration's flags may be a database writer's.
-        let config = match verdict {
-            Ok(true) => SealConfig {
-                flags: cautious_flags(config.flags),
-                ..config
-            },
-            _ => config,
+        let config = SealConfig {
+            flags: kept_flags(&config, verdict, marks),
+            ..config
         };
-        let copy = signed(
+        let copy = sign(
             &root,
             SealConfig {
                 remembered: None,
@@ -2438,9 +2542,139 @@ mod tests {
         assert!(!root_recognised(&paths, &k.new));
         record_epoch(&paths, 3, &k.old_pin).context("record")?;
         assert_eq!(high_water(&paths).highest, Some(5));
-        reset_epoch(&paths, 1, &k.new_pin).context("reset")?;
+        lower_marks(&paths, 1, &k.new_pin, false).context("lower")?;
         assert_eq!(high_water(&paths).highest, Some(1));
         assert!(root_recognised(&paths, &k.new) && !root_recognised(&paths, &k.old));
+        Ok(())
+    }
+
+    #[test]
+    fn once_a_mark_records_the_migrations_nothing_clears_it() -> anyhow::Result<()> {
+        let k = keys()?;
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        record_epoch(&paths, 1, &k.old_pin).context("record")?;
+        assert!(!high_water(&paths).migrated);
+        record_mark(&paths[..1], 2, &k.old_pin, true).context("record")?;
+        let marks = high_water(&paths);
+        assert!(marks.migrated && marks.named);
+        record_epoch(&paths, 3, &k.old_pin).context("record")?;
+        assert!(high_water(&paths[..1]).migrated, "kept by a later record");
+        let before = begin_rekey(&paths, &k.old_pin, &k.new_pin, 4).context("begin")?;
+        assert!(high_water(&paths[..1]).migrated, "kept while rekeying");
+        abort_rekey(&before).context("abort")?;
+        lower_marks(&paths, 1, &k.old_pin, false).context("lower")?;
+        assert!(high_water(&paths[1..]).migrated, "lowering spreads it to every mark");
+        Ok(())
+    }
+
+    #[test]
+    fn epochs_stop_short_of_the_ceiling() {
+        use sekret_core::seal::MAX_SEAL_EPOCH;
+        assert_eq!(next_epoch(3, 7).ok(), Some(8));
+        assert_eq!(next_epoch(MAX_SEAL_EPOCH - 2, 0).ok(), Some(MAX_SEAL_EPOCH - 1));
+        assert_eq!(next_epoch(MAX_SEAL_EPOCH - 1, 0), Err(CryptoError::EpochExhausted));
+        assert_eq!(next_epoch(0, i64::MAX), Err(CryptoError::EpochExhausted));
+        assert_eq!(next_epoch(i64::MAX, 0), Err(CryptoError::EpochExhausted));
+    }
+
+    #[test]
+    fn short_fingerprint_marks_vouch_for_nothing() -> anyhow::Result<()> {
+        let k = keys()?;
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        assert!(!marks_pin(&paths, &k.old), "no marks vouch for nothing");
+        record_epoch(&paths[..1], 4, &k.old.fingerprint()).context("short")?;
+        assert_eq!(marks_name(&paths, &k.old), Some(true));
+        assert!(!marks_pin(&paths, &k.old), "64 bits are not enough");
+        record_epoch(&paths[1..], 4, &k.old_pin).context("pin")?;
+        assert!(!marks_pin(&paths, &k.old), "every naming mark must pin it");
+        record_epoch(&paths, 4, &k.old_pin).context("rewrite")?;
+        assert!(marks_pin(&paths, &k.old));
+        assert!(!marks_pin(&paths, &k.new));
+        Ok(())
+    }
+
+    fn signed_config(root: &RootKey, flags: SealFlags) -> anyhow::Result<SealConfig> {
+        let config = SealConfig {
+            mode: SealMode::KeyFile,
+            wrapped: None,
+            unlock_policy: UnlockPolicy::Manual,
+            remembered: None,
+            epoch: 1,
+            mac: None,
+            flags,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let fingerprint = root.fingerprint();
+        let mac = seal_config_mac(root, &binding(&fingerprint, &config)).context("mac")?;
+        Ok(SealConfig {
+            mac: Some(mac),
+            ..config
+        })
+    }
+
+    #[test]
+    fn a_configuration_the_marks_do_not_vouch_for_starts_no_migration() -> anyhow::Result<()> {
+        let k = keys()?;
+        let legacy = signed_config(&k.old, SealFlags::default())?;
+        let current = signed_config(
+            &k.old,
+            SealFlags {
+                wrap_form_signed: true,
+                ..SealFlags::default()
+            },
+        )?;
+        let none = HighWater::default();
+        let named = HighWater {
+            highest: Some(1),
+            named: true,
+            ..HighWater::default()
+        };
+        let migrated = HighWater {
+            migrated: true,
+            ..named
+        };
+        assert_eq!(verify_config(&k.old, &legacy, none), Ok(false));
+        // Signed before the wrap's form, with no mark naming a key: an old copy, marks deleted.
+        assert!(migrations_done(kept_flags(&legacy, Ok(false), none)));
+        assert_eq!(kept_flags(&legacy, Ok(false), named), legacy.flags);
+        assert_eq!(kept_flags(&current, Ok(false), none), current.flags);
+        // A mark says they ran: nothing runs again, whatever signed the configuration.
+        assert!(migrations_done(kept_flags(&legacy, Ok(false), migrated)));
+        assert!(migrations_done(kept_flags(&current, Ok(false), migrated)));
+        let done = signed_config(&k.old, cautious_flags(SealFlags::default()))?;
+        assert_eq!(
+            kept_flags(&done, Ok(false), migrated),
+            done.flags,
+            "nothing else changes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tampered_epoch_is_never_carried_over() -> anyhow::Result<()> {
+        let k = keys()?;
+        for epoch in [i64::MAX, i64::MAX - 1, sekret_core::seal::MAX_SEAL_EPOCH - 1, -1] {
+            let config = SealConfig {
+                epoch,
+                ..signed_config(&k.old, SealFlags::default())?
+            };
+            let marks = HighWater {
+                highest: Some(3),
+                named: true,
+                ..HighWater::default()
+            };
+            assert_eq!(
+                verify_config(&k.old, &config, marks),
+                Err(Distrust::Tampered),
+                "{epoch}"
+            );
+            let reset = distrusted(config, Distrust::Tampered, marks);
+            assert_eq!(reset.epoch, 3, "{epoch}");
+            assert_eq!(signed(&k.old, reset, marks.floor()).context("sign")?.epoch, 4);
+        }
         Ok(())
     }
 

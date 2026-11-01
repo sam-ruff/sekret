@@ -134,8 +134,52 @@ const SUMMARISED = new Set([
   "bytes",
 ]);
 
-function summary(action: string, detail: Detail): string[] {
+/** Name lookups the reader's own data can answer; anything they miss shows its ID. */
+export interface AuditNames {
+  user?: (id: string) => string | undefined;
+  identity?: (id: string) => string | undefined;
+  role?: (slug: string) => string | undefined;
+}
+
+const METHOD_NAMES: Record<string, string> = { universal: "Universal", oidc: "OIDC", kubernetes: "Kubernetes" };
+
+function principalName(kind: string, id: string, names: AuditNames): string {
+  if (kind === "user") return names.user?.(id) ?? id;
+  if (kind === "identity") return names.identity?.(id) ?? id;
+  return id;
+}
+
+function identityName(detail: Detail, names: AuditNames): string {
+  const id = String(detail.identity);
+  if (typeof detail.name === "string" && detail.name) return detail.name;
+  return names.identity?.(id) ?? id;
+}
+
+/** Fields an identity sentence already covers. */
+const IDENTITY_SUMMARISED = new Set(["identity", "name", "method", "kind", "prefix", "secret"]);
+
+function identitySummary(action: string, detail: Detail, names: AuditNames): string | null {
+  if (!action.startsWith("identity.") || typeof detail.identity !== "string") return null;
+  const who = identityName(detail, names);
+  const method = detail.method ?? detail.kind;
+  const methodName = typeof method === "string" ? (METHOD_NAMES[method] ?? method) : null;
+  switch (action) {
+    case "identity.auth-put":
+    case "identity.auth-delete":
+      return methodName ? `${methodName} auth on ${who}` : `Auth method on ${who}`;
+    case "identity.client-secret-create":
+      return typeof detail.prefix === "string" ? `Client secret starting ${detail.prefix} for ${who}` : `Client secret for ${who}`;
+    case "identity.client-secret-revoke":
+      return `Client secret of ${who}`;
+    default:
+      return `Machine identity ${who}`;
+  }
+}
+
+function summary(action: string, detail: Detail, names: AuditNames): string[] {
   const parts: string[] = [];
+  const identity = identitySummary(action, detail, names);
+  if (identity) parts.push(identity);
   if (typeof detail.count === "number") {
     const what = action === "secret.read" ? count(detail.count, "value read", "values read") : String(detail.count);
     parts.push(detail.recursive === true ? `${what}, including sub-folders` : what);
@@ -153,23 +197,29 @@ function summary(action: string, detail: Detail): string[] {
     const format = detail.content_type.replace(/^image\//, "").replace(/\+xml$/, "").toUpperCase();
     parts.push(`${format} image, ${formatBytes(detail.bytes)}`);
   }
-  if (typeof detail.role === "string" && typeof detail.principal_id === "string") {
-    const kind = KIND_NAMES[String(detail.principal_kind)] ?? "principal";
-    const removed = action.endsWith("remove");
-    parts.push(`Role ${detail.role} ${removed ? "taken from" : "given to"} ${kind} ${detail.principal_id}`);
-  } else if (typeof detail.role === "string") {
-    parts.push(`Role ${detail.role}`);
+  if (typeof detail.role === "string") {
+    const role = names.role?.(detail.role) ?? detail.role;
+    if (typeof detail.principal_id === "string") {
+      const kindCode = String(detail.principal_kind);
+      const kind = KIND_NAMES[kindCode] ?? "principal";
+      const removed = action.endsWith("remove");
+      const who = principalName(kindCode, detail.principal_id, names);
+      parts.push(`Role ${role} ${removed ? "taken from" : "given to"} ${kind} ${who}`);
+    } else {
+      parts.push(`Role ${role}`);
+    }
   }
   return parts;
 }
 
 /** An audit entry's detail in plain words, falling back to `key: value` for fields it does not know. */
-export function describeDetail(action: string, detail: unknown): string {
+export function describeDetail(action: string, detail: unknown, names: AuditNames = {}): string {
   if (!detail || typeof detail !== "object" || Array.isArray(detail)) return "";
   const fields = detail as Detail;
-  const known = summary(action, fields);
+  const known = summary(action, fields, names);
+  const skip = action.startsWith("identity.") && typeof fields.identity === "string" ? IDENTITY_SUMMARISED : null;
   const rest = Object.entries(fields)
-    .filter(([k]) => !SUMMARISED.has(k))
+    .filter(([k]) => !SUMMARISED.has(k) && !skip?.has(k))
     .filter(([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0))
     .map(([k, v]) => `${k.replace(/_/g, " ")}: ${rawValue(v)}`);
   return [...known, ...rest].join(" · ");

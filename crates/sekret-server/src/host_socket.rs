@@ -34,6 +34,7 @@ pub fn parent_of(path: &Path) -> &Path {
 pub struct Ancestor {
     pub dir: PathBuf,
     pub dir_uid: u32,
+    pub dir_gid: u32,
     pub dir_mode: u32,
     pub entry_uid: u32,
 }
@@ -73,6 +74,7 @@ pub fn ancestors(dir: &Path) -> std::io::Result<Vec<Ancestor>> {
             found.push(Ancestor {
                 dir: parent.to_path_buf(),
                 dir_uid: parent_meta.uid(),
+                dir_gid: parent_meta.gid(),
                 dir_mode: parent_meta.mode(),
                 entry_uid: entry_meta.uid(),
             });
@@ -220,13 +222,16 @@ pub fn spawn(state: AppState, socket: &UnixSocketSettings) -> Result<(), Startup
     let path = socket.path.clone();
     tracing::info!(path = %path.display(), mode = format!("{:o}", socket.mode), "unseal socket ready");
     warn_about_group_access(socket);
+    let limits = crate::serve::ConnectionLimits::new(LOCAL_CONNECTIONS);
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, crate::api::host_router(state)).await {
-            tracing::error!(%error, path = %path.display(), "the unseal socket stopped");
-        }
+        crate::serve::serve_local(listener, crate::api::host_router(state), limits).await;
+        tracing::error!(path = %path.display(), "the unseal socket stopped");
     });
     Ok(())
 }
+
+/// Connections the socket serves at once; one person unlocking needs one or two.
+pub const LOCAL_CONNECTIONS: usize = 16;
 
 /// Removes the socket file at shutdown, if it is still a socket.
 pub fn remove(path: &Path) {
@@ -291,6 +296,7 @@ mod tests {
         Ancestor {
             dir: "/srv".into(),
             dir_uid,
+            dir_gid: dir_uid,
             dir_mode,
             entry_uid,
         }

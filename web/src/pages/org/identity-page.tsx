@@ -24,7 +24,7 @@ import { Switch } from "@/components/ui/switch";
 import { keys, useApiMutation } from "@/hooks/queries";
 import { usePageTitle } from "@/hooks/use-page-title";
 import { useOrgPermissions } from "@/hooks/use-permissions";
-import { formatDateTime } from "@/lib/format";
+import { durationText, formatDateTime, parseDuration } from "@/lib/format";
 
 const TABS = ["details", "auth", "usage"] as const;
 type Tab = (typeof TABS)[number];
@@ -33,8 +33,8 @@ function draftFrom(identity: Identity): IdentityDraft {
   return {
     name: identity.name,
     description: identity.description,
-    tokenTtl: String(identity.token_ttl),
-    tokenMaxTtl: String(identity.token_max_ttl),
+    tokenTtl: durationText(identity.token_ttl),
+    tokenMaxTtl: durationText(identity.token_max_ttl),
     trustedCidrs: identity.trusted_cidrs,
   };
 }
@@ -52,8 +52,8 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
       api.updateIdentity(identity.id, {
         name: draft.name.trim(),
         description: draft.description,
-        token_ttl: Number(draft.tokenTtl),
-        token_max_ttl: Number(draft.tokenMaxTtl),
+        token_ttl: parseDuration(draft.tokenTtl) ?? 0,
+        token_max_ttl: parseDuration(draft.tokenMaxTtl) ?? 0,
         trusted_cidrs: draft.trustedCidrs,
         disabled,
       }),
@@ -72,7 +72,10 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
   });
 
   const valid = draft.name.trim() !== "" && !ttlProblem(draft);
-  const changed = disabled !== identity.disabled || JSON.stringify(draft) !== JSON.stringify(draftFrom(identity));
+  // Lifetimes compare as seconds, so "1800" and "30m" count as the same.
+  const comparable = (d: IdentityDraft) =>
+    JSON.stringify({ ...d, tokenTtl: parseDuration(d.tokenTtl), tokenMaxTtl: parseDuration(d.tokenMaxTtl) });
+  const changed = disabled !== identity.disabled || comparable(draft) !== comparable(draftFrom(identity));
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (valid && changed) save.mutate();

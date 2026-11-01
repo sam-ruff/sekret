@@ -254,7 +254,10 @@ route("GET", `${E}/secrets/{key}`, (b, c) => b.getSecret(c.params[0], c.params[1
 route("PUT", `${E}/secrets/{key}`, (b, c) => b.setSecret(c.params[0], c.params[1], c.params[2], qs(c, "path"), body<SetSecret>(c)));
 route("DELETE", `${E}/secrets/{key}`, (b, c) => b.deleteSecret(c.params[0], c.params[1], c.params[2], qs(c, "path")));
 route("GET", `${E}/secrets/{key}/versions`, (b, c) =>
-  b.listVersions(c.params[0], c.params[1], c.params[2], qs(c, "path"), flag(c, "values")),
+  b.listVersions(c.params[0], c.params[1], c.params[2], qs(c, "path"), flag(c, "values"), {
+    limit: num(c, "limit"),
+    before: num(c, "before"),
+  }),
 );
 route("POST", `${E}/secrets/{key}/rollback`, (b, c) =>
   b.rollback(c.params[0], c.params[1], c.params[2], qs(c, "path"), body<{ version: number }>(c).version),

@@ -783,6 +783,10 @@ async fn run_and_export_hold_back_tool_settings() -> anyhow::Result<()> {
             {"key": "CLOUDSDK_PYTHON", "value": "/tmp/evil"},
             {"key": "SED", "value": "/tmp/evil"},
             {"key": "TMPDIR", "value": "/tmp/evil"},
+            {"key": "COREPACK_NPM_REGISTRY", "value": "https://evil.example"},
+            {"key": "VAULT_ADDR", "value": "https://evil.example"},
+            {"key": "ACTIONS_ID_TOKEN_REQUEST_URL", "value": "https://evil.example"},
+            {"key": "ANT_HOME", "value": "/tmp/evil"},
         ]}),
     )
     .await?;
@@ -794,6 +798,7 @@ async fn run_and_export_hold_back_tool_settings() -> anyhow::Result<()> {
     ];
     let probe = "test \"$DATABASE_URL\" = postgres://db && test \"$STRIPE_SECRET\" = sk && test \"$PORT\" = 8080 \
                  && test -z \"${CONFIG_SHELL-}${CLOUDSDK_PYTHON-}${SED-}\" && test \"${TMPDIR-}\" != /tmp/evil \
+                 && test -z \"${COREPACK_NPM_REGISTRY-}${VAULT_ADDR-}${ACTIONS_ID_TOKEN_REQUEST_URL-}${ANT_HOME-}\" \
                  && ${CONFIG_SHELL:-true} && exit 7";
     let ran = run(&["run", "--", "sh", "-c", probe], &env, h, None)?;
     let notes = String::from_utf8_lossy(&ran.stderr).into_owned();
@@ -810,7 +815,16 @@ async fn run_and_export_hold_back_tool_settings() -> anyhow::Result<()> {
 
     let dotenv = ok(run(&["export"], &env, h, None)?)?;
     assert!(dotenv.contains("DATABASE_URL=") && dotenv.contains("PORT="), "{dotenv}");
-    for held in ["CONFIG_SHELL", "CLOUDSDK_PYTHON", "SED=", "TMPDIR"] {
+    for held in [
+        "CONFIG_SHELL",
+        "CLOUDSDK_PYTHON",
+        "SED=",
+        "TMPDIR",
+        "COREPACK_NPM_REGISTRY",
+        "VAULT_ADDR",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ANT_HOME",
+    ] {
         assert!(!dotenv.contains(held), "{held}: {dotenv}");
     }
 

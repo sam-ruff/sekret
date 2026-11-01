@@ -24,6 +24,24 @@ test("highlights keys missing from some environments", async ({ page }) => {
   await expect(page.getByTestId("overview-grid").getByTestId("overview-row-WEBHOOK_SECRET")).toBeVisible();
 });
 
+test("an empty folder offers the next step instead of a dead end", async ({ page }) => {
+  await page.goto("/projects/storefront/overview?path=%2Fnothing-here");
+  const empty = page.getByTestId("overview-empty");
+  await expect(empty).toContainText("No secrets in this folder");
+  await expect(page.getByTestId("only-missing")).toHaveCount(0);
+
+  await empty.getByTestId("overview-import").click();
+  await expect(page).toHaveURL(/\/projects\/storefront\/secrets\/dev\?path=%2Fnothing-here$/);
+  await expect(page.getByTestId("import-env-text")).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.goto("/projects/storefront/overview?path=%2Fnothing-here");
+  await expect(page.getByTestId("overview-add-secret")).toHaveText("Add secret to Development");
+  await page.getByTestId("overview-add-secret").click();
+  await expect(page.getByTestId("new-secret-form").getByTestId("secret-key-input")).toHaveValue("");
+  await expect(page).toHaveURL(/\/secrets\/dev\?path=%2Fnothing-here$/);
+});
+
 test("a missing cell opens the add form with the key filled in", async ({ page }) => {
   await openProject(page);
   await navigate(page, "nav-overview");

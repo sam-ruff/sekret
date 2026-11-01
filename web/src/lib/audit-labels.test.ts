@@ -49,9 +49,43 @@ describe("describeDetail", () => {
     expect(describeDetail("secret.rotate", { automatic: true })).toBe("Automatic");
   });
 
+  it("names principals and roles when the reader's data knows them", () => {
+    const names = {
+      user: (id: string) => (id === "user-sam" ? "Sam Ruff" : undefined),
+      identity: (id: string) => (id === "ident-1" ? "github-deploy" : undefined),
+      role: (slug: string) => (slug === "org-admin" ? "org admin" : undefined),
+    };
+    expect(describeDetail("org.binding-add", { principal_kind: "user", principal_id: "user-sam", role: "org-admin" }, names)).toBe(
+      "Role org admin given to user Sam Ruff",
+    );
+    expect(describeDetail("member.add", { principal_kind: "identity", principal_id: "ident-1", role: "viewer" }, names)).toBe(
+      "Role viewer given to machine identity github-deploy",
+    );
+    expect(describeDetail("member.add", { principal_kind: "identity", principal_id: "ident-9", role: "viewer" }, names)).toBe(
+      "Role viewer given to machine identity ident-9",
+    );
+  });
+
+  it("gives machine identity actions sentences instead of ID fields", () => {
+    const names = { identity: (id: string) => (id === "ident-1" ? "github-deploy" : undefined) };
+    expect(describeDetail("identity.create", { identity: "ident-1", name: "ci-runner" })).toBe("Machine identity ci-runner");
+    expect(describeDetail("identity.update", { identity: "ident-1" }, names)).toBe("Machine identity github-deploy");
+    expect(describeDetail("identity.auth-put", { identity: "ident-1", method: "oidc" }, names)).toBe("OIDC auth on github-deploy");
+    expect(describeDetail("identity.auth-delete", { identity: "ident-1", method: "kubernetes" }, names)).toBe(
+      "Kubernetes auth on github-deploy",
+    );
+    expect(describeDetail("identity.client-secret-create", { identity: "ident-1", prefix: "sks_ab12" }, names)).toBe(
+      "Client secret starting sks_ab12 for github-deploy",
+    );
+    expect(describeDetail("identity.client-secret-revoke", { identity: "ident-1", secret: "cs-9" }, names)).toBe(
+      "Client secret of github-deploy",
+    );
+    expect(describeDetail("identity.revoke-tokens", { identity: "ident-2" })).toBe("Machine identity ident-2");
+  });
+
   it("falls back to plain fields for anything unknown", () => {
     expect(describeDetail("identity.auth-put", { identity: "id-1", method: "oidc", empty: "", none: null })).toBe(
-      "identity: id-1 · method: oidc",
+      "OIDC auth on id-1",
     );
     expect(describeDetail("x", { nested: { a: 1 }, list: ["a", "b"] })).toBe('nested: {"a":1} · list: a, b');
     expect(describeDetail("x", null)).toBe("");

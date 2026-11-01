@@ -112,7 +112,8 @@ test.describe("first-boot setup", () => {
     await expect(page.getByTestId("admin-token")).toHaveText(/^skt_[0-9a-f]{48}$/);
     await expect(page.getByTestId("admin-token-copy")).toBeVisible();
     await expect(page.getByTestId("admin-token-help")).toContainText(
-      /Copy this token now\. It is shown once and expires in 1 hour \(\d{2}:\d{2}\)\./,
+      // Within an hour of midnight the expiry falls tomorrow, so the date is shown as well.
+      /Copy this token now\. It is shown once and expires in 1 hour \((\d{1,2} \w{3} \d{4}, )?\d{2}:\d{2}\)\./,
     );
     await expect(page.getByTestId("admin-token-help")).toContainText("It lets the CLI act as an organisation admin");
     // The expiry is said once, in the warning.
@@ -518,6 +519,36 @@ test.describe("server page", () => {
     await expect(page.getByTestId("server-policy-remember")).toBeDisabled();
     await expect(page.getByTestId("server-policy-unavailable")).toBeVisible();
     await expect(page.getByTestId("server-policy-passphrase-file")).toBeEnabled();
+  });
+
+  test("closes the policy dialog and drops a typed passphrase after three idle minutes", async ({ page }) => {
+    await page.clock.install();
+    await page.goto("/org/server");
+    await page.getByTestId("server-policy-card-remember").click();
+    await page.getByTestId("policy-save").click();
+    const dialog = page.getByTestId("policy-dialog");
+    await dialog.getByTestId("policy-passphrase").fill("not it");
+    await dialog.getByTestId("confirm-action").click();
+    await expect(dialog.getByTestId("policy-passphrase-error")).toHaveText("That passphrase is wrong.");
+    await page.clock.fastForward(170_000);
+    await expect(dialog).toBeVisible();
+    await page.clock.fastForward(11_000);
+    await expect(dialog).toBeHidden();
+    await expectToast(page, "Closed the policy dialog after three idle minutes.");
+
+    // Opening it again starts empty, with no error left from the wrong attempt.
+    await page.getByTestId("policy-save").click();
+    await expect(dialog.getByTestId("policy-passphrase")).toHaveValue("");
+    await expect(dialog.getByTestId("policy-passphrase-error")).toHaveCount(0);
+  });
+
+  test("leaves an untouched policy dialog open while idle", async ({ page }) => {
+    await page.clock.install();
+    await page.goto("/org/server");
+    await page.getByTestId("server-policy-card-remember").click();
+    await page.getByTestId("policy-save").click();
+    await page.clock.fastForward(200_000);
+    await expect(page.getByTestId("policy-dialog")).toBeVisible();
   });
 
   test("confirms a weaker policy with the passphrase, and forgets a remembered unlock only after confirming", async ({

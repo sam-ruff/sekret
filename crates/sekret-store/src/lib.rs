@@ -147,7 +147,8 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Vec<SecretWithVersion>>;
     async fn get_secret(&self, environment_id: &str, path: &str, key: &str) -> StoreResult<Option<SecretWithVersion>>;
     async fn get_secret_by_id(&self, id: &str) -> StoreResult<Option<SecretWithVersion>>;
-    async fn list_versions(&self, secret_id: &str) -> StoreResult<Vec<SecretVersion>>;
+    /// Up to `limit` versions, newest first, older than `before` when given.
+    async fn list_versions(&self, secret_id: &str, before: Option<i64>, limit: i64) -> StoreResult<Vec<SecretVersion>>;
     async fn get_version(&self, secret_id: &str, version: i64) -> StoreResult<Option<SecretVersion>>;
     /// Applies every change and records an environment snapshot atomically.
     async fn write_secrets(&self, batch: WriteBatch) -> StoreResult<()>;

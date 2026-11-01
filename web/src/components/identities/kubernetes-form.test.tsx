@@ -91,27 +91,27 @@ describe("KubernetesForm reviewer token", () => {
 
   it("keeps a custom maximum token lifetime when editing other fields", async () => {
     const { saved } = renderForm({ ...config(REDACTED_CREDENTIAL), max_token_lifetime: 600 });
-    expect(screen.getByTestId("k8s-max-lifetime")).toHaveValue("600");
+    expect(screen.getByTestId("k8s-max-lifetime")).toHaveValue("10m");
     await userEvent.clear(screen.getByTestId("k8s-host"));
     await userEvent.type(screen.getByTestId("k8s-host"), "https://other.example:6443");
     await userEvent.click(screen.getByTestId("k8s-save"));
     expect(saved()).toMatchObject({ host: "https://other.example:6443", max_token_lifetime: 600 });
   });
 
-  it("defaults the lifetime to an hour and refuses anything but whole seconds", async () => {
+  it("defaults the lifetime to an hour and refuses anything but a duration", async () => {
     const { saved, onSave } = renderForm(config(null));
     const field = screen.getByTestId("k8s-max-lifetime");
-    expect(field).toHaveValue("3600");
-    expect(screen.getByLabelText("Longest Kubernetes token accepted (seconds)")).toBe(field);
+    expect(field).toHaveValue("1h");
+    expect(screen.getByLabelText("Longest Kubernetes token accepted")).toBe(field);
     expect(screen.getByTestId("k8s-max-lifetime-help")).toHaveTextContent(
-      "Kubernetes tokens valid for longer than this are refused: 1 hour. Keep pods' projected token expirationSeconds at or below it.",
+      "Kubernetes tokens valid for longer than this are refused: 1 hour (3600 seconds). Keep pods' projected token expirationSeconds at or below it.",
     );
     expect(screen.getByTestId("k8s-save")).toHaveTextContent("Save Kubernetes settings");
     await userEvent.clear(field);
     await userEvent.type(field, "0");
     expect(screen.getByTestId("k8s-save")).toBeDisabled();
     const error = screen.getByTestId("k8s-max-lifetime-error");
-    expect(error).toHaveTextContent("Enter a whole number of seconds, from 1 up to 10 years.");
+    expect(error).toHaveTextContent("Enter a duration such as 3600, 30m, 1h or 7d, from 1 second up to 10 years.");
     expect(error).toHaveAttribute("role", "alert");
     expect(field).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
     await userEvent.clear(field);

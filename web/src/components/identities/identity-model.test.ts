@@ -13,13 +13,15 @@ import {
 import { REDACTED_CREDENTIAL } from "@/api/types";
 
 describe("parseLifetime", () => {
-  it("takes whole seconds from one up to ten years", () => {
+  it("takes a duration from one second up to ten years", () => {
     expect(parseLifetime(" 900 ")).toBe(900);
+    expect(parseLifetime("15m")).toBe(900);
+    expect(parseLifetime("10y")).toBe(MAX_TOKEN_LIFETIME_LIMIT);
     expect(parseLifetime(String(MAX_TOKEN_LIFETIME_LIMIT))).toBe(MAX_TOKEN_LIFETIME_LIMIT);
     expect(MAX_TOKEN_LIFETIME_LIMIT).toBe(315_360_000);
   });
 
-  it.each(["0", "-5", "1.5", "soon", "", String(MAX_TOKEN_LIFETIME_LIMIT + 1)])("refuses %j", (text) => {
+  it.each(["0", "0h", "-5", "1.5", "soon", "", "11y", String(MAX_TOKEN_LIFETIME_LIMIT + 1)])("refuses %j", (text) => {
     expect(parseLifetime(text)).toBeNull();
   });
 });
@@ -56,15 +58,17 @@ const draft = (tokenTtl: string, tokenMaxTtl: string): IdentityDraft => ({
 });
 
 describe("ttlProblem", () => {
-  it("accepts sensible TTLs", () => {
+  it("accepts sensible TTLs, in seconds or with units", () => {
     expect(ttlProblem(draft("3600", "86400"))).toBeUndefined();
+    expect(ttlProblem(draft("1h", "1d"))).toBeUndefined();
+    expect(ttlProblem(draft("15m", "1h 30m"))).toBeUndefined();
   });
 
   it("mirrors the server's TTL rules", () => {
     expect(ttlProblem(draft("30", "3600"))).toMatch(/at least 60/);
-    expect(ttlProblem(draft("3600", "60"))).toMatch(/shorter/);
-    expect(ttlProblem(draft("3600", String(400 * 86400)))).toMatch(/a year/);
-    expect(ttlProblem(draft("1.5", "3600"))).toMatch(/whole numbers/);
+    expect(ttlProblem(draft("1h", "1m"))).toMatch(/shorter/);
+    expect(ttlProblem(draft("3600", "400d"))).toMatch(/a year/);
+    expect(ttlProblem(draft("1.5", "3600"))).toBe("Enter each lifetime as a duration such as 3600, 30m, 1h or 7d");
   });
 });
 

@@ -163,14 +163,43 @@ impl StoreLocation {
 }
 
 impl StoreArgs {
+    /// Finds the store for an admin command, printing the same file warnings the server would.
     pub fn locate(&self, sources: &Sources) -> anyhow::Result<StoreLocation> {
+        let (location, warnings) = self.locate_checked(sources)?;
+        for warning in warnings {
+            eprintln!("sekret: warning: {warning}");
+        }
+        Ok(location)
+    }
+
+    pub fn locate_checked(&self, sources: &Sources) -> anyhow::Result<(StoreLocation, Vec<String>)> {
         let file = load(self.config.as_deref())?;
-        Ok(StoreLocation {
-            database_url: choose_database(self, &file.database, sources)?.url,
+        let config_has_password = file.database.url.as_deref().is_some_and(has_password);
+        let database = choose_database(self, &file.database, sources)?;
+        let location = StoreLocation {
             root_key_file: self.root_key_file.clone().or(file.seal.root_key_file),
             remember_file: self.remember_file.clone().or(file.seal.remember_file),
             epoch_file: self.epoch_file.clone().or(file.seal.epoch_file),
-        })
+            database_url: database.url,
+        };
+        let mut warnings = database.ignored;
+        warnings.extend(self.config.as_deref().and_then(config_writers));
+        warnings.extend(exposure_warnings(&[
+            ("root key file", location.root_key_file.as_deref()),
+            ("remember file", location.remember_file.as_deref()),
+            (
+                "database URL file",
+                database
+                    .file
+                    .as_deref()
+                    .filter(|_| has_password(&location.database_url)),
+            ),
+            (
+                "configuration file, which holds a database password,",
+                self.config.as_deref().filter(|_| config_has_password),
+            ),
+        ]));
+        Ok((location, warnings))
     }
 }
 
@@ -851,6 +880,28 @@ pub fn replaceable_in(dir: DirFacts, uid: u32, gid: u32) -> Option<&'static str>
     None
 }
 
+/// Why users other than `uid` could swap a directory above a file, and so the file with it. A
+/// sticky directory is only safe when the entry the path goes through is `uid`'s or root's.
+pub fn ancestor_replaceable(
+    ancestor: &sekret_server::host_socket::Ancestor,
+    uid: u32,
+    gid: u32,
+) -> Option<&'static str> {
+    let facts = DirFacts {
+        uid: ancestor.dir_uid,
+        gid: ancestor.dir_gid,
+        mode: ancestor.dir_mode,
+    };
+    if let Some(why) = replaceable_in(facts, uid, gid) {
+        return Some(why);
+    }
+    let shared = ancestor.dir_mode & 0o022 != 0;
+    if shared && ancestor.entry_uid != uid && ancestor.entry_uid != 0 {
+        return Some("it is shared, and the entry in it belongs to another user, who can replace it");
+    }
+    None
+}
+
 #[cfg(unix)]
 fn directory_exposure(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -865,7 +916,7 @@ fn directory_exposure(path: &Path) -> Option<String> {
     }
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    dirs.iter().find_map(|dir| {
+    let immediate = dirs.iter().find_map(|dir| {
         let meta = std::fs::metadata(dir).ok()?;
         let facts = DirFacts {
             uid: meta.uid(),
@@ -873,12 +924,66 @@ fn directory_exposure(path: &Path) -> Option<String> {
             mode: meta.mode(),
         };
         replaceable_in(facts, uid, gid).map(|why| format!("{} is in {}, and {why}", path.display(), dir.display()))
-    })
+    });
+    if immediate.is_some() {
+        return immediate;
+    }
+    // A missing directory cannot be checked; reading the file fails on its own.
+    dirs.iter()
+        .filter_map(|dir| sekret_server::host_socket::ancestors(dir).ok())
+        .flatten()
+        .find_map(|ancestor| {
+            ancestor_replaceable(&ancestor, uid, gid)
+                .map(|why| format!("{} is below {}, and {why}", path.display(), ancestor.dir.display()))
+        })
 }
 
 #[cfg(not(unix))]
 fn directory_exposure(_path: &Path) -> Option<String> {
     None
+}
+
+/// Refuses a backup staging directory that someone else could swap between the server making
+/// its private directory there and writing the database snapshot into it. A directory that does
+/// not exist yet is made by the server, so its nearest existing ancestor is checked instead.
+#[cfg(unix)]
+fn check_staging_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some((existing, meta)) = dir
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .find_map(|p| std::fs::metadata(p).ok().map(|m| (p, m)))
+    else {
+        return Ok(());
+    };
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let facts = DirFacts {
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode(),
+    };
+    let own = replaceable_in(facts, uid, gid).map(|why| format!("{}: {why}", existing.display()));
+    let above = || {
+        sekret_server::host_socket::ancestors(existing)
+            .ok()?
+            .into_iter()
+            .find_map(|a| ancestor_replaceable(&a, uid, gid).map(|why| format!("{}: {why}", a.dir.display())))
+    };
+    let Some(why) = own.or_else(above) else {
+        return Ok(());
+    };
+    bail!(
+        "backup.temp_dir {} is not safe for staging database snapshots, since another user could swap the \
+         staging directory and read or replace the snapshot ({why}); choose a directory only sekret's user \
+         or root can write to",
+        dir.display()
+    )
+}
+
+#[cfg(not(unix))]
+fn check_staging_dir(_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Why a file holding a key, passphrase or credential is exposed: others can read it, another
@@ -940,6 +1045,17 @@ fn parse_socket_mode(raw: &str) -> anyhow::Result<u32> {
     }
 }
 
+const OIDC_DEFAULT_CLIENT_ID: &str = "sekret";
+const OIDC_DEFAULT_SCOPES: &[&str] = &["openid", "profile", "email"];
+const OIDC_DEFAULT_GROUP_CLAIMS: &[&str] = &["roles", "groups"];
+const OIDC_DEFAULT_ADMIN_GROUPS: &[&str] = &["sekret-admin"];
+
+/// An empty flag or variable gives `[""]`; for lists that grant rather than restrict, that means
+/// none. `required_groups` and `allowed_subjects` keep it, so they fail closed.
+fn without_blanks(values: Vec<String>) -> Vec<String> {
+    values.into_iter().filter(|v| !v.trim().is_empty()).collect()
+}
+
 fn oidc(args: &ServerArgs, file: OidcSection) -> anyhow::Result<Option<HumanOidcConfig>> {
     let Some(issuer) = args.oidc_issuer.clone().or(file.issuer) else {
         return Ok(None);
@@ -955,23 +1071,25 @@ fn oidc(args: &ServerArgs, file: OidcSection) -> anyhow::Result<Option<HumanOidc
             .oidc_client_id
             .clone()
             .or(file.client_id)
-            .unwrap_or_else(|| "sekret".into()),
+            .unwrap_or_else(|| OIDC_DEFAULT_CLIENT_ID.into()),
         client_secret: read_secret_file(&secret_file)?,
         scopes: args
             .oidc_scopes
             .clone()
             .or(file.scopes)
-            .unwrap_or_else(|| strings(&["openid", "profile", "email"])),
-        group_claims: args
-            .oidc_group_claims
-            .clone()
-            .or(file.group_claims)
-            .unwrap_or_else(|| strings(&["roles", "groups"])),
-        admin_groups: args
-            .oidc_admin_groups
-            .clone()
-            .or(file.admin_groups)
-            .unwrap_or_else(|| strings(&["sekret-admin"])),
+            .unwrap_or_else(|| strings(OIDC_DEFAULT_SCOPES)),
+        group_claims: without_blanks(
+            args.oidc_group_claims
+                .clone()
+                .or(file.group_claims)
+                .unwrap_or_else(|| strings(OIDC_DEFAULT_GROUP_CLAIMS)),
+        ),
+        admin_groups: without_blanks(
+            args.oidc_admin_groups
+                .clone()
+                .or(file.admin_groups)
+                .unwrap_or_else(|| strings(OIDC_DEFAULT_ADMIN_GROUPS)),
+        ),
         required_groups: args
             .oidc_required_groups
             .clone()
@@ -1166,6 +1284,9 @@ pub fn resolve_with(
         .max(1);
     let login_rate_per_minute = args.login_rate_per_minute.or(auth.login_rate_per_minute).unwrap_or(30);
     let backup_temp_dir = args.backup_temp_dir.clone().or(backup.temp_dir.clone());
+    if let Some(dir) = &backup_temp_dir {
+        check_staging_dir(dir)?;
+    }
     notes.note(
         "server.listen",
         "listen",
@@ -1237,6 +1358,8 @@ pub fn resolve_with(
         Some(login_rate_per_minute.to_string()),
         auth.login_rate_per_minute.is_some(),
     );
+    let oidc_on = args.oidc_issuer.is_some() || oidc_file.issuer.is_some();
+    let oidc_default = |values: &[&str], sep: &str| oidc_on.then(|| values.join(sep));
     notes.note(
         "oidc.issuer",
         "oidc-issuer",
@@ -1248,7 +1371,10 @@ pub fn resolve_with(
         "oidc.client_id",
         "oidc-client-id",
         "SEKRET_OIDC_CLIENT_ID",
-        args.oidc_client_id.clone().or(oidc_file.client_id.clone()),
+        args.oidc_client_id
+            .clone()
+            .or(oidc_file.client_id.clone())
+            .or_else(|| oidc_default(&[OIDC_DEFAULT_CLIENT_ID], "")),
         oidc_file.client_id.is_some(),
     );
     notes.note(
@@ -1265,7 +1391,8 @@ pub fn resolve_with(
         args.oidc_scopes
             .clone()
             .or(oidc_file.scopes.clone())
-            .map(|s| s.join(" ")),
+            .map(|s| s.join(" "))
+            .or_else(|| oidc_default(OIDC_DEFAULT_SCOPES, " ")),
         oidc_file.scopes.is_some(),
     );
     notes.note(
@@ -1353,13 +1480,14 @@ pub fn resolve_with(
         Some(allow_insecure_http.to_string()),
         insecure_in_file,
     );
-    let oidc_lists = [
+    let oidc_lists: [(_, _, _, _, _, &[&str]); 4] = [
         (
             "oidc.group_claims",
             "oidc-group-claims",
             "SEKRET_OIDC_GROUP_CLAIMS",
             &args.oidc_group_claims,
             &oidc_file.group_claims,
+            OIDC_DEFAULT_GROUP_CLAIMS,
         ),
         (
             "oidc.admin_groups",
@@ -1367,6 +1495,7 @@ pub fn resolve_with(
             "SEKRET_OIDC_ADMIN_GROUPS",
             &args.oidc_admin_groups,
             &oidc_file.admin_groups,
+            OIDC_DEFAULT_ADMIN_GROUPS,
         ),
         (
             "oidc.required_groups",
@@ -1374,6 +1503,7 @@ pub fn resolve_with(
             "SEKRET_OIDC_REQUIRED_GROUPS",
             &args.oidc_required_groups,
             &oidc_file.required_groups,
+            &[],
         ),
         (
             "oidc.allowed_subjects",
@@ -1381,10 +1511,15 @@ pub fn resolve_with(
             "SEKRET_OIDC_ALLOWED_SUBJECTS",
             &args.oidc_allowed_subjects,
             &oidc_file.allowed_subjects,
+            &[],
         ),
     ];
-    for (name, flag, env, given, in_file) in oidc_lists {
-        let value = given.as_ref().or(in_file.as_ref()).map(|v| v.join(","));
+    for (name, flag, env, given, in_file, default) in oidc_lists {
+        let value = given
+            .as_ref()
+            .or(in_file.as_ref())
+            .map(|v| v.join(","))
+            .or_else(|| oidc_default(default, ",").filter(|v| !v.is_empty()));
         notes.note(name, flag, env, value, in_file.is_some());
     }
     notes.note(
@@ -1642,26 +1777,39 @@ fn server_warnings(config: &ServerConfig, warnings: &mut Vec<String>) {
 /// Past this, the passphrase guessing rate the same setting allows is worth a warning.
 const LOGIN_RATE_USUAL_MOST: u32 = 300;
 
-/// With no restriction, every account at the provider can sign in and gets the default role.
-/// Not refused, since a single-tenant provider is already a restriction sekret cannot see.
+/// With no restriction, every account at the provider can sign in, and gets the default role,
+/// org-admin through `admin_groups` and any role bound to a group it claims. Only silent when
+/// none of those can grant anything. Not refused, since a single-tenant provider is already a
+/// restriction sekret cannot see.
 fn open_sign_in_warning(oidc: Option<&HumanOidcConfig>, default_org_role: &str) -> Option<String> {
     let oidc = oidc?;
-    if !oidc.required_groups.is_empty() || !oidc.allowed_subjects.is_empty() || default_org_role.is_empty() {
+    if !oidc.required_groups.is_empty() || !oidc.allowed_subjects.is_empty() {
         return None;
     }
-    let admins = match (oidc.group_claims.is_empty(), oidc.admin_groups.is_empty()) {
-        (false, false) => format!(
-            ", and anyone whose {} claim holds {} becomes an organisation admin",
-            oidc.group_claims.join(" or "),
-            oidc.admin_groups.join(" or ")
-        ),
-        _ => String::new(),
-    };
+    let claims_groups = !oidc.group_claims.is_empty();
+    if default_org_role.is_empty() && !claims_groups {
+        return None;
+    }
+    let mut grants = Vec::new();
+    if !default_org_role.is_empty() {
+        grants.push(format!("becomes {default_org_role}"));
+    }
+    if claims_groups {
+        let claims = oidc.group_claims.join(" or ");
+        if !oidc.admin_groups.is_empty() {
+            grants.push(format!(
+                "becomes an organisation admin if their {claims} claim holds {}",
+                oidc.admin_groups.join(" or ")
+            ));
+        }
+        grants.push(format!("gets any role bound to a group their {claims} claim names"));
+    }
     Some(format!(
         "OIDC sign-in is open to every account at {}: oidc.required_groups and oidc.allowed_subjects are empty, \
-         so anyone the provider signs in becomes {default_org_role}{admins}; set oidc.required_groups or \
-         oidc.allowed_subjects, or set auth.default_org_role to \"\" (an empty list means no restriction, not no one)",
+         so anyone the provider signs in {}; set oidc.required_groups or oidc.allowed_subjects (an empty list \
+         means no restriction, not no one)",
         oidc.issuer,
+        grants.join(", ")
     ))
 }
 
@@ -2065,9 +2213,33 @@ mod tests {
             open_sign_in_warning(None, "org-member").is_none(),
             "no OIDC, no warning"
         );
+        let no_role = open_sign_in_warning(Some(&open), "").unwrap_or_default();
         assert!(
-            open_sign_in_warning(Some(&open), "").is_none(),
-            "no default role is a restriction"
+            no_role.contains("organisation admin") && no_role.contains("sekret-admin"),
+            "admin_groups still grants admin with no default role: {no_role}"
+        );
+        assert!(!no_role.contains("default_org_role"), "{no_role}");
+        let no_role_no_admins = HumanOidcConfig {
+            admin_groups: Vec::new(),
+            ..open.clone()
+        };
+        let warning = open_sign_in_warning(Some(&no_role_no_admins), "").unwrap_or_default();
+        assert!(
+            warning.contains("any role bound to a group") && !warning.contains("organisation admin"),
+            "group bindings still grant roles: {warning}"
+        );
+        let no_groups = HumanOidcConfig {
+            group_claims: Vec::new(),
+            ..open.clone()
+        };
+        assert!(
+            open_sign_in_warning(Some(&no_groups), "").is_none(),
+            "no role and no group claims grants nothing"
+        );
+        let warning = open_sign_in_warning(Some(&no_groups), "org-member").unwrap_or_default();
+        assert!(
+            warning.contains("org-member") && !warning.contains("organisation admin"),
+            "{warning}"
         );
 
         let grouped = HumanOidcConfig {
@@ -2086,6 +2258,46 @@ mod tests {
         };
         let warning = open_sign_in_warning(Some(&no_admins), "org-member").unwrap_or_default();
         assert!(!warning.contains("organisation admin"), "{warning}");
+    }
+
+    #[test]
+    fn blank_grant_lists_mean_none_and_defaults_are_reported() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let secret = dir.path().join("oidc-secret");
+        std::fs::write(&secret, "s\n").context("secret")?;
+        let mut flags = args(&["--public-url", "https://x"])?;
+        flags.oidc_issuer = Some("https://issuer".into());
+        flags.oidc_client_secret_file = Some(secret);
+        let defaults = resolve(&flags, FileConfig::default())?;
+        let reported = |resolved: &Resolved, name: &str| {
+            resolved
+                .report
+                .settings
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.value.clone(), s.origin))
+        };
+        assert_eq!(
+            reported(&defaults, "oidc.admin_groups"),
+            Some(("sekret-admin".into(), Origin::Default))
+        );
+        assert_eq!(
+            reported(&defaults, "oidc.group_claims"),
+            Some(("roles,groups".into(), Origin::Default))
+        );
+        assert_eq!(
+            reported(&defaults, "oidc.client_id"),
+            Some(("sekret".into(), Origin::Default))
+        );
+
+        flags.oidc_group_claims = Some(vec![String::new()]);
+        flags.oidc_admin_groups = Some(vec![String::new()]);
+        flags.oidc_required_groups = Some(vec![String::new()]);
+        let blank = resolve(&flags, FileConfig::default())?;
+        let oidc = blank.config.oidc.context("oidc")?;
+        assert!(oidc.group_claims.is_empty() && oidc.admin_groups.is_empty());
+        assert_eq!(oidc.required_groups, [""], "restrictions still fail closed");
+        Ok(())
     }
 
     #[test]
@@ -2613,6 +2825,50 @@ mod tests {
         assert_eq!(sqlite_path("postgres://x/y"), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn admin_commands_get_the_servers_file_warnings() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let key = dir.path().join("root.key");
+        std::fs::write(&key, "k").context("write")?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+        let config = dir.path().join("sekret.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "database:\n  url: postgres://u:Hunter2Secret@db/x\nseal:\n  root_key_file: {}\n",
+                key.display()
+            ),
+        )
+        .context("write")?;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let store = StoreArgs {
+            config: Some(config.clone()),
+            database_url: None,
+            database_url_file: None,
+            root_key_file: None,
+            remember_file: None,
+            epoch_file: None,
+        };
+        let (_, warnings) = store.locate_checked(&Sources::none())?;
+        let text = warnings.join("\n");
+        for expected in [
+            "decides who signs in",
+            "the root key file",
+            "the configuration file, which holds a database password,",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
+        assert!(!text.contains("Hunter2Secret"), "{text}");
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        let (_, warnings) = store.locate_checked(&Sources::none())?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
+    }
+
     #[test]
     fn store_args_read_the_file() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("dir")?;
@@ -2837,6 +3093,62 @@ mod tests {
             secret_file_exposure(&link).is_some(),
             "the target's directory counts too"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ancestors_others_can_rearrange_let_them_replace_files() {
+        use sekret_server::host_socket::Ancestor;
+        let above = |dir_uid, dir_gid, dir_mode, entry_uid| Ancestor {
+            dir: "/srv".into(),
+            dir_uid,
+            dir_gid,
+            dir_mode,
+            entry_uid,
+        };
+        assert_eq!(ancestor_replaceable(&above(0, 0, 0o40755, 0), 1000, 1000), None);
+        assert_eq!(
+            ancestor_replaceable(&above(1000, 1000, 0o40775, 1000), 1000, 1000),
+            None,
+            "a user private group"
+        );
+        assert_eq!(
+            ancestor_replaceable(&above(0, 0, 0o41777, 1000), 1000, 1000),
+            None,
+            "sticky, with my entry"
+        );
+        assert!(
+            ancestor_replaceable(&above(0, 0, 0o41777, 2000), 1000, 1000).is_some(),
+            "sticky, with someone else's entry"
+        );
+        assert!(ancestor_replaceable(&above(0, 0, 0o40777, 1000), 1000, 1000).is_some());
+        assert!(ancestor_replaceable(&above(0, 50, 0o40775, 0), 1000, 1000).is_some());
+        assert!(ancestor_replaceable(&above(2000, 2000, 0o40755, 1000), 1000, 1000).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_below_an_open_directory_further_up_are_exposed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let shared = dir.path().join("shared");
+        let conf = shared.join("conf");
+        std::fs::create_dir_all(&conf).context("mkdir")?;
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let file = conf.join("open.yaml");
+        std::fs::write(&file, "x").context("write")?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        let why = secret_file_exposure(&file).context("exposed")?;
+        assert!(why.contains("is below") && why.contains("shared"), "{why}");
+        let why = config_writers(&file).context("config exposed")?;
+        assert!(why.contains("decides who signs in"), "{why}");
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).context("chmod")?;
+        assert_eq!(secret_file_exposure(&file), None, "sticky, and the entry below is mine");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).context("chmod")?;
+        assert_eq!(secret_file_exposure(&file), None);
+        assert_eq!(config_writers(&file), None);
         Ok(())
     }
 }

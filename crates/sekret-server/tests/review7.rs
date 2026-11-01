@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SHORT: BodyTimeouts = BodyTimeouts {
     gap: Duration::from_secs(1),
     total: Duration::from_secs(2),
+    open: Duration::from_secs(2),
 };
 
 async fn short_deadlines() -> anyhow::Result<Harness> {

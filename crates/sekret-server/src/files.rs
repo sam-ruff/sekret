@@ -289,6 +289,7 @@ pub fn exposure(path: &Path) -> Option<String> {
 }
 
 const EPOCH_PREFIX: &str = "sekret-seal-epoch";
+const MIGRATED: &str = "migrated";
 /// More than a rotation in progress ever records.
 const MAX_MARK_ROOTS: usize = 2;
 
@@ -298,23 +299,33 @@ const MAX_MARK_ROOTS: usize = 2;
 pub struct EpochMark {
     pub epoch: i64,
     pub roots: Vec<String>,
+    /// A configuration recorded here had run the one-off migrations, so none may run again.
+    pub migrated: bool,
 }
 
 fn is_fingerprint(text: &str) -> bool {
     (8..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// An epoch out of range was written by someone else, so the mark reads as damaged.
 fn parse_mark(text: &str) -> Option<EpochMark> {
     let mut words = text.split_ascii_whitespace();
     if words.next()? != EPOCH_PREFIX {
         return None;
     }
     let epoch = words.next()?.parse().ok()?;
-    let roots: Vec<String> = words.map(str::to_string).collect();
+    if !sekret_core::seal::plausible_epoch(epoch) {
+        return None;
+    }
+    let mut roots: Vec<String> = words.map(str::to_string).collect();
+    let migrated = roots.last().is_some_and(|word| word == MIGRATED);
+    if migrated {
+        roots.pop();
+    }
     if roots.len() > MAX_MARK_ROOTS || !roots.iter().all(|r| is_fingerprint(r)) {
         return None;
     }
-    Some(EpochMark { epoch, roots })
+    Some(EpochMark { epoch, roots, migrated })
 }
 
 /// The mark in a mark file, if there is one.
@@ -343,10 +354,20 @@ pub fn write_mark(path: &Path, mark: &EpochMark) -> io::Result<()> {
             "not a root key fingerprint",
         ));
     }
+    if !sekret_core::seal::plausible_epoch(mark.epoch) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the seal epoch is out of range",
+        ));
+    }
     let mut text = format!("{EPOCH_PREFIX} {}", mark.epoch);
     for root in &mark.roots {
         text.push(' ');
         text.push_str(root);
+    }
+    if mark.migrated {
+        text.push(' ');
+        text.push_str(MIGRATED);
     }
     text.push('\n');
     write_private_atomic(path, text.as_bytes())
@@ -528,12 +549,44 @@ mod tests {
         let mark = EpochMark {
             epoch: 7,
             roots: vec!["0123456789abcdef".into()],
+            migrated: false,
         };
         write_mark(&path, &mark).context("write")?;
         assert_eq!(read_epoch(&path).context("read")?, Some(7));
         assert_eq!(read_mark(&path).context("read")?, Some(mark));
+        let migrated = EpochMark {
+            epoch: 8,
+            roots: vec!["0123456789abcdef".into()],
+            migrated: true,
+        };
+        write_mark(&path, &migrated).context("write")?;
+        assert_eq!(
+            std::fs::read_to_string(&path).context("text")?,
+            "sekret-seal-epoch 8 0123456789abcdef migrated\n"
+        );
+        assert_eq!(read_mark(&path).context("read")?, Some(migrated));
         std::fs::write(&path, b"garbage").context("garbage")?;
         assert!(read_epoch(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn marks_with_an_implausible_epoch_read_as_damaged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("sekret.db.epoch");
+        let ceiling = sekret_core::seal::MAX_SEAL_EPOCH;
+        for epoch in [i64::MAX, ceiling, -1] {
+            std::fs::write(&path, format!("sekret-seal-epoch {epoch}\n")).context("write")?;
+            assert!(read_mark(&path).is_err(), "{epoch}");
+            let mark = EpochMark {
+                epoch,
+                roots: Vec::new(),
+                migrated: false,
+            };
+            assert!(write_mark(&path, &mark).is_err(), "{epoch}");
+        }
+        std::fs::write(&path, format!("sekret-seal-epoch {}\n", ceiling - 1)).context("write")?;
+        assert_eq!(read_epoch(&path).context("read")?, Some(ceiling - 1));
         Ok(())
     }
 
@@ -546,12 +599,14 @@ mod tests {
             read_mark(&path).context("read")?,
             Some(EpochMark {
                 epoch: 12,
-                roots: Vec::new()
+                roots: Vec::new(),
+                migrated: false,
             })
         );
         let rotating = EpochMark {
             epoch: 13,
             roots: vec!["0123456789abcdef".into(), "fedcba9876543210".into()],
+            migrated: true,
         };
         write_mark(&path, &rotating).context("write")?;
         assert_eq!(read_mark(&path).context("read")?, Some(rotating));
@@ -567,6 +622,8 @@ mod tests {
             "sekret-seal-epoch 3 aaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbb cccccccccccccccc\n",
             "sekret-seal-epoch\n",
             "sekret-seal-epochs 3\n",
+            "sekret-seal-epoch 3 migrated migrated\n",
+            "sekret-seal-epoch 3 migrated aaaaaaaaaaaaaaaa\n",
         ] {
             std::fs::write(&path, bad).context("write")?;
             assert!(read_mark(&path).is_err(), "{bad}");
@@ -574,6 +631,7 @@ mod tests {
         let injected = EpochMark {
             epoch: 1,
             roots: vec!["aa\nsekret-seal-epoch 0".into()],
+            migrated: false,
         };
         assert!(write_mark(&path, &injected).is_err());
         Ok(())

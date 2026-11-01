@@ -43,6 +43,11 @@ test("shows where the request came from and approves only after the code is type
   await page.getByTestId("cli-approve").click();
   await expect(page.getByTestId("cli-approved")).toBeVisible();
   await expect(page.getByTestId("cli-request")).toHaveCount(0);
+  // A way back into the app, after the message.
+  const home = page.getByTestId("cli-go-home");
+  expect((await home.boundingBox())?.y ?? 0).toBeGreaterThan((await page.getByTestId("cli-approved").boundingBox())?.y ?? Infinity);
+  await home.click();
+  await expect(page).not.toHaveURL(/cli-login/);
 });
 
 test("a request from another network needs a strong warning and an extra tick", async ({ page }) => {
@@ -134,6 +139,7 @@ test("cancelling refuses the request on the server", async ({ page }) => {
   await expect(page.getByTestId("standalone-title")).toHaveText("Command line sign-in denied");
   await expect(page.getByTestId("cli-login")).not.toContainText("will act as");
   expect(await requests(page)).toContain("POST /api/v1/auth/cli/deny");
+  await expect(page.getByTestId("cli-go-home")).toHaveText("Go to sekret");
   // The request is gone, so the same link now says it has ended.
   await page.goto(`/cli-login?code=${SAME}`);
   await expect(page.getByTestId("cli-unknown")).toBeVisible();

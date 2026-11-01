@@ -9,7 +9,7 @@ function MissingProject({ slug }: { slug: string }) {
   return (
     <MissingState
       title="Project not found"
-      description={`There is no project called ${slug} that you can see. It may have been deleted or renamed, or you may not have access to it.`}
+      description={`There is no project called "${slug}" that you can see. It may have been deleted or renamed, or you may not have access to it.`}
       backTo="/projects"
       backLabel="Back to projects"
       testId="project-missing"

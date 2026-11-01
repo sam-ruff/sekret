@@ -24,6 +24,14 @@ pub const MIN_REMEMBER_SECRET_LEN: usize = 32;
 pub const BACKUP_MAGIC: &[u8; 4] = b"SKB1";
 /// Largest backup accepted or produced, whole file.
 pub const MAX_BACKUP_LEN: usize = 1 << 30;
+/// Seal configuration epochs and epoch marks stay below this. An honest server never gets near
+/// it, so a stored epoch at or above it was put there by someone without the root key.
+pub const MAX_SEAL_EPOCH: i64 = 1 << 48;
+
+/// Whether `epoch` is one a seal configuration or epoch mark could honestly hold.
+pub fn plausible_epoch(epoch: i64) -> bool {
+    (0..MAX_SEAL_EPOCH).contains(&epoch)
+}
 
 const ROOT_KEY_AAD: &[u8] = b"sekret/root-key/v1";
 const REMEMBER_AAD: &[u8] = b"sekret/remember/v1";

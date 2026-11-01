@@ -1,5 +1,5 @@
 import { useQueries, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Folder, Layers, Minus } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileUp, Folder, Layers, Minus, Plus } from "lucide-react";
 import { useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { api } from "@/api/endpoints";
@@ -12,7 +12,8 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { folderQuery } from "@/hooks/use-project-env";
 import { keys, useEnvironments } from "@/hooks/queries";
-import { normalisePath } from "@/lib/paths";
+import { useProjectPermissions } from "@/hooks/use-permissions";
+import { folderFromLink } from "@/lib/paths";
 import { ROW_PAGE } from "@/lib/secret-limits";
 import { cn } from "@/lib/utils";
 
@@ -23,6 +24,12 @@ function cellHref(project: string, env: string, path: string, missingKey?: strin
   if (missingKey) params.set("add", missingKey);
   const query = params.toString();
   return `/projects/${project}/secrets/${env}${query ? `?${query}` : ""}`;
+}
+
+/** Opens an environment's secrets page with the add form or the import dialog already open. */
+function addHref(project: string, env: string, path: string, open: "add=" | "import=1"): string {
+  const folder = path === "/" ? "" : `path=${encodeURIComponent(path)}&`;
+  return `/projects/${project}/secrets/${env}?${folder}${open}`;
 }
 
 /** Lets a long key wrap after each underscore before it has to break inside a word. */
@@ -39,7 +46,8 @@ function BreakableKey({ value }: { value: string }) {
 export function OverviewPage() {
   const { project = "" } = useParams();
   const [search] = useSearchParams();
-  const path = normalisePath(search.get("path") ?? "/");
+  const path = folderFromLink(search.get("path"));
+  const perms = useProjectPermissions(project);
   const [onlyMissing, setOnlyMissing] = useState(false);
   const [shownRows, setShownRows] = useState(ROW_PAGE);
   const [shownFolderCount, setShownFolderCount] = useState(ROW_PAGE);
@@ -70,6 +78,7 @@ export function OverviewPage() {
     ),
   ).sort();
 
+  const firstEnv = environments.data?.[0];
   const envs = overview.data?.environments ?? [];
   const rows = overview.data?.rows ?? [];
   const incomplete = rows.filter((r) => envs.some((e) => r.environments[e.slug] === undefined));
@@ -86,12 +95,14 @@ export function OverviewPage() {
 
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <FolderBreadcrumbs path={path} hrefFor={href} />
-        <div className="flex items-center gap-2">
-          <Switch id="only-missing" checked={onlyMissing} onCheckedChange={setOnlyMissing} data-testid="only-missing" />
-          <Label htmlFor="only-missing" className="font-normal">
-            Only keys with gaps
-          </Label>
-        </div>
+        {rows.length > 0 && (
+          <div className="flex items-center gap-2">
+            <Switch id="only-missing" checked={onlyMissing} onCheckedChange={setOnlyMissing} data-testid="only-missing" />
+            <Label htmlFor="only-missing" className="font-normal">
+              Only keys with gaps
+            </Label>
+          </div>
+        )}
       </div>
 
       {subfolders.length > 0 && (
@@ -147,7 +158,31 @@ export function OverviewPage() {
       )}
 
       {overview.isSuccess && rows.length === 0 && (
-        <EmptyState icon={<Layers />} title="No secrets in this folder" description="Keys appear here once any environment has them." testId="overview-empty" />
+        <EmptyState
+          icon={<Layers />}
+          title="No secrets in this folder"
+          description="Keys appear here once any environment has them."
+          action={
+            firstEnv &&
+            perms.canSomewhere("secrets", "create") && (
+              <div className="flex flex-wrap justify-center gap-2">
+                <Button asChild>
+                  <Link to={addHref(project, firstEnv.slug, path, "add=")} data-testid="overview-add-secret">
+                    <Plus />
+                    Add secret to {firstEnv.name}
+                  </Link>
+                </Button>
+                <Button variant="outline" asChild>
+                  <Link to={addHref(project, firstEnv.slug, path, "import=1")} data-testid="overview-import">
+                    <FileUp />
+                    Import .env
+                  </Link>
+                </Button>
+              </div>
+            )
+          }
+          testId="overview-empty"
+        />
       )}
 
       {shown.length > 0 && envs.length > 1 && (

@@ -97,6 +97,9 @@ import {
 const DAY = 24 * 3600;
 const DEFAULT_PAGE = 50;
 const MAX_PAGE = 500;
+/** Mirrors the server's history page sizes. */
+export const DEFAULT_HISTORY_PAGE = 100;
+export const MAX_HISTORY_PAGE = 200;
 
 /** The actor the server records on automatic rotations. */
 export const ROTATION_ACTOR = { kind: "identity", id: "sekret-rotation", name: "automatic rotation" } as const;
@@ -958,7 +961,21 @@ export class MockBackend {
     return this.batchWrite(projectId, envSlug, { path: rawPath, deletes: [key] });
   }
 
-  listVersions(projectId: string, envSlug: string, key: string, rawPath: string, values: boolean): SecretVersion[] {
+  listVersions(
+    projectId: string,
+    envSlug: string,
+    key: string,
+    rawPath: string,
+    values: boolean,
+    page: { limit?: number; before?: number } = {},
+  ): SecretVersion[] {
+    const limit = page.limit ?? DEFAULT_HISTORY_PAGE;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_HISTORY_PAGE) {
+      throw badRequest(`limit must be between 1 and ${MAX_HISTORY_PAGE}`);
+    }
+    if (page.before !== undefined && !Number.isSafeInteger(page.before)) {
+      throw badRequest("Failed to deserialize query string: before: invalid digit found in string");
+    }
     const { project, rules } = this.loadProject(projectId);
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(rawPath);
@@ -973,7 +990,12 @@ export class MockBackend {
     if (reveal) {
       this.audit("secret.history-read", { project_id: project.id, environment: env.slug, path, secret_key: key }, {});
     }
-    return [...s.versions].reverse().map((v) => ({
+    const before = page.before ?? Number.MAX_SAFE_INTEGER;
+    const shown = [...s.versions]
+      .reverse()
+      .filter((v) => v.version < before)
+      .slice(0, limit);
+    return shown.map((v) => ({
       version: v.version,
       value: reveal ? v.value : null,
       value_hidden: !reveal && v.value !== null,
@@ -1410,7 +1432,7 @@ export class MockBackend {
       created_at: this.now(),
     };
     this.state.identities.push(identity);
-    this.audit("identity.create", {}, { identity: identity.id });
+    this.audit("identity.create", {}, { identity: identity.id, name: identity.name });
     return this.apiIdentity(identity);
   }
 
@@ -1504,14 +1526,14 @@ export class MockBackend {
     const list = (this.state.authMethods[id] ?? []).filter((m) => m.kind !== config.kind);
     list.push(stored);
     this.state.authMethods[id] = list;
-    this.audit("identity.auth-put", {}, { identity: id, kind });
+    this.audit("identity.auth-put", {}, { identity: id, method: kind });
   }
 
   deleteAuthMethod(id: string, kind: AuthMethodKind): void {
     this.requireOrg("identities", "edit");
     this.loadIdentity(id);
     this.state.authMethods[id] = (this.state.authMethods[id] ?? []).filter((m) => m.kind !== kind);
-    this.audit("identity.auth-delete", {}, { identity: id, kind });
+    this.audit("identity.auth-delete", {}, { identity: id, method: kind });
   }
 
   listClientSecrets(id: string): ClientSecret[] {
@@ -1539,7 +1561,7 @@ export class MockBackend {
       last_used_at: null,
     };
     this.state.clientSecrets[id] = [...(this.state.clientSecrets[id] ?? []), secret];
-    this.audit("identity.client-secret-create", {}, { identity: id, secret: secret.id });
+    this.audit("identity.client-secret-create", {}, { identity: id, prefix: secret.prefix });
     return { client_id: id, client_secret: clientSecret, secret };
   }
 

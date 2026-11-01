@@ -232,6 +232,20 @@ describe("ServerPage", () => {
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
   });
 
+  it("drops the downloaded backup from the mutation cache once it is saved", async () => {
+    const createObjectURL = vi.fn(() => "blob:backup");
+    const revokeObjectURL = vi.fn();
+    Object.assign(URL, { createObjectURL, revokeObjectURL });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    mocked.backup.mockResolvedValue({ blob: new Blob(["encrypted"]), filename: "sekret-backup.skb" });
+    const { client } = renderServer(unlocked, backupReader);
+    await userEvent.click(await screen.findByTestId("backup-download"));
+    await waitFor(() => expect(click).toHaveBeenCalled());
+    expect(createObjectURL).toHaveBeenCalled();
+    await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
+    click.mockRestore();
+  });
+
   it("marks every passphrase field as a secret for spellcheckers and writing assistants", async () => {
     renderServer();
     await screen.findByTestId("current-passphrase");

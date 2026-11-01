@@ -57,11 +57,14 @@ pub struct HostSocket;
 
 /// The status and unseal routes alone, for the host socket. Nothing else is reachable through it.
 pub fn host_router(state: AppState) -> axum::Router {
+    let timeouts = crate::BodyTimeouts::default();
     axum::Router::new()
         .route("/api/v1/sys/status", axum::routing::get(status))
         .route("/api/v1/sys/unseal", axum::routing::post(unseal))
         .layer(Extension(HostSocket))
         .layer(DefaultBodyLimit::max(SYS_BODY_LIMIT))
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(timeouts.gap))
+        .layer(tower_http::timeout::RequestBodyDeadlineLayer::new(timeouts.open))
         .with_state(state)
 }
 
@@ -372,7 +375,8 @@ fn database_size(state: &AppState) -> u64 {
         (status = 403, body = ErrorBody),
         (status = 409, body = ErrorBody, description = "`seal_config_tampered`: the seal configuration failed its \
             integrity check, so it is not backed up"),
-        (status = 429, body = ErrorBody, description = "Another backup is running"),
+        (status = 429, body = ErrorBody, description = "Another backup is running, or this caller has taken six in \
+            the last hour"),
         (status = 501, body = ErrorBody, description = "Postgres; use pg_dump"),
         (status = 507, body = ErrorBody, description = "Too large to back up through the API")),
     security(("bearer" = [])))]
@@ -391,6 +395,9 @@ async fn backup(State(state): State<AppState>, ClientIp(ip): ClientIp, principal
     let Ok(running) = state.backup_lock.clone().try_lock_owned() else {
         return Err(ApiError::backup_in_progress());
     };
+    if !state.backup_limiter.allow(&principal.id) {
+        return Err(ApiError::too_many_requests());
+    }
     // Runs to the end holding the lock even if the client goes away, so cancelling one backup
     // cannot start a second beside it.
     let task = state.clone();

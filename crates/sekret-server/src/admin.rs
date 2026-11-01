@@ -5,7 +5,6 @@ use sekret_core::crypto::{
     DataKey, IntegrityKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
 };
 use sekret_core::permissions::BuiltinRole;
-use sekret_core::seal::UnlockPolicy;
 use sekret_store::{
     AuthMethod, Binding, EncryptedValue, INTEGRITY_KEY_META, PrincipalKind, Rekey, SealConfig, Store, UserLogin,
 };
@@ -13,7 +12,7 @@ use sekret_store::{
 use crate::auth::{TokenKind, TokenRequest, mint_token};
 use crate::error::{ApiError, ApiResult};
 use crate::machine::reseal;
-use crate::seal::{HighWater, cautious_flags, verify_config};
+use crate::seal::{HighWater, distrusted, kept_flags, verify_config};
 use crate::state::AppState;
 
 pub const BOOTSTRAP_SUBJECT: &str = "local|bootstrap-admin";
@@ -75,26 +74,18 @@ pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(Str
 /// to grant no unlock, so a database writer's change or rollback is never signed as it stands.
 /// An unsigned one grants nothing already, but its flags are not trusted to start a migration.
 pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater) -> SealConfig {
-    let distrust = match verify_config(old_root, &config, marks) {
-        Ok(false) => return config,
-        Ok(true) => {
-            return SealConfig {
-                flags: cautious_flags(config.flags),
-                ..config
-            };
-        }
-        Err(distrust) => distrust,
+    let verdict = verify_config(old_root, &config, marks);
+    let Err(distrust) = verdict else {
+        return SealConfig {
+            flags: kept_flags(&config, verdict, marks),
+            ..config
+        };
     };
     tracing::error!(
         action = distrust.action(),
         "the seal configuration failed its integrity check; resetting it to the manual unlock policy"
     );
-    SealConfig {
-        unlock_policy: UnlockPolicy::Manual,
-        remembered: None,
-        flags: cautious_flags(config.flags),
-        ..config
-    }
+    distrusted(config, distrust, marks)
 }
 
 /// How a root key replacement treats the seal configuration and data it cannot read.
@@ -248,9 +239,12 @@ pub async fn rotate_root_key(
     }
     let projects = rewrapped.len();
     let seal = seal
-        .map(|config| crate::seal::signed(new_root, config, rotation.marks.floor()))
+        .map(|config| crate::seal::sign(new_root, config, rotation.marks.floor()))
         .transpose()?;
     let epoch = seal.as_ref().map_or(rotation.marks.floor(), |config| config.epoch);
+    let migrated = seal
+        .as_ref()
+        .is_some_and(|config| crate::seal::migrations_done(config.flags));
     let fingerprint = new_root.fingerprint();
     let new_pin = new_root.pin()?;
     let before = crate::seal::begin_rekey(rotation.epoch_files, &old_root.pin()?, &new_pin, epoch)
@@ -274,7 +268,7 @@ pub async fn rotate_root_key(
     // The database has moved on, so this is reported rather than undone. Marks that still name
     // both keys already sit at the new epoch, so an older copy under the old key counts as a
     // rollback meanwhile.
-    let stale_marks = crate::seal::record_epoch(rotation.epoch_files, epoch, &new_pin)
+    let stale_marks = crate::seal::record_mark(rotation.epoch_files, epoch, &new_pin, migrated)
         .err()
         .map(|error| {
             tracing::error!(%error, "the root key was replaced, but an epoch mark still accepts the old one");

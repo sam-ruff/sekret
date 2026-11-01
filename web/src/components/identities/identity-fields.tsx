@@ -2,14 +2,15 @@ import { ListInput } from "@/components/list-input";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { formatDurationWords } from "@/lib/format";
+import { formatDurationWords, parseDuration } from "@/lib/format";
 import { ttlProblem, type IdentityDraft } from "./identity-model";
 
 const CIDR = /^[0-9a-fA-F:.]+\/\d{1,3}$/;
 
-function hint(seconds: string): string {
-  const n = Number(seconds);
-  return Number.isInteger(n) && n > 0 ? formatDurationWords(n) : "a whole number of seconds";
+/** "How long each token lasts: 1 hour.", leaving the words out while the text is not a duration. */
+function hint(lead: string, text: string): string {
+  const seconds = parseDuration(text);
+  return seconds !== null && seconds > 0 ? `${lead}: ${formatDurationWords(seconds)}.` : `${lead}.`;
 }
 
 export function IdentityFields({
@@ -44,32 +45,43 @@ export function IdentityFields({
         />
       </Field>
       <Field>
-        <FieldLabel htmlFor={`${idPrefix}-ttl`}>Token lifetime (seconds)</FieldLabel>
+        <FieldLabel htmlFor={`${idPrefix}-ttl`}>Token lifetime</FieldLabel>
         <Input
           id={`${idPrefix}-ttl`}
-          inputMode="numeric"
           value={draft.tokenTtl}
+          placeholder="1h"
           aria-invalid={!!problem}
+          aria-describedby={problem ? `${idPrefix}-ttl-hint ${idPrefix}-ttl-problem` : `${idPrefix}-ttl-hint`}
           onChange={(e) => onChange({ ...draft, tokenTtl: e.target.value.trim() })}
           data-testid="identity-ttl"
         />
-        <FieldDescription data-testid="identity-ttl-hint">How long each token lasts: {hint(draft.tokenTtl)}.</FieldDescription>
+        <FieldDescription id={`${idPrefix}-ttl-hint`} data-testid="identity-ttl-hint">
+          {hint("How long each token lasts", draft.tokenTtl)}
+        </FieldDescription>
       </Field>
       <Field>
-        <FieldLabel htmlFor={`${idPrefix}-max-ttl`}>Longest renewed lifetime (seconds)</FieldLabel>
+        <FieldLabel htmlFor={`${idPrefix}-max-ttl`}>Longest renewed lifetime</FieldLabel>
         <Input
           id={`${idPrefix}-max-ttl`}
-          inputMode="numeric"
           value={draft.tokenMaxTtl}
+          placeholder="1d"
           aria-invalid={!!problem}
+          aria-describedby={problem ? `${idPrefix}-max-ttl-hint ${idPrefix}-ttl-problem` : `${idPrefix}-max-ttl-hint`}
           onChange={(e) => onChange({ ...draft, tokenMaxTtl: e.target.value.trim() })}
           data-testid="identity-max-ttl"
         />
-        <FieldDescription data-testid="identity-max-ttl-hint">
-          How long renewals can keep a token going: {hint(draft.tokenMaxTtl)}.
+        <FieldDescription id={`${idPrefix}-max-ttl-hint`} data-testid="identity-max-ttl-hint">
+          {hint("How long renewals can keep a token going", draft.tokenMaxTtl)}
         </FieldDescription>
       </Field>
-      {problem && <p className="text-sm text-destructive md:col-span-2">{problem}</p>}
+      <p className="text-xs text-muted-foreground md:col-span-2">
+        Lifetimes take a number of seconds or a unit, such as 30m, 1h, 7d or 1h 30m.
+      </p>
+      {problem && (
+        <p id={`${idPrefix}-ttl-problem`} role="alert" className="text-sm text-destructive md:col-span-2" data-testid="identity-ttl-problem">
+          {problem}
+        </p>
+      )}
       <Field className="md:col-span-2">
         <FieldLabel htmlFor={`${idPrefix}-cidrs`}>Allowed networks (CIDR ranges)</FieldLabel>
         <ListInput

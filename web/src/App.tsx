@@ -11,6 +11,7 @@ import { StatusGate } from "@/components/sys/status-gate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useIsMobile } from "@/hooks/use-mobile";
+import { useSheetOpen } from "@/hooks/use-sheet-open";
 import { beginLeaving } from "@/lib/leaving";
 import { forgetWhenHidden } from "@/lib/page-lifecycle";
 import { ThemeProvider } from "@/lib/theme";
@@ -97,13 +98,16 @@ const TOAST_TOP_MOBILE = 84;
  */
 function AppToaster() {
   const mobile = useIsMobile();
+  // A full-screen drawer keeps its actions at the bottom, so toasts move up only while one is open.
+  const sheetOpen = useSheetOpen();
+  if (!mobile) return <Toaster richColors closeButton position="bottom-right" />;
   return (
     <Toaster
       richColors
       closeButton
-      position={mobile ? "top-center" : "bottom-right"}
-      offset={mobile ? { top: TOAST_TOP_MOBILE } : undefined}
-      mobileOffset={{ top: TOAST_TOP_MOBILE }}
+      position={sheetOpen ? "top-center" : "bottom-center"}
+      offset={sheetOpen ? { top: TOAST_TOP_MOBILE } : undefined}
+      mobileOffset={sheetOpen ? { top: TOAST_TOP_MOBILE } : undefined}
     />
   );
 }

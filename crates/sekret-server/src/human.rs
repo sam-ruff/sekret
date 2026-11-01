@@ -294,7 +294,15 @@ fn user_labels(claims: &serde_json::Value, subject: &str) -> (String, String) {
         .or(Some(email.as_str()).filter(|e| !e.is_empty()))
         .unwrap_or(subject)
         .to_string();
-    (email, name)
+    (email.clone(), unspoofable(name, &email))
+}
+
+/// The name labels a user with no verified email, so it must not pass for someone's email.
+fn unspoofable(name: String, email: &str) -> String {
+    if !email.is_empty() || !name.contains('@') {
+        return name;
+    }
+    format!("{name} (unverified)")
 }
 
 /// OIDC Core 3.1.3.7: a token for several audiences must name this client as `azp`, and any
@@ -1004,6 +1012,21 @@ mod tests {
                 "mal",
             ),
             (json!({"email": "", "email_verified": true, "name": ""}), "", "sub-1"),
+            (
+                json!({"email": "m@x", "name": "cfo@example.com"}),
+                "",
+                "cfo@example.com (unverified)",
+            ),
+            (
+                json!({"preferred_username": "cfo@example.com"}),
+                "",
+                "cfo@example.com (unverified)",
+            ),
+            (
+                json!({"email": "a@x", "email_verified": true, "name": "a@y"}),
+                "a@x",
+                "a@y",
+            ),
         ];
         for (claims, email, name) in cases {
             assert_eq!(

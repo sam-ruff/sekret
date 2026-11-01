@@ -4,21 +4,19 @@ import { Link } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Identity } from "@/api/types";
 import { ErrorState, ListSkeleton } from "@/components/states";
-import { Badge } from "@/components/ui/badge";
+import { RoleLabel } from "@/components/roles/role-label";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { keys, useProjects } from "@/hooks/queries";
 import { PROJECT_ACCESS_LIMIT, projectAccessRows } from "./project-access-model";
 
-function RolesCell({ roles }: { roles: string[] | null }) {
+function RolesCell({ roles, nameOf }: { roles: string[] | null; nameOf: (slug: string) => string }) {
   if (roles === null) return <span className="text-xs text-muted-foreground">Cannot see members</span>;
   if (roles.length === 0) return <span className="text-xs text-muted-foreground">No access</span>;
   return (
     <span className="flex flex-wrap gap-1">
       {roles.map((role) => (
-        <Badge key={role} variant="secondary" className="font-mono text-[0.7rem]">
-          {role}
-        </Badge>
+        <RoleLabel key={role} name={nameOf(role)} id={role} />
       ))}
     </span>
   );
@@ -31,6 +29,14 @@ export function ProjectAccess({ identity }: { identity: Identity }) {
   const members = useQueries({
     queries: shown.map((p) => ({ queryKey: keys.members(p.slug), queryFn: () => api.members(p.slug), retry: false })),
   });
+  // Names only; a project whose roles cannot be read falls back to the role IDs.
+  const roles = useQueries({
+    queries: shown.map((p) => ({ queryKey: keys.roles(p.slug), queryFn: () => api.roles(p.slug), retry: false })),
+  });
+  const nameIn = (project: string) => {
+    const list = roles[shown.findIndex((p) => p.slug === project)]?.data;
+    return (slug: string) => list?.find((r) => r.slug === slug)?.name ?? slug;
+  };
   const loading = projects.isPending || members.some((m) => m.isPending);
   const rows = projectAccessRows(
     identity.id,
@@ -66,7 +72,7 @@ export function ProjectAccess({ identity }: { identity: Identity }) {
                 <div className="flex min-w-0 items-center gap-2">
                   <FolderKey className="size-4 shrink-0 text-muted-foreground" />
                   <span className="truncate text-sm font-medium">{project.name}</span>
-                  <RolesCell roles={roles} />
+                  <RolesCell roles={roles} nameOf={nameIn(project.slug)} />
                 </div>
                 {roles !== null && (
                   <Button asChild variant="ghost" size="sm" className="ml-auto">

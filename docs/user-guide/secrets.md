@@ -1,6 +1,6 @@
 # Secrets, history and snapshots
 
-A secret is a key, a value and some metadata: a comment and tags. Keys start with a letter or underscore and may contain letters, digits, `_`, `-` and `.`, up to 256 characters. Values can be up to 64 KiB of text.
+A secret is a key, a value and some metadata: a comment and tags. Keys start with a letter or underscore and may contain letters, digits, `_`, `-` and `.`, up to 256 characters. Values can be up to 64 KiB of text, and comments up to 1,024 characters.
 
 Every change writes a new version. Nothing is ever edited in place, so the history of a secret is complete, and rolling back is itself a new version that copies an old value.
 
@@ -30,7 +30,9 @@ sekret secrets history DATABASE_URL --diff 3 5
 sekret secrets rollback DATABASE_URL 3
 ```
 
-The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and, once there are two versions, a line diff between any two of them. Versions that differ in a great many lines are not compared. The secret's generation and rotation settings sit below the history. Closing the drawer or opening another secret hides them again.
+The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and, once there are two versions, a line diff between any two of them. Versions that differ in a great many lines are not compared. A long history opens on its newest 50 versions, with "Load older versions" below them for the next 50; showing values and the diff cover only the versions loaded so far. The secret's generation and rotation settings sit below the history. Closing the drawer or opening another secret hides them again.
+
+The API hands history out newest first, 100 versions at a time unless `limit` asks for fewer or more (up to 200). A page shorter than `limit` is the last one; for the next, pass the oldest version you have as `before`, as in `.../secrets/DATABASE_URL/versions?limit=50&before=151`. With `values=true`, only the versions on that page are decrypted.
 
 A rollback keeps the restored version's comment, noting the rollback in front of it, as in `rolled back to version 2: Too noisy`. Rotating a secret by hand from the web interface keeps its current comment; the audit log records the rotation.
 

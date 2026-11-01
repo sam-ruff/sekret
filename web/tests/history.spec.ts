@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { expectToast, openProject, secretAction, secretRow } from "./helpers";
 
 test.describe("on a 390 pixel phone", () => {
@@ -27,6 +27,65 @@ test.describe("on a 390 pixel phone", () => {
     expect(overflow.viewport).toBeLessThanOrEqual(0);
     expect(overflow.beyond).toEqual([]);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  });
+});
+
+/** Writes `count` versions of a new secret straight through the mock server. */
+async function writeVersions(page: Page, key: string, count: number): Promise<void> {
+  await page.evaluate(
+    async ({ key, count }) => {
+      const path = "/src/api/mock/server.ts";
+      const mock = (await import(/* @vite-ignore */ path)) as { mockFetch: (request: Request) => Promise<Response> };
+      for (let i = 1; i <= count; i++) {
+        const response = await mock.mockFetch(
+          new Request(`${location.origin}/api/v1/projects/storefront/environments/dev/secrets/${key}?path=%2F`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", "x-sekret-csrf": "1" },
+            body: JSON.stringify({ value: `value-${i}`, comment: `write ${i}`, tags: [] }),
+          }),
+        );
+        if (!response.ok) throw new Error(`write ${i} failed with ${response.status}`);
+      }
+    },
+    { key, count },
+  );
+}
+
+test("a long history loads a page at a time, with values for every page loaded", async ({ page }) => {
+  test.setTimeout(90_000);
+  await openProject(page);
+  await writeVersions(page, "LONG_HISTORY", 55);
+  await page.reload();
+  await secretAction(page, "LONG_HISTORY", "secret-history");
+  const drawer = page.getByTestId("secret-drawer");
+  const items = drawer.getByTestId("version-list").locator("li");
+  await expect(items).toHaveCount(50);
+  await expect(drawer.getByTestId("version-55")).toBeVisible();
+  await expect(drawer.getByTestId("version-5")).toHaveCount(0);
+  await expect(drawer.getByTestId("history-shown-count")).toHaveText("Showing the newest 50 versions");
+
+  await drawer.getByTestId("history-values-toggle").click();
+  await expect(drawer.getByTestId("version-value-6")).toHaveText("value-6");
+  await drawer.getByTestId("history-load-older").click();
+  await expect(items).toHaveCount(55);
+  await expect(drawer.getByTestId("version-value-1")).toHaveText("value-1");
+  await expect(drawer.getByTestId("history-load-older")).toHaveCount(0);
+
+  // The diff offers every loaded version, the oldest included.
+  await drawer.getByTestId("diff-from").click();
+  await expect(page.getByRole("option", { name: "Version 1", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+});
+
+test.describe("on a wide screen", () => {
+  test.skip(({ isMobile }) => isMobile, "the drawer is full width on phones");
+
+  test("the history drawer uses the wider width meant for diffs", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openProject(page);
+    await secretAction(page, "LOG_LEVEL", "secret-history");
+    const box = await page.getByTestId("secret-drawer").boundingBox();
+    expect(box?.width).toBeGreaterThan(550);
   });
 });
 
@@ -119,7 +178,7 @@ test("hides history values until asked, then diffs versions and rolls back", asy
 
   await drawer.getByTestId("rollback-2").click();
   await expect(page.getByTestId("rollback-confirm")).toContainText(
-    'Its comment becomes "rolled back to version 2" followed by that version\'s comment.',
+    'Its comment becomes "Rolled back to version 2" followed by that version\'s comment.',
   );
   await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rolled LOG_LEVEL back to version 2");

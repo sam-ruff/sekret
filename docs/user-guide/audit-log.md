@@ -6,7 +6,9 @@ Each project has its own log under *Project audit log* in the project, readable 
 
 The project log only shows what the reader could see in the secrets view. If a role lets someone read the log but not a particular key, entries about that key appear with the key name, folder and details hidden. Entries for an environment the reader cannot list lose the environment as well.
 
-In the web interface each entry says what happened in plain words, such as "Viewed history values" or "2 values read", with the action's code, such as `secret.history-read`, underneath. The codes are what the action filter, the API and the CLI use.
+People are shown by their email when the identity provider says it verified it, and otherwise by their display name. A display name that looks like an email address is shown with "(unverified)" after it, so nobody can pass for someone else's address in the log, in a secret's history or in member lists. The `actor_id` the API returns with each entry is what tells two people apart for certain.
+
+In the web interface each entry says what happened in plain words, such as "Viewed history values" or "2 values read", with the action's code, such as `secret.history-read`, underneath. The codes are what the action filter, the API and the CLI use. Entries store people, machine identities and roles by ID; the web interface shows their names where it can look them up with what you may already see, and the ID otherwise.
 
 ![The audit log, filtered to secret actions](../assets/screenshots/audit-light.png)
 

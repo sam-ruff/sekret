@@ -18,7 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { SecretTextarea } from "@/components/secret-field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,13 +26,25 @@ import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { keys, useApiMutation, useSealWatch } from "@/hooks/queries";
 import { useIdle } from "@/hooks/use-idle";
-import { formatDateTime, formatDuration, formatRelative } from "@/lib/format";
+import { formatDateTime, formatDurationWords, formatRelative, parseDuration } from "@/lib/format";
 
 function positiveOrNull(text: string): number | null | "invalid" {
   if (!text.trim()) return null;
   const n = Number(text);
   return Number.isInteger(n) && n > 0 ? n : "invalid";
 }
+
+function durationOrNull(text: string): number | null | "invalid" {
+  if (!text.trim()) return null;
+  const n = parseDuration(text);
+  return n !== null && n > 0 ? n : "invalid";
+}
+
+const EXPIRY_PRESETS = [
+  { label: "30 days", value: "30d" },
+  { label: "90 days", value: "90d" },
+  { label: "1 year", value: "365d" },
+] as const;
 
 function CreateSecretDialog({
   identityId,
@@ -48,7 +60,7 @@ function CreateSecretDialog({
   const [description, setDescription] = useState("");
   const [ttl, setTtl] = useState("");
   const [maxUses, setMaxUses] = useState("");
-  const ttlValue = positiveOrNull(ttl);
+  const ttlValue = durationOrNull(ttl);
   const usesValue = positiveOrNull(maxUses);
   const valid = ttlValue !== "invalid" && usesValue !== "invalid";
 
@@ -102,20 +114,44 @@ function CreateSecretDialog({
             />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field>
-              <FieldLabel htmlFor="cs-ttl">Expires after (seconds)</FieldLabel>
+            <Field data-invalid={ttlValue === "invalid"}>
+              <FieldLabel htmlFor="cs-ttl">Expires after</FieldLabel>
               <Input
                 id="cs-ttl"
-                inputMode="numeric"
                 value={ttl}
                 placeholder="Never"
                 aria-invalid={ttlValue === "invalid"}
+                aria-describedby="cs-ttl-help"
                 onChange={(e) => setTtl(e.target.value.trim())}
                 data-testid="client-secret-ttl"
               />
-              <FieldDescription>
-                {typeof ttlValue === "number" ? formatDuration(ttlValue) : "Leave empty for no expiry"}
-              </FieldDescription>
+              {ttlValue === "invalid" ? (
+                <FieldError id="cs-ttl-help" data-testid="client-secret-ttl-error">
+                  Enter a duration such as 3600, 12h or 90d.
+                </FieldError>
+              ) : (
+                <FieldDescription id="cs-ttl-help" data-testid="client-secret-ttl-help">
+                  {typeof ttlValue === "number"
+                    ? formatDurationWords(ttlValue)
+                    : "Such as 90d. Empty means it never expires, which is riskier if it leaks."}
+                </FieldDescription>
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                {EXPIRY_PRESETS.map((preset) => (
+                  <Button
+                    key={preset.value}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-foreground"
+                    aria-pressed={ttl === preset.value}
+                    onClick={() => setTtl(preset.value)}
+                    data-testid={`client-secret-ttl-${preset.value}`}
+                  >
+                    {preset.label}
+                  </Button>
+                ))}
+              </div>
             </Field>
             <Field>
               <FieldLabel htmlFor="cs-uses">Max uses</FieldLabel>

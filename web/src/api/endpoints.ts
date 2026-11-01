@@ -30,6 +30,14 @@ export type AuditQuery = QueryOf<"org_audit">;
 export type UserQuery = QueryOf<"list_users">;
 export type IdentityQuery = QueryOf<"list_identities">;
 
+export interface VersionPageQuery {
+  values: boolean;
+  /** Versions per page; the server allows 1 to 200. */
+  limit: number;
+  /** Only versions older than this one. */
+  before?: number;
+}
+
 interface SecretLocation {
   project: string;
   env: string;
@@ -127,12 +135,16 @@ export const api = {
         body,
       }),
     ),
-  versions: (at: SecretLocation, key: string, values: boolean) =>
-    unwrap(
+  /** One page of history, newest first; a page shorter than `limit` is the last. */
+  versions: (at: SecretLocation, key: string, page: VersionPageQuery) => {
+    const query: QueryOf<"list_versions"> = { path: at.path, values: page.values, limit: page.limit };
+    if (page.before !== undefined) query.before = page.before;
+    return unwrap(
       client.GET("/api/v1/projects/{project}/environments/{env}/secrets/{key}/versions", {
-        params: { path: { project: at.project, env: at.env, key }, query: { path: at.path, values } },
+        params: { path: { project: at.project, env: at.env, key }, query },
       }),
-    ),
+    );
+  },
   rollback: (at: SecretLocation, key: string, version: number) =>
     unwrap(
       client.POST("/api/v1/projects/{project}/environments/{env}/secrets/{key}/rollback", {

@@ -1195,12 +1195,23 @@ mod tests {
             jwks_url: None,
             bindings: ClaimBindings {
                 audiences: vec!["a".into()],
-                subjects: vec!["*".into()],
+                subjects: vec!["repo:a/*".into()],
                 claims: Default::default(),
             },
             max_token_lifetime: sekret_api::DEFAULT_MAX_TOKEN_LIFETIME,
         };
         assert!(validate_config(&AuthMethodConfig::Oidc(oidc.clone()), false).is_err());
+        let any_subject = OidcAuthConfig {
+            bindings: ClaimBindings {
+                subjects: vec!["*".into()],
+                ..oidc.bindings.clone()
+            },
+            ..oidc.clone()
+        };
+        assert!(
+            validate_config(&AuthMethodConfig::Oidc(any_subject), true).is_err(),
+            "a subject of only wildcards binds nothing"
+        );
         assert!(validate_config(&AuthMethodConfig::Oidc(oidc.clone()), true).is_ok());
         let forever = OidcAuthConfig {
             max_token_lifetime: 0,

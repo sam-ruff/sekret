@@ -100,7 +100,7 @@ test("offers Rotate now in the row menu only for generated values", async ({ pag
 test("warns before rotating a typed value from the drawer, and says no generator is set", async ({ page }) => {
   const drawer = await openDrawer(page, "LOG_LEVEL");
   await expect(drawer.getByTestId("policy-effective-generator")).toHaveText(
-    "No generator set; Rotate now would use the built-in default of 32 alphanumeric characters",
+    "No generator chosen. Rotating now makes 32 random letters and digits.",
   );
   await drawer.getByTestId("policy-rotate-now").click();
   const confirm = page.getByTestId("rotate-confirm");
@@ -130,10 +130,11 @@ test("sets a custom policy that applies once the value is generated", async ({ p
   await drawer.getByTestId("policy-rotate-now").click();
   await page.getByTestId("rotate-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rotated DATABASE_URL");
-  await expect(drawer.getByTestId("policy-next-rotation")).toContainText("in 14 days");
+  // The mock's clock steps a second ahead per write, so a fresh 14-day rotation can round up a day.
+  await expect(drawer.getByTestId("policy-next-rotation")).toContainText(/in 1[45] days/);
   await expect(drawer.getByTestId("policy-not-generated")).toHaveCount(0);
   await closeDrawer(page);
-  await expect(secretRow(page, "DATABASE_URL").getByTestId("secret-rotation-badge")).toContainText("Rotates in 14d");
+  await expect(secretRow(page, "DATABASE_URL").getByTestId("secret-rotation-badge")).toContainText(/Rotates in 1[45]d/);
   expect(await reveal(page, "DATABASE_URL")).toHaveLength(40);
 });
 

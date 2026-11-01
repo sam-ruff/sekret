@@ -30,7 +30,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { keys, useApiMutation, useOrgRoles } from "@/hooks/queries";
+import { keys, useApiMutation, useMe, useOrgRoles } from "@/hooks/queries";
+import { describeRemoval } from "@/lib/org-bindings";
 import { useOrgPermissions } from "@/hooks/use-permissions";
 import { errorMessage, isEscalation } from "@/lib/errors";
 
@@ -182,11 +183,13 @@ function BindingsTab() {
   const canCreate = org.can("org-members", "create");
   const canDelete = org.can("org-members", "delete");
 
+  const me = useMe();
   const remove = useApiMutation({
     mutationFn: (b: OrgBinding) => api.removeOrgBinding(b.principal_kind, b.principal_id, b.role),
     invalidate: [keys.orgBindings, keys.me],
     success: "Role removed",
   });
+  const removal = removing ? describeRemoval(removing, bindings.data ?? [], me.data, roleName(removing.role)) : null;
 
   return (
     <div className="space-y-4">
@@ -255,11 +258,13 @@ function BindingsTab() {
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}
-        title={`Remove ${removing ? roleName(removing.role) : ""} from ${removing?.principal_name}?`}
-        description="They lose the access this role granted across the organisation."
+        title={removal?.title ?? ""}
+        description={<span data-testid="binding-remove-description">{removal?.description}</span>}
         confirmLabel="Remove role"
         destructive
+        blocked={removal?.blocked}
         onConfirm={() => remove.mutateAsync(removing as OrgBinding)}
+        testId="binding-remove-confirm"
       />
     </div>
   );

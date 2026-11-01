@@ -244,7 +244,8 @@ pub async fn run(
         SysCommand::Status { json, .. } => {
             let status = best_status(api).await?;
             if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
+                let text = serde_json::to_string_pretty(&status)?;
+                writeln!(out, "{}", sekret_client::terminal_safe_json(&text))?;
             } else {
                 write!(out, "{}", describe(&status))?;
             }
@@ -413,6 +414,26 @@ mod tests {
         run(&api, plain_status(true), &Scripted::new(&[]), &mut out).await?;
         let parsed: serde_json::Value = serde_json::from_slice(&out)?;
         assert_eq!(parsed["state"], "sealed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_json_escapes_text_that_could_rewrite_the_terminal() -> anyhow::Result<()> {
+        let hostile = "1.0\u{9b}31m\u{202e}evil";
+        let mut api = MockSekretApi::new();
+        api.expect_sys_status_detail().returning(move || {
+            Ok(SysStatus {
+                version: hostile.into(),
+                ..status(SealState::Unsealed)
+            })
+        });
+        let mut out = Vec::new();
+        run(&api, plain_status(true), &Scripted::new(&[]), &mut out).await?;
+        let text = String::from_utf8(out.clone())?;
+        assert!(!text.contains('\u{9b}') && !text.contains('\u{202e}'), "{text:?}");
+        assert!(text.contains("\\u009b31m\\u202eevil"), "{text}");
+        let parsed: serde_json::Value = serde_json::from_slice(&out)?;
+        assert_eq!(parsed["version"], hostile, "a parser still reads the real value");
         Ok(())
     }
 

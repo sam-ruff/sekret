@@ -108,6 +108,26 @@ for (const theme of ["light", "dark"] as const) {
       expect(await contrastOf(changed)).toBeGreaterThanOrEqual(AA);
     });
 
+    test("diff markers, success toasts and selected toggles meet AA", async ({ page }) => {
+      await page.goto("/projects/storefront/secrets/dev");
+      await page.getByTestId("secret-row-LOG_LEVEL").getByTestId("secret-key").click();
+      await page.getByTestId("history-values-toggle").click();
+      const marker = page.getByTestId("diff-output").locator('[data-kind="removed"] span').first();
+      await expect(marker).toHaveText("-");
+      expect(await contrastOf(marker)).toBeGreaterThanOrEqual(AA);
+      // Project default is the selected toggle in the drawer's generation settings.
+      const selected = page.getByTestId("policy-mode-inherit");
+      await expect(selected).toHaveAttribute("data-state", "on");
+      expect(await contrastOf(selected)).toBeGreaterThanOrEqual(AA);
+      await page.getByTestId("rollback-1").click();
+      await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
+      const toast = page.locator('[data-sonner-toast][data-type="success"] [data-title]').first();
+      await expect(toast).toHaveText("Rolled LOG_LEVEL back to version 1");
+      // The toast slides in; wait for it to settle before measuring.
+      await expect.poll(() => toast.evaluate((el) => getComputedStyle(el.closest("[data-sonner-toast]") ?? el).opacity)).toBe("1");
+      expect(await contrastOf(toast)).toBeGreaterThanOrEqual(AA);
+    });
+
     test("avatar initials and the Configured badge meet AA", async ({ page }) => {
       await page.goto("/org/identities");
       await page.getByTestId("identity-link-billing-worker").click();

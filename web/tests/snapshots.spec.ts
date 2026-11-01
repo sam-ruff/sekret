@@ -30,6 +30,13 @@ test("previews and restores a snapshot", async ({ page }) => {
   );
   await expect(changes.getByTestId("change-WEBHOOK_SECRET")).toBeVisible();
 
+  // Existing folders are suggested, so the filter is not typed blind.
+  const suggestions = await sheet.locator("#restore-path-folders option").evaluateAll((options) =>
+    options.map((o) => (o as HTMLOptionElement).value),
+  );
+  expect(suggestions).toEqual(expect.arrayContaining(["/", "/payments"]));
+  await expect(sheet.getByTestId("restore-path")).toHaveAttribute("list", "restore-path-folders");
+
   await sheet.getByTestId("restore-path").fill("/payments");
   await expect(changes.getByTestId("change-LOG_LEVEL")).toHaveCount(0);
   await expect(changes.getByTestId("change-WEBHOOK_SECRET")).toBeVisible();

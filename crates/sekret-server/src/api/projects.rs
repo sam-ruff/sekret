@@ -7,8 +7,8 @@ use sekret_api::{
 };
 use sekret_core::crypto::{DataKey, wrap_data_key};
 use sekret_core::permissions::{
-    Action, BuiltinRole, MAX_PRINCIPAL_PATTERNS, MAX_ROLE_PATTERNS, Resource, Rule, Subject, covers, dropped_rules,
-    may_remove, pattern_count,
+    Action, BuiltinRole, MAX_PRINCIPAL_PATTERNS, MAX_ROLE_PATTERNS, Resource, Rule, Subject, covers, denied,
+    dropped_rules, may_remove, pattern_count,
 };
 use sekret_core::validate;
 use sekret_store::PrincipalKind;
@@ -74,6 +74,7 @@ async fn create_project(
     require_any(&org_rules(&state, &principal).await?, Subject::Projects, Action::Create)?;
     validate::slug(&request.slug)?;
     validate::name(&request.name)?;
+    validate::description(&request.description)?;
     let now = state.clock.now();
     let id = uuid::Uuid::new_v4().to_string();
     let wrapped_key = wrap_data_key(state.keyring.root()?.as_ref(), &DataKey::generate()?, &id)?;
@@ -216,6 +217,7 @@ async fn update_project(
     let (mut project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::Settings, Action::Edit)?;
     validate::name(&request.name)?;
+    validate::description(&request.description)?;
     state
         .store
         .update_project(&project.id, request.name.trim(), &request.description)
@@ -321,6 +323,15 @@ async fn create_environment(
         Action::Create,
         &env_resource(&request.slug),
     )?;
+    // A hidden environment must answer the same whether or not it exists.
+    if denied(
+        &rules,
+        Subject::Environments,
+        Action::Read,
+        &env_resource(&request.slug),
+    ) {
+        return Err(ApiError::forbidden());
+    }
     validate::slug(&request.slug)?;
     validate::name(&request.name)?;
     let existing = state.store.list_environments(&project.id).await?;
@@ -476,6 +487,18 @@ async fn create_folder(
         path: Some(&path),
         ..Default::default()
     };
+    // Hidden folders answer as missing before anything that depends on whether they exist.
+    let hidden_parent = ancestors(&path).iter().any(|parent| {
+        let folder = Resource {
+            environment: Some(&env.slug),
+            path: Some(parent),
+            ..Default::default()
+        };
+        denied(&rules, Subject::Folders, Action::Read, &folder)
+    });
+    if hidden_parent || !allowed(&rules, Subject::Folders, Action::Read, &resource) {
+        return Err(ApiError::not_found("folder"));
+    }
     require(&rules, Subject::Folders, Action::Create, &resource)?;
     // Missing parents are created too, so each of them needs the same permission.
     let existing: Vec<String> = state
@@ -515,6 +538,10 @@ async fn create_folder(
     Ok((StatusCode::CREATED, Json(Folder { path, created_at: now })))
 }
 
+fn not_empty() -> ApiError {
+    ApiError::conflict("the folder still contains secrets")
+}
+
 /// Proper ancestors of a normalised folder path, excluding the root: `/a/b/c` gives `/a` and `/a/b`.
 fn ancestors(path: &str) -> Vec<String> {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -543,6 +570,10 @@ async fn delete_folder(
         path: Some(&path),
         ..Default::default()
     };
+    // A folder the caller cannot read answers as missing, whether or not it exists or is empty.
+    if !allowed(&rules, Subject::Folders, Action::Read, &resource) {
+        return Err(ApiError::not_found("folder"));
+    }
     require(&rules, Subject::Folders, Action::Delete, &resource)?;
     let prefix = format!("{path}/");
     for child in state.store.list_folders(&env.id).await? {
@@ -554,10 +585,14 @@ async fn delete_folder(
             path: Some(&child.path),
             ..Default::default()
         };
+        // Hidden folders inside are refused like secrets inside, without naming them.
+        if denied(&rules, Subject::Folders, Action::Read, &child_resource) {
+            return Err(not_empty());
+        }
         require(&rules, Subject::Folders, Action::Delete, &child_resource)?;
     }
     state.store.delete_folder(&env.id, &path).await.map_err(|e| match e {
-        sekret_store::StoreError::Conflict => ApiError::conflict("the folder still contains secrets"),
+        sekret_store::StoreError::Conflict => not_empty(),
         other => other.into(),
     })?;
     audit(
@@ -825,6 +860,7 @@ async fn list_roles(
 pub fn validate_role(slug: &str, request: &PutRole, author_rules: &[Rule], org_scope: bool) -> ApiResult<()> {
     validate::slug(slug)?;
     validate::name(&request.name)?;
+    validate::description(&request.description)?;
     if BuiltinRole::from_slug(slug).is_some() {
         return Err(ApiError::bad_request("that slug belongs to a built-in role"));
     }
@@ -845,6 +881,12 @@ pub fn validate_role(slug: &str, request: &PutRole, author_rules: &[Rule], org_s
         let c = &rule.conditions;
         for list in [&c.environments, &c.paths, &c.keys, &c.tags] {
             validate::globs(list)?;
+        }
+        // These match exactly, so anything but a slug would silently never apply.
+        if c.environments.iter().chain(&c.tags).any(|v| validate::slug(v).is_err()) {
+            return Err(ApiError::bad_request(
+                "environment and tag conditions must be exact lowercase slugs, without wildcards",
+            ));
         }
     }
     // Deny rules escape the escalation check below, so this bounds them too.

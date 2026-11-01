@@ -68,10 +68,76 @@ test("the usage tab lists the identity's projects and links to where access is g
   await expect(page.getByTestId("topbar-section")).toHaveText("Machine identities");
   await expect(page.getByTestId("topbar-item")).toHaveText("github-deploy");
   const card = page.getByTestId("identity-projects");
-  await expect(card.getByTestId("identity-project-storefront")).toContainText("viewer");
+  await expect(card.getByTestId("identity-project-storefront").getByTestId("role-label-name")).toHaveText("viewer");
   await expect(card.getByTestId("identity-project-payments-api")).toContainText("No access");
   await card.getByTestId("identity-project-manage-payments-api").click();
   await expect(page).toHaveURL(/\/projects\/payments-api\/settings\/members$/);
+});
+
+test("the usage tab leads with snippets for methods that are set up and tucks the rest away", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-usage").click();
+  // Only OIDC is set up on this identity.
+  await expect(page.getByTestId("snippet-github-actions")).toBeVisible();
+  await expect(page.getByTestId("snippet-cli-universal")).toBeHidden();
+  const rest = page.getByTestId("usage-not-set-up");
+  await expect(rest).toContainText("2 snippets need an auth method this identity does not have yet.");
+  await rest.getByTestId("usage-not-set-up-toggle").click();
+  await expect(page.getByTestId("snippet-cli-universal")).toContainText("Needs the universal auth method, which is not set up.");
+  await rest.getByTestId("usage-set-up-auth").click();
+  await expect(page).toHaveURL(/\/org\/identities\/[^/]+\/auth$/);
+});
+
+test("the client secret expiry takes units, suggests one, and explains a bad entry", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-billing-worker").click();
+  await page.getByTestId("identity-tab-auth").click();
+  await page.getByTestId("auth-method-universal").getByTestId("new-client-secret").click();
+  const dialog = page.getByTestId("create-client-secret-dialog");
+  await dialog.getByLabel("Expires after").fill("later");
+  await expect(dialog.getByTestId("client-secret-ttl-error")).toHaveText("Enter a duration such as 3600, 12h or 90d.");
+  await expect(dialog.getByTestId("client-secret-create")).toBeDisabled();
+  await dialog.getByTestId("client-secret-ttl-30d").click();
+  await expect(dialog.getByLabel("Expires after")).toHaveValue("30d");
+  await expect(dialog.getByTestId("client-secret-ttl-help")).toHaveText("30 days");
+  await dialog.getByTestId("client-secret-create").click();
+  await page.getByTestId("client-secret-once-dialog").getByTestId("client-secret-done").click();
+});
+
+test("the audit log names identities and roles instead of showing their IDs", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-billing-worker").click();
+  await page.getByTestId("identity-tab-auth").click();
+  await page.getByTestId("auth-method-universal").getByTestId("new-client-secret").click();
+  await page.getByTestId("client-secret-description").fill("named in the log");
+  await page.getByTestId("client-secret-create").click();
+  await page.getByTestId("client-secret-once-dialog").getByTestId("client-secret-done").click();
+
+  await page.goto("/org/audit");
+  const detail = page
+    .getByTestId("audit-row")
+    .filter({ has: page.locator('[data-action="identity.client-secret-create"]') })
+    .first()
+    .getByTestId("audit-detail");
+  await expect(detail).toHaveText(/^Client secret starting sks_\S+ for billing-worker$/);
+  const details = await page.getByTestId("audit-detail").allTextContents();
+  expect(details.filter((d) => /identity: |kind: universal/.test(d))).toEqual([]);
+});
+
+test("OIDC claim globs are named after their claim, and a bad network says why by the field", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  const cidrs = page.getByLabel("Allowed networks (CIDR ranges)");
+  await cidrs.fill("not a range");
+  await cidrs.press("Enter");
+  const problem = page.getByTestId("identity-cidrs-problem");
+  await expect(problem).toHaveText("Use a range such as 10.0.0.0/8 or 192.168.1.5/32");
+  await expect(cidrs).toHaveAttribute("aria-invalid", "true");
+  await expect(cidrs).toHaveAttribute("aria-describedby", (await problem.getAttribute("id")) ?? "missing");
+
+  await page.getByTestId("identity-tab-auth").click();
+  await expect(page.getByTestId("auth-method-oidc").getByLabel("Globs for claim repository_owner")).toBeVisible();
 });
 
 test("long OIDC subjects wrap inside the form instead of widening it", async ({ page }) => {
@@ -110,19 +176,22 @@ test("sets the longest OIDC token lifetime, which survives a reload", async ({ p
   await page.getByTestId("identity-link-github-deploy").click();
   await page.getByTestId("identity-tab-auth").click();
   const oidc = page.getByTestId("auth-method-oidc");
-  const lifetime = oidc.getByLabel("Longest OIDC token accepted (seconds)");
-  await expect(lifetime).toHaveValue("900");
+  const lifetime = oidc.getByLabel("Longest OIDC token accepted");
+  await expect(lifetime).toHaveValue("15m");
   await expect(oidc.getByTestId("oidc-max-lifetime-help")).toHaveText(
     "Tokens valid for longer than this, or without an iat claim, are refused: 15 minutes.",
   );
   await lifetime.fill("999999999999");
-  await expect(oidc.getByTestId("oidc-max-lifetime-error")).toHaveText("Enter a whole number of seconds, from 1 up to 10 years.");
+  await expect(oidc.getByTestId("oidc-max-lifetime-error")).toHaveText(
+    "Enter a duration such as 3600, 30m, 1h or 7d, from 1 second up to 10 years.",
+  );
   await expect(oidc.getByTestId("oidc-save")).toBeDisabled();
-  await lifetime.fill("300");
+  await lifetime.fill("2h");
   await oidc.getByTestId("oidc-save").click();
   await expectToast(page, "OIDC saved");
   await page.reload();
-  await expect(page.getByTestId("auth-method-oidc").getByTestId("oidc-max-lifetime")).toHaveValue("300");
+  await expect(page.getByTestId("auth-method-oidc").getByTestId("oidc-max-lifetime")).toHaveValue("2h");
+  await expect(page.getByTestId("auth-method-oidc").getByTestId("oidc-max-lifetime-help")).toContainText("2 hours");
 });
 
 test("a cloud metadata URL is flagged by the field, and the server's refusal reads plainly", async ({ page }) => {
@@ -159,12 +228,12 @@ test("keeps, replaces and clears a stored Kubernetes reviewer token", async ({ p
   await expect(k8s.getByTestId("k8s-reviewer-jwt")).toHaveCount(0);
 
   // Saving untouched keeps the stored token and the custom token lifetime.
-  await expect(k8s.getByTestId("k8s-max-lifetime")).toHaveValue("600");
+  await expect(k8s.getByTestId("k8s-max-lifetime")).toHaveValue("10m");
   await k8s.getByTestId("k8s-save").click();
   await expectToast(page, /saved/);
   await expect(k8s.getByTestId("k8s-reviewer-jwt-stored")).toBeVisible();
   await page.reload();
-  await expect(page.getByTestId("auth-method-kubernetes").getByTestId("k8s-max-lifetime")).toHaveValue("600");
+  await expect(page.getByTestId("auth-method-kubernetes").getByTestId("k8s-max-lifetime")).toHaveValue("10m");
 
   // Replacing with a new token stores it without echoing it back.
   await k8s.getByTestId("k8s-reviewer-jwt-replace").click();
@@ -188,23 +257,32 @@ test("labels token lifetimes in plain words", async ({ page }) => {
   await expect(page.locator("body")).not.toContainText("TTL");
   await page.getByTestId("identity-link-github-deploy").click();
   const form = page.getByTestId("identity-details-form");
-  await expect(form.getByLabel("Token lifetime (seconds)")).toBeVisible();
-  await expect(form.getByLabel("Longest renewed lifetime (seconds)")).toBeVisible();
+  await expect(form.getByLabel("Token lifetime")).toHaveValue("1h");
+  await expect(form.getByLabel("Longest renewed lifetime")).toHaveValue("1d");
   await form.getByTestId("identity-ttl").fill("5400");
   await expect(form.getByTestId("identity-ttl-hint")).toHaveText("How long each token lasts: 1 hour 30 minutes.");
+  await form.getByTestId("identity-ttl").fill("1h 30m");
+  await expect(form.getByTestId("identity-ttl-hint")).toHaveText("How long each token lasts: 1 hour 30 minutes.");
+  await form.getByTestId("identity-ttl").fill("soon");
+  await expect(form.getByTestId("identity-ttl-problem")).toHaveText(
+    "Enter each lifetime as a duration such as 3600, 30m, 1h or 7d",
+  );
+  await expect(form.getByTestId("identity-ttl")).toHaveAttribute("aria-invalid", "true");
   await expect(form).not.toContainText("TTL");
 
   await page.goto("/org/identities");
   await page.getByTestId("identity-link-billing-worker").click();
   await page.getByTestId("identity-tab-auth").click();
   const k8s = page.getByTestId("auth-method-kubernetes");
-  const lifetime = k8s.getByLabel("Longest Kubernetes token accepted (seconds)");
-  await expect(lifetime).toHaveValue("600");
+  const lifetime = k8s.getByLabel("Longest Kubernetes token accepted");
+  await expect(lifetime).toHaveValue("10m");
   await expect(k8s.getByTestId("k8s-max-lifetime-help")).toHaveText(
-    "Kubernetes tokens valid for longer than this are refused: 10 minutes. Keep pods' projected token expirationSeconds at or below it.",
+    "Kubernetes tokens valid for longer than this are refused: 10 minutes (600 seconds). Keep pods' projected token expirationSeconds at or below it.",
   );
   await lifetime.fill("soon");
-  await expect(k8s.getByTestId("k8s-max-lifetime-error")).toHaveText("Enter a whole number of seconds, from 1 up to 10 years.");
+  await expect(k8s.getByTestId("k8s-max-lifetime-error")).toHaveText(
+    "Enter a duration such as 3600, 30m, 1h or 7d, from 1 second up to 10 years.",
+  );
   await expect(lifetime).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
   await expect(k8s.getByTestId("k8s-save")).toHaveText("Save Kubernetes settings");
   await expect(k8s.getByTestId("k8s-save")).toBeDisabled();
@@ -271,12 +349,17 @@ test("edits identity settings and revokes tokens", async ({ page }) => {
   const form = page.getByTestId("identity-details-form");
   // Nothing to save until something changes.
   await expect(form.getByTestId("identity-save")).toBeDisabled();
+  // The same lifetime written another way is not a change.
+  await form.getByTestId("identity-ttl").fill("3600");
+  await expect(form.getByTestId("identity-save")).toBeDisabled();
   await form.getByTestId("identity-ttl").fill("1800");
   await expect(form.getByTestId("identity-save")).toBeEnabled();
   await form.getByTestId("identity-disabled").click();
   await form.getByTestId("identity-save").click();
   await expectToast(page, /saved/i);
   await expect(form.getByTestId("identity-save")).toBeDisabled();
+  await page.reload();
+  await expect(page.getByTestId("identity-details-form").getByTestId("identity-ttl")).toHaveValue("30m");
   await expect(page.getByText("Removes its auth methods, client secrets and memberships.")).toBeVisible();
 
   await page.getByTestId("revoke-tokens").click();

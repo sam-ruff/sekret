@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useState, type KeyboardEvent } from "react";
+import { useId, useState, type KeyboardEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
@@ -8,6 +8,8 @@ interface ListInputProps {
   onChange: (value: string[]) => void;
   placeholder?: string;
   id?: string;
+  /** Names the input when no label points at `id`. */
+  ariaLabel?: string;
   testId?: string;
   /** Applied to each entry before adding, e.g. lower-casing tags. */
   normalise?: (entry: string) => string;
@@ -22,6 +24,7 @@ export function ListInput({
   onChange,
   placeholder,
   id,
+  ariaLabel,
   testId,
   normalise = (s) => s.trim(),
   validate,
@@ -30,6 +33,7 @@ export function ListInput({
 }: ListInputProps) {
   const [draft, setDraft] = useState("");
   const [problem, setProblem] = useState<string>();
+  const problemId = `${useId()}-problem`;
 
   const commit = () => {
     const entry = normalise(draft);
@@ -87,6 +91,9 @@ export function ListInput({
         ))}
         <input
           id={id}
+          aria-label={ariaLabel}
+          aria-invalid={problem ? true : undefined}
+          aria-describedby={problem ? problemId : undefined}
           value={draft}
           disabled={disabled}
           onChange={(e) => {
@@ -100,7 +107,11 @@ export function ListInput({
           data-testid={testId ? `${testId}-input` : undefined}
         />
       </div>
-      {problem && <p className="text-xs text-destructive">{problem}</p>}
+      {problem && (
+        <p id={problemId} role="alert" className="text-xs text-destructive" data-testid={testId ? `${testId}-problem` : undefined}>
+          {problem}
+        </p>
+      )}
     </div>
   );
 }

@@ -33,7 +33,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { keys, useApiMutation, useIdentityPage } from "@/hooks/queries";
 import { useListParams } from "@/hooks/use-list-params";
 import { useOrgPermissions } from "@/hooks/use-permissions";
-import { formatDateTime, formatDuration, formatRelative } from "@/lib/format";
+import { formatDateTime, formatDuration, formatRelative, parseDuration } from "@/lib/format";
 import { listQuery, listSearchParams, toggleSort, type SortSpec } from "@/lib/list-params";
 
 const METHOD_LABELS: Record<string, string> = { oidc: "OIDC", kubernetes: "Kubernetes", universal: "Universal" };
@@ -41,7 +41,7 @@ const METHOD_LABELS: Record<string, string> = { oidc: "OIDC", kubernetes: "Kuber
 const SPEC: SortSpec<IdentitySort> = { sorts: ["name", "created"], fallback: "name", descending: ["created"] };
 const SORT_LABELS: Record<IdentitySort, string> = { name: "Name", created: "Newest" };
 
-const EMPTY: IdentityDraft = { name: "", description: "", tokenTtl: "3600", tokenMaxTtl: "86400", trustedCidrs: [] };
+const EMPTY: IdentityDraft = { name: "", description: "", tokenTtl: "1h", tokenMaxTtl: "1d", trustedCidrs: [] };
 
 function CreateIdentityDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const navigate = useNavigate();
@@ -51,8 +51,8 @@ function CreateIdentityDialog({ open, onOpenChange }: { open: boolean; onOpenCha
       api.createIdentity({
         name: draft.name.trim(),
         description: draft.description,
-        token_ttl: Number(draft.tokenTtl),
-        token_max_ttl: Number(draft.tokenMaxTtl),
+        token_ttl: parseDuration(draft.tokenTtl) ?? 0,
+        token_max_ttl: parseDuration(draft.tokenMaxTtl) ?? 0,
         trusted_cidrs: draft.trustedCidrs,
       }),
     invalidate: [keys.identities],

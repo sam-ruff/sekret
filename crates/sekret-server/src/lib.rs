@@ -112,6 +112,9 @@ pub struct BodyTimeouts {
     /// request time limit, so without this a client sending a byte now and then holds a
     /// connection for days.
     pub total: Duration,
+    /// The whole body on the sign-in and system routes, which anyone may call and whose bodies
+    /// are a few KiB, so a trickle there cannot hold a connection for the full `total`.
+    pub open: Duration,
 }
 
 impl Default for BodyTimeouts {
@@ -120,8 +123,55 @@ impl Default for BodyTimeouts {
             gap: Duration::from_secs(30),
             // As long as any other request may take, so no upload loses time it had before.
             total: REQUEST_TIMEOUT,
+            open: Duration::from_secs(10),
         }
     }
+}
+
+/// Routes anyone may call without a token, where a body has [`BodyTimeouts::open`] to arrive.
+fn open_route(path: &str) -> bool {
+    path.starts_with("/api/v1/auth/") || path.starts_with("/api/v1/sys/")
+}
+
+/// Gives bodies on the open routes their shorter deadline, inside the general one.
+fn open_body_deadline(request: Request, deadline: Duration) -> Request {
+    if !open_route(request.uri().path()) {
+        return request;
+    }
+    request.map(|body| axum::body::Body::new(tower_http::timeout::DeadlineBody::new(deadline, body)))
+}
+
+/// Failed authentications one client address may make each minute before requests carrying a
+/// credential are turned away unchecked, so junk tokens cannot keep the database busy.
+pub const FAILED_AUTH_PER_MINUTE: u32 = 60;
+
+fn carries_credential(state: &AppState, request: &Request) -> bool {
+    let headers = request.headers();
+    headers.contains_key(header::AUTHORIZATION)
+        || auth::cookie_value(headers, auth::session_cookie_name(&state.config)).is_some()
+}
+
+/// Answers 429 without a lookup once a client has failed authentication too often, and counts
+/// each failure. Sign-in routes are left alone, so a stale cookie never blocks signing in again.
+async fn failed_auth_gate(
+    State(state): State<AppState>,
+    auth::ClientIp(ip): auth::ClientIp,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let checked = path.starts_with("/api/v1/") && !path.starts_with("/api/v1/auth/");
+    if !checked || !carries_credential(&state, &request) {
+        return next.run(request).await;
+    }
+    if state.failed_auth_limiter.exhausted(&ratelimit::limiter_key(ip)) {
+        return ApiError::too_many_requests().into_response();
+    }
+    let response = next.run(request).await;
+    if response.status() == axum::http::StatusCode::UNAUTHORIZED {
+        state.failed_auth_limiter.allow_ip(ip);
+    }
+    response
 }
 /// How long any request may take, and a backup, which reads and encrypts the whole database.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -278,10 +328,14 @@ pub fn app_with(state: AppState, body: BodyTimeouts) -> Router {
         .fallback(web::static_handler)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(), write_gate))
+        .layer(middleware::from_fn_with_state(state.clone(), failed_auth_gate))
         .layer(middleware::from_fn_with_state(state.clone(), sys_fingerprint_gate))
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
         // Outside tracing, so a sealed server does not log every refused request as an error.
         .layer(middleware::from_fn_with_state(state.clone(), seal_gate))
+        .layer(tower::util::MapRequestLayer::new(move |request| {
+            open_body_deadline(request, body.open)
+        }))
         .layer(RequestBodyTimeoutLayer::new(body.gap))
         .layer(RequestBodyDeadlineLayer::new(body.total))
         .layer(middleware::from_fn(request_timeout))

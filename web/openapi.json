@@ -1121,7 +1121,17 @@
           }
         ],
         "responses": {
-          "204": {}
+          "204": {},
+          "409": {
+            "description": "`last_org_admin`: nobody else holds org-admin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
         },
         "security": [
           {
@@ -2389,6 +2399,7 @@
         "tags": [
           "secrets"
         ],
+        "description": "Newest first, one page at a time. A page shorter than `limit` is the last; otherwise pass the oldest version returned as `before` for the next.",
         "operationId": "list_versions",
         "parameters": [
           {
@@ -2424,20 +2435,39 @@
             }
           },
           {
-            "name": "recursive",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
-          },
-          {
             "name": "values",
             "in": "query",
             "description": "Include decrypted values where permitted.",
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Versions to return, newest first: 100 by default, at most 200.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Only versions older than this one, to fetch the page after one ending at `before`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
             }
           }
         ],
@@ -3239,7 +3269,7 @@
             }
           },
           "429": {
-            "description": "Another backup is running",
+            "description": "Another backup is running, or this caller has taken six in the last hour",
             "content": {
               "application/json": {
                 "schema": {

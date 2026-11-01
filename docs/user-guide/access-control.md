@@ -18,6 +18,8 @@ There are two scopes. Organisation roles cover projects in general, machine iden
 
 Whoever creates a project becomes its `admin`. People in one of the `--oidc-admin-groups` groups are `org-admin` from their first sign-in.
 
+Organisation roles are granted under *Organisation > Access control*. The web interface will not remove the last `org-admin` grant listed there; grant it to someone else first. Removing a role that applies to you, directly or through a group, says so before you confirm.
+
 ## Rules
 
 A rule has an effect (`allow` or `deny`), a subject, a list of actions and optional conditions.
@@ -41,7 +43,7 @@ Not every action means something for every subject. The role editor in the web i
 
 A role saved earlier with another action keeps it, and the editor shows it so it can be removed.
 
-A secret's history and rollback also need `read` on the secret itself; a secret someone cannot read answers as not found, the same as one that does not exist. In the history, a version whose own tags the reader may not read keeps its number and date, but its comment, tags and author are left blank. Snapshot descriptions leave out the folder when the reader cannot read that folder. Someone who cannot read every secret in the environment sees "secrets changed" in place of the counts of created, updated and deleted secrets, and a snapshot's secret count only includes the secrets they can read.
+A secret's history and rollback also need `read` on the secret itself; a secret someone cannot read answers as not found, the same as one that does not exist. Writes work the same way: setting, generating, importing or deleting a secret needs `read` on it as well as `create`, `edit` or `delete`, so a role that can write but not read gets "not found" whether or not the key is there, and never overwrites it. A new secret is judged by the folder and tags it would have. Restoring a snapshot leaves out every secret the person cannot read and never names one in its result. A folder someone cannot read answers as not found when they try to create or delete it, and a hidden folder inside one they delete stops the delete like a secret in it would. Creating an environment that a deny hides from you is refused the same way whether or not it already exists. A deny by tag cannot hide everything: a key that is taken by a secret you cannot read still cannot be created again beside it. In the history, a version whose own tags the reader may not read keeps its number and date, but its comment, tags and author are left blank. Snapshot descriptions leave out the folder when the reader cannot read that folder. Someone who cannot read every secret in the environment sees "secrets changed" in place of the counts of created, updated and deleted secrets, and a snapshot's secret count only includes the secrets they can read.
 
 `read` on `environments` lists an environment in the interface. A deny on it hides the environment completely: its secrets, folders and snapshots answer as not found, even where `secrets` rules would allow them, and its entries in the audit log are redacted. Without a deny, `secrets` rules alone decide who reaches secrets, so a role for a machine that only fetches values need not grant `environments` as well.
 
@@ -54,7 +56,7 @@ Conditions narrow a rule to some secrets:
 | `keys` | Key globs, such as `DB_*`. |
 | `tags` | Secrets carrying any of these tags. |
 
-All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters. A role may hold at most 200 path and key patterns across all its rules, deny rules included, and one member may hold at most 400 across the roles they are given directly in a project. Adding a member, or changing a role someone already holds, is refused if it would take them past that.
+`environments` and `tags` match exactly, so they must be lowercase slugs, and a role with `prod*` or `Restricted` in them is refused rather than saved as a rule that never applies. All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters. A role may hold at most 200 path and key patterns across all its rules, deny rules included, and one member may hold at most 400 across the roles they are given directly in a project. Adding a member, or changing a role someone already holds, is refused if it would take them past that.
 
 This custom role lets a team read and change everything in `dev` and `staging`, read key names in `prod` but not values, and never read anything tagged `restricted`:
 
@@ -74,6 +76,8 @@ This custom role lets a team read and change everything in `dev` and `staging`, 
 The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule. A role made only of deny rules grants nothing on its own, and the editor says so; give it alongside a role that allows access. On the secrets page, values your roles hide show as *No access to value*, with a note under the list that a deny in any role wins.
 
 ![The role editor](../assets/screenshots/roles-light.png)
+
+Roles are not secret. Anyone with `read` on `roles` can see every rule, and everyone can see their own, so the environment slugs, folder globs and tags named in conditions are visible even where those rules hide the things themselves. Keep confidential words out of slugs, folder names and tags.
 
 ## Members
 

@@ -17,9 +17,31 @@ pub enum ValidationError {
         crate::glob::MAX_GLOB_LEN
     )]
     Globs,
+    #[error("comment must be at most {MAX_COMMENT_CHARS} characters")]
+    Comment,
+    #[error("description must be at most {MAX_DESCRIPTION_CHARS} characters")]
+    Description,
 }
 
 pub const MAX_GLOBS: usize = 50;
+pub const MAX_COMMENT_CHARS: usize = 1024;
+pub const MAX_DESCRIPTION_CHARS: usize = 4096;
+
+/// A version comment, kept with every version of a secret.
+pub fn comment(value: &str) -> Result<(), ValidationError> {
+    if value.chars().count() > MAX_COMMENT_CHARS {
+        return Err(ValidationError::Comment);
+    }
+    Ok(())
+}
+
+/// A free-text description of a project, role, identity or credential.
+pub fn description(value: &str) -> Result<(), ValidationError> {
+    if value.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(ValidationError::Description);
+    }
+    Ok(())
+}
 
 /// Bounds a list of saved glob patterns so matching stays cheap.
 pub fn globs(patterns: &[String]) -> Result<(), ValidationError> {
@@ -151,6 +173,20 @@ mod tests {
         assert!(path_within("/app", "/app"));
         assert!(path_within("/anything", "/"));
         assert!(!path_within("/apps", "/app"));
+    }
+
+    #[test]
+    fn comments_and_descriptions_are_bounded() {
+        assert!(comment(&"é".repeat(MAX_COMMENT_CHARS)).is_ok());
+        assert_eq!(
+            comment(&"x".repeat(MAX_COMMENT_CHARS + 1)),
+            Err(ValidationError::Comment)
+        );
+        assert!(description(&"x".repeat(MAX_DESCRIPTION_CHARS)).is_ok());
+        assert_eq!(
+            description(&"x".repeat(MAX_DESCRIPTION_CHARS + 1)),
+            Err(ValidationError::Description)
+        );
     }
 
     #[test]

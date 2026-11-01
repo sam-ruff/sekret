@@ -24,6 +24,10 @@ pub enum BindingError {
     NoAudience,
     #[error("a bound subject or bound claim is required so arbitrary tokens from the issuer are not accepted")]
     Unbounded,
+    #[error(
+        "subject and claim patterns need at least one literal character; a pattern of only wildcards matches any token"
+    )]
+    Wildcard,
     #[error("token audience is not bound")]
     Audience,
     #[error("token subject is not bound")]
@@ -49,6 +53,11 @@ impl ClaimBindings {
             || lists.into_iter().any(|l| crate::validate::globs(l).is_err())
         {
             return Err(BindingError::TooLarge);
+        }
+        // A pattern of wildcards alone matches every token, so it bounds nothing.
+        let mut patterns = self.subjects.iter().chain(self.claims.values().flatten());
+        if patterns.any(|p| only_wildcards(p)) {
+            return Err(BindingError::Wildcard);
         }
         Ok(())
     }
@@ -82,6 +91,10 @@ impl ClaimBindings {
         }
         Ok(())
     }
+}
+
+fn only_wildcards(pattern: &str) -> bool {
+    pattern.chars().all(|c| matches!(c, '*' | '?'))
 }
 
 fn string_values(value: Option<&Value>) -> Vec<String> {
@@ -170,5 +183,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(only_aud.validate(), Err(BindingError::Unbounded));
+    }
+
+    #[test]
+    fn wildcard_only_patterns_do_not_count_as_bounds() {
+        for pattern in ["*", "**", "?", "*?*", ""] {
+            let any_subject = ClaimBindings {
+                subjects: vec![pattern.into()],
+                ..github()
+            };
+            assert_eq!(any_subject.validate(), Err(BindingError::Wildcard), "{pattern:?}");
+            let any_claim = ClaimBindings {
+                claims: BTreeMap::from([("sub".into(), vec![pattern.into()])]),
+                ..github()
+            };
+            assert_eq!(any_claim.validate(), Err(BindingError::Wildcard), "{pattern:?}");
+        }
+        let claims = json!({"aud": "sekret", "sub": "repo:anyone/app:ref:refs/heads/main"});
+        let saved_before = ClaimBindings {
+            subjects: vec!["*".into()],
+            claims: BTreeMap::new(),
+            ..github()
+        };
+        assert_eq!(
+            saved_before.check(&claims),
+            Err(BindingError::Wildcard),
+            "a binding saved before the check refuses logins"
+        );
+        assert_eq!(github().validate(), Ok(()), "a pattern with a literal part is fine");
     }
 }

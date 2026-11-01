@@ -183,3 +183,69 @@ test("values stay in the environment they were revealed in, and one secret is fe
   await page.getByTestId("confirm-action").click();
   await expect(page).toHaveURL(/\/projects$/);
 });
+
+test("a long history is fetched from the server a page at a time", async ({ page }) => {
+  test.setTimeout(180_000);
+  const slug = await createProject(page, unique("E2E History"));
+  // Written through the API from the page, so the session cookie and CSRF header are the app's own.
+  await page.evaluate(async (project) => {
+    for (let i = 1; i <= 55; i++) {
+      const response = await fetch(`/api/v1/projects/${project}/environments/dev/secrets/LONG_HISTORY?path=%2F`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "x-sekret-csrf": "1" },
+        body: JSON.stringify({ value: `value-${i}`, comment: "", tags: [] }),
+      });
+      if (!response.ok) throw new Error(`write ${i} failed with ${response.status}`);
+    }
+  }, slug);
+  await page.reload();
+
+  const pages: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes("/LONG_HISTORY/versions")) pages.push(new URL(r.url()).search);
+  });
+  await page.getByTestId("secret-row-LONG_HISTORY").getByTestId("secret-key").click();
+  const drawer = page.getByTestId("secret-drawer");
+  const items = drawer.getByTestId("version-list").locator("li");
+  await expect(items).toHaveCount(50);
+  await drawer.getByTestId("history-values-toggle").click();
+  await expect(drawer.getByTestId("version-value-55")).toHaveText("value-55");
+  await drawer.getByTestId("history-load-older").click();
+  await expect(items).toHaveCount(55);
+  await expect(drawer.getByTestId("version-value-1")).toHaveText("value-1");
+  await expect(drawer.getByTestId("history-load-older")).toHaveCount(0);
+  expect(pages.every((q) => q.includes("limit=50"))).toBe(true);
+  expect(pages.some((q) => q.includes("before=6"))).toBe(true);
+
+  await page.goto(`/projects/${slug}/settings/danger`);
+  await page.getByTestId("delete-project").click();
+  await page.getByTestId("delete-project-slug").fill(slug);
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/projects$/);
+});
+
+test("an environment with secrets cannot be deleted, and an empty one needs its ID typed", async ({ page }) => {
+  const slug = await createProject(page, unique("E2E Envs"));
+  await page.goto(`/projects/${slug}/secrets/staging`);
+  await addSecret(page, "KEEP_ME", "here");
+
+  await page.goto(`/projects/${slug}/settings/environments`);
+  await page.getByTestId("env-delete-staging").click();
+  const dialog = page.getByTestId("delete-env-confirm");
+  await expect(dialog).toContainText("Staging is not empty");
+  await expect(dialog.getByTestId("confirm-action")).toHaveCount(0);
+  await dialog.getByTestId("confirm-cancel").click();
+
+  await page.getByTestId("env-delete-prod").click();
+  await expect(dialog.getByTestId("delete-env-contents")).toContainText("It holds no secrets you can see.");
+  await expect(dialog.getByTestId("confirm-action")).toBeDisabled();
+  await dialog.getByTestId("delete-env-slug").fill("prod");
+  await dialog.getByTestId("confirm-action").click();
+  await expect(page.getByTestId("env-delete-prod")).toHaveCount(0);
+
+  await page.goto(`/projects/${slug}/settings/danger`);
+  await page.getByTestId("delete-project").click();
+  await page.getByTestId("delete-project-slug").fill(slug);
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/projects$/);
+});

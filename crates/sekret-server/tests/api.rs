@@ -551,7 +551,11 @@ async fn rbac_key_tag_and_folder_conditions(db: String) -> anyhow::Result<()> {
     let (status, _) = h.post(&batch, &token, edit("DB_PASS")).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "tag-scoped deny on edit");
     let (status, _) = h.post(&batch, &token, edit("API_KEY")).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a key the role cannot read answers as missing"
+    );
 
     let value_only = json!({"name": "Value only", "rules": [
         {"effect": "allow", "subject": "secrets", "actions": ["read-value"]}

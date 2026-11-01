@@ -1,6 +1,7 @@
 //! Regressions for the seventh security audit: credentials authenticated under the integrity
 //! key, the project key backstop, deleted epoch marks, the mode in the keyring and passphrase
-//! changes beside a root key file.
+//! changes beside a root key file. Also the eighth: replayed configurations that would run the
+//! one-off migrations again.
 
 mod common;
 
@@ -9,12 +10,12 @@ use std::path::Path;
 use anyhow::Context;
 use common::{Harness, api_error, opened, persistent, start};
 use reqwest::{Method, StatusCode};
-use sekret_core::crypto::{DataKey, RootKey, hash_token, wrap_data_key};
-use sekret_core::seal::{SealFlags, SealMode, wrap_root_key};
+use sekret_core::crypto::{DataKey, RootKey, hash_token, seal_credential, wrap_data_key};
+use sekret_core::seal::{SealBinding, SealFlags, SealMode, seal_config_mac, wrap_root_key};
 use sekret_server::auth::{Form, client_secret_mac};
 use sekret_server::config::SealSettings;
 use sekret_server::seal::{StartupSecrets, high_water, signed};
-use sekret_store::{AccessToken, ClientSecret, PrincipalKind, Rekey, SealConfig};
+use sekret_store::{AccessToken, AuthMethod, ClientSecret, PrincipalKind, Rekey, SealConfig};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -64,6 +65,14 @@ async fn bootstrap_user_id(h: &Harness) -> anyhow::Result<String> {
     let (status, me) = h.get("/api/v1/me", &h.admin).await?;
     anyhow::ensure!(status == StatusCode::OK, "me {status}: {me}");
     Ok(me["id"].as_str().context("id")?.to_string())
+}
+
+/// Marks as a version from before they recorded the one-off migrations wrote them.
+fn old_marks(settings: &SealSettings, epoch: i64, root: &RootKey) -> anyhow::Result<()> {
+    for mark in &settings.epoch_files {
+        std::fs::write(mark, format!("sekret-seal-epoch {epoch} {}\n", root.pin()?)).context("old mark")?;
+    }
+    Ok(())
 }
 
 /// A token row as a database writer would plant it, under the old plain hash.
@@ -309,10 +318,9 @@ async fn credentials_from_before_the_upgrade_are_vouched_for_once(db: String) ->
         ..stored(&h).await?
     };
     let floor = high_water(&settings.epoch_files).floor();
-    h.state
-        .store
-        .update_seal_config(signed(&root_key, unflagged, floor)?)
-        .await?;
+    let unflagged = signed(&root_key, unflagged, floor)?;
+    h.state.store.update_seal_config(unflagged.clone()).await?;
+    old_marks(&settings, unflagged.epoch, &root_key)?;
     drop(h);
 
     let upgraded = fresh(&db.url, settings.clone()).await?;
@@ -322,6 +330,10 @@ async fn credentials_from_before_the_upgrade_are_vouched_for_once(db: String) ->
     );
     assert_eq!(unseal_with(&upgraded, PASSPHRASE).await?.0, StatusCode::OK);
     assert!(stored(&upgraded).await?.flags.credentials_keyed);
+    assert!(
+        high_water(&settings.epoch_files).migrated,
+        "the marks now say the vouching ran"
+    );
     let (status, me) = upgraded.get("/api/v1/me", old_token).await?;
     assert_eq!(status, StatusCode::OK, "{me}");
     let moved = upgraded.token_record(old_token).await?;
@@ -667,7 +679,157 @@ async fn the_plain_hash_only_counts_while_sealed(db: String) -> anyhow::Result<(
     Ok(())
 }
 
+/// The configuration as a version from before `wrap_form_signed` signed it, at `epoch`, with none
+/// of the flags set.
+fn signed_before_the_wrap_form(root: &RootKey, config: SealConfig, epoch: i64) -> anyhow::Result<SealConfig> {
+    let config = SealConfig {
+        epoch,
+        flags: SealFlags::default(),
+        ..config
+    };
+    let fingerprint = root.fingerprint();
+    let binding = SealBinding {
+        mode: config.mode,
+        policy: config.unlock_policy,
+        fingerprint: &fingerprint,
+        epoch,
+        wrapped: config.wrapped.as_ref(),
+        remembered: config.remembered.as_deref(),
+        flags: config.flags,
+    };
+    let mac = seal_config_mac(root, &binding).context("mac")?;
+    Ok(SealConfig {
+        mac: Some(mac),
+        ..config
+    })
+}
+
+/// An identity whose Kubernetes reviewer token a database writer replaced with one in the old
+/// format, pointed at a cluster of their own. Returns the identity and the method as planted.
+async fn plant_old_reviewer(h: &Harness, admin: &str) -> anyhow::Result<(String, AuthMethod)> {
+    let (_, identity) = h.post("/api/v1/identities", admin, json!({"name": "k3s"})).await?;
+    let id = identity["id"].as_str().context("id")?.to_string();
+    let (status, body) = h
+        .put(
+            &format!("/api/v1/identities/{id}/auth/kubernetes"),
+            admin,
+            json!({"kind": "kubernetes", "mode": "token-review", "host": "https://k8s.example.com:6443",
+                "reviewer_jwt": "reviewer-plaintext", "namespaces": ["apps"], "service_accounts": ["web"]}),
+        )
+        .await?;
+    anyhow::ensure!(status == StatusCode::NO_CONTENT, "{status}: {body}");
+    let legacy =
+        seal_credential(root(h)?.as_ref(), "old-reviewer", &format!("identity:{id}:kubernetes")).context("seal")?;
+    let mut method = h
+        .state
+        .store
+        .get_auth_method(&id, "kubernetes")
+        .await?
+        .context("method")?;
+    method.config["host"] = json!("https://attacker.example");
+    method.config["reviewer_jwt"] = json!(legacy);
+    method.mac = None;
+    h.state.store.put_auth_method(method.clone()).await?;
+    Ok((id, method))
+}
+
+/// The demonstrated attack: a configuration signed before `wrap_form_signed` has no migration
+/// flags. Put back with the marks deleted, it ran the one-off migrations again, which vouched for
+/// an admin token the database writer planted and moved their reviewer token.
+async fn a_replayed_configuration_never_restarts_the_migrations(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h).await?;
+    let admin_id = {
+        let (_, me) = h.get("/api/v1/me", &admin).await?;
+        me["id"].as_str().context("id")?.to_string()
+    };
+    let (identity, planted_method) = plant_old_reviewer(&h, &admin).await?;
+    let forged = "skt_planted-before-the-replay";
+    h.state
+        .store
+        .create_token(planted_token(forged, &admin_id, None))
+        .await?;
+    let root_key = root(&h)?;
+    let replayed = signed_before_the_wrap_form(&root_key, stored(&h).await?, 1)?;
+    h.state.store.update_seal_config(replayed).await?;
+    drop(h);
+    for mark in &settings.epoch_files {
+        std::fs::remove_file(mark).context("delete the mark")?;
+    }
+
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal_with(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
+    assert_eq!(
+        restarted.get("/api/v1/sys/status/detail", forged).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(restarted.get("/api/v1/me", forged).await?.0, StatusCode::UNAUTHORIZED);
+    let flags = stored(&restarted).await?.flags;
+    assert!(flags.credentials_keyed && flags.reviewer_tokens_migrated, "{flags:?}");
+    assert!(high_water(&settings.epoch_files).migrated);
+    let after = restarted
+        .state
+        .store
+        .get_auth_method(&identity, "kubernetes")
+        .await?
+        .context("method")?;
+    assert_eq!(
+        after.config, planted_method.config,
+        "the planted reviewer token is not moved"
+    );
+    assert!(after.mac.is_none(), "nor is the planted method vouched for");
+    assert_eq!(restarted.get("/api/v1/me", &admin).await?.0, StatusCode::OK);
+    Ok(())
+}
+
+/// Once a mark records that the one-off migrations ran, a validly signed configuration that says
+/// they did not, as one replayed after the marks were lowered would, starts none of them.
+async fn a_mark_that_records_the_migrations_stops_them_running_again(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h).await?;
+    assert!(
+        high_water(&settings.epoch_files).migrated,
+        "a new server records them at once"
+    );
+    let admin_id = {
+        let (_, me) = h.get("/api/v1/me", &admin).await?;
+        me["id"].as_str().context("id")?.to_string()
+    };
+    let forged = "skt_planted-beside-a-migrated-mark";
+    h.state
+        .store
+        .create_token(planted_token(forged, &admin_id, None))
+        .await?;
+    let current = stored(&h).await?;
+    let pending = SealConfig {
+        flags: SealFlags {
+            credentials_keyed: false,
+            reviewer_tokens_migrated: false,
+            ..current.flags
+        },
+        ..current
+    };
+    let floor = high_water(&settings.epoch_files).floor();
+    let pending = signed(root(&h)?.as_ref(), pending, floor)?;
+    h.state.store.update_seal_config(pending).await?;
+    drop(h);
+
+    let restarted = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal_with(&restarted, PASSPHRASE).await?.0, StatusCode::OK);
+    assert_eq!(restarted.get("/api/v1/me", forged).await?.0, StatusCode::UNAUTHORIZED);
+    let flags = stored(&restarted).await?.flags;
+    assert!(flags.credentials_keyed && flags.reviewer_tokens_migrated, "{flags:?}");
+    assert_eq!(restarted.get("/api/v1/me", &admin).await?.0, StatusCode::OK);
+    Ok(())
+}
+
 on_both_backends!(
+    a_replayed_configuration_never_restarts_the_migrations,
+    a_mark_that_records_the_migrations_stops_them_running_again,
     the_plain_hash_only_counts_while_sealed,
     a_database_writer_cannot_mint_or_move_a_token,
     planted_client_secrets_auth_methods_and_approvals_are_refused,

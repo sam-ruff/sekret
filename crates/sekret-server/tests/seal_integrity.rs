@@ -1,6 +1,7 @@
 //! Regressions for the third security audit of the seal state: backups of tampered
 //! configurations, epoch reuse and marks, the reviewer token migration, remember secrets,
-//! unsigned repairs and unreadable data during a passphrase change.
+//! unsigned repairs and unreadable data during a passphrase change. Also the eighth: planted
+//! epochs and marks from before pins.
 
 mod common;
 
@@ -11,7 +12,7 @@ use common::{Harness, api_error, opened, persistent, start};
 use reqwest::{Method, StatusCode};
 use sekret_core::crypto::{DataKey, RootKey, seal_credential, wrap_data_key};
 use sekret_core::seal::{
-    KdfParams, RememberSecret, SealFlags, UnlockPolicy, decrypt_backup, parse_backup, unwrap_root_key,
+    KdfParams, MAX_SEAL_EPOCH, RememberSecret, SealFlags, UnlockPolicy, decrypt_backup, parse_backup, unwrap_root_key,
     wrap_root_key_with,
 };
 use sekret_server::StartupError;
@@ -265,11 +266,13 @@ async fn old_format_reviewer_tokens_are_moved_only_once(db: String) -> anyhow::R
         ..stored(&restarted).await?
     };
     let floor = high_water(&settings.epoch_files).floor();
-    restarted
-        .state
-        .store
-        .update_seal_config(signed(&root_key, unflagged, floor)?)
-        .await?;
+    let unflagged = signed(&root_key, unflagged, floor)?;
+    restarted.state.store.update_seal_config(unflagged.clone()).await?;
+    // As a version from before marks recorded the migrations wrote them.
+    for mark in &settings.epoch_files {
+        let text = format!("sekret-seal-epoch {} {}\n", unflagged.epoch, root_key.pin()?);
+        std::fs::write(mark, text).context("old mark")?;
+    }
     let upgraded = fresh(&db.url, settings).await?;
     assert_eq!(unseal(&upgraded).await?, StatusCode::OK);
     assert!(stored(&upgraded).await?.flags.reviewer_tokens_migrated);
@@ -764,6 +767,8 @@ on_both_backends!(
     marks_without_a_fingerprint_learn_it_at_the_next_unlock,
     a_passphrase_change_moves_the_marks_to_the_new_key,
     a_rotation_cut_short_still_unlocks,
+    a_planted_epoch_never_blocks_the_unseal,
+    short_fingerprint_marks_never_skip_the_data_check,
 );
 
 #[test]
@@ -774,20 +779,134 @@ fn a_configuration_at_the_last_epoch_is_refused() -> anyhow::Result<()> {
         wrapped: None,
         unlock_policy: UnlockPolicy::Manual,
         remembered: None,
-        epoch: i64::MAX - 1,
+        epoch: MAX_SEAL_EPOCH - 2,
         mac: None,
         flags: SealFlags::default(),
         created_at: 0,
         updated_at: 0,
     };
     let last = signed(&root, config.clone(), 0)?;
-    assert_eq!(last.epoch, i64::MAX);
-    assert_eq!(
-        check_signature(&root, &last),
-        Signature::Invalid,
-        "nothing can follow it"
+    assert_eq!(last.epoch, MAX_SEAL_EPOCH - 1);
+    assert_eq!(check_signature(&root, &last), Signature::Valid);
+    assert!(signed(&root, last, 0).is_err(), "nothing follows it");
+    assert!(
+        signed(&root, config.clone(), i64::MAX).is_err(),
+        "the epoch never wraps around"
     );
-    assert!(signed(&root, last, 0).is_err(), "the epoch never wraps around");
-    assert!(signed(&root, config, i64::MAX).is_err());
+    for epoch in [MAX_SEAL_EPOCH, i64::MAX, -1] {
+        let mut planted = signed(&root, config.clone(), 0)?;
+        planted.epoch = epoch;
+        assert_eq!(check_signature(&root, &planted), Signature::Invalid, "{epoch}");
+    }
+    Ok(())
+}
+
+/// The demonstrated attack: a database writer set the stored epoch to the last one, or the one
+/// before. Every signature after it overflowed: a passphrase unseal failed with an internal
+/// error, and a server under the passphrase-file policy did not start at all.
+async fn a_planted_epoch_never_blocks_the_unseal(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h, "passphrase-file").await?;
+    drop(h);
+    for planted in [i64::MAX, i64::MAX - 1] {
+        let mark = high_water(&settings.epoch_files).highest.context("mark")?;
+        let store = SqlStore::connect(&db.url).await.context("store")?;
+        let config = store.get_seal_config().await?.context("config")?;
+        store
+            .update_seal_config(SealConfig {
+                epoch: planted,
+                ..config
+            })
+            .await?;
+        drop(store);
+
+        let h = start(opened(&db.url, settings.clone(), with_unlock_passphrase())).await?;
+        assert_eq!(
+            state_of(&h).await?,
+            "sealed",
+            "{planted}: tampered, so no unlock at start"
+        );
+        let repaired = stored(&h).await?;
+        assert_eq!(repaired.epoch, mark + 1, "{planted}: started from the marks");
+        assert_eq!(repaired.unlock_policy, UnlockPolicy::Manual);
+        assert_eq!(high_water(&settings.epoch_files).highest, Some(mark + 1));
+        assert_eq!(unseal(&h).await?, StatusCode::OK, "{planted}");
+        let body = json!({"policy": "passphrase-file", "passphrase": PASSPHRASE});
+        let (status, body) = h.put("/api/v1/sys/unlock-policy", &admin, body).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // A planted mark out of range reads as damaged: a rollback, then written again.
+    let mark = db.dir.path().join("sekret.db.epoch");
+    std::fs::write(&mark, format!("sekret-seal-epoch {} \n", i64::MAX)).context("mark")?;
+    let h = fresh(&db.url, settings.clone()).await?;
+    assert_eq!(unseal(&h).await?, StatusCode::OK);
+    let config = stored(&h).await?;
+    assert_eq!(high_water(&settings.epoch_files).highest, Some(config.epoch));
+    assert!(config.epoch < 100, "{}", config.epoch);
+
+    // One just below the limit stops every signature, and says so.
+    let (status, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pin = root_pin(&config)?;
+    std::fs::write(&mark, format!("sekret-seal-epoch {} {pin}\n", MAX_SEAL_EPOCH - 1)).context("mark")?;
+    let (status, body) = unseal_with(&h, PASSPHRASE).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "seal_epoch_exhausted");
+    assert_eq!(state_of(&h).await?, "sealed");
+    Ok(())
+}
+
+fn root_pin(config: &SealConfig) -> anyhow::Result<String> {
+    let wrapped = config.wrapped.as_ref().context("wrap")?;
+    Ok(unwrap_root_key(wrapped, PASSPHRASE).context("unwrap")?.pin()?)
+}
+
+/// Marks from before pins name the root key by 64 bits, which a well-funded database writer could
+/// match with a key of their own. Until the next unlock rewrites them, they do not stand in for
+/// opening every stored value.
+async fn short_fingerprint_marks_never_skip_the_data_check(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
+    let admin = init(&h, "manual").await?;
+    h.create_project_as("app", &admin).await?;
+    h.set_secrets_as("app", "dev", "/", &[("A", "damaged")], &admin).await?;
+    let project = h.state.store.get_project("app").await?.context("project")?;
+    let value = h
+        .state
+        .store
+        .list_encrypted_values(&project.id)
+        .await?
+        .into_iter()
+        .next()
+        .context("value")?;
+    let fingerprint = root(&h)?.fingerprint();
+    h.state
+        .store
+        .replace_wrapped_keys(Rekey {
+            values: vec![EncryptedValue {
+                value: vec![0u8; 48],
+                ..value
+            }],
+            fingerprint: fingerprint.clone(),
+            ..Rekey::default()
+        })
+        .await?;
+    let (status, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(unseal(&h).await?, StatusCode::OK, "pinned marks vouch for the key");
+
+    let (status, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let epoch = high_water(&settings.epoch_files).highest.context("mark")?;
+    let mark = db.dir.path().join("sekret.db.epoch");
+    std::fs::write(&mark, format!("sekret-seal-epoch {epoch} {fingerprint}\n")).context("old mark")?;
+    let (status, body) = unseal_with(&h, PASSPHRASE).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "root_key_not_recognised");
+    assert_eq!(state_of(&h).await?, "sealed");
     Ok(())
 }

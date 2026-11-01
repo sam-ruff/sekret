@@ -23,9 +23,7 @@ describe("generation model", () => {
   });
 
   it("does not claim a generator is set when only the built-in default applies", () => {
-    expect(describeEffectiveGenerator(null)).toBe(
-      "No generator set; Rotate now would use the built-in default of 32 alphanumeric characters",
-    );
+    expect(describeEffectiveGenerator(null)).toBe("No generator chosen. Rotating now makes 32 random letters and digits.");
     expect(describeEffectiveGenerator({ length: 64, charset: "hex" })).toBe("Generates 64 hex characters");
   });
 

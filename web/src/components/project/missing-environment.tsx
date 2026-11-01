@@ -14,7 +14,7 @@ export function MissingEnvironment({
   return (
     <MissingState
       title="Environment not found"
-      description={`There is no environment called ${name} in this project. It may have been renamed or deleted.`}
+      description={`There is no environment called "${name}" in this project. It may have been renamed or deleted.`}
       backTo={hrefFor(first.slug)}
       backLabel={`Open ${first.name}`}
       testId="environment-missing"

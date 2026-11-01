@@ -12,7 +12,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { useSealWatch } from "@/hooks/queries";
 import { useIdle } from "@/hooks/use-idle";
-import { formatDurationWords } from "@/lib/format";
+import { durationText, formatDurationWords } from "@/lib/format";
 import {
   credentialPayload,
   DEFAULT_MAX_TOKEN_LIFETIME,
@@ -116,7 +116,7 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
   const [namespaces, setNamespaces] = useState<string[]>(initial?.namespaces ?? []);
   const [serviceAccounts, setServiceAccounts] = useState<string[]>(initial?.service_accounts ?? []);
   const [audiences, setAudiences] = useState<string[]>(initial?.audiences ?? ["sekret"]);
-  const [lifetime, setLifetime] = useState(String(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
+  const [lifetime, setLifetime] = useState(durationText(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
 
   const jwks = parseJwks(jwksText);
   const maxLifetime = parseLifetime(lifetime);
@@ -279,13 +279,13 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
       <p className="text-xs text-muted-foreground">Namespaces and service accounts accept globs, such as team-*.</p>
       <MaxLifetimeField
         idPrefix="k8s"
-        label="Longest Kubernetes token accepted (seconds)"
+        label="Longest Kubernetes token accepted"
         value={lifetime}
         disabled={disabled}
         onChange={setLifetime}
         help={(seconds) => (
           <>
-            Kubernetes tokens valid for longer than this are refused: {formatDurationWords(seconds)}. Keep pods&apos;
+            Kubernetes tokens valid for longer than this are refused: {formatDurationWords(seconds)} ({seconds} seconds). Keep pods&apos;
             projected token <code className="font-mono text-xs">expirationSeconds</code> at or below it.
           </>
         )}

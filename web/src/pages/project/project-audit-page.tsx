@@ -16,6 +16,7 @@ export function ProjectAuditPage() {
         queryKey={keys.projectAudit(project)}
         fetchPage={(q) => api.projectAudit(project, q)}
         scope="project"
+        project={project}
         environments={environments.data}
         seesEverything={(environment) =>
           perms.can("secrets", "read", { environment }) && perms.can("environments", "read", { environment })

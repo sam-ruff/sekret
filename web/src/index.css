@@ -130,6 +130,14 @@
   --sidebar-ring: oklch(0.6 0.09 182);
 }
 
+/* Sonner's light rich colours fall short of 4.5:1 for small text; the extra `html` outranks its own rules. */
+html [data-sonner-toaster][data-sonner-theme="light"] {
+  --success-text: hsl(140, 100%, 21%);
+  --info-text: hsl(210, 92%, 34%);
+  --warning-text: hsl(31, 92%, 28%);
+  --error-text: hsl(360, 100%, 37%);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

@@ -35,8 +35,9 @@ struct Buckets<K> {
     last_sweep: Instant,
 }
 
-/// Token bucket per key, refilled continuously at `per_minute`.
+/// Token bucket per key, refilled continuously at `per_minute` up to `capacity`.
 pub struct RateLimiter<K> {
+    capacity: f64,
     per_minute: f64,
     buckets: Mutex<Buckets<K>>,
 }
@@ -78,8 +79,20 @@ pub fn prefix_key(ip: IpAddr) -> IpAddr {
 
 impl<K: Eq + Hash + Clone> RateLimiter<K> {
     pub fn new(per_minute: u32) -> Self {
+        let per_minute = f64::from(per_minute.max(1));
+        Self::with_rate(per_minute, per_minute)
+    }
+
+    /// `per_hour` at once, then one more every hour / `per_hour`.
+    pub fn per_hour(per_hour: u32) -> Self {
+        let per_hour = f64::from(per_hour.max(1));
+        Self::with_rate(per_hour, per_hour / 60.0)
+    }
+
+    fn with_rate(capacity: f64, per_minute: f64) -> Self {
         Self {
-            per_minute: f64::from(per_minute.max(1)),
+            capacity,
+            per_minute,
             buckets: Mutex::new(Buckets {
                 map: HashMap::new(),
                 last_sweep: Instant::now(),
@@ -91,24 +104,43 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
         self.allow_at(key, Instant::now())
     }
 
+    /// Whether `key` has nothing left, without using anything.
+    pub fn exhausted(&self, key: &K) -> bool {
+        self.exhausted_at(key, Instant::now())
+    }
+
+    fn refilled(&self, tokens: f64, since: Instant, now: Instant) -> f64 {
+        let refill = now.saturating_duration_since(since).as_secs_f64() * self.per_minute / 60.0;
+        (tokens + refill).min(self.capacity)
+    }
+
+    fn exhausted_at(&self, key: &K, now: Instant) -> bool {
+        let Ok(buckets) = self.buckets.lock() else {
+            return true;
+        };
+        buckets
+            .map
+            .get(key)
+            .is_some_and(|(tokens, at)| self.refilled(*tokens, *at, now) < 1.0)
+    }
+
     fn allow_at(&self, key: &K, now: Instant) -> bool {
         let Ok(mut buckets) = self.buckets.lock() else {
             return false;
         };
-        let full = self.per_minute;
+        let full = self.capacity;
         // Amortised: at most one pass a minute, however many requests arrive.
         if now.saturating_duration_since(buckets.last_sweep) >= SWEEP_EVERY {
-            buckets.map.retain(|_, (tokens, at)| {
-                *tokens + now.saturating_duration_since(*at).as_secs_f64() * full / 60.0 < full
-            });
+            buckets
+                .map
+                .retain(|_, (tokens, at)| self.refilled(*tokens, *at, now) < full);
             buckets.last_sweep = now;
         }
         if !buckets.map.contains_key(key) && buckets.map.len() >= MAX_KEYS {
             evict_oldest(&mut buckets.map, EVICT_BATCH, |(_, at)| *at);
         }
         let (tokens, at) = buckets.map.entry(key.clone()).or_insert((full, now));
-        let refill = now.saturating_duration_since(*at).as_secs_f64() * full / 60.0;
-        *tokens = (*tokens + refill).min(full);
+        *tokens = self.refilled(*tokens, *at, now);
         *at = now;
         if *tokens < 1.0 {
             return false;
@@ -475,6 +507,34 @@ mod tests {
         assert!(!limiter.allow_at(&"a", start));
         assert!(limiter.allow_at(&"b", start));
         assert!(limiter.allow_at(&"a", start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn exhaustion_can_be_checked_without_spending() {
+        let limiter = RateLimiter::new(2);
+        let start = Instant::now();
+        assert!(
+            !limiter.exhausted_at(&"a", start),
+            "an unknown key has its full allowance"
+        );
+        assert!(limiter.allow_at(&"a", start));
+        assert!(!limiter.exhausted_at(&"a", start));
+        assert!(!limiter.exhausted_at(&"a", start), "checking spends nothing");
+        assert!(limiter.allow_at(&"a", start));
+        assert!(limiter.exhausted_at(&"a", start));
+        assert!(!limiter.exhausted_at(&"a", start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn hourly_limits_refill_slowly() {
+        let limiter = RateLimiter::per_hour(3);
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(limiter.allow_at(&"a", start));
+        }
+        assert!(!limiter.allow_at(&"a", start + Duration::from_secs(60)));
+        assert!(limiter.allow_at(&"a", start + Duration::from_secs(21 * 60)));
+        assert!(!limiter.allow_at(&"a", start + Duration::from_secs(21 * 60)));
     }
 
     #[test]

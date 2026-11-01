@@ -96,6 +96,35 @@ export function formatDuration(seconds: number): string {
   return parts.slice(0, 2).join(" ");
 }
 
+const DURATION_UNITS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400, w: 604800, y: 365 * 86400 };
+const DURATION_PART = /(\d+)\s*([smhdwy])/gi;
+
+/**
+ * Seconds from text such as "3600", "30m", "1h", "90d" or "1h 30m", or null when it is not a
+ * duration. A bare number is seconds.
+ */
+export function parseDuration(text: string): number | null {
+  const trimmed = text.trim().toLowerCase();
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    return Number.isSafeInteger(n) ? n : null;
+  }
+  if (!/^(\d+\s*[smhdwy]\s*)+$/.test(trimmed)) return null;
+  let total = 0;
+  for (const [, count, unit] of trimmed.matchAll(DURATION_PART)) {
+    total += Number(count) * DURATION_UNITS[unit];
+  }
+  return Number.isSafeInteger(total) ? total : null;
+}
+
+/** The shortest exact form of a duration for an input field: 86400 is "1d", 5400 is "90m". */
+export function durationText(seconds: number): string {
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60]] as const) {
+    if (seconds > 0 && seconds % size === 0) return `${seconds / size}${unit}`;
+  }
+  return String(seconds);
+}
+
 /** "186 bytes", "12.4 KB" or "1.2 MB". */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return bytes === 1 ? "1 byte" : `${bytes} bytes`;

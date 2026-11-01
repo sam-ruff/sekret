@@ -173,6 +173,19 @@ const BLOCKED_EXACT: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "CONFIG_SITE",
     "MKDIR_P",
+    "GITHUB_API_URL",
+    "GITHUB_SERVER_URL",
+    "GITHUB_GRAPHQL_URL",
+    "GITHUB_ENV",
+    "GITHUB_PATH",
+    "GITHUB_OUTPUT",
+    "GITHUB_STATE",
+    "GITHUB_STEP_SUMMARY",
+    "CI_SERVER_URL",
+    "CI_API_V4_URL",
+    "CI_API_GRAPHQL_URL",
+    "AZURE_AUTHORITY_HOST",
+    "CYPRESS_INSTALL_BINARY",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -252,12 +265,37 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "AWS_ENDPOINT_URL",
     "KRB5",
     "CLOUDSDK_",
+    "COREPACK_",
+    "VAULT_",
+    "BAO_",
+    "CONSUL_",
+    "NOMAD_",
+    "BOUNDARY_",
+    "ACTIONS_",
+    "RUNNER_",
+    "NVM_",
+    "VOLTA_",
+    "FNM_",
+    "HOMEBREW_",
+    "CONDA_",
+    "MAMBA_",
+    "PNPM_",
+    "ASDF_",
+    "PYENV_",
+    "RBENV_",
+    "SDKMAN_",
+    "MISE_",
+    "COMPOSER_",
+    "PUPPETEER_",
+    "PLAYWRIGHT_",
 ];
 
 /// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
 /// `IRBRC`, `PHPRC` and `WGETRC`. `FLAGS` covers `GNUMAKEFLAGS` and `CGO_LDFLAGS` as well as
 /// `_FLAGS` names. The suffixes from `_SHELL` on name a program or interpreter to run, such as
-/// autoconf's `CONFIG_SHELL` or gcloud's `CLOUDSDK_PYTHON`.
+/// autoconf's `CONFIG_SHELL` or gcloud's `CLOUDSDK_PYTHON`. The suffixes from `_HOME` on point a
+/// tool at where it loads plugins, packages, settings or trusted CAs from. `_URL`, `_ADDR` and
+/// `_ENDPOINT` are left alone, since most app config ends that way.
 const BLOCKED_SUFFIXES: &[&str] = &[
     "PAGER",
     "EDITOR",
@@ -291,6 +329,21 @@ const BLOCKED_SUFFIXES: &[&str] = &[
     "_PROG",
     "_PROGRAM",
     "_INTERPRETER",
+    "_HOME",
+    "_MIRROR",
+    "_REGISTRY",
+    "_INDEX_URL",
+    "_BINARY_SITE",
+    "_DOWNLOAD_HOST",
+    "_CONFIG_FILE",
+    "_CONFIG_PATH",
+    "_CONFIG_DIR",
+    "_CA_BUNDLE",
+    "_CA_FILE",
+    "_CA_PATH",
+    "_CAFILE",
+    "_CAPATH",
+    "_CA_CERTS",
 ];
 
 /// Names without an underscore that are plainly app config. Every other such name is held back,
@@ -749,6 +802,18 @@ mod tests {
         "DYLD_INSERT_LIBRARIES",
         "OPENSSL_CONF",
         "LUA_INIT",
+        "COREPACK_NPM_REGISTRY",
+        "COREPACK_INTEGRITY_KEYS",
+        "COREPACK_HOME",
+        "VAULT_ADDR",
+        "CONSUL_HTTP_ADDR",
+        "NOMAD_ADDR",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "GITHUB_API_URL",
+        "NVM_NODEJS_ORG_MIRROR",
+        "CONDA_CHANNEL_ALIAS",
+        "HOMEBREW_API_DOMAIN",
+        "ANT_HOME",
     ];
 
     #[test]
@@ -945,6 +1010,82 @@ mod tests {
             Err(SkipReason::Blocked),
             "listed names keep their reason"
         );
+    }
+
+    /// Installers, secret stores and CI settings from the round 8 audit that fetch code from, or
+    /// send the loader's own credentials to, a server the secret writer names. The `SOME_TOOL_`
+    /// names are caught by the structural suffixes rather than a list.
+    const CREDENTIAL_REDIRECTS: &[&str] = &[
+        "COREPACK_NPM_REGISTRY",
+        "COREPACK_INTEGRITY_KEYS",
+        "COREPACK_HOME",
+        "VAULT_ADDR",
+        "BAO_ADDR",
+        "CONSUL_HTTP_ADDR",
+        "NOMAD_ADDR",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_RUNTIME_URL",
+        "RUNNER_TEMP",
+        "GITHUB_API_URL",
+        "GITHUB_SERVER_URL",
+        "GITHUB_GRAPHQL_URL",
+        "GITHUB_ENV",
+        "CI_API_V4_URL",
+        "NVM_NODEJS_ORG_MIRROR",
+        "CONDA_CHANNEL_ALIAS",
+        "MAMBA_ROOT_PREFIX",
+        "HOMEBREW_API_DOMAIN",
+        "ANT_HOME",
+        "PNPM_HOME",
+        "ASDF_DATA_DIR",
+        "PYENV_ROOT",
+        "RBENV_ROOT",
+        "SDKMAN_DIR",
+        "MISE_DATA_DIR",
+        "COMPOSER_AUTH",
+        "PUPPETEER_EXECUTABLE_PATH",
+        "PLAYWRIGHT_DOWNLOAD_HOST",
+        "AZURE_AUTHORITY_HOST",
+        "SOME_TOOL_HOME",
+        "SOME_TOOL_MIRROR",
+        "SOME_TOOL_REGISTRY",
+        "SOME_TOOL_INDEX_URL",
+        "SOME_TOOL_EXTRA_INDEX_URL",
+        "SASS_BINARY_SITE",
+        "SOME_TOOL_DOWNLOAD_HOST",
+        "SOME_TOOL_CONFIG_FILE",
+        "SOME_TOOL_CONFIG_PATH",
+        "SOME_TOOL_CONFIG_DIR",
+        "SOME_TOOL_CA_BUNDLE",
+        "SOME_TOOL_CA_FILE",
+        "SOME_TOOL_CAFILE",
+        "SOME_TOOL_CA_CERTS",
+        "vault_addr",
+    ];
+
+    #[test]
+    fn names_that_redirect_installers_or_credentials_are_refused() {
+        let policy = strict();
+        for name in CREDENTIAL_REDIRECTS {
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(policy.check(name), Err(SkipReason::Blocked), "{name}");
+        }
+        for fine in [
+            "DATABASE_URL",
+            "API_KEY",
+            "STRIPE_SECRET",
+            "GITHUB_TOKEN",
+            "LISTEN_ADDR",
+            "REDIS_ADDR",
+            "S3_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "SCHEMA_REGISTRY_URL",
+            "FIREBASE_CONFIG",
+            "DATABASE_CA_CERT",
+            "HOMEPAGE_URL",
+        ] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
     }
 
     #[test]

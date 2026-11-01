@@ -38,9 +38,9 @@ const Toaster = ({ ...props }: ToasterProps) => {
       }
       toastOptions={{
         classNames: {
-          toast: "cn-toast",
+          toast: "cn-toast !pr-9",
           // Sonner puts the close button half outside the top-left corner, over whatever is behind.
-          closeButton: "!left-auto !right-1 !top-1 !translate-x-0 !translate-y-0 !border-0 !bg-transparent",
+          closeButton: "!left-auto !right-0.5 !top-0.5 !size-7 !translate-x-0 !translate-y-0 !border-0 !bg-transparent",
         },
       }}
       {...props}
