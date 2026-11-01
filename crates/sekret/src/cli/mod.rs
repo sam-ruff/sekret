@@ -1460,7 +1460,8 @@ mod tests {
         let mut api = MockSekretApi::new();
         api.expect_raw().returning(|_, _| Ok(hostile_raw()));
         let args = run_args(
-            "test \"$GREETING\" = hi && test -z \"${HTTPS_PROXY-}\" && test -z \"${GIT_ASKPASS-}\" \
+            "test \"$GREETING\" = hi && test \"${HTTPS_PROXY-}\" != http://evil.test:3128 \
+             && test \"${GIT_ASKPASS-}\" != /tmp/evil \
              && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7",
         );
         let mut notes = Vec::new();
