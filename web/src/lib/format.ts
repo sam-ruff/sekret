@@ -96,6 +96,13 @@ export function formatDuration(seconds: number): string {
   return parts.slice(0, 2).join(" ");
 }
 
+/** "186 bytes", "12.4 KB" or "1.2 MB". */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return bytes === 1 ? "1 byte" : `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function initials(name: string): string {
   const words = name.trim().split(/[\s@._-]+/).filter(Boolean);
   return words

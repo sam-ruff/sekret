@@ -6,7 +6,7 @@ use sekret_api::{
     AuthMethodConfig, AuthMethodKind, JwtLoginRequest, KubernetesAuthConfig, KubernetesMode, MAX_LIFETIME,
     OidcAuthConfig, REDACTED_CREDENTIAL, TokenResponse, UniversalLoginRequest,
 };
-use sekret_core::crypto::{RootKey, hash_token, open_credential, seal_credential};
+use sekret_core::crypto::{IntegrityKey, RootKey, open_credential, seal_credential};
 use sekret_core::glob::glob_match;
 use sekret_store::{Identity, PrincipalKind, Store};
 use serde_json::{Value, json};
@@ -205,7 +205,7 @@ pub fn reseal(
 /// Re-seals reviewer tokens stored before they were bound to their cluster. Best effort, since a
 /// token that cannot be moved only stops its own logins; false when the database could not be
 /// read or written, so the migration is tried again.
-pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) -> bool {
+pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey, key: &IntegrityKey) -> bool {
     let result: ApiResult<usize> = async {
         let mut moved = 0;
         for identity in store.list_identities().await? {
@@ -224,8 +224,14 @@ pub async fn migrate_reviewer_tokens(store: &dyn Store, root: &RootKey) -> bool 
                     continue;
                 };
                 k8s.reviewer_jwt = Some(seal_credential(root, &plain, &credential_context(&identity.id, &k8s))?);
+                let vouched = crate::auth::auth_method_verified(key, &method);
                 method.config = serde_json::to_value(AuthMethodConfig::Kubernetes(k8s))
                     .map_err(|e| ApiError::internal("auth method config", e))?;
+                // A method nothing vouches for yet stays that way, to be vouched for or refused.
+                method = match vouched {
+                    true => crate::auth::sign_auth_method(key, method)?,
+                    false => sekret_store::AuthMethod { mac: None, ..method },
+                };
                 store.put_auth_method(method).await?;
                 moved += 1;
             }
@@ -441,6 +447,8 @@ async fn refused<T>(state: &AppState, ip: std::net::IpAddr, identity: &Identity,
     Err(ApiError::login_failed())
 }
 
+/// The identity's auth method of `kind`, when it has one this server signed. One a database
+/// writer added or changed counts as none.
 async fn method_config(
     state: &AppState,
     identity: &Identity,
@@ -449,6 +457,11 @@ async fn method_config(
     let Some(method) = state.store.get_auth_method(&identity.id, kind.as_str()).await? else {
         return Ok(None);
     };
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    if !crate::auth::auth_method_verified(&key, &method) {
+        tracing::error!(identity = %identity.name, kind = kind.as_str(), "an auth method fails its integrity check; save it again");
+        return Ok(None);
+    }
     serde_json::from_value(method.config)
         .map(Some)
         .map_err(|e| ApiError::internal("auth method config", e))
@@ -613,18 +626,11 @@ pub async fn universal_login(
     Json(request): Json<UniversalLoginRequest>,
 ) -> ApiResult<Json<TokenResponse>> {
     let identity = login_identity(&state, &request.client_id, ip).await?;
-    if state
-        .store
-        .get_auth_method(&identity.id, AuthMethodKind::Universal.as_str())
-        .await?
-        .is_none()
-    {
+    let Some(AuthMethodConfig::Universal) = method_config(&state, &identity, AuthMethodKind::Universal).await? else {
         return refused(&state, ip, &identity, "no universal auth method").await;
-    }
+    };
     let now = state.clock.now();
-    let Some(secret) = state
-        .store
-        .find_client_secret(&hash_token(&request.client_secret))
+    let Some(secret) = crate::auth::find_client_secret(&state, &request.client_secret)
         .await?
         .filter(|s| s.identity_id == identity.id && !s.revoked && s.expires_at.is_none_or(|at| at > now))
     else {
@@ -986,7 +992,10 @@ mod tests {
             kind: "kubernetes".into(),
             config: serde_json::to_value(AuthMethodConfig::Kubernetes(k8s))?,
             created_at: 0,
+            mac: None,
         };
+        let key = IntegrityKey::generate().context("integrity key")?;
+        let signed = crate::auth::sign_auth_method(&key, method.clone()).map_err(api("sign"))?;
         let mut store = MockStore::new();
         store.expect_list_identities().returning(|| {
             Ok(vec![Identity {
@@ -1000,20 +1009,37 @@ mod tests {
                 created_at: 0,
             }])
         });
+        // One method this server signed, and one nothing vouches for yet.
+        let unsigned = AuthMethod {
+            identity_id: "i1".into(),
+            kind: "kubernetes-unsigned".into(),
+            ..method
+        };
         store
             .expect_list_auth_methods()
-            .returning(move |_| Ok(vec![method.clone()]));
-        let saved = Arc::new(std::sync::Mutex::new(None));
+            .returning(move |_| Ok(vec![signed.clone(), unsigned.clone()]));
+        let saved = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = saved.clone();
-        store.expect_put_auth_method().times(1).returning(move |m| {
+        store.expect_put_auth_method().times(2).returning(move |m| {
             if let Ok(mut slot) = sink.lock() {
-                *slot = Some(m);
+                slot.push(m);
             }
             Ok(())
         });
-        assert!(migrate_reviewer_tokens(&store, &root).await);
-        let moved = saved.lock().ok().and_then(|m| m.clone()).context("saved")?;
-        let AuthMethodConfig::Kubernetes(moved) = serde_json::from_value(moved.config)? else {
+        assert!(migrate_reviewer_tokens(&store, &root, &key).await);
+        let saved = saved
+            .lock()
+            .map(|m| m.clone())
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        let [moved, still_unsigned] = saved.as_slice() else {
+            bail!("two methods saved");
+        };
+        assert!(
+            crate::auth::auth_method_verified(&key, moved),
+            "signed again over the new form"
+        );
+        assert_eq!(still_unsigned.mac, None, "nothing vouches for it, so nothing signs it");
+        let AuthMethodConfig::Kubernetes(moved) = serde_json::from_value(moved.config.clone())? else {
             bail!("kubernetes config expected");
         };
         let opened = unseal_reviewer(&root, "i1", &moved).map_err(api("unseal"))?;

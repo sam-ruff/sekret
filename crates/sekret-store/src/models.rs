@@ -39,6 +39,8 @@ pub struct Rekey {
     pub auth_methods: Vec<AuthMethod>,
     pub fingerprint: String,
     pub seal: Option<SealConfig>,
+    /// The integrity key wrapped under the new root key, replacing the stored one.
+    pub integrity_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub struct AuthMethod {
     pub kind: String,
     pub config: serde_json::Value,
     pub created_at: i64,
+    /// Authenticates the identity, kind and configuration under the integrity key.
+    pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +100,8 @@ pub struct ClientSecret {
     pub uses_remaining: Option<i64>,
     pub revoked: bool,
     pub last_used_at: Option<i64>,
+    /// Authenticates the row's fixed fields under the integrity key.
+    pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -143,6 +149,10 @@ pub struct AccessToken {
     pub last_used_at: Option<i64>,
     /// When the person last authenticated with the identity provider, for browser sessions.
     pub auth_time: Option<i64>,
+    /// Authenticates the row's fixed fields under the integrity key.
+    pub mac: Option<String>,
+    /// SHA-256 of the token, for the routes open while sealed, which grant nothing.
+    pub sealed_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +362,10 @@ pub struct CliLogin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliPoll {
     Pending,
-    Approved(String),
+    /// `mac` authenticates the approval under the integrity key; absent on approvals from before.
+    Approved {
+        user_id: String,
+        mac: Option<String>,
+    },
     Gone,
 }

@@ -38,7 +38,9 @@ spec:
   validationActions: ["Deny"]
 ---
 # A Secret of type service-account-token would get a non-expiring token from the cluster, so the
-# operator may only write the types reconcile.rs ALLOWED_SECRET_TYPES lists.
+# operator may only write the types reconcile.rs ALLOWED_SECRET_TYPES lists. It may also only
+# create Secrets marked as its own and change Secrets a SekretSecret already controls, so a bug or
+# a stolen token cannot overwrite other Secrets its RBAC reaches. Reads are not limited.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -56,6 +58,15 @@ spec:
   matchConditions:
     - name: written-by-the-operator
       expression: request.userInfo.username == {{ $username | quote }}
+  variables:
+    - name: controller
+      expression: >-
+        has(object.metadata.ownerReferences) ?
+        object.metadata.ownerReferences.filter(r, has(r.controller) && r.controller) : []
+    - name: oldController
+      expression: >-
+        request.operation == "UPDATE" && has(oldObject.metadata.ownerReferences) ?
+        oldObject.metadata.ownerReferences.filter(r, has(r.controller) && r.controller) : []
   validations:
     - expression: >-
         has(object.type) && object.type in ["Opaque", "kubernetes.io/basic-auth", "kubernetes.io/dockercfg",
@@ -65,6 +76,20 @@ spec:
         !has(object.metadata.annotations) ||
         !object.metadata.annotations.exists(k, k.startsWith("kubernetes.io/service-account."))
       message: the sekret operator may not write service account annotations
+    - expression: request.namespace != "kube-system"
+      message: the sekret operator may not write Secrets in kube-system
+    - expression: >-
+        has(object.metadata.labels) && "app.kubernetes.io/managed-by" in object.metadata.labels &&
+        object.metadata.labels["app.kubernetes.io/managed-by"] == "sekret-operator" &&
+        size(variables.controller) == 1 && variables.controller[0].kind == "SekretSecret" &&
+        variables.controller[0].apiVersion.startsWith("sekret.sam-ruff.github.io/")
+      message: the sekret operator may only write Secrets it manages for a SekretSecret
+    - expression: >-
+        request.operation != "UPDATE" ||
+        (size(variables.oldController) == 1 && size(variables.controller) == 1 &&
+        variables.oldController[0].kind == "SekretSecret" &&
+        variables.oldController[0].uid == variables.controller[0].uid)
+      message: the sekret operator may only change Secrets its SekretSecret already controls
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

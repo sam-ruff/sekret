@@ -149,6 +149,15 @@ describe("mock administration", () => {
     expect(b.setUnlockPolicy("manual").unlock_policy).toBe("manual");
   });
 
+  it("refuses a passphrase change on a server a key file unlocked, and keeps the passphrase", () => {
+    const { b, state } = backend({ ...mockSys(), unsealedBy: "key-file" });
+    expect(failure(() => b.changePassphrase({ current: MOCK_PASSPHRASE, new: "plum orbit gravel lantern" }, check))).toMatchObject({
+      status: 409,
+      code: "root_key_file_in_use",
+    });
+    expect(state.sys.passphrase).toBe(MOCK_PASSPHRASE);
+  });
+
   it("saves passphrase and policy changes but answers epoch_mark_stale while the mark is behind", () => {
     const { b, state } = backend();
     const stale = { status: 500, code: "epoch_mark_stale" };

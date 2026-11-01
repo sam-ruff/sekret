@@ -162,9 +162,7 @@ async fn session_auth_time(state: &AppState, headers: &HeaderMap) -> ApiResult<O
     let Some(token) = cookie_value(headers, session_cookie_name(&state.config)) else {
         return Ok(None);
     };
-    Ok(state
-        .store
-        .find_token(&hash_token(token))
+    Ok(crate::auth::find_token(state, token)
         .await?
         .and_then(|record| record.auth_time))
 }
@@ -770,7 +768,9 @@ pub async fn cli_approve(
     let Some(login) = state.store.get_cli_login(&code, now).await? else {
         return Err(ApiError::not_found("login code"));
     };
-    if !state.store.approve_cli_login(&code, &principal.id, now).await? {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    let mac = crate::auth::cli_approval_mac(&key, &login.device_code_hash, &principal.id)?;
+    if !state.store.approve_cli_login(&code, &principal.id, now, &mac).await? {
         return Err(ApiError::not_found("login code"));
     }
     audit(
@@ -817,11 +817,8 @@ pub async fn cli_poll(
         ));
     }
     let now = state.clock.now();
-    match state
-        .store
-        .poll_cli_login(&hash_token(&request.device_code), now)
-        .await?
-    {
+    let device_code_hash = hash_token(&request.device_code);
+    match state.store.poll_cli_login(&device_code_hash, now).await? {
         CliPoll::Pending => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "authorization_pending",
@@ -832,7 +829,12 @@ pub async fn cli_poll(
             "expired_token",
             "login code expired or already used",
         )),
-        CliPoll::Approved(user_id) => {
+        CliPoll::Approved { user_id, mac } => {
+            let key = state.keyring.integrity(state.store.as_ref()).await?;
+            if !crate::auth::cli_approval_verified(&key, &device_code_hash, &user_id, mac.as_deref()) {
+                tracing::error!("a CLI login approval fails its integrity check; it was not given through sekret");
+                return Err(ApiError::login_failed());
+            }
             let user = state
                 .store
                 .get_user(&user_id)

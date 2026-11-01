@@ -233,8 +233,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::Policy(flags) => {
             let (resolved, api) = authenticated(&cli.client).await?;
             let project = resolved
-                .project
-                .clone()
+                .checked_project()?
                 .ok_or_else(|| anyhow::anyhow!("no project; pass -p or set SEKRET_PROJECT"))?;
             print!("{}", cli::project_policy(&api, project, &flags).await?);
         }
@@ -278,6 +277,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
                 recursive,
                 policy: &policy,
                 previous: &previous,
+                project_file: resolved.project_file.as_deref(),
             };
             cli::env_use(
                 &api,

@@ -25,11 +25,16 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// The meta key holding the integrity key, wrapped under the root key.
+pub const INTEGRITY_KEY_META: &str = "integrity_key";
+
 #[cfg_attr(any(test, feature = "mock"), mockall::automock)]
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn get_meta(&self, key: &str) -> StoreResult<Option<String>>;
     async fn set_meta(&self, key: &str, value: &str) -> StoreResult<()>;
+    /// Sets `key` only when it has no value yet. False when one was already there.
+    async fn insert_meta(&self, key: &str, value: &str) -> StoreResult<bool>;
 
     async fn get_seal_config(&self) -> StoreResult<Option<SealConfig>>;
     /// Records the seal configuration and root key fingerprint together. `Conflict` if already initialised.
@@ -62,9 +67,24 @@ pub trait Store: Send + Sync {
     /// Records a use, decrementing any remaining-use counter. False when no use is left.
     async fn consume_client_secret(&self, id: &str, now: i64) -> StoreResult<bool>;
     async fn revoke_client_secret(&self, identity_id: &str, id: &str) -> StoreResult<()>;
+    /// Moves a client secret from `old_hash` to `new_hash` with a new MAC. False when it is no
+    /// longer stored under `old_hash`.
+    async fn rekey_client_secret(&self, id: &str, old_hash: &str, new_hash: &str, mac: &str) -> StoreResult<bool>;
+    /// Client secrets with no MAC, from before the integrity key.
+    async fn list_unsigned_client_secrets(&self) -> StoreResult<Vec<ClientSecret>>;
+    async fn set_client_secret_mac(&self, id: &str, mac: &str) -> StoreResult<()>;
 
     async fn create_token(&self, token: AccessToken) -> StoreResult<()>;
     async fn find_token(&self, token_hash: &str) -> StoreResult<Option<AccessToken>>;
+    /// The token stored with this plain hash, for the routes open while sealed.
+    async fn find_sealed_token(&self, sealed_hash: &str) -> StoreResult<Option<AccessToken>>;
+    /// As [`Store::rekey_client_secret`], for an access token.
+    async fn rekey_token(&self, id: &str, old_hash: &str, new_hash: &str, mac: &str) -> StoreResult<bool>;
+    /// Unrevoked access tokens with no MAC, from before the integrity key.
+    async fn list_unsigned_tokens(&self) -> StoreResult<Vec<AccessToken>>;
+    async fn set_token_mac(&self, id: &str, mac: &str) -> StoreResult<()>;
+    /// Auth methods with no MAC, from before the integrity key.
+    async fn list_unsigned_auth_methods(&self) -> StoreResult<Vec<AuthMethod>>;
     async fn touch_token(&self, id: &str, now: i64) -> StoreResult<()>;
     async fn extend_token(&self, id: &str, expires_at: i64) -> StoreResult<()>;
     async fn revoke_token(&self, id: &str) -> StoreResult<()>;
@@ -146,7 +166,8 @@ pub trait Store: Send + Sync {
 
     async fn create_cli_login(&self, login: CliLogin) -> StoreResult<()>;
     async fn get_cli_login(&self, user_code: &str, now: i64) -> StoreResult<Option<CliLogin>>;
-    async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64) -> StoreResult<bool>;
+    /// `mac` authenticates the approval, and is handed back by [`Store::poll_cli_login`].
+    async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64, mac: &str) -> StoreResult<bool>;
     /// Consumes a pending, unapproved login so its poller is told it has gone.
     async fn deny_cli_login(&self, user_code: &str, now: i64) -> StoreResult<bool>;
     async fn poll_cli_login(&self, device_code_hash: &str, now: i64) -> StoreResult<CliPoll>;

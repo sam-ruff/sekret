@@ -6,7 +6,7 @@ use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Connection, Row};
 
 use crate::models::*;
-use crate::{Store, StoreError, StoreResult};
+use crate::{INTEGRITY_KEY_META, Store, StoreError, StoreResult};
 
 /// [`Store`] over sqlx's `Any` driver. SQL is kept portable between SQLite and Postgres.
 #[derive(Clone)]
@@ -90,6 +90,7 @@ fn auth_method_from(row: &AnyRow) -> StoreResult<AuthMethod> {
         kind: row.try_get("kind")?,
         config: from_json(&row.try_get::<String, _>("config")?)?,
         created_at: row.try_get("created_at")?,
+        mac: row.try_get("mac")?,
     })
 }
 
@@ -105,6 +106,7 @@ fn client_secret_from(row: &AnyRow) -> StoreResult<ClientSecret> {
         uses_remaining: row.try_get("uses_remaining")?,
         revoked: get_flag(row, "revoked")?,
         last_used_at: row.try_get("last_used_at")?,
+        mac: row.try_get("mac")?,
     })
 }
 
@@ -123,6 +125,8 @@ fn token_from(row: &AnyRow) -> StoreResult<AccessToken> {
         revoked: get_flag(row, "revoked")?,
         last_used_at: row.try_get("last_used_at")?,
         auth_time: row.try_get("auth_time")?,
+        mac: row.try_get("mac")?,
+        sealed_hash: row.try_get("sealed_hash")?,
     })
 }
 
@@ -759,6 +763,15 @@ impl Store for SqlStore {
         Ok(())
     }
 
+    async fn insert_meta(&self, key: &str, value: &str) -> StoreResult<bool> {
+        let result = sqlx::query("INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn get_seal_config(&self) -> StoreResult<Option<SealConfig>> {
         let row = sqlx::query("SELECT * FROM seal_config WHERE id = 1")
             .fetch_optional(&self.pool)
@@ -974,13 +987,14 @@ impl Store for SqlStore {
 
     async fn put_auth_method(&self, method: AuthMethod) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO identity_auth_methods (identity_id, kind, config, created_at) VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (identity_id, kind) DO UPDATE SET config = excluded.config",
+            "INSERT INTO identity_auth_methods (identity_id, kind, config, created_at, mac) VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (identity_id, kind) DO UPDATE SET config = excluded.config, mac = excluded.mac",
         )
         .bind(&method.identity_id)
         .bind(&method.kind)
         .bind(to_json(&method.config)?)
         .bind(method.created_at)
+        .bind(method.mac.clone())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1015,7 +1029,7 @@ impl Store for SqlStore {
     async fn create_client_secret(&self, secret: ClientSecret) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO client_secrets (id, identity_id, description, secret_hash, prefix, created_at, expires_at, \
-             uses_remaining, revoked, last_used_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             uses_remaining, revoked, last_used_at, mac) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&secret.id)
         .bind(&secret.identity_id)
@@ -1027,8 +1041,37 @@ impl Store for SqlStore {
         .bind(secret.uses_remaining)
         .bind(flag(secret.revoked))
         .bind(secret.last_used_at)
+        .bind(secret.mac.clone())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn rekey_client_secret(&self, id: &str, old_hash: &str, new_hash: &str, mac: &str) -> StoreResult<bool> {
+        let result =
+            sqlx::query("UPDATE client_secrets SET secret_hash = $1, mac = $2 WHERE id = $3 AND secret_hash = $4")
+                .bind(new_hash)
+                .bind(mac)
+                .bind(id)
+                .bind(old_hash)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_unsigned_client_secrets(&self) -> StoreResult<Vec<ClientSecret>> {
+        let rows = sqlx::query("SELECT * FROM client_secrets WHERE mac IS NULL AND revoked = 0 ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        collect(rows, client_secret_from)
+    }
+
+    async fn set_client_secret_mac(&self, id: &str, mac: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE client_secrets SET mac = $1 WHERE id = $2")
+            .bind(mac)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1076,8 +1119,8 @@ impl Store for SqlStore {
     async fn create_token(&self, token: AccessToken) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO access_tokens (id, token_hash, kind, principal_kind, principal_id, description, created_at, \
-             expires_at, max_expires_at, revoked, last_used_at, source, auth_time) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             expires_at, max_expires_at, revoked, last_used_at, source, auth_time, mac, sealed_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&token.id)
         .bind(&token.token_hash)
@@ -1092,9 +1135,54 @@ impl Store for SqlStore {
         .bind(token.last_used_at)
         .bind(&token.source)
         .bind(token.auth_time)
+        .bind(token.mac.clone())
+        .bind(token.sealed_hash.clone())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn find_sealed_token(&self, sealed_hash: &str) -> StoreResult<Option<AccessToken>> {
+        let row = sqlx::query("SELECT * FROM access_tokens WHERE sealed_hash = $1")
+            .bind(sealed_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(token_from).transpose()
+    }
+
+    async fn rekey_token(&self, id: &str, old_hash: &str, new_hash: &str, mac: &str) -> StoreResult<bool> {
+        let result =
+            sqlx::query("UPDATE access_tokens SET token_hash = $1, mac = $2 WHERE id = $3 AND token_hash = $4")
+                .bind(new_hash)
+                .bind(mac)
+                .bind(id)
+                .bind(old_hash)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_unsigned_tokens(&self) -> StoreResult<Vec<AccessToken>> {
+        let rows = sqlx::query("SELECT * FROM access_tokens WHERE mac IS NULL AND revoked = 0 ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        collect(rows, token_from)
+    }
+
+    async fn set_token_mac(&self, id: &str, mac: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE access_tokens SET mac = $1 WHERE id = $2")
+            .bind(mac)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_unsigned_auth_methods(&self) -> StoreResult<Vec<AuthMethod>> {
+        let rows = sqlx::query("SELECT * FROM identity_auth_methods WHERE mac IS NULL ORDER BY identity_id, kind")
+            .fetch_all(&self.pool)
+            .await?;
+        collect(rows, auth_method_from)
     }
 
     async fn revoke_tokens_from_source(&self, source: &str) -> StoreResult<()> {
@@ -1415,6 +1503,7 @@ impl Store for SqlStore {
             auth_methods,
             fingerprint,
             seal,
+            integrity_key,
         } = rekey;
         let mut tx = self.pool.begin().await?;
         if let Some(config) = seal {
@@ -1442,12 +1531,22 @@ impl Store for SqlStore {
             }
         }
         for method in auth_methods {
-            sqlx::query("UPDATE identity_auth_methods SET config = $1 WHERE identity_id = $2 AND kind = $3")
+            sqlx::query("UPDATE identity_auth_methods SET config = $1, mac = $2 WHERE identity_id = $3 AND kind = $4")
                 .bind(to_json(&method.config)?)
+                .bind(method.mac.clone())
                 .bind(&method.identity_id)
                 .bind(&method.kind)
                 .execute(&mut *tx)
                 .await?;
+        }
+        if let Some(wrapped) = integrity_key {
+            sqlx::query(
+                "INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(INTEGRITY_KEY_META)
+            .bind(wrapped)
+            .execute(&mut *tx)
+            .await?;
         }
         sqlx::query(
             "INSERT INTO meta (key, value) VALUES ('root_key_fingerprint', $1) \
@@ -2023,12 +2122,13 @@ impl Store for SqlStore {
         row.as_ref().map(cli_login_from).transpose()
     }
 
-    async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64) -> StoreResult<bool> {
+    async fn approve_cli_login(&self, user_code: &str, user_id: &str, now: i64, mac: &str) -> StoreResult<bool> {
         let result = sqlx::query(
-            "UPDATE cli_logins SET approved_user_id = $1 WHERE user_code = $2 AND expires_at > $3 \
+            "UPDATE cli_logins SET approved_user_id = $1, approval_mac = $2 WHERE user_code = $3 AND expires_at > $4 \
              AND approved_user_id IS NULL AND consumed = 0",
         )
         .bind(user_id)
+        .bind(mac)
         .bind(user_code)
         .bind(now)
         .execute(&self.pool)
@@ -2062,6 +2162,7 @@ impl Store for SqlStore {
         let Some(user_id) = login.approved_user_id else {
             return Ok(CliPoll::Pending);
         };
+        let mac: Option<String> = row.as_ref().map(|r| r.try_get("approval_mac")).transpose()?.flatten();
         // Only one poller can claim the approval.
         let result = sqlx::query("UPDATE cli_logins SET consumed = 1 WHERE device_code_hash = $1 AND consumed = 0")
             .bind(device_code_hash)
@@ -2070,7 +2171,7 @@ impl Store for SqlStore {
         if result.rows_affected() != 1 {
             return Ok(CliPoll::Gone);
         }
-        Ok(CliPoll::Approved(user_id))
+        Ok(CliPoll::Approved { user_id, mac })
     }
 
     async fn purge_expired(&self, now: i64) -> StoreResult<()> {

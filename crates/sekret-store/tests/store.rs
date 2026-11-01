@@ -290,10 +290,33 @@ async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> 
             kind: "oidc".into(),
             config: serde_json::json!({"issuer": "https://x"}),
             created_at: 1,
+            mac: None,
         })
         .await
         .context("method")?;
     assert_eq!(store.list_auth_methods("i1").await.context("methods")?.len(), 1);
+    assert_eq!(store.list_unsigned_auth_methods().await.context("unsigned")?.len(), 1);
+    let method = store
+        .get_auth_method("i1", "oidc")
+        .await
+        .context("get")?
+        .context("method")?;
+    store
+        .put_auth_method(AuthMethod {
+            mac: Some("m1".into()),
+            ..method
+        })
+        .await
+        .context("sign")?;
+    assert_eq!(
+        store
+            .get_auth_method("i1", "oidc")
+            .await
+            .context("get")?
+            .and_then(|m| m.mac),
+        Some("m1".into())
+    );
+    assert!(store.list_unsigned_auth_methods().await.context("unsigned")?.is_empty());
 
     let secret = ClientSecret {
         id: "c1".into(),
@@ -306,8 +329,40 @@ async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> 
         uses_remaining: Some(1),
         revoked: false,
         last_used_at: None,
+        mac: None,
     };
     store.create_client_secret(secret).await.context("secret")?;
+    assert_eq!(store.list_unsigned_client_secrets().await.context("unsigned")?.len(), 1);
+    store.set_client_secret_mac("c1", "legacy").await.context("mac")?;
+    assert!(
+        store
+            .list_unsigned_client_secrets()
+            .await
+            .context("unsigned")?
+            .is_empty()
+    );
+    assert!(
+        !store
+            .rekey_client_secret("c1", "not-h1", "h2", "m2")
+            .await
+            .context("rekey")?,
+        "only from the hash it is stored under"
+    );
+    assert!(
+        store
+            .rekey_client_secret("c1", "h1", "h2", "m2")
+            .await
+            .context("rekey")?
+    );
+    assert!(store.find_client_secret("h1").await.context("find")?.is_none());
+    assert_eq!(
+        store
+            .find_client_secret("h2")
+            .await
+            .context("find")?
+            .and_then(|s| s.mac),
+        Some("m2".into())
+    );
     assert!(store.consume_client_secret("c1", 5).await.context("consume")?);
     assert!(!store.consume_client_secret("c1", 6).await.context("exhausted")?);
 
@@ -325,15 +380,37 @@ async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> 
         revoked: false,
         last_used_at: None,
         auth_time: Some(1),
+        mac: Some("m".into()),
+        sealed_hash: Some("plain".into()),
     };
     store
         .create_token(AccessToken {
             id: "t0".into(),
             token_hash: "th0".into(),
+            mac: None,
+            sealed_hash: Some("plain0".into()),
             ..token.clone()
         })
         .await
         .context("token")?;
+    let unsigned = store.list_unsigned_tokens().await.context("unsigned")?;
+    assert_eq!(unsigned.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t0"]);
+    store.set_token_mac("t0", "legacy").await.context("mac")?;
+    assert!(store.rekey_token("t0", "th0", "th0-new", "m0").await.context("rekey")?);
+    assert!(
+        !store
+            .rekey_token("t0", "th0", "th0-again", "m0")
+            .await
+            .context("rekey twice")?
+    );
+    let moved = store.find_token("th0-new").await.context("find")?.context("moved")?;
+    assert_eq!(moved.mac.as_deref(), Some("m0"));
+    assert_eq!(
+        store.find_sealed_token("plain0").await.context("sealed")?.map(|t| t.id),
+        Some("t0".into()),
+        "moving the lookup keeps the plain hash"
+    );
+    store.rekey_token("t0", "th0-new", "th0", "m0").await.context("back")?;
     store
         .revoke_tokens_from_source("client-secret:c1")
         .await
@@ -349,6 +426,10 @@ async fn exercise_identities_and_tokens(store: &SqlStore) -> anyhow::Result<()> 
     assert_eq!(
         store.find_token("th").await.context("find")?.map(|t| t.principal_kind),
         Some(PrincipalKind::Identity)
+    );
+    assert!(
+        store.list_unsigned_tokens().await.context("unsigned")?.is_empty(),
+        "revoked or signed"
     );
     store
         .revoke_principal_tokens(PrincipalKind::Identity, "i1")
@@ -431,19 +512,22 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
     assert_eq!(store.poll_cli_login("dc", 2).await.context("poll")?, CliPoll::Pending);
     assert!(
         store
-            .approve_cli_login("ABCD-EFGH", &user.id, 3)
+            .approve_cli_login("ABCD-EFGH", &user.id, 3, "approval")
             .await
             .context("approve")?
     );
     assert!(
         !store
-            .approve_cli_login("ABCD-EFGH", "someone-else", 3)
+            .approve_cli_login("ABCD-EFGH", "someone-else", 3, "other")
             .await
             .context("approve twice")?
     );
     assert_eq!(
         store.poll_cli_login("dc", 4).await.context("poll")?,
-        CliPoll::Approved(user.id.clone())
+        CliPoll::Approved {
+            user_id: user.id.clone(),
+            mac: Some("approval".into())
+        }
     );
     assert_eq!(store.poll_cli_login("dc", 5).await.context("poll")?, CliPoll::Gone);
 
@@ -612,6 +696,7 @@ fn seal_config(remembered: Option<Vec<u8>>) -> SealConfig {
             reviewer_tokens_migrated: true,
             remember_secret: true,
             wrap_form_signed: true,
+            credentials_keyed: true,
         },
         created_at: 10,
         updated_at: 10,
@@ -676,10 +761,18 @@ async fn exercise_seal_config(store: &SqlStore) -> anyhow::Result<()> {
         Some("fp1".into()),
         "updating the seal configuration leaves the fingerprint alone"
     );
+    let integrity = sekret_store::INTEGRITY_KEY_META;
+    assert!(store.insert_meta(integrity, "wrap-1").await.context("insert")?);
+    assert!(
+        !store.insert_meta(integrity, "wrap-2").await.context("insert again")?,
+        "the first key stored wins"
+    );
+    assert_eq!(store.get_meta(integrity).await.context("meta")?, Some("wrap-1".into()));
     store
         .replace_wrapped_keys(Rekey {
             fingerprint: "fp3".into(),
             seal: Some(seal_config(Some(vec![4; 57]))),
+            integrity_key: Some("wrap-3".into()),
             ..Rekey::default()
         })
         .await
@@ -688,6 +781,7 @@ async fn exercise_seal_config(store: &SqlStore) -> anyhow::Result<()> {
         store.get_meta("root_key_fingerprint").await.context("meta")?,
         Some("fp3".into())
     );
+    assert_eq!(store.get_meta(integrity).await.context("meta")?, Some("wrap-3".into()));
     assert_eq!(
         store.get_seal_config().await.context("get")?,
         Some(seal_config(Some(vec![4; 57])))

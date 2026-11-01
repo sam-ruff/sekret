@@ -636,12 +636,16 @@ pub struct SealFlags {
     /// The wrap's passphrase form marker is part of the signed message. Configurations signed
     /// before this leave it out.
     pub wrap_form_signed: bool,
+    /// Credentials stored before the integrity key existed have been vouched for, so one in the
+    /// old form that a database writer adds later is never accepted.
+    pub credentials_keyed: bool,
 }
 
 impl SealFlags {
     const REVIEWER_TOKENS_MIGRATED: i64 = 1;
     const REMEMBER_SECRET: i64 = 2;
     const WRAP_FORM_SIGNED: i64 = 4;
+    const CREDENTIALS_KEYED: i64 = 8;
 
     /// The flags as stored in the database.
     pub fn bits(self) -> i64 {
@@ -655,12 +659,16 @@ impl SealFlags {
         if self.wrap_form_signed {
             bits |= Self::WRAP_FORM_SIGNED;
         }
+        if self.credentials_keyed {
+            bits |= Self::CREDENTIALS_KEYED;
+        }
         bits
     }
 
     /// Unknown bits are refused, so a flag this version does not understand is never dropped.
     pub fn from_bits(bits: i64) -> Option<Self> {
-        let known = Self::REVIEWER_TOKENS_MIGRATED | Self::REMEMBER_SECRET | Self::WRAP_FORM_SIGNED;
+        let known =
+            Self::REVIEWER_TOKENS_MIGRATED | Self::REMEMBER_SECRET | Self::WRAP_FORM_SIGNED | Self::CREDENTIALS_KEYED;
         if bits & !known != 0 {
             return None;
         }
@@ -668,6 +676,7 @@ impl SealFlags {
             reviewer_tokens_migrated: bits & Self::REVIEWER_TOKENS_MIGRATED != 0,
             remember_secret: bits & Self::REMEMBER_SECRET != 0,
             wrap_form_signed: bits & Self::WRAP_FORM_SIGNED != 0,
+            credentials_keyed: bits & Self::CREDENTIALS_KEYED != 0,
         })
     }
 }
@@ -1181,6 +1190,13 @@ mod tests {
                 },
                 ..binding
             },
+            SealBinding {
+                flags: SealFlags {
+                    credentials_keyed: true,
+                    ..SealFlags::default()
+                },
+                ..binding
+            },
         ];
         for tampered in changed {
             assert_eq!(
@@ -1226,6 +1242,7 @@ mod tests {
                 reviewer_tokens_migrated: true,
                 remember_secret: true,
                 wrap_form_signed: true,
+                credentials_keyed: true,
             },
             ..binding
         };
@@ -1234,10 +1251,10 @@ mod tests {
             verify_seal_config(&root, &binding, &mac).is_err(),
             "clearing the flags breaks the signature"
         );
-        for bits in 0..8 {
+        for bits in 0..16 {
             assert_eq!(SealFlags::from_bits(bits).map(SealFlags::bits), Some(bits));
         }
-        assert_eq!(SealFlags::from_bits(8), None, "unknown flags are refused");
+        assert_eq!(SealFlags::from_bits(16), None, "unknown flags are refused");
         Ok(())
     }
 

@@ -3634,6 +3634,22 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
         .await
         .context("drop column")?;
     }
+    sqlx::query("DROP INDEX access_tokens_sealed_hash")
+        .execute(&pool)
+        .await
+        .context("drop index")?;
+    for (table, column) in [
+        ("access_tokens", "mac"),
+        ("access_tokens", "sealed_hash"),
+        ("client_secrets", "mac"),
+        ("identity_auth_methods", "mac"),
+        ("cli_logins", "approval_mac"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} DROP COLUMN {column}")))
+            .execute(&pool)
+            .await
+            .context("drop column")?;
+    }
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 5")
         .execute(&pool)
         .await
@@ -3662,8 +3678,10 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
         .await?;
     assert!(log.contains("set-seal-mode"), "{log}");
 
-    // With the key it upgrades in key-file mode and the data is readable.
+    // With the key it upgrades in key-file mode and the data is readable. The token minted above
+    // was stored in this version's keyed form, which no older release wrote, so a new one is used.
     let server = sb.keyed(&key).start().await?;
+    let admin = sb.bootstrap(&key)?;
     let status = server.detail(&admin).await?;
     assert_eq!(
         (status["state"].as_str(), status["seal_mode"].as_str()),

@@ -39,12 +39,16 @@ pub struct ConnectionLimits {
     pub max_connections: usize,
     /// Connections one client address (an IPv6 /64) may hold at once; more are closed straight away.
     pub max_per_client: usize,
+    /// Connections one IPv6 /48 may hold at once, since one party often holds a /48 and so
+    /// thousands of /64s.
+    pub max_per_network: usize,
     /// Peers the per-client cap does not apply to, such as reverse proxies.
     pub exempt: Arc<[IpNet]>,
 }
 
 impl ConnectionLimits {
-    /// A quarter of the connections per client, with loopback exempt for a local proxy.
+    /// A quarter of the connections per client and half per IPv6 /48, with loopback exempt for a
+    /// local proxy.
     pub fn new(max_connections: usize) -> Self {
         let max_connections = max_connections.max(1);
         Self {
@@ -52,6 +56,7 @@ impl ConnectionLimits {
             idle_timeout: IDLE_TIMEOUT,
             max_connections,
             max_per_client: (max_connections / 4).max(1),
+            max_per_network: (max_connections / 2).max(1),
             exempt: loopback().into(),
         }
     }
@@ -78,30 +83,60 @@ fn loopback() -> Vec<IpNet> {
     .collect()
 }
 
-/// Open connections per client, each released when its slot drops.
+/// Open connections per client and per IPv6 network, each released when its slot drops.
 #[derive(Default)]
 struct PerClient {
-    open: Mutex<HashMap<IpAddr, usize>>,
+    open: Mutex<Open>,
+}
+
+#[derive(Default)]
+struct Open {
+    hosts: HashMap<IpAddr, usize>,
+    networks: HashMap<IpAddr, usize>,
 }
 
 struct ClientSlot {
     owner: Arc<PerClient>,
-    key: IpAddr,
+    host: IpAddr,
+    network: Option<IpAddr>,
+}
+
+/// The IPv6 /48 a peer is in. IPv4 hosts are counted alone, as before.
+fn network_key(peer: IpAddr) -> Option<IpAddr> {
+    match peer.to_canonical() {
+        IpAddr::V4(_) => None,
+        v6 @ IpAddr::V6(_) => Some(crate::ratelimit::prefix_key(v6)),
+    }
 }
 
 impl PerClient {
-    fn claim(self: &Arc<Self>, peer: IpAddr, max: usize) -> Option<ClientSlot> {
-        let key = crate::ratelimit::limiter_key(peer);
+    fn claim(self: &Arc<Self>, peer: IpAddr, limits: &ConnectionLimits) -> Option<ClientSlot> {
+        let host = crate::ratelimit::limiter_key(peer);
+        let network = network_key(peer);
         let mut open = self.open.lock().ok()?;
-        let count = open.entry(key).or_insert(0);
-        if *count >= max {
+        let hosts = open.hosts.get(&host).copied().unwrap_or(0);
+        let networks = network.map_or(0, |n| open.networks.get(&n).copied().unwrap_or(0));
+        if hosts >= limits.max_per_client || networks >= limits.max_per_network {
             return None;
         }
-        *count += 1;
+        *open.hosts.entry(host).or_insert(0) += 1;
+        if let Some(network) = network {
+            *open.networks.entry(network).or_insert(0) += 1;
+        }
         Some(ClientSlot {
             owner: self.clone(),
-            key,
+            host,
+            network,
         })
+    }
+}
+
+fn release(counts: &mut HashMap<IpAddr, usize>, key: &IpAddr) {
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
+        }
     }
 }
 
@@ -110,11 +145,9 @@ impl Drop for ClientSlot {
         let Ok(mut open) = self.owner.open.lock() else {
             return;
         };
-        if let Some(count) = open.get_mut(&self.key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                open.remove(&self.key);
-            }
+        release(&mut open.hosts, &self.host);
+        if let Some(network) = &self.network {
+            release(&mut open.networks, network);
         }
     }
 }
@@ -156,7 +189,7 @@ pub async fn serve(
             },
         };
         let slot = if limits.capped(peer.ip()) {
-            let Some(slot) = per_client.claim(peer.ip(), limits.max_per_client) else {
+            let Some(slot) = per_client.claim(peer.ip(), &limits) else {
                 tracing::debug!(%peer, "closed a connection over the per-client limit");
                 continue;
             };
@@ -364,5 +397,72 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Tracked<T> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    fn ip(text: &str) -> anyhow::Result<IpAddr> {
+        text.parse().context("address")
+    }
+
+    #[test]
+    fn one_ipv6_network_cannot_take_more_than_its_share() -> anyhow::Result<()> {
+        let limits = ConnectionLimits::new(8);
+        assert_eq!((limits.max_per_client, limits.max_per_network), (2, 4));
+        let per_client = Arc::new(PerClient::default());
+        let mut held = Vec::new();
+        // Four /64s inside one /48, as a single host with a /48 can present.
+        for subnet in 1..=4 {
+            let peer = ip(&format!("2001:db8:7:{subnet}::1"))?;
+            held.push(per_client.claim(peer, &limits).context("within the network's share")?);
+        }
+        let fifth = ip("2001:db8:7:5::1")?;
+        assert!(
+            per_client.claim(fifth, &limits).is_none(),
+            "a fifth /64 in the same /48"
+        );
+        let elsewhere = ip("2001:db8:8:1::1")?;
+        assert!(
+            per_client.claim(elsewhere, &limits).is_some(),
+            "another /48 is unaffected"
+        );
+        held.pop();
+        assert!(
+            per_client.claim(fifth, &limits).is_some(),
+            "a closed connection frees room"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_per_host_cap_still_applies_inside_a_network() -> anyhow::Result<()> {
+        let limits = ConnectionLimits::new(8);
+        let per_client = Arc::new(PerClient::default());
+        let host = ip("2001:db8:7:1::1")?;
+        let same_64 = ip("2001:db8:7:1::2")?;
+        let _a = per_client.claim(host, &limits).context("first")?;
+        let _b = per_client.claim(same_64, &limits).context("second")?;
+        assert!(per_client.claim(host, &limits).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ipv4_hosts_are_counted_alone() -> anyhow::Result<()> {
+        let limits = ConnectionLimits::new(8);
+        let per_client = Arc::new(PerClient::default());
+        let mut held = Vec::new();
+        for host in 1..=6 {
+            let peer = ip(&format!("192.0.2.{host}"))?;
+            held.push(per_client.claim(peer, &limits).context("each host has its own share")?);
+        }
+        // An IPv4-mapped IPv6 address is the same host.
+        let mapped = ip("::ffff:192.0.2.1")?;
+        let _again = per_client.claim(mapped, &limits).context("second for that host")?;
+        assert!(per_client.claim(mapped, &limits).is_none());
+        Ok(())
     }
 }

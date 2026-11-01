@@ -88,7 +88,7 @@ test("shows where a CLI login came from and approves it only with the typed code
   await expect(details.getByTestId("cli-request-agent")).toHaveText("sekret-live-test/1.0");
   await expect(details.getByTestId("cli-request-age")).toHaveText("just now");
   await expect(details.getByTestId("cli-request-expires")).toHaveText(/^in \d+ minutes? \(\d{2}:\d{2}\)$/);
-  await expect(details).toContainText("Program (reported by the requester, can be faked)");
+  await expect(details.getByTestId("cli-request-agent-note")).toHaveText("Reported by the requester, so it can be faked.");
   // The CLI and this browser are on the same machine, so there is no different-network warning.
   await expect(page.getByTestId("cli-other-address")).toHaveCount(0);
   // The code in the link is not shown or filled in.

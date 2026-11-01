@@ -81,6 +81,66 @@ test("creates a project, adds and updates a secret, then rolls it back", async (
   await expect(page).toHaveURL(/\/projects$/);
 });
 
+test("an edit waits for the value, and rotation and rollback keep the comment", async ({ page }) => {
+  const slug = await createProject(page, unique("E2E Comment"));
+
+  await page.getByTestId("add-secret").click();
+  const form = page.getByTestId("new-secret-form");
+  await form.getByTestId("secret-key-input").fill("API_TOKEN");
+  await form.getByTestId("secret-value-input").fill("keep-me");
+  await form.getByTestId("secret-comment-input").fill("Vendor token");
+  await form.getByTestId("secret-save").click();
+  const row = page.getByTestId("secret-row-API_TOKEN");
+  await expect(row.getByTestId("secret-comment")).toHaveText("Vendor token");
+
+  // While the value cannot be read, the editor stays closed instead of starting empty.
+  const valueUrl = (url: URL) => url.pathname === `/api/v1/projects/${slug}/environments/dev/secrets/API_TOKEN`;
+  await page.route(valueUrl, (route) =>
+    route.request().method() === "GET"
+      ? route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"internal","message":"try later"}' })
+      : route.fallback(),
+  );
+  await row.getByTestId("secret-actions").click();
+  await page.getByTestId("secret-edit").click();
+  const failed = page.getByTestId("edit-load-failed-API_TOKEN");
+  await expect(failed).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId("edit-secret-API_TOKEN")).toHaveCount(0);
+  await page.unroute(valueUrl);
+  await failed.getByRole("button", { name: "Try again" }).click();
+
+  const editor = page.getByTestId("edit-secret-API_TOKEN");
+  await expect(editor.getByTestId("secret-value-input")).toHaveValue("keep-me");
+  await editor.getByTestId("secret-comment-input").fill("Vendor token, renewed yearly");
+  await editor.getByTestId("secret-save").click();
+  await expect(editor).toBeHidden();
+  await expect(await revealedValue(page, "API_TOKEN")).toHaveText("keep-me");
+
+  // Rolling back keeps the restored version's comment, with the rollback in front.
+  await row.getByTestId("secret-key").click();
+  const drawer = page.getByTestId("secret-drawer");
+  await drawer.getByTestId("rollback-1").click();
+  await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
+  await expect(drawer.getByTestId("version-3")).toContainText("rolled back to version 1: Vendor token");
+  await drawer.getByRole("button", { name: "Close" }).click();
+  await expect(drawer).toBeHidden();
+  await expect(row.getByTestId("secret-comment")).toHaveText("rolled back to version 1: Vendor token");
+
+  // Rotating by hand keeps the comment as it is.
+  await row.getByTestId("secret-key").click();
+  await expect(drawer.getByTestId("version-3")).toBeVisible();
+  await drawer.getByTestId("policy-rotate-now").click();
+  await page.getByTestId("rotate-confirm").getByTestId("confirm-action").click();
+  await expect(drawer.getByTestId("version-4")).toContainText("Current");
+  await expect(drawer.getByTestId("version-4")).toContainText("rolled back to version 1: Vendor token");
+  await drawer.getByRole("button", { name: "Close" }).click();
+
+  await page.goto(`/projects/${slug}/settings/danger`);
+  await page.getByTestId("delete-project").click();
+  await page.getByTestId("delete-project-slug").fill(slug);
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/projects$/);
+});
+
 /** Records every secrets API request the page makes from now on. */
 function watchSecretRequests(page: Page): string[] {
   const seen: string[] = [];

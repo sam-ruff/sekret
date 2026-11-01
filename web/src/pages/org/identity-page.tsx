@@ -9,6 +9,7 @@ import { AuthMethods } from "@/components/identities/auth-methods";
 import { IdentityFields } from "@/components/identities/identity-fields";
 import { ttlProblem, type IdentityDraft } from "@/components/identities/identity-model";
 import { LinkTabs } from "@/components/link-tabs";
+import { ProjectAccess } from "@/components/identities/project-access";
 import { UsageSnippets } from "@/components/identities/usage-snippets";
 import { PageHeader } from "@/components/page-header";
 import { ErrorBoundary } from "@/components/error-boundary";
@@ -225,7 +226,12 @@ export function IdentityPage() {
               <DetailsTab key={JSON.stringify(identity.data)} identity={identity.data} canEdit={canEdit} canDelete={canDelete} />
             )}
             {current === "auth" && <AuthMethods identityId={id} canEdit={canEdit} />}
-            {current === "usage" && <UsageSnippets identity={identity.data} />}
+            {current === "usage" && (
+              <div className="space-y-6">
+                <ProjectAccess identity={identity.data} />
+                <UsageSnippets identity={identity.data} />
+              </div>
+            )}
           </ErrorBoundary>
         </>
       )}

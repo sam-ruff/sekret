@@ -898,11 +898,11 @@ async fn session(h: &Harness, auth_time: Option<i64>) -> anyhow::Result<String> 
         })
         .await?;
     let token = format!("skt_{}", uuid::Uuid::new_v4().simple());
-    h.state
-        .store
-        .create_token(AccessToken {
+    h.store_token(
+        &token,
+        AccessToken {
             id: uuid::Uuid::new_v4().to_string(),
-            token_hash: sekret_core::crypto::hash_token(&token),
+            token_hash: String::new(),
             kind: "session".into(),
             principal_kind: PrincipalKind::User,
             principal_id: user.id,
@@ -914,8 +914,11 @@ async fn session(h: &Harness, auth_time: Option<i64>) -> anyhow::Result<String> 
             revoked: false,
             last_used_at: None,
             auth_time,
-        })
-        .await?;
+            mac: None,
+            sealed_hash: None,
+        },
+    )
+    .await?;
     Ok(token)
 }
 

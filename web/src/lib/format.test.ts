@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatBytes,
   formatDateTime,
   formatDuration,
   formatDurationWords,
@@ -17,6 +18,15 @@ describe("formatDuration", () => {
     expect(formatDuration(900)).toBe("15m");
     expect(formatDuration(86400 + 6 * 3600)).toBe("1d 6h");
     expect(formatDuration(45)).toBe("45s");
+  });
+});
+
+describe("formatBytes", () => {
+  it("uses bytes below a kilobyte and one decimal above", () => {
+    expect(formatBytes(1)).toBe("1 byte");
+    expect(formatBytes(186)).toBe("186 bytes");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+    expect(formatBytes(3 * 1024 * 1024)).toBe("3.0 MB");
   });
 });
 

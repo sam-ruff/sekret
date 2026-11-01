@@ -13,14 +13,14 @@ use sekret_server::admin::{Rotation, RotationReport};
 use sekret_server::clock::{Clock, SystemClock};
 use sekret_server::config::{SealSettings, ServerConfig};
 use sekret_server::files::{
-    SECRET_FILE_LIMIT, WrittenFile, can_create, read_limited, remove_device_key_file, write_new_private,
-    write_new_recorded, write_private_atomic,
+    SECRET_FILE_LIMIT, WrittenFile, can_create, read_limited, remove_device_key_file, remove_if_present,
+    write_new_private, write_new_recorded,
 };
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
 use sekret_server::seal::{
     AutoInit, Distrust, HighWater, InitPlan, Keyring, StartupSecrets, audit_as, cautious_flags, check_database_root,
-    check_root, high_water, initialise, open_keyring, record_epoch, reset_epoch, root_recognised, signed,
-    verify_config,
+    check_root, high_water, initialise, open_keyring, pending_key_file, record_epoch, reset_epoch, root_recognised,
+    signed, verify_config,
 };
 use sekret_server::state::{AppState, Dependencies, build_state};
 use sekret_store::{InstanceLock, Open, SealConfig, SqlStore, Store};
@@ -355,6 +355,7 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets, sources: &Sou
     log_report(&report);
     check_epoch_file(epoch_file.as_deref())?;
     config.seal.epoch_files = require_marks(std::mem::take(&mut config.seal.epoch_files))?;
+    warn_if_marks_beside_database(&config.database_url, &config.seal.epoch_files);
     // Held for the life of the server, so admin commands cannot write underneath it.
     let mut lock = InstanceLock::acquire_within(&config.database_url, LOCK_WAIT)
         .await
@@ -395,6 +396,37 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets, sources: &Sou
         lost = watch_lock(&mut lock) => return Err(lost),
     }
     Ok(())
+}
+
+/// The device a file is on, or would be on, from its directory.
+#[cfg(unix)]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(parent_dir(path)).ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device_of(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Someone who can replace a SQLite file can usually delete a mark on the same disk too, which
+/// turns off rollback detection and root key pinning, so say so at start.
+fn warn_if_marks_beside_database(database_url: &str, marks: &[PathBuf]) {
+    let Some(database) = sekret_store::sqlite_file(database_url) else {
+        return;
+    };
+    let Some(device) = device_of(&database) else {
+        return;
+    };
+    if marks.iter().any(|mark| device_of(mark).is_some_and(|d| d != device)) {
+        return;
+    }
+    tracing::warn!(
+        "every seal epoch mark is on the same disk as the SQLite database, so whoever can replace the database can \
+         usually delete the marks too; set seal.epoch_file to a path on another volume that the database's owner \
+         cannot write"
+    );
 }
 
 /// The only place the setup code is shown. It goes to stderr as well as the log, so a quiet log
@@ -532,8 +564,9 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
             ttl,
             passphrase_file,
         } => {
-            // No instance lock: this writes nothing under the root key, and it is how admin
-            // access is recovered on a server that is running.
+            // No instance lock: it is how admin access is recovered on a server that is running.
+            // The only thing it may write under the root key is a missing integrity key, which
+            // only the first writer stores, and which a rotation wraps again rather than replaces.
             let location = store.locate(sources)?;
             // Never migrates: a running server of another version would break under it.
             let url = existing_database(&location.database_url)?;
@@ -759,7 +792,9 @@ async fn rotate(
         .as_ref()
         .and(location.root_key_file.as_deref())
         .filter(|p| p.exists());
-    let report = replace_root(sql, &old, &new, seal_config, &epoch_files, inputs.skip_unreadable).await?;
+    let staged = key_file_too.map(|path| stage_key_file(path, &new)).transpose()?;
+    let replaced = replace_root(sql, &old, &new, seal_config, &epoch_files, inputs.skip_unreadable).await;
+    let report = unstage_on_error(replaced, staged.as_deref())?;
     let count = report.projects;
     audit_admin(
         sql,
@@ -767,14 +802,8 @@ async fn rotate(
         json!({"projects": count, "fingerprint": new.fingerprint(), "skipped": report.skipped}),
     )
     .await;
-    if let Some(path) = key_file_too {
-        write_private_atomic(path, new.to_key_file_text().as_bytes()).with_context(|| {
-            format!(
-                "the database is now under a new root key, but {} still holds the old one, which no longer starts \
-                 the server; delete it and unseal with the passphrase",
-                path.display()
-            )
-        })?;
+    if let (Some(path), Some(staged)) = (key_file_too, &staged) {
+        promote_key_file(staged, path)?;
         eprintln!("wrote the new root key to {}", path.display());
     }
     match seal {
@@ -788,6 +817,40 @@ async fn rotate(
         ),
     }
     stale_marks(&report)
+}
+
+/// Writes `key` under the key file's pending name before the database moves to it, so a crash
+/// after the commit leaves the new key on disk; the server's start-up error points at it.
+fn stage_key_file(path: &Path, key: &RootKey) -> anyhow::Result<PathBuf> {
+    let pending = pending_key_file(path);
+    remove_if_present(&pending).with_context(|| format!("removing {} left by an earlier run", pending.display()))?;
+    write_new_private(&pending, key.to_key_file_text().as_bytes())
+        .with_context(|| format!("writing {}", pending.display()))?;
+    Ok(pending)
+}
+
+/// Removes the staged key when the database did not move to it.
+fn unstage_on_error<T>(result: anyhow::Result<T>, staged: Option<&Path>) -> anyhow::Result<T> {
+    if result.is_err()
+        && let Some(staged) = staged
+        && let Err(error) = remove_if_present(staged)
+    {
+        eprintln!("could not remove {}: {error}", staged.display());
+    }
+    result
+}
+
+/// Puts the staged key in place once the database is under it.
+fn promote_key_file(staged: &Path, path: &Path) -> anyhow::Result<()> {
+    std::fs::rename(staged, path)
+        .and_then(|()| sekret_server::files::sync_parent(path))
+        .with_context(|| {
+            format!(
+                "the database is now under a new root key, which is in {}; move it over {} before starting the server",
+                staged.display(),
+                path.display()
+            )
+        })
 }
 
 /// Fails a command whose change was committed but whose epoch marks were left behind.
@@ -881,13 +944,16 @@ async fn set_seal_mode(
                 updated_at: now,
                 ..config
             };
-            write_new_private(path, new.to_key_file_text().as_bytes())
-                .with_context(|| format!("writing {}", path.display()))?;
-            let replaced = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable).await;
-            if replaced.is_err() {
-                let _ = std::fs::remove_file(path);
+            if path.symlink_metadata().is_ok() {
+                bail!(
+                    "{} already exists; key-file mode writes a new key and will not replace one",
+                    path.display()
+                );
             }
-            let report = replaced?;
+            let staged = stage_key_file(path, &new)?;
+            let replaced = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable).await;
+            let report = unstage_on_error(replaced, Some(&staged))?;
+            promote_key_file(&staged, path)?;
             if let Some(remember) = &location.remember_file
                 && let Err(error) = remove_device_key_file(remember)
             {
@@ -1052,7 +1118,8 @@ async fn reset_epoch_marks(
     let (root, config, passphrase) = obtain_root(sql, source, prompter).await?;
     let config = config.context("the database has no seal configuration yet")?;
     let fingerprint = root.fingerprint();
-    let adopted = !root_recognised(&paths, &fingerprint);
+    let pin = root.pin()?;
+    let adopted = !root_recognised(&paths, &root);
     let marks = high_water(&paths);
     let verdict = verify_config(&root, &config, marks);
     let unproven = wrap_unproven(&config, verdict, passphrase.is_some());
@@ -1075,8 +1142,8 @@ async fn reset_epoch_marks(
     };
     sql.update_seal_config(config.clone()).await?;
     match restarted {
-        true => reset_epoch(&paths, config.epoch, &fingerprint),
-        false => record_epoch(&paths, config.epoch, &fingerprint),
+        true => reset_epoch(&paths, config.epoch, &pin),
+        false => record_epoch(&paths, config.epoch, &pin),
     }
     .context("writing the epoch marks")?;
     audit_admin(
@@ -1351,8 +1418,7 @@ fn one_line(text: &str) -> String {
 /// restore has just proved. A mark already there for another root key is left for the operator.
 async fn mark_restored(restored: &SqlStore, database_url: &str, root: &RootKey) {
     let paths = sekret_server::config::epoch_files(database_url, None, None, None);
-    let fingerprint = root.fingerprint();
-    if !root_recognised(&paths, &fingerprint) {
+    if !root_recognised(&paths, root) {
         eprintln!(
             "warning: an epoch mark beside the restored database names another root key, so a server will refuse \
              it; if that mark is from an older database, run `sekret admin reset-epoch --adopt-root-key`"
@@ -1363,7 +1429,7 @@ async fn mark_restored(restored: &SqlStore, database_url: &str, root: &RootKey) 
         Ok(Some(config)) => config.epoch,
         _ => return,
     };
-    if let Err(error) = record_epoch(&paths, epoch, &fingerprint) {
+    if let Err(error) = sekret_server::seal::pin(root).and_then(|pin| record_epoch(&paths, epoch, &pin)) {
         eprintln!("warning: could not write the epoch mark beside the restored database: {error}");
     }
 }

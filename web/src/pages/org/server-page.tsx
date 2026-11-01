@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, AlertTriangle, Download, Lock } from "lucide-react";
+import { AlertCircle, AlertTriangle, Download, ExternalLink, Lock } from "lucide-react";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import { ApiError } from "@/api/client";
@@ -25,6 +25,7 @@ import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
 import { EpochMarkStaleAlert } from "@/components/sys/epoch-mark-stale";
 import { errorMessage, isEpochMarkStale } from "@/lib/errors";
+import { DOCS_URL } from "@/lib/links";
 import { passphraseProblem, problemText } from "@/lib/passphrase";
 import { broadcast } from "@/lib/tab-sync";
 import { keyFileOverride, POLICY_NAMES, UNSEALED_BY_NAMES } from "@/lib/sys-gate";
@@ -177,10 +178,10 @@ function StatusCard({ status, admin, canLock }: { status: SysStatus; admin: bool
       {canLock && (
         <CardFooter className="flex-col items-stretch gap-3 border-t sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-1">
-            <p className="text-sm font-medium">Lock (seal) the server</p>
+            <p className="text-sm font-medium">Lock the server</p>
             <p className="text-sm text-muted-foreground" data-testid="lock-help">
               Locking drops the key from memory straight away. Everything that reads secrets gets errors until someone
-              unlocks it with the passphrase.
+              unlocks it with the passphrase. The CLI and the docs call this sealing.
             </p>
           </div>
           <Button variant="outline" className="shrink-0" onClick={() => setConfirming(true)} data-testid="seal-now">
@@ -452,7 +453,8 @@ function ChangePassphraseCard() {
   const error = change.error instanceof ApiError ? change.error : null;
   const wrong = error?.code === "invalid_passphrase" ? error : null;
   const weak = error?.code === "weak_passphrase" ? error : null;
-  const otherError = change.error && !wrong && !weak ? change.error : null;
+  const keyFile = error?.code === "root_key_file_in_use" ? error : null;
+  const otherError = change.error && !wrong && !weak && !keyFile ? change.error : null;
   const problem = passphraseProblem(passphrase, confirm, strength);
   const blocker = current === "" ? "Enter the current passphrase to continue." : problem ? problemText(problem) : null;
   const ready = !blocker && !change.isPending;
@@ -515,6 +517,30 @@ function ChangePassphraseCard() {
                 <AlertTitle>The server refused this passphrase</AlertTitle>
                 <AlertDescription>
                   {weak.strength ? <StrengthFeedback strength={weak.strength} /> : errorMessage(weak)}
+                </AlertDescription>
+              </Alert>
+            )}
+            {keyFile && (
+              <Alert variant="destructive" data-testid="change-key-file">
+                <AlertCircle />
+                <AlertTitle>Change it on the host instead</AlertTitle>
+                <AlertDescription>
+                  <p>
+                    This server also starts from a root key file, which would still hold the old key, so the passphrase
+                    cannot be changed here. Remove the key file, restart, unlock with the passphrase, then change it
+                    here or with <code className="font-mono">sekret sys change-passphrase</code>.
+                  </p>
+                  <a
+                    href={`${DOCS_URL}security/#changing-the-passphrase`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 underline underline-offset-2"
+                    data-testid="change-key-file-docs"
+                  >
+                    Changing the passphrase
+                    <ExternalLink className="size-3.5" aria-hidden />
+                    <span className="sr-only">(opens in a new tab)</span>
+                  </a>
                 </AlertDescription>
               </Alert>
             )}

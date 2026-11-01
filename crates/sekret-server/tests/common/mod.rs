@@ -31,6 +31,7 @@ pub struct Options {
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// The address the server believes it is published at; the test listener's own when absent.
     pub public_url: Option<String>,
+    pub body_timeouts: sekret_server::BodyTimeouts,
 }
 
 /// Where the test server's root key comes from.
@@ -53,6 +54,7 @@ impl Default for Options {
             keys: Keys::Generated,
             trusted_proxies: Vec::new(),
             public_url: None,
+            body_timeouts: sekret_server::BodyTimeouts::default(),
         }
     }
 }
@@ -179,7 +181,7 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
         http: Arc::new(ReqwestOidcHttp::new(true).context("http")?),
         token_reviewer: Arc::new(ReqwestTokenReviewer::new(true)),
     });
-    let app = sekret_server::app(state.clone());
+    let app = sekret_server::app_with(state.clone(), options.body_timeouts);
     // The production accept loop, so its limits apply to every test.
     let limits = sekret_server::serve::ConnectionLimits::new(sekret_server::config::DEFAULT_MAX_CONNECTIONS);
     tokio::spawn(sekret_server::serve::serve(
@@ -208,6 +210,32 @@ pub async fn start(options: Options) -> anyhow::Result<Harness> {
 }
 
 impl Harness {
+    /// Stores `record` as the bearer token `token`, signed as the server signs the ones it mints.
+    pub async fn store_token(&self, token: &str, record: sekret_store::AccessToken) -> anyhow::Result<()> {
+        use sekret_server::auth::{Form, token_lookup, token_mac};
+        let key = self
+            .state
+            .keyring
+            .integrity(self.state.store.as_ref())
+            .await
+            .map_err(api_error("integrity key"))?;
+        let mut record = sekret_store::AccessToken {
+            token_hash: token_lookup(&key, token).map_err(api_error("lookup"))?,
+            sealed_hash: Some(sekret_core::crypto::hash_token(token)),
+            ..record
+        };
+        record.mac = Some(token_mac(&key, &record, Form::Current).map_err(api_error("mac"))?);
+        self.state.store.create_token(record).await.context("token")
+    }
+
+    /// The stored row of a token the server minted.
+    pub async fn token_record(&self, token: &str) -> anyhow::Result<sekret_store::AccessToken> {
+        sekret_server::auth::find_token(&self.state, token)
+            .await
+            .map_err(api_error("find"))?
+            .context("no such token")
+    }
+
     pub async fn call(
         &self,
         method: Method,

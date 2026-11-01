@@ -120,8 +120,9 @@ function SnapshotSheet({
       >
         <SheetHeader className="border-b pr-12">
           <SheetTitle>Snapshot from {snapshot && formatRelative(snapshot.created_at)}</SheetTitle>
-          <SheetDescription>
-            {snapshot && snapshotTitle(snapshot.reason)} · {snapshot?.actor} · {envName}
+          <SheetDescription data-testid="snapshot-drawer-description">
+            {snapshot && formatDateTime(snapshot.created_at)} · {snapshot && snapshotTitle(snapshot.reason)} · {snapshot?.actor} ·{" "}
+            {envName}
           </SheetDescription>
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">

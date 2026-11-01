@@ -13,7 +13,7 @@ use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, Role, RoleBinding, RoleRef,
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::{Client, Config, CustomResourceExt};
+use kube::{Client, Config, CustomResourceExt, Resource};
 use sekret_client::ClientOptions;
 use sekret_operator::{
     ALLOW_ANNOTATION, AuthSpec, Context, HttpSekretFactory, KubeClient, SekretSecret, SekretSecretSpec, TargetSpec,
@@ -212,6 +212,78 @@ async fn operator_cannot_write_token_secrets(admin: &Client, operator: &Client) 
         denial.to_string().contains("may not write service account annotations"),
         "{denial}"
     );
+    Ok(())
+}
+
+/// The admission policy confines the operator's writes to Secrets a SekretSecret controls, so a
+/// bug or a stolen token cannot overwrite other Secrets its RBAC reaches.
+async fn operator_writes_only_its_own_secrets(
+    admin: &Client,
+    operator: &Client,
+    owner: &SekretSecret,
+    other: &SekretSecret,
+) -> anyhow::Result<()> {
+    let as_operator: Api<Secret> = Api::namespaced(operator.clone(), NAMESPACE);
+    let as_admin: Api<Secret> = Api::namespaced(admin.clone(), NAMESPACE);
+    let owner_ref = owner.controller_owner_ref(&()).context("owner reference")?;
+    let other_ref = other.controller_owner_ref(&()).context("other owner reference")?;
+    let managed = |mut secret: Secret, owner| {
+        secret.metadata.labels = Some(
+            [(
+                "app.kubernetes.io/managed-by".to_string(),
+                "sekret-operator".to_string(),
+            )]
+            .into(),
+        );
+        secret.metadata.owner_references = Some(vec![owner]);
+        secret
+    };
+
+    let denial = as_operator
+        .create(&PostParams::default(), &plain_secret("stray", "Opaque", &[]))
+        .await
+        .err()
+        .context("an unmarked Secret must be refused")?;
+    assert!(
+        denial
+            .to_string()
+            .contains("only write Secrets it manages for a SekretSecret"),
+        "{denial}"
+    );
+
+    as_admin
+        .create(&PostParams::default(), &plain_secret("foreign", "Opaque", &[]))
+        .await
+        .context("admin creates a Secret the operator does not own")?;
+    let foreign = as_admin.get("foreign").await.context("foreign secret")?;
+    let denial = as_operator
+        .replace("foreign", &PostParams::default(), &managed(foreign, owner_ref.clone()))
+        .await
+        .err()
+        .context("taking over a Secret by adding an owner must be refused")?;
+    assert!(
+        denial
+            .to_string()
+            .contains("only change Secrets its SekretSecret already controls"),
+        "{denial}"
+    );
+
+    let owned = as_admin.get("app-env").await.context("synced secret")?;
+    let denial = as_operator
+        .replace("app-env", &PostParams::default(), &managed(owned, other_ref))
+        .await
+        .err()
+        .context("moving a Secret to another SekretSecret must be refused")?;
+    assert!(
+        denial
+            .to_string()
+            .contains("only change Secrets its SekretSecret already controls"),
+        "{denial}"
+    );
+    as_admin
+        .delete("foreign", &Default::default())
+        .await
+        .context("clean up")?;
     Ok(())
 }
 
@@ -610,6 +682,9 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
         denial.to_string().contains("may not write service account annotations"),
         "{denial}"
     );
+    let owner = resources.get("app-config").await.context("resource")?;
+    let other = resources.get("unapproved").await.context("other resource")?;
+    operator_writes_only_its_own_secrets(&client, &operator, &owner, &other).await?;
 
     let refused = wait_for(
         "the unapproved account to be refused",

@@ -27,7 +27,7 @@ test("shows where the request came from and approves only after the code is type
   const request = page.getByTestId("cli-request");
   await expect(request.getByTestId("cli-request-ip")).toHaveText(MOCK_ADDRESS);
   await expect(request.getByTestId("cli-request-agent")).toHaveText(MOCK_AGENT);
-  await expect(request).toContainText("Program (reported by the requester, can be faked)");
+  await expect(request.getByTestId("cli-request-agent-note")).toHaveText("Reported by the requester, so it can be faked.");
   await expect(request.getByTestId("cli-request-age")).toHaveText("1 minute ago");
   await expect(request.getByTestId("cli-request-expires")).toHaveText(/^in 9 minutes \(\d{2}:\d{2}\)$/);
   // Same network, so no extra check is asked for.

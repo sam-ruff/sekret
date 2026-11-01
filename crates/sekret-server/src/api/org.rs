@@ -6,7 +6,7 @@ use sekret_api::{
     CreatedClientSecret, Identity, IdentityPage, MAX_CLIENT_SECRET_USES, MAX_LIFETIME, Me, OrgBinding, PutRole, Role,
     UpdateIdentity, UpdateUser, User, UserPage,
 };
-use sekret_core::crypto::{generate_token, hash_token};
+use sekret_core::crypto::generate_token;
 use sekret_core::permissions::{Action, Subject, covers, dropped_rules, may_remove};
 use sekret_core::validate;
 use sekret_store::{Binding, PrincipalKind};
@@ -402,15 +402,18 @@ async fn put_auth_method(
     };
     let config = seal_for_storage(state.keyring.root()?.as_ref(), &id, config, stored.as_ref())?;
     let value = serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
-    state
-        .store
-        .put_auth_method(sekret_store::AuthMethod {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    let method = crate::auth::sign_auth_method(
+        &key,
+        sekret_store::AuthMethod {
             identity_id: id.clone(),
             kind: kind.clone(),
             config: value,
             created_at: state.clock.now(),
-        })
-        .await?;
+            mac: None,
+        },
+    )?;
+    state.store.put_auth_method(method).await?;
     // Tokens issued under the old configuration should not outlive it.
     if stored.is_some() {
         state
@@ -532,18 +535,25 @@ async fn create_client_secret(
         None => None,
     };
     let secret = generate_token(CLIENT_SECRET_PREFIX)?;
-    let record = sekret_store::ClientSecret {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    let mut record = sekret_store::ClientSecret {
         id: uuid::Uuid::new_v4().to_string(),
         identity_id: id.clone(),
         description: request.description,
-        secret_hash: hash_token(&secret),
+        secret_hash: crate::auth::client_secret_lookup(&key, &secret)?,
         prefix: secret.chars().take(8).collect(),
         created_at: now,
         expires_at,
         uses_remaining: request.max_uses,
         revoked: false,
         last_used_at: None,
+        mac: None,
     };
+    record.mac = Some(crate::auth::client_secret_mac(
+        &key,
+        &record,
+        crate::auth::Form::Current,
+    )?);
     state.store.create_client_secret(record.clone()).await?;
     audit(
         &state,

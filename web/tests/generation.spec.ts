@@ -77,6 +77,8 @@ test("rotates a generated secret on demand", async ({ page }) => {
   await expect.poll(() => reveal(page, "SESSION_SECRET")).not.toBe(before);
   expect(await reveal(page, "SESSION_SECRET")).toMatch(/^[0-9a-f]{64}$/);
   await expect(secretRow(page, "SESSION_SECRET").getByTestId("secret-rotation-badge")).toContainText("Rotates in 30d");
+  // The comment still describes the secret rather than the rotation.
+  await expect(secretRow(page, "SESSION_SECRET").getByTestId("secret-comment")).toHaveText("Signs session cookies");
 });
 
 test("offers Rotate now in the row menu only for generated values", async ({ page }) => {

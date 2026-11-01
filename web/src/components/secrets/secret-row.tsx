@@ -131,7 +131,7 @@ export function SecretRow({
           data-testid="secret-value"
         >
           {hidden ? (
-            <span className="flex items-center gap-1.5 text-muted-foreground">
+            <span className="flex items-center gap-1.5 text-muted-foreground" data-testid="secret-no-access">
               <Lock className="size-3.5" />
               No access to value
             </span>

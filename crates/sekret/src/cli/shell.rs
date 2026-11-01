@@ -28,7 +28,17 @@ pub struct Origin {
     pub project: String,
     pub environment: String,
     pub path: String,
+    /// The project file in force when loading, empty when there was none.
+    pub project_file: String,
 }
+
+/// What `env use` exports besides the secrets, and `env unload` removes.
+const ORIGIN_VARS: [&str; 4] = [
+    "SEKRET_PROJECT",
+    "SEKRET_ENVIRONMENT",
+    "SEKRET_PATH",
+    super::config::LOADED_FILE_VAR,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switch {
@@ -161,6 +171,8 @@ const BLOCKED_EXACT: &[&str] = &[
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "DBUS_SESSION_BUS_ADDRESS",
+    "CONFIG_SITE",
+    "MKDIR_P",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -239,11 +251,13 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "JUPYTER_",
     "AWS_ENDPOINT_URL",
     "KRB5",
+    "CLOUDSDK_",
 ];
 
 /// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
 /// `IRBRC`, `PHPRC` and `WGETRC`. `FLAGS` covers `GNUMAKEFLAGS` and `CGO_LDFLAGS` as well as
-/// `_FLAGS` names.
+/// `_FLAGS` names. The suffixes from `_SHELL` on name a program or interpreter to run, such as
+/// autoconf's `CONFIG_SHELL` or gcloud's `CLOUDSDK_PYTHON`.
 const BLOCKED_SUFFIXES: &[&str] = &[
     "PAGER",
     "EDITOR",
@@ -261,6 +275,53 @@ const BLOCKED_SUFFIXES: &[&str] = &[
     "RC",
     "_RSH",
     "_SSH",
+    "_SHELL",
+    "_SH",
+    "_BASH",
+    "_ZSH",
+    "_PYTHON",
+    "_PERL",
+    "_RUBY",
+    "_BIN",
+    "_EXE",
+    "_EXEC",
+    "_EXECUTABLE",
+    "_BINARY",
+    "_CMD",
+    "_PROG",
+    "_PROGRAM",
+    "_INTERPRETER",
+];
+
+/// Names without an underscore that are plainly app config. Every other such name is held back,
+/// since the settings Unix tools read are mostly single words (`CC`, `SED`, `TMPDIR`, `PGHOST`)
+/// while app config is mostly not, so a name missing from the lists above fails safe.
+const PLAIN_SINGLE_WORDS: &[&str] = &[
+    "PORT",
+    "HOST",
+    "DEBUG",
+    "ENVIRONMENT",
+    "STAGE",
+    "REGION",
+    "DOMAIN",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "USERNAME",
+    "APIKEY",
+    "DATABASE",
+    "DSN",
+    "BUCKET",
+    "TENANT",
+    "LOGLEVEL",
+    "VERBOSE",
+    "TIMEOUT",
+    "WORKERS",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
 ];
 
 /// `PS1`, `RPS2` and the like.
@@ -272,14 +333,21 @@ fn is_numbered_prompt(upper: &str) -> bool {
     })
 }
 
-/// Whether a name is in the blocked set, which `--allow NAME` or `allow = [...]` can unblock.
-pub fn is_blocked(key: &str) -> bool {
+/// Why a name is held back unless `--allow NAME` or `allow = [...]` names it.
+pub fn blocked_reason(key: &str) -> Option<SkipReason> {
     let upper = key.to_ascii_uppercase();
-    BLOCKED_EXACT.contains(&upper.as_str())
+    let listed = BLOCKED_EXACT.contains(&upper.as_str())
         || BLOCKED_PREFIXES.iter().any(|p| upper.starts_with(p))
         || BLOCKED_SUFFIXES.iter().any(|s| upper.ends_with(s))
         || upper.contains("PROMPT")
-        || is_numbered_prompt(&upper)
+        || is_numbered_prompt(&upper);
+    if listed {
+        return Some(SkipReason::Blocked);
+    }
+    if !upper.contains('_') && !PLAIN_SINGLE_WORDS.contains(&upper.as_str()) {
+        return Some(SkipReason::SingleWord);
+    }
+    None
 }
 
 /// sekret's own settings are never loaded from secrets, even when allowed.
@@ -293,6 +361,7 @@ pub enum SkipReason {
     InvalidName,
     SekretSetting,
     Blocked,
+    SingleWord,
 }
 
 impl SkipReason {
@@ -303,6 +372,10 @@ impl SkipReason {
             SkipReason::Blocked => {
                 "they can change what programs run or where they connect; pass --allow NAME, or add the name to \
                  `allow` in .sekret.toml, to load one anyway"
+            }
+            SkipReason::SingleWord => {
+                "names without an underscore are mostly settings programs read, such as CC or TMPDIR; pass \
+                 --allow NAME, or add the name to `allow` in .sekret.toml, to load one anyway"
             }
         }
     }
@@ -344,10 +417,10 @@ impl LoadPolicy {
         if is_sekret_setting(key) {
             return Err(SkipReason::SekretSetting);
         }
-        if is_blocked(key) && !self.allowed.contains(key) {
-            return Err(SkipReason::Blocked);
+        if self.allowed.contains(key) {
+            return Ok(());
         }
-        Ok(())
+        blocked_reason(key).map_or(Ok(()), Err)
     }
 
     /// Splits secrets into those that may be loaded and those left out, with why.
@@ -440,6 +513,7 @@ pub fn switch_script(
     script.push_str(&export(shell, "SEKRET_PROJECT", &origin.project));
     script.push_str(&export(shell, "SEKRET_ENVIRONMENT", &origin.environment));
     script.push_str(&export(shell, "SEKRET_PATH", &origin.path));
+    script.push_str(&export(shell, super::config::LOADED_FILE_VAR, &origin.project_file));
     script.push_str(&export(shell, LOADED_KEYS_VAR, &loaded.join(" ")));
     Switch {
         script,
@@ -448,10 +522,11 @@ pub fn switch_script(
     }
 }
 
-/// Removes what the last switch loaded.
+/// Removes what the last switch loaded, and the project and environment it chose.
 pub fn unload_script(shell: Shell, previous: &[String]) -> String {
     let mut names = previous.to_vec();
     names.push(LOADED_KEYS_VAR.into());
+    names.extend(ORIGIN_VARS.iter().map(|n| n.to_string()));
     unset(shell, &names)
 }
 
@@ -483,14 +558,20 @@ pub fn init_script(shell: Shell) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::LOADED_FILE_VAR;
     use super::*;
     use anyhow::Context;
+
+    fn is_blocked(key: &str) -> bool {
+        blocked_reason(key).is_some()
+    }
 
     fn origin(environment: &str) -> Origin {
         Origin {
             project: "app".into(),
             environment: environment.into(),
             path: "/".into(),
+            project_file: "/repo/.sekret.toml".into(),
         }
     }
 
@@ -551,8 +632,14 @@ mod tests {
     #[test]
     fn hostile_values_are_not_executed() -> anyhow::Result<()> {
         let value = "'; touch /tmp/sekret-pwned; echo '$(id) `id` \"\\ \n end";
-        let switch = switch_script(Shell::Bash, &[], vars(&[("NASTY", value)]), &strict(), &origin("dev"));
-        assert_eq!(bash_after(&switch.script, &["NASTY"])?.join("\n"), value);
+        let switch = switch_script(
+            Shell::Bash,
+            &[],
+            vars(&[("NASTY_VALUE", value)]),
+            &strict(),
+            &origin("dev"),
+        );
+        assert_eq!(bash_after(&switch.script, &["NASTY_VALUE"])?.join("\n"), value);
         Ok(())
     }
 
@@ -804,6 +891,147 @@ mod tests {
         }
     }
 
+    /// Autoconf, gcloud and interpreter overrides from the round 7 audit, and names in the same
+    /// classes that no list names, which the structural rules catch.
+    const PROGRAM_OVERRIDES: &[&str] = &[
+        "CONFIG_SHELL",
+        "CONFIG_SITE",
+        "SED",
+        "GREP",
+        "EGREP",
+        "FGREP",
+        "AWK",
+        "MKDIR_P",
+        "LIBTOOL",
+        "LIBTOOLIZE",
+        "AUTOCONF",
+        "AUTOHEADER",
+        "AUTOMAKE",
+        "ACLOCAL",
+        "AUTOM4TE",
+        "CLOUDSDK_PYTHON",
+        "CLOUDSDK_PYTHON_ARGS",
+        "CLOUDSDK_API_ENDPOINT_OVERRIDES_STORAGE",
+        "TMPDIR",
+        "PYSPARK_PYTHON",
+        "CHROME_BIN",
+        "SOME_TOOL_EXECUTABLE",
+        "SOME_TOOL_EXE",
+        "SOME_TOOL_CMD",
+        "SOME_TOOL_PROGRAM",
+        "SOME_TOOL_INTERPRETER",
+        "SOME_TOOL_SH",
+        "PERL5DB",
+        "PGSERVICEFILE",
+        "PGSSLROOTCERT",
+        "SOMEFUTURETOOL",
+        "config_shell",
+        "tmpdir",
+    ];
+
+    #[test]
+    fn program_overrides_and_unknown_single_words_are_refused() {
+        let policy = strict();
+        for name in PROGRAM_OVERRIDES {
+            assert!(is_blocked(name), "{name}");
+            assert!(policy.check(name).is_err(), "{name}");
+        }
+        assert_eq!(policy.check("CONFIG_SHELL"), Err(SkipReason::Blocked));
+        assert_eq!(policy.check("CLOUDSDK_PYTHON"), Err(SkipReason::Blocked));
+        assert_eq!(policy.check("TMPDIR"), Err(SkipReason::SingleWord));
+        assert_eq!(policy.check("SED"), Err(SkipReason::SingleWord));
+        assert_eq!(
+            policy.check("CC"),
+            Err(SkipReason::Blocked),
+            "listed names keep their reason"
+        );
+    }
+
+    #[test]
+    fn ordinary_app_config_still_loads() {
+        let policy = strict();
+        for fine in [
+            "DATABASE_URL",
+            "API_KEY",
+            "STRIPE_SECRET",
+            "STRIPE_SECRET_KEY",
+            "JWT_SECRET",
+            "REDIS_URL",
+            "SENTRY_DSN",
+            "SMTP_HOST",
+            "LOG_LEVEL",
+            "S3_BUCKET",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "FEATURE_X_ENABLED",
+            "SHELL_COLOUR_THEME",
+            "BIN_COUNT",
+            "PORT",
+            "HOST",
+            "DEBUG",
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "PGHOST",
+            "PGPASSWORD",
+            "port",
+        ] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
+    }
+
+    #[test]
+    fn single_words_load_when_allowed_and_are_explained() -> anyhow::Result<()> {
+        let policy = LoadPolicy::new(["TMPDIR".to_string(), "CONFIG_SHELL".to_string()])?;
+        assert_eq!(policy.check("TMPDIR"), Ok(()));
+        assert_eq!(policy.check("CONFIG_SHELL"), Ok(()));
+        assert_eq!(policy.check("SED"), Err(SkipReason::SingleWord));
+        let (_, skipped) = strict().split(vars(&[("SED", "/tmp/evil"), ("CONFIG_SHELL", "/tmp/evil")]));
+        let lines = describe_skipped(&skipped);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("CONFIG_SHELL") && lines[0].contains("--allow"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("SED") && lines[1].contains("without an underscore") && lines[1].contains("--allow"),
+            "{lines:?}"
+        );
+        assert!(!lines.join("\n").contains("/tmp/evil"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_shell_from_a_secret_does_not_reach_configure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let marker = dir.path().join("pwned");
+        let payload = format!("/bin/sh -c touch${{IFS}}{}", marker.display());
+        let switch = switch_script(
+            Shell::Bash,
+            &[],
+            vars(&[
+                ("CONFIG_SHELL", payload.as_str()),
+                ("SED", "/bin/false"),
+                ("TMPDIR", "/tmp/elsewhere"),
+                ("DATABASE_URL", "postgres://db"),
+            ]),
+            &strict(),
+            &origin("dev"),
+        );
+        assert_eq!(switch.loaded, ["DATABASE_URL"]);
+        assert!(!switch.script.contains("TMPDIR") && !switch.script.contains("touch"));
+        let probe = "${CONFIG_SHELL:-true}\n";
+        let state = bash_after(
+            &format!("{}{probe}", switch.script),
+            &["CONFIG_SHELL", "SED", "DATABASE_URL"],
+        )?;
+        assert_eq!(state, ["<unset>", "<unset>", "postgres://db"]);
+        assert!(!marker.exists());
+        Ok(())
+    }
+
     #[test]
     fn gnumakeflags_from_a_secret_is_not_exported() -> anyhow::Result<()> {
         let switch = switch_script(
@@ -924,8 +1152,8 @@ mod tests {
         }
         assert_eq!(strict().check("SEKRET_URL"), Err(SkipReason::SekretSetting));
         assert_eq!(strict().check("bad.key"), Err(SkipReason::InvalidName));
-        let (kept, skipped) = strict().split(vars(&[("A", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
-        assert_eq!(kept.keys().collect::<Vec<_>>(), ["A"]);
+        let (kept, skipped) = strict().split(vars(&[("DB_URL", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["DB_URL"]);
         assert_eq!(skipped_keys(&skipped), ["HTTPS_PROXY", "SEKRET_TOKEN"]);
     }
 
@@ -969,13 +1197,27 @@ mod tests {
 
     #[test]
     fn unload_removes_only_what_was_loaded() -> anyhow::Result<()> {
-        let load = switch_script(Shell::Bash, &[], vars(&[("A", "1")]), &strict(), &origin("dev"));
-        let unload = unload_script(Shell::Bash, &previously_loaded(Some("A")));
+        let load = switch_script(Shell::Bash, &[], vars(&[("DB_URL", "1")]), &strict(), &origin("dev"));
+        let unload = unload_script(Shell::Bash, &previously_loaded(Some("DB_URL")));
+        let loaded = bash_after(&load.script, &["SEKRET_PROJECT", LOADED_FILE_VAR])?;
+        assert_eq!(loaded, ["app", "/repo/.sekret.toml"]);
         let state = bash_after(
             &format!("KEEP=me\n{}{unload}", load.script),
-            &["A", "KEEP", LOADED_KEYS_VAR],
+            &[
+                "DB_URL",
+                "KEEP",
+                LOADED_KEYS_VAR,
+                "SEKRET_PROJECT",
+                "SEKRET_ENVIRONMENT",
+                "SEKRET_PATH",
+                LOADED_FILE_VAR,
+            ],
         )?;
-        assert_eq!(state, ["<unset>", "me", "<unset>"]);
+        assert_eq!(
+            state,
+            ["<unset>", "me", "<unset>", "<unset>", "<unset>", "<unset>", "<unset>"],
+            "unloading also forgets the project and environment, so another folder's file applies"
+        );
         Ok(())
     }
 
@@ -990,12 +1232,12 @@ mod tests {
         let switch = switch_script(
             Shell::Fish,
             &["OLD".into()],
-            vars(&[("A", "it's \\")]),
+            vars(&[("APP_NOTE", "it's \\")]),
             &strict(),
             &origin("dev"),
         );
         assert!(switch.script.starts_with("set -e OLD\n"));
-        assert!(switch.script.contains("set -gx A 'it\\'s \\\\'\n"));
+        assert!(switch.script.contains("set -gx APP_NOTE 'it\\'s \\\\'\n"));
         assert!(init_script(Shell::Fish).contains("| source"));
     }
 

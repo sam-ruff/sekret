@@ -2,11 +2,13 @@ use std::path::PathBuf;
 
 use sekret_api::AuthMethodConfig;
 use sekret_core::crypto::{
-    DataKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
+    DataKey, IntegrityKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
 };
 use sekret_core::permissions::BuiltinRole;
 use sekret_core::seal::UnlockPolicy;
-use sekret_store::{Binding, EncryptedValue, PrincipalKind, Rekey, SealConfig, Store, UserLogin};
+use sekret_store::{
+    AuthMethod, Binding, EncryptedValue, INTEGRITY_KEY_META, PrincipalKind, Rekey, SealConfig, Store, UserLogin,
+};
 
 use crate::auth::{TokenKind, TokenRequest, mint_token};
 use crate::error::{ApiError, ApiResult};
@@ -161,8 +163,9 @@ fn unreadable_rows(rows: &[String]) -> ApiError {
 }
 
 /// Replaces the root key: every project gets a fresh data key wrapped under `new_root`, every
-/// secret value (history included) is re-encrypted under it, machine credentials are resealed
-/// and the fingerprint recorded, all in one transaction. In passphrase mode `seal` carries the new
+/// secret value (history included) is re-encrypted under it, machine credentials are resealed,
+/// the integrity key is wrapped again, so tokens and client secrets keep working, and the
+/// fingerprint is recorded, all in one transaction. In passphrase mode `seal` carries the new
 /// wrap. Either way the stored seal configuration moves past its epoch and the recorded marks and
 /// is signed with the new root key, so the next start does not take it for tampering.
 pub async fn rotate_root_key(
@@ -202,11 +205,23 @@ pub async fn rotate_root_key(
         )?);
         rewrapped.push((project.id.clone(), wrap_data_key(new_root, &new_key, &project.id)?));
     }
+    let integrity = match store.get_meta(INTEGRITY_KEY_META).await? {
+        None => crate::seal::load_integrity_key(store, old_root).await?,
+        Some(wrapped) => match IntegrityKey::unwrap(old_root, &wrapped) {
+            Ok(key) => key,
+            Err(_) => {
+                // A fresh one means signing in again and new client secrets, rather than
+                // vouching for whatever the database holds now.
+                unreadable.push("the integrity key, so every token, client secret and auth method".into());
+                IntegrityKey::generate()?
+            }
+        },
+    };
     let mut resealed = Vec::new();
     for identity in store.list_identities().await? {
         for mut method in store.list_auth_methods(&identity.id).await? {
-            let config: AuthMethodConfig =
-                serde_json::from_value(method.config).map_err(|e| ApiError::internal("auth method config", e))?;
+            let config: AuthMethodConfig = serde_json::from_value(method.config.clone())
+                .map_err(|e| ApiError::internal("auth method config", e))?;
             let config = match reseal(old_root, new_root, &identity.id, &config) {
                 Ok(Some(config)) => config,
                 Ok(None) => continue,
@@ -215,7 +230,13 @@ pub async fn rotate_root_key(
                     continue;
                 }
             };
+            // Only a method that was this server's keeps a signature over its new form.
+            let vouched = crate::auth::auth_method_verified(&integrity, &method);
             method.config = serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
+            method = match vouched {
+                true => crate::auth::sign_auth_method(&integrity, method)?,
+                false => AuthMethod { mac: None, ..method },
+            };
             resealed.push(method);
         }
     }
@@ -231,15 +252,17 @@ pub async fn rotate_root_key(
         .transpose()?;
     let epoch = seal.as_ref().map_or(rotation.marks.floor(), |config| config.epoch);
     let fingerprint = new_root.fingerprint();
-    let before = crate::seal::begin_rekey(rotation.epoch_files, &old_root.fingerprint(), &fingerprint, epoch)
+    let new_pin = new_root.pin()?;
+    let before = crate::seal::begin_rekey(rotation.epoch_files, &old_root.pin()?, &new_pin, epoch)
         .map_err(|e| ApiError::internal("preparing the seal epoch marks for the new root key", e))?;
     let replaced = store
         .replace_wrapped_keys(Rekey {
             keys: rewrapped,
             values,
             auth_methods: resealed,
-            fingerprint: fingerprint.clone(),
+            fingerprint,
             seal,
+            integrity_key: Some(integrity.wrap(new_root)?),
         })
         .await;
     if let Err(error) = replaced {
@@ -251,7 +274,7 @@ pub async fn rotate_root_key(
     // The database has moved on, so this is reported rather than undone. Marks that still name
     // both keys already sit at the new epoch, so an older copy under the old key counts as a
     // rollback meanwhile.
-    let stale_marks = crate::seal::record_epoch(rotation.epoch_files, epoch, &fingerprint)
+    let stale_marks = crate::seal::record_epoch(rotation.epoch_files, epoch, &new_pin)
         .err()
         .map(|error| {
             tracing::error!(%error, "the root key was replaced, but an epoch mark still accepts the old one");

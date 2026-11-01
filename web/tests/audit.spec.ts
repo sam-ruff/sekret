@@ -158,6 +158,23 @@ test("explains plainly when some secrets are hidden, so key and folder filters a
   await expect(page.getByTestId("audit-search")).toHaveAttribute("placeholder", "Search actions, people, keys, addresses");
 });
 
+test("says why a search finds no key names when some secrets are hidden", async ({ page }) => {
+  await page.goto("/projects/payments-api/audit?q=HSM_PIN");
+  const empty = page.getByTestId("audit-empty");
+  await expect(empty).toContainText("No matching activity");
+  await expect(empty).toContainText("Key names and folders are not searched because some secrets in this log are hidden from you.");
+
+  // A search that does match something still says what it skipped.
+  await page.getByTestId("audit-search").fill("secret");
+  await expect(page.getByTestId("audit-keys-skipped")).toBeVisible();
+
+  // In an environment the user can read in full, the key is found and nothing is said.
+  await choose(page, "audit-environment", "audit-environment-dev", /env=dev/);
+  await page.getByTestId("audit-search").fill("HSM_PIN");
+  await expect(page.getByTestId("audit-total")).toHaveText(/[1-9]\d* entr/);
+  await expect(page.getByTestId("audit-keys-skipped")).toHaveCount(0);
+});
+
 test("lets a reader who sees everything filter by key", async ({ page }) => {
   await page.goto("/projects/storefront/audit?key=DATABASE_URL");
   await expect(page.getByTestId("audit-chip-key")).toContainText("DATABASE_URL");

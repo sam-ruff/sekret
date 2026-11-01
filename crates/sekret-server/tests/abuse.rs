@@ -339,11 +339,11 @@ async fn cli_renewals_follow_the_current_groups(db: String) -> anyhow::Result<()
         .await?;
     let token = format!("skt_{}", uuid::Uuid::new_v4().simple());
     let created_at = now - ttl + 3600;
-    h.state
-        .store
-        .create_token(sekret_store::AccessToken {
+    h.store_token(
+        &token,
+        sekret_store::AccessToken {
             id: uuid::Uuid::new_v4().to_string(),
-            token_hash: sekret_core::crypto::hash_token(&token),
+            token_hash: String::new(),
             kind: "cli".into(),
             principal_kind: sekret_store::PrincipalKind::User,
             principal_id: user.id.clone(),
@@ -355,8 +355,11 @@ async fn cli_renewals_follow_the_current_groups(db: String) -> anyhow::Result<()
             revoked: false,
             last_used_at: None,
             auth_time: None,
-        })
-        .await?;
+            mac: None,
+            sealed_hash: None,
+        },
+    )
+    .await?;
     let (status, renewed) = h.post("/api/v1/auth/token/renew", &token, json!({})).await?;
     assert_eq!(status, StatusCode::OK, "{renewed}");
     let expires_in = renewed["expires_in"].as_i64().context("expires_in")?;

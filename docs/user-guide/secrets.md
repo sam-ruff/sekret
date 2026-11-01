@@ -30,7 +30,11 @@ sekret secrets history DATABASE_URL --diff 3 5
 sekret secrets rollback DATABASE_URL 3
 ```
 
-The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and a line diff between any two versions. Versions that differ in a great many lines are not compared. The secret's generation and rotation settings sit below the history. Closing the drawer or opening another secret hides them again.
+The web interface shows the same history in a drawer, with a button to roll back. Values stay hidden until you choose "Show values", which is recorded in the audit log; then it shows each version's value and, once there are two versions, a line diff between any two of them. Versions that differ in a great many lines are not compared. The secret's generation and rotation settings sit below the history. Closing the drawer or opening another secret hides them again.
+
+A rollback keeps the restored version's comment, noting the rollback in front of it, as in `rolled back to version 2: Too noisy`. Rotating a secret by hand from the web interface keeps its current comment; the audit log records the rotation.
+
+The edit form opens only once the current value has loaded. If it cannot be loaded, the form says so and offers to try again, so saving a comment or tag change can never replace the value with an empty one. When your roles hide a value, editing the secret means typing a replacement for it.
 
 ![A secret's history, with a diff between two versions](../assets/screenshots/history-light.png)
 

@@ -532,6 +532,7 @@ async fn unreadable_values_are_listed_or_skipped(db: String) -> anyhow::Result<(
             auth_methods: vec![],
             fingerprint: root(&h)?.fingerprint(),
             seal: None,
+            integrity_key: None,
         })
         .await?;
 
@@ -592,7 +593,8 @@ async fn a_database_writer_cannot_swap_in_their_own_root_key(db: String) -> anyh
     let h = fresh(&db.url, settings.clone()).await?;
     let admin = init(&h, "manual").await?;
     let real = root(&h)?.fingerprint();
-    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real.clone()]));
+    let real_pin = root(&h)?.pin()?;
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real_pin.clone()]));
     let original = stored(&h).await?;
 
     swap_in_a_forged_root(&h).await?;
@@ -610,7 +612,7 @@ async fn a_database_writer_cannot_swap_in_their_own_root_key(db: String) -> anyh
         "{body}"
     );
     assert_eq!(state_of(&restarted).await?, "sealed");
-    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real.clone()]));
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![real_pin]));
 
     // Putting the owner's rows back, as a restore would, lets the owner in, and the refusal shows.
     restarted.state.store.update_seal_config(original).await?;
@@ -685,7 +687,7 @@ async fn marks_without_a_fingerprint_learn_it_at_the_next_unlock(db: String) -> 
     let settings = marked(db.dir.path());
     let h = fresh(&db.url, settings.clone()).await?;
     init(&h, "manual").await?;
-    let real = root(&h)?.fingerprint();
+    let real = root(&h)?.pin()?;
     let epoch = stored(&h).await?.epoch;
     let mark = db.dir.path().join("sekret.db.epoch");
     std::fs::write(&mark, format!("sekret-seal-epoch {epoch}\n")).context("old mark")?;
@@ -708,13 +710,13 @@ async fn a_passphrase_change_moves_the_marks_to_the_new_key(db: String) -> anyho
     let change = json!({"current": PASSPHRASE, "new": NEW_PASSPHRASE});
     let (status, body) = h.post("/api/v1/sys/passphrase", &admin, change).await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    let new = root(&h)?.fingerprint();
-    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![new.clone()]));
-    assert!(!root_recognised(&settings.epoch_files, &old.fingerprint()));
+    let new = root(&h)?;
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![new.pin()?]));
+    assert!(!root_recognised(&settings.epoch_files, &old));
 
     let restarted = fresh(&db.url, settings.clone()).await?;
     assert_eq!(unseal_with(&restarted, NEW_PASSPHRASE).await?.0, StatusCode::OK);
-    assert_eq!(root(&restarted)?.fingerprint(), new);
+    assert_eq!(root(&restarted)?.fingerprint(), new.fingerprint());
     Ok(())
 }
 
@@ -729,17 +731,19 @@ async fn a_rotation_cut_short_still_unlocks(db: String) -> anyhow::Result<()> {
     let change = json!({"current": PASSPHRASE, "new": NEW_PASSPHRASE});
     let (status, body) = h.post("/api/v1/sys/passphrase", &admin, change).await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    let new = root(&h)?.fingerprint();
+    let new_key = root(&h)?;
+    let new = new_key.fingerprint();
     let epoch = high_water(&settings.epoch_files).highest.context("mark")?;
     let mark = db.dir.path().join("sekret.db.epoch");
+    // As a version from before pins left it, naming both keys by their short fingerprints.
     std::fs::write(&mark, format!("sekret-seal-epoch {epoch} {old} {new}\n")).context("mark")?;
 
     let restarted = fresh(&db.url, settings.clone()).await?;
     assert_eq!(unseal_with(&restarted, NEW_PASSPHRASE).await?.0, StatusCode::OK);
     assert_eq!(
         accepted_roots(&settings.epoch_files),
-        Some(vec![new]),
-        "the unlock narrows the mark again"
+        Some(vec![new_key.pin()?]),
+        "the unlock narrows the mark again, to the full-length value"
     );
     Ok(())
 }

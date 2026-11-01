@@ -1,5 +1,6 @@
 import { LockKeyhole } from "lucide-react";
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import { REDACTED_CREDENTIAL, type KubernetesAuthConfig, type KubernetesMode } from "@/api/types";
 import { ListInput } from "@/components/list-input";
 import { MaskedSecretInput } from "@/components/secret-field";
@@ -9,6 +10,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
+import { useSealWatch } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
 import { formatDurationWords } from "@/lib/format";
 import {
   credentialPayload,
@@ -98,6 +101,12 @@ function ReviewerTokenField({ value, hadStored, disabled, onChange }: ReviewerTo
 export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFormProps) {
   const hadStoredReviewer = initial?.reviewer_jwt === REDACTED_CREDENTIAL;
   const [reviewer, setReviewer] = useState<WriteOnlyCredential>(() => initialCredential(initial?.reviewer_jwt));
+  const pasted = reviewer.kind === "new" && reviewer.value !== "";
+  useSealWatch(pasted);
+  useIdle(pasted, () => {
+    setReviewer(initialCredential(initial?.reviewer_jwt));
+    toast.info("Cleared the pasted reviewer token after three idle minutes.");
+  });
   const [mode, setMode] = useState<KubernetesMode>(initial?.mode ?? "token-review");
   const [host, setHost] = useState(initial?.host ?? "");
   const [caCert, setCaCert] = useState(initial?.ca_cert ?? "");

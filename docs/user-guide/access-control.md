@@ -54,7 +54,7 @@ Conditions narrow a rule to some secrets:
 | `keys` | Key globs, such as `DB_*`. |
 | `tags` | Secrets carrying any of these tags. |
 
-All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters.
+All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters. A role may hold at most 200 path and key patterns across all its rules, deny rules included, and one member may hold at most 400 across the roles they are given directly in a project. Adding a member, or changing a role someone already holds, is refused if it would take them past that.
 
 This custom role lets a team read and change everything in `dev` and `staging`, read key names in `prod` but not values, and never read anything tagged `restricted`:
 
@@ -71,7 +71,7 @@ This custom role lets a team read and change everything in `dev` and `staging`, 
 }
 ```
 
-The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule.
+The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule. A role made only of deny rules grants nothing on its own, and the editor says so; give it alongside a role that allows access. On the secrets page, values your roles hide show as *No access to value*, with a note under the list that a deny in any role wins.
 
 ![The role editor](../assets/screenshots/roles-light.png)
 

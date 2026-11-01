@@ -51,6 +51,17 @@ test("opens on the history, with rotation settings below it, and returns focus t
   await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-key")).toBeFocused();
 });
 
+test("offers no comparison for a secret with a single version", async ({ page }) => {
+  await page.goto("/projects/payments-api/secrets/dev");
+  await secretAction(page, "WEBHOOK_SIGNING_KEY", "secret-history");
+  const drawer = page.getByTestId("secret-drawer");
+  await expect(drawer.getByTestId("version-list").locator("li")).toHaveCount(1);
+  await drawer.getByTestId("history-values-toggle").click();
+  await expect(drawer.getByTestId("version-value-1")).not.toContainText("•");
+  await expect(drawer.getByTestId("compare-section")).toHaveCount(0);
+  await expect(drawer).not.toContainText("Compare versions");
+});
+
 test("says when two versions are too different to compare instead of failing", async ({ page }) => {
   await openProject(page);
   // Two versions of nearly 64 KiB with no line in common, written straight to the fake server.
@@ -101,10 +112,25 @@ test("hides history values until asked, then diffs versions and rolls back", asy
   await page.getByRole("option", { name: "Version 1" }).click();
   await expect(diff.locator('[data-kind="removed"]')).toHaveText(/debug/);
 
+  // History comes first and the comparison sits under it.
+  const listTop = (await drawer.getByTestId("version-list").boundingBox())?.y ?? Infinity;
+  const compareTop = (await drawer.getByTestId("compare-section").boundingBox())?.y ?? -Infinity;
+  expect(listTop).toBeLessThan(compareTop);
+
+  await drawer.getByTestId("rollback-2").click();
+  await expect(page.getByTestId("rollback-confirm")).toContainText(
+    'Its comment becomes "rolled back to version 2" followed by that version\'s comment.',
+  );
+  await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
+  await expectToast(page, "Rolled LOG_LEVEL back to version 2");
+  // The restored version's comment comes back with the rollback noted in front of it.
+  await expect(drawer.getByTestId("version-4")).toContainText("rolled back to version 2: Too noisy");
+  await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-comment")).toHaveText("rolled back to version 2: Too noisy");
+
   await drawer.getByTestId("rollback-1").click();
   await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rolled LOG_LEVEL back to version 1");
-  await expect(drawer.getByTestId("version-4")).toContainText("rolled back to version 1");
+  await expect(drawer.getByTestId("version-5")).toContainText("rolled back to version 1");
   // Rolling back to a version that matches the current one would change nothing, so it is not offered.
   await expect(drawer.getByTestId("same-as-current-1")).toHaveText("Same as current");
   await expect(drawer.getByTestId("rollback-1")).toHaveCount(0);

@@ -81,9 +81,9 @@ describe("ServerPage", () => {
     expect(screen.getByText("Protected by")).toBeInTheDocument();
     expect(screen.getByTestId("server-unsealed-by")).toHaveTextContent("Passphrase, typed by a person");
     expect(screen.getByTestId("server-state")).toHaveTextContent("Unlocked");
-    expect(screen.getByText("Lock (seal) the server")).toBeInTheDocument();
+    expect(screen.getByText("Lock the server")).toBeInTheDocument();
     expect(screen.getByTestId("lock-help")).toHaveTextContent(
-      "Locking drops the key from memory straight away. Everything that reads secrets gets errors until someone unlocks it with the passphrase.",
+      "Locking drops the key from memory straight away. Everything that reads secrets gets errors until someone unlocks it with the passphrase. The CLI and the docs call this sealing.",
     );
     expect(screen.queryByTestId("server-key-file-override")).toBeNull();
     expect(document.title).toBe("Server · sekret");
@@ -139,6 +139,25 @@ describe("ServerPage", () => {
     expect(screen.queryByTestId("change-error")).toBeNull();
     expect(screen.getByTestId("current-passphrase")).toHaveValue("");
     expect(screen.getByTestId("change-passphrase")).toHaveValue("");
+  });
+
+  it("says a server with a root key file has its passphrase changed on the host", async () => {
+    mocked.changePassphrase.mockRejectedValue(
+      new ApiError("this server reads its root key from seal.root_key_file", 409, "root_key_file_in_use"),
+    );
+    renderServer();
+    await userEvent.type(await screen.findByTestId("current-passphrase"), "correct horse battery staple");
+    await userEvent.type(screen.getByTestId("change-passphrase"), "plum orbit gravel lantern");
+    await userEvent.type(screen.getByTestId("change-confirm"), "plum orbit gravel lantern");
+    await waitFor(() => expect(screen.getByTestId("change-submit")).toBeEnabled());
+    await userEvent.click(screen.getByTestId("change-submit"));
+    await userEvent.click(within(await screen.findByTestId("change-passphrase-dialog")).getByTestId("confirm-action"));
+
+    const alert = await screen.findByTestId("change-key-file");
+    expect(alert).toHaveTextContent("This server also starts from a root key file");
+    expect(alert).toHaveTextContent("Remove the key file, restart, unlock with the passphrase");
+    expect(screen.getByTestId("change-key-file-docs")).toHaveAttribute("href", expect.stringMatching(/security\/#changing-the-passphrase$/));
+    expect(screen.queryByTestId("change-error")).toBeNull();
   });
 
   it("treats a stale seal mark after a policy change as saved and closes the dialog", async () => {

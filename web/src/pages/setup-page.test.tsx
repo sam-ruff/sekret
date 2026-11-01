@@ -99,6 +99,19 @@ describe("SetupPage", () => {
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
   });
 
+  it("clears the typed setup code and passphrases after the page sits idle", async () => {
+    renderSetup();
+    await userEvent.type(screen.getByTestId("setup-code"), "ABCD-EFGH-JKLM");
+    await userEvent.type(screen.getByTestId("setup-passphrase"), "plum orbit gravel lantern");
+    await userEvent.type(screen.getByTestId("setup-confirm"), "plum orbit gravel lantern");
+
+    act(() => idle.fire?.());
+    expect(screen.getByTestId("setup-code")).toHaveValue("");
+    expect(screen.getByTestId("setup-passphrase")).toHaveValue("");
+    expect(screen.getByTestId("setup-confirm")).toHaveValue("");
+    expect(init).not.toHaveBeenCalled();
+  });
+
   it("masks the admin token after the page sits idle, and shows it again on request", async () => {
     init.mockResolvedValue({ status: { ...uninitialised, state: "unsealed" }, admin_token: "skt_abc" });
     renderSetup();

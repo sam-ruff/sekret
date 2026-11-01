@@ -269,7 +269,8 @@ export function MembersSection({ project, perms }: { project: string; perms: Per
     <div className="space-y-4">
       <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-muted-foreground" data-testid="members-help">
-          Organisation admins can always manage this project.
+          Organisation admins can always manage this project. Someone listed more than once gets every role they hold,
+          but a deny rule in any of them wins over the others.
         </p>
         {perms.can("members", "create") && (
           <Button onClick={() => setAdding(true)} data-testid="add-member">

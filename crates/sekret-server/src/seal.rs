@@ -5,13 +5,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use sekret_api::SysStatus;
-use sekret_core::crypto::{CryptoError, RootKey};
+use sekret_core::crypto::{CryptoError, IntegrityKey, RootKey};
 use sekret_core::seal::{
     DeviceKey, MAX_PASSPHRASE_BYTES, PassphraseError, SealBinding, SealFlags, SealMode, SealState, UnlockPolicy,
     UnsealedBy, Unwrapped, WrappedRootKey, generate_setup_code, recall_root_key, remember_root_key, seal_config_mac,
     setup_code_matches, unwrap_root_key_checked, validate_passphrase, verify_seal_config, wrap_root_key,
 };
-use sekret_store::{AuditEntry, SealConfig, Store, StoreError};
+use sekret_store::{AuditEntry, INTEGRITY_KEY_META, SealConfig, Store, StoreError};
 use tokio::sync::{OwnedSemaphorePermit, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 use zeroize::Zeroizing;
 
@@ -37,6 +37,8 @@ struct Slot {
     remembered: bool,
     setup_code: Option<Zeroizing<String>>,
     unsealed_by: Option<UnsealedBy>,
+    /// Opened from the database on first use while unsealed, and dropped with the root key.
+    integrity: Option<Arc<IntegrityKey>>,
 }
 
 /// Holds the root key while unsealed. Everything that needs it asks here and gets the sealed
@@ -82,6 +84,7 @@ impl Keyring {
             remembered: false,
             setup_code: None,
             unsealed_by: Some(unsealed_by),
+            integrity: None,
         })
     }
 
@@ -93,6 +96,7 @@ impl Keyring {
             remembered,
             setup_code: None,
             unsealed_by: None,
+            integrity: None,
         })
     }
 
@@ -105,6 +109,7 @@ impl Keyring {
             remembered: false,
             setup_code,
             unsealed_by: None,
+            integrity: None,
         })
     }
 
@@ -176,15 +181,36 @@ impl Keyring {
         .unwrap_or(false)
     }
 
-    fn install(&self, root: Arc<RootKey>, config: &SealConfig, by: UnsealedBy) -> ApiResult<()> {
+    /// The mode comes from what opened the key, and from the stored configuration only when
+    /// `trusted`, so a database writer's change to the mode never reaches the keyring.
+    fn install(&self, root: Arc<RootKey>, config: &SealConfig, by: UnsealedBy, trusted: bool) -> ApiResult<()> {
+        let mode = proven_mode(config, by, trusted);
         self.write(|slot| {
             slot.root = Some(root);
-            slot.mode = Some(config.mode);
+            slot.mode = Some(mode);
             slot.policy = config.unlock_policy;
             slot.remembered = config.remembered.is_some();
             slot.setup_code = None;
             slot.unsealed_by = Some(by);
+            slot.integrity = None;
         })
+    }
+
+    /// The integrity key, opened from the database the first time it is needed while unsealed.
+    pub async fn integrity(&self, store: &dyn Store) -> ApiResult<Arc<IntegrityKey>> {
+        let root = self.root()?;
+        if let Some(key) = self.read(|slot| slot.integrity.clone())? {
+            return Ok(key);
+        }
+        let key = Arc::new(load_integrity_key(store, &root).await?);
+        self.write(|slot| match (&slot.root, &slot.integrity) {
+            (_, Some(cached)) => Ok(cached.clone()),
+            (Some(_), None) => {
+                slot.integrity = Some(key.clone());
+                Ok(key)
+            }
+            (None, None) => Err(ApiError::sealed()),
+        })?
     }
 
     fn record(&self, config: &SealConfig) -> ApiResult<()> {
@@ -210,6 +236,7 @@ impl Keyring {
         self.write(|slot| {
             slot.root = None;
             slot.unsealed_by = None;
+            slot.integrity = None;
         })
     }
 
@@ -278,6 +305,41 @@ impl Keyring {
             _ => Err(ApiError::root_key_changed()),
         }
     }
+}
+
+/// The mode a newly opened key puts the keyring in. See [`Keyring::install`].
+fn proven_mode(config: &SealConfig, by: UnsealedBy, trusted: bool) -> SealMode {
+    match by {
+        UnsealedBy::KeyFile if trusted => config.mode,
+        UnsealedBy::KeyFile => SealMode::KeyFile,
+        UnsealedBy::Passphrase | UnsealedBy::PassphraseFile | UnsealedBy::Remember => SealMode::Passphrase,
+    }
+}
+
+/// The integrity key stored under `root`, made and stored first when there is none. Whoever
+/// stores one first wins, so two servers or requests never end up with different keys.
+pub async fn load_integrity_key(store: &dyn Store, root: &RootKey) -> ApiResult<IntegrityKey> {
+    let open = |wrapped: &str| {
+        IntegrityKey::unwrap(root, wrapped).map_err(|error| {
+            tracing::error!(%error, "the stored integrity key does not open with the root key");
+            ApiError::internal(
+                "integrity key",
+                "the stored integrity key does not open with the root key",
+            )
+        })
+    };
+    if let Some(wrapped) = store.get_meta(INTEGRITY_KEY_META).await? {
+        return open(&wrapped);
+    }
+    let key = IntegrityKey::generate()?;
+    if store.insert_meta(INTEGRITY_KEY_META, &key.wrap(root)?).await? {
+        return Ok(key);
+    }
+    let wrapped = store
+        .get_meta(INTEGRITY_KEY_META)
+        .await?
+        .ok_or_else(|| ApiError::internal("integrity key", "stored and gone again"))?;
+    open(&wrapped)
 }
 
 /// The unlock policy in force: configuration wins over the database.
@@ -375,6 +437,7 @@ pub fn cautious_flags(flags: SealFlags) -> SealFlags {
         reviewer_tokens_migrated: true,
         remember_secret: true,
         wrap_form_signed: flags.wrap_form_signed,
+        credentials_keyed: true,
     }
 }
 
@@ -419,6 +482,9 @@ pub struct HighWater {
     pub highest: Option<i64>,
     /// A mark exists but is unreadable, malformed or a symlink, so the true mark is unknown.
     pub broken: bool,
+    /// There is no mark at all, though one could have been written, so any that existed were
+    /// deleted.
+    pub absent: bool,
 }
 
 impl HighWater {
@@ -431,6 +497,13 @@ impl HighWater {
     /// closed: it counts as a rollback.
     pub fn rolled_back(self, epoch: i64) -> bool {
         self.broken || self.highest.is_some_and(|mark| epoch < mark)
+    }
+
+    /// Whether marks a configuration says were written are missing. Every configuration signed
+    /// since the wrap's form was covered also raised the marks, so one with no mark anywhere a
+    /// mark could be written means they were deleted.
+    pub fn lost_for(self, config: &SealConfig) -> bool {
+        self.absent && config.flags.wrap_form_signed && config.epoch > 0
     }
 }
 
@@ -446,12 +519,16 @@ pub fn high_water(paths: &[PathBuf]) -> HighWater {
             }
         }
     }
+    // Only probed when nothing was found, which is rare once a server has run.
+    if marks.highest.is_none() && !marks.broken {
+        marks.absent = paths.iter().any(|path| crate::files::can_create(path).is_ok());
+    }
     marks
 }
 
-/// The root key fingerprints every mark that names any agrees on, or `None` when no mark names
-/// one: there are no marks, or they were all written before fingerprints were recorded. A mark
-/// that cannot be read says nothing here; [`high_water`] already treats it as a rollback.
+/// The root keys every mark that names any agrees on, as recorded, or `None` when no mark names
+/// one: there are no marks, or they were all written before keys were recorded. A mark that
+/// cannot be read says nothing here; [`high_water`] already treats it as a rollback.
 pub fn accepted_roots(paths: &[PathBuf]) -> Option<Vec<String>> {
     let mut accepted: Option<Vec<String>> = None;
     for path in paths {
@@ -469,25 +546,73 @@ pub fn accepted_roots(paths: &[PathBuf]) -> Option<Vec<String>> {
     accepted
 }
 
-/// Whether the marks allow a database under the root key with `fingerprint`.
-pub fn root_recognised(paths: &[PathBuf], fingerprint: &str) -> bool {
-    accepted_roots(paths).is_none_or(|roots| roots.iter().any(|r| r == fingerprint))
+/// Whether the marks name `root`: `None` when no mark names any key, otherwise whether every
+/// mark that names one names this one, by its pin or, in marks from before pins, its fingerprint.
+pub fn marks_name(paths: &[PathBuf], root: &RootKey) -> Option<bool> {
+    let mut named = None;
+    for path in paths {
+        let Ok(Some(mark)) = read_mark(path) else {
+            continue;
+        };
+        if mark.roots.is_empty() {
+            continue;
+        }
+        let here = mark.roots.iter().any(|recorded| root.is_named_by(recorded));
+        named = Some(named.unwrap_or(true) && here);
+    }
+    named
 }
 
-/// Whether `root` opens every project's data key. Planting one project under a key of their own
-/// is then not enough: a database writer would have to remove every real project too.
-async fn opens_existing_data(store: &dyn Store, root: &RootKey) -> Result<bool, StoreError> {
-    let projects = store.list_projects().await?;
-    Ok(projects
-        .iter()
-        .all(|p| sekret_core::crypto::unwrap_data_key(root, &p.wrapped_key, &p.id).is_ok()))
+/// Whether the marks allow a database under `root`.
+pub fn root_recognised(paths: &[PathBuf], root: &RootKey) -> bool {
+    marks_name(paths, root).unwrap_or(true)
+}
+
+/// What the marks record for `root`.
+pub fn pin(root: &RootKey) -> std::io::Result<String> {
+    root.pin().map_err(std::io::Error::other)
+}
+
+/// Whether `root` opens every project's data key, and every stored value under it. A database
+/// writer can wrap new data keys under a root key of their own, and sign anything with it, but
+/// cannot make the values already stored decrypt under those keys. To get a key of their own
+/// past this they would have to delete every stored value, which cannot go unnoticed. Without
+/// `values`, only the data keys are checked, for an operator adopting a key on the host.
+async fn opens_existing_data(store: &dyn Store, root: &RootKey, values: bool) -> Result<bool, StoreError> {
+    use sekret_core::crypto::{ValueContext, decrypt_value, unwrap_data_key};
+    for project in store.list_projects().await? {
+        let Ok(key) = unwrap_data_key(root, &project.wrapped_key, &project.id) else {
+            return Ok(false);
+        };
+        if !values {
+            continue;
+        }
+        for value in store.list_encrypted_values(&project.id).await? {
+            let ctx = ValueContext {
+                project_id: &project.id,
+                secret_id: &value.secret_id,
+                version: value.version,
+            };
+            if decrypt_value(&key, &value.value, ctx).is_err() {
+                tracing::error!(
+                    project = %project.id,
+                    secret = %value.secret_id,
+                    version = value.version,
+                    "a stored value does not decrypt under this root key"
+                );
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Refuses a root key that does not match the database's fingerprint, then one the epoch marks
-/// outside the database do not name. Where no mark names it, every project key must open with
-/// it. The fingerprint is recorded only when the database has none and the key passed. A database
-/// writer can change everything the database holds, but not the marks, so swapping in a root key
-/// of their own fails here.
+/// outside the database do not name. Where no mark names it, every project key and every stored
+/// value must open with it. The fingerprint is recorded only when the database has none and the
+/// key passed. A database writer can change everything the database holds, but not the marks or
+/// the values already encrypted, so swapping in a root key of their own fails here unless they
+/// also delete every stored value.
 pub async fn check_root(store: &dyn Store, epoch_files: &[PathBuf], root: &RootKey) -> Result<(), StartupError> {
     check_root_against(store, root, Some(epoch_files)).await
 }
@@ -509,16 +634,14 @@ async fn check_root_against(
     if stored.as_ref().is_some_and(|s| *s != fingerprint) {
         return Err(StartupError::WrongRootKey);
     }
-    // Marks that name the key already vouch for it, and then a project key damaged since does
-    // not lock everyone out. Without them, every project key must open.
-    let vouched = epoch_files
-        .and_then(accepted_roots)
-        .is_some_and(|roots| roots.contains(&fingerprint));
-    if !vouched && !opens_existing_data(store, root).await? {
+    // Marks that name the key already vouch for it, and then data damaged since does not lock
+    // everyone out. Without them, everything stored must open.
+    let vouched = epoch_files.and_then(|paths| marks_name(paths, root)) == Some(true);
+    if !vouched && !opens_existing_data(store, root, epoch_files.is_some()).await? {
         return Err(StartupError::WrongRootKey);
     }
     if let Some(paths) = epoch_files
-        && !root_recognised(paths, &fingerprint)
+        && !root_recognised(paths, root)
     {
         return Err(StartupError::UnrecognisedRootKey);
     }
@@ -649,7 +772,7 @@ async fn save(
     let floor = high_water(&settings.epoch_files).floor();
     let config = signed(root, config, floor)?;
     store.update_seal_config(config.clone()).await?;
-    record_epoch(&settings.epoch_files, config.epoch, &root.fingerprint()).map_err(mark_error)?;
+    record_epoch(&settings.epoch_files, config.epoch, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
     Ok(config)
 }
 
@@ -711,7 +834,7 @@ impl Distrust {
 /// signing existed that may be signed now.
 pub fn verify_config(root: &RootKey, config: &SealConfig, marks: HighWater) -> Result<bool, Distrust> {
     match check_signature(root, config) {
-        Signature::Valid if marks.rolled_back(config.epoch) => Err(Distrust::RolledBack),
+        Signature::Valid if marks.rolled_back(config.epoch) || marks.lost_for(config) => Err(Distrust::RolledBack),
         Signature::Valid => Ok(false),
         // Marks only exist once signing does, so an unsigned configuration beside one was stripped.
         Signature::Missing if marks.highest.is_none() && !marks.broken => Ok(true),
@@ -738,7 +861,7 @@ pub async fn check_config(
     let marks = high_water(&settings.epoch_files);
     let distrust = match verify_config(root, &config, marks) {
         Ok(false) if config.flags.wrap_form_signed => {
-            record_epoch(&settings.epoch_files, config.epoch, &root.fingerprint()).map_err(mark_error)?;
+            record_epoch(&settings.epoch_files, config.epoch, &pin(root).map_err(mark_error)?).map_err(mark_error)?;
             return Ok(Checked {
                 config,
                 tampered: false,
@@ -987,7 +1110,9 @@ pub async fn initialise(
     if marks.highest.is_some() || marks.broken {
         config.flags.reviewer_tokens_migrated = true;
     }
-    if !root_recognised(&plan.epoch_files, &root.fingerprint()) {
+    // A database with no root key yet holds no credentials to vouch for.
+    config.flags.credentials_keyed |= existing.is_none();
+    if !root_recognised(&plan.epoch_files, &root) {
         // Only setup, which needs the host or the setup code, may move the marks to a new key.
         tracing::warn!("the epoch marks name the root key of an earlier install; they now name the new one");
     }
@@ -999,7 +1124,7 @@ pub async fn initialise(
         return Err(error.into());
     }
     // The database is set up by now, so a mark that cannot be written is reported, not undone.
-    if let Err(error) = record_epoch(&plan.epoch_files, config.epoch, &root.fingerprint()) {
+    if let Err(error) = pin(&root).and_then(|pin| record_epoch(&plan.epoch_files, config.epoch, &pin)) {
         tracing::error!(%error, "setup finished, but the seal epoch marks could not be updated");
     }
     Ok((root, config))
@@ -1095,6 +1220,33 @@ fn read_key_file(path: &Path) -> Result<Option<RootKey>, StartupError> {
     }
 }
 
+/// Where a host command writes a new root key before the database moves to it, and which it
+/// renames over the key file once the database has.
+pub fn pending_key_file(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".new");
+    PathBuf::from(name)
+}
+
+/// Points at a new key left beside the key file by a host command that stopped part way.
+fn key_file_refused(error: StartupError, settings: &SealSettings) -> StartupError {
+    let Some(path) = &settings.root_key_file else {
+        return error;
+    };
+    let pending = pending_key_file(path);
+    let relevant = matches!(error, StartupError::WrongRootKey | StartupError::MissingRootKey);
+    if !relevant || pending.symlink_metadata().is_err() {
+        return error;
+    }
+    StartupError::KeyFile(format!(
+        "{}: {error}. {} holds a newer root key left by a host command that stopped before it finished; if the \
+         database had already moved to it, move that file over {} and start again",
+        path.display(),
+        pending.display(),
+        path.display()
+    ))
+}
+
 fn startup(error: ApiError) -> StartupError {
     StartupError::Init(error.message)
 }
@@ -1137,22 +1289,29 @@ pub async fn open_keyring(
         check_mode(settings, config.mode)?;
         return match (config.mode, key) {
             (mode, Some(key)) => {
-                check_root(store, &settings.epoch_files, &key).await?;
+                check_root(store, &settings.epoch_files, &key)
+                    .await
+                    .map_err(|e| key_file_refused(e, settings))?;
                 if mode == SealMode::Passphrase {
                     tracing::warn!("started unsealed from the root key file; this database is in passphrase mode");
                 }
                 let checked = check_config(store, settings, now, LOCAL, &key, config, None)
                     .await
                     .map_err(startup)?;
-                migrate_reviewer_tokens_once(store, settings, now, &key).await;
+                migrate_once(store, settings, now, &key).await;
                 let keyring = Keyring::unsealed(key, SealMode::KeyFile);
                 keyring
-                    .install(keyring.root().map_err(startup)?, &checked.config, UnsealedBy::KeyFile)
+                    .install(
+                        keyring.root().map_err(startup)?,
+                        &checked.config,
+                        UnsealedBy::KeyFile,
+                        checked.trusted,
+                    )
                     .map_err(startup)?;
                 audit_unlock_at_start(store, now, UnsealedBy::KeyFile).await;
                 Ok(opened(keyring))
             }
-            (SealMode::KeyFile, None) => Err(StartupError::MissingRootKey),
+            (SealMode::KeyFile, None) => Err(key_file_refused(StartupError::MissingRootKey, settings)),
             (SealMode::Passphrase, None) => {
                 let keyring = Keyring::sealed(config.unlock_policy, config.remembered.is_some());
                 unlock_at_start(store, now, settings, &keyring, config, secrets.unlock_passphrase).await?;
@@ -1173,7 +1332,9 @@ pub async fn open_keyring(
         // The mode is checked first, so a refused start leaves the database as it was.
         check_mode(settings, SealMode::KeyFile)?;
         let fingerprint = key.fingerprint();
-        check_root(store, &settings.epoch_files, &key).await?;
+        check_root(store, &settings.epoch_files, &key)
+            .await
+            .map_err(|e| key_file_refused(e, settings))?;
         let config = SealConfig {
             mode: SealMode::KeyFile,
             wrapped: None,
@@ -1181,7 +1342,11 @@ pub async fn open_keyring(
             remembered: None,
             epoch: 0,
             mac: None,
-            flags: SealFlags::default(),
+            flags: SealFlags {
+                // A database with no root key yet holds no credentials to vouch for.
+                credentials_keyed: !has_root,
+                ..SealFlags::default()
+            },
             created_at: now,
             updated_at: now,
         };
@@ -1197,11 +1362,11 @@ pub async fn open_keyring(
         };
         let config = signed(&key, config, marks.floor()).map_err(|e| StartupError::Init(e.to_string()))?;
         match store.init_seal_config(config.clone(), &fingerprint).await {
-            Ok(()) => record_epoch(&settings.epoch_files, config.epoch, &fingerprint)?,
+            Ok(()) => record_epoch(&settings.epoch_files, config.epoch, &pin(&key)?)?,
             Err(StoreError::Conflict) => {}
             Err(error) => return Err(error.into()),
         }
-        migrate_reviewer_tokens_once(store, settings, now, &key).await;
+        migrate_once(store, settings, now, &key).await;
         audit_unlock_at_start(store, now, UnsealedBy::KeyFile).await;
         return Ok(opened(Keyring::unsealed(key, SealMode::KeyFile)));
     }
@@ -1336,9 +1501,11 @@ async fn unlock_at_start(
         tracing::error!("not unlocking automatically after the seal configuration was tampered with; unlock by hand");
         return Ok(());
     }
-    migrate_reviewer_tokens_once(store, settings, now, &root).await;
+    migrate_once(store, settings, now, &root).await;
     let root = Arc::new(root);
-    keyring.install(root.clone(), &checked.config, by).map_err(startup)?;
+    keyring
+        .install(root.clone(), &checked.config, by, checked.trusted)
+        .map_err(startup)?;
     audit_unlock_at_start(store, now, by).await;
     tracing::info!("unlocked at start");
     if let Some((passphrase, force)) = rewrap {
@@ -1484,28 +1651,34 @@ pub async fn forget(store: &dyn Store, now: i64, settings: &SealSettings, keyrin
     keyring.record(&config)
 }
 
-/// Moves reviewer tokens sealed in the old format once, and records that in the signed
-/// configuration, so an old-format token put back by a database writer is never moved again.
-/// Best effort; at start, or with the keyring gate held.
-pub async fn migrate_reviewer_tokens_once(store: &dyn Store, settings: &SealSettings, now: i64, root: &RootKey) {
+/// Runs each one-off migration that has not run yet, and records it in the signed configuration,
+/// so data in an old form put back by a database writer is never migrated again: reviewer tokens
+/// sealed in the old format are moved, and credentials from before the integrity key are vouched
+/// for. Best effort; at start, or with the keyring gate held.
+pub async fn migrate_once(store: &dyn Store, settings: &SealSettings, now: i64, root: &RootKey) {
     let result: ApiResult<()> = async {
         let config = load_trusted(store, settings, now, LOCAL, root).await?;
-        if config.flags.reviewer_tokens_migrated {
+        let mut flags = config.flags;
+        if flags.reviewer_tokens_migrated && flags.credentials_keyed {
             return Ok(());
         }
-        if !crate::machine::migrate_reviewer_tokens(store, root).await {
-            return Ok(());
+        let key = load_integrity_key(store, root).await?;
+        if !flags.reviewer_tokens_migrated && crate::machine::migrate_reviewer_tokens(store, root, &key).await {
+            flags.reviewer_tokens_migrated = true;
         }
-        let flags = SealFlags {
-            reviewer_tokens_migrated: true,
-            ..config.flags
-        };
-        save(store, settings, root, now, SealConfig { flags, ..config }).await?;
+        if !flags.credentials_keyed {
+            let signed = crate::auth::vouch_for_legacy_credentials(store, &key).await?;
+            tracing::info!(signed, "vouched for the credentials stored before the integrity key");
+            flags.credentials_keyed = true;
+        }
+        if flags != config.flags {
+            save(store, settings, root, now, SealConfig { flags, ..config }).await?;
+        }
         Ok(())
     }
     .await;
     if let Err(error) = result {
-        tracing::warn!(error = %error.message, "could not record the reviewer token migration");
+        tracing::warn!(error = %error.message, "could not record a one-off migration");
     }
 }
 
@@ -1732,7 +1905,7 @@ pub mod ops {
         let root = Arc::new(opened.root);
         state
             .keyring
-            .install(root.clone(), &checked.config, UnsealedBy::Passphrase)?;
+            .install(root.clone(), &checked.config, UnsealedBy::Passphrase, checked.trusted)?;
         audit(
             state,
             &principal,
@@ -1758,7 +1931,7 @@ pub mod ops {
         tampered: bool,
     ) {
         let now = state.clock.now();
-        migrate_reviewer_tokens_once(state.store.as_ref(), &state.config.seal, now, root).await;
+        migrate_once(state.store.as_ref(), &state.config.seal, now, root).await;
         if let Some((passphrase, force)) = rewrap {
             upgrade_wrap(
                 state.store.as_ref(),
@@ -1799,6 +1972,7 @@ pub mod ops {
         skip_unreadable: bool,
     ) -> ApiResult<bool> {
         require_passphrase_mode(state)?;
+        refuse_beside_key_file(state)?;
         check_length(&current)?;
         check_length(&new)?;
         validate_passphrase(&new).map_err(ApiError::weak_passphrase)?;
@@ -1827,6 +2001,10 @@ pub mod ops {
             Some(&wrapped),
         )
         .await?;
+        // Only what this server signed may be signed again under the new key.
+        if !checked.trusted {
+            return Err(untrusted_config());
+        }
         let new_root = Arc::new(RootKey::generate()?);
         let permit = state.keyring.kdf_permit_queued().await?;
         let wrapped = wrap_blocking(new_root.clone(), new, Some(permit)).await?;
@@ -1883,6 +2061,29 @@ pub mod ops {
             return Err(stale_marks());
         }
         Ok(checked.tampered)
+    }
+
+    /// A passphrase change replaces the root key, and a key file read at start would still hold
+    /// the old one, so the server could not start again and the stale file would keep opening
+    /// old backups. Refused while one is in use or configured and present.
+    fn refuse_beside_key_file(state: &AppState) -> ApiResult<()> {
+        let from_file = state.keyring.unsealed_by() == Some(UnsealedBy::KeyFile);
+        let present = state
+            .config
+            .seal
+            .root_key_file
+            .as_deref()
+            .is_some_and(|path| path.symlink_metadata().is_ok());
+        if !from_file && !present {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "root_key_file_in_use",
+            "this server reads its root key from seal.root_key_file, which would still hold the old key after a \
+             passphrase change and stop the server starting; remove that file, restart, unseal with the passphrase \
+             and change it then",
+        ))
     }
 
     /// The change is done, but the operator has to repair a mark it could not move. Which mark,
@@ -2187,7 +2388,7 @@ pub mod ops {
             SealMode::Passphrase => UnsealedBy::Passphrase,
             SealMode::KeyFile => UnsealedBy::KeyFile,
         };
-        state.keyring.install(root, &config, by)?;
+        state.keyring.install(root, &config, by, true)?;
         if let Some(written) = &settings.setup_code_file
             && let Err(error) = crate::files::remove_if_unchanged(written)
         {
@@ -2202,8 +2403,24 @@ mod tests {
     use super::*;
     use anyhow::Context;
 
-    const OLD: &str = "0123456789abcdef";
-    const NEW: &str = "fedcba9876543210";
+    /// Two root keys and what the marks record for each.
+    struct Keys {
+        old: RootKey,
+        new: RootKey,
+        old_pin: String,
+        new_pin: String,
+    }
+
+    fn keys() -> anyhow::Result<Keys> {
+        let old = RootKey::generate().context("old")?;
+        let new = RootKey::generate().context("new")?;
+        Ok(Keys {
+            old_pin: old.pin().context("pin")?,
+            new_pin: new.pin().context("pin")?,
+            old,
+            new,
+        })
+    }
 
     fn marks(dir: &Path) -> Vec<PathBuf> {
         vec![dir.join("sekret.db.epoch"), dir.join("unlock.key.epoch")]
@@ -2211,63 +2428,155 @@ mod tests {
 
     #[test]
     fn marks_record_the_root_and_only_raise_the_epoch() -> anyhow::Result<()> {
+        let k = keys()?;
         let dir = tempfile::tempdir().context("dir")?;
         let paths = marks(dir.path());
         assert_eq!(accepted_roots(&paths), None);
-        assert!(root_recognised(&paths, OLD), "no marks refuse nothing");
-        record_epoch(&paths, 5, OLD).context("record")?;
-        assert_eq!(accepted_roots(&paths), Some(vec![OLD.to_string()]));
-        assert!(!root_recognised(&paths, NEW));
-        record_epoch(&paths, 3, OLD).context("record")?;
+        assert!(root_recognised(&paths, &k.old), "no marks refuse nothing");
+        record_epoch(&paths, 5, &k.old_pin).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![k.old_pin.clone()]));
+        assert!(!root_recognised(&paths, &k.new));
+        record_epoch(&paths, 3, &k.old_pin).context("record")?;
         assert_eq!(high_water(&paths).highest, Some(5));
-        reset_epoch(&paths, 1, NEW).context("reset")?;
+        reset_epoch(&paths, 1, &k.new_pin).context("reset")?;
         assert_eq!(high_water(&paths).highest, Some(1));
-        assert!(root_recognised(&paths, NEW) && !root_recognised(&paths, OLD));
+        assert!(root_recognised(&paths, &k.new) && !root_recognised(&paths, &k.old));
         Ok(())
     }
 
     #[test]
     fn a_rekey_in_progress_accepts_both_keys_until_it_is_recorded() -> anyhow::Result<()> {
+        let k = keys()?;
         let dir = tempfile::tempdir().context("dir")?;
         let paths = marks(dir.path());
-        record_epoch(&paths[..1], 4, OLD).context("record")?;
-        begin_rekey(&paths, OLD, NEW, 5).context("begin")?;
+        record_epoch(&paths[..1], 4, &k.old_pin).context("record")?;
+        begin_rekey(&paths, &k.old_pin, &k.new_pin, 5).context("begin")?;
         assert!(!paths[1].exists(), "a missing mark is not created halfway");
-        assert!(root_recognised(&paths, OLD) && root_recognised(&paths, NEW));
+        assert!(root_recognised(&paths, &k.old) && root_recognised(&paths, &k.new));
         // A copy from before the change, at epoch 4, already counts as a rollback.
         assert_eq!(high_water(&paths).highest, Some(5));
         assert!(high_water(&paths).rolled_back(4));
-        record_epoch(&paths, 5, NEW).context("record")?;
-        assert_eq!(accepted_roots(&paths), Some(vec![NEW.to_string()]));
+        record_epoch(&paths, 5, &k.new_pin).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![k.new_pin.clone()]));
         assert!(paths[1].exists());
         Ok(())
     }
 
     #[test]
     fn an_aborted_rekey_puts_the_marks_back_as_they_were() -> anyhow::Result<()> {
+        let k = keys()?;
         let dir = tempfile::tempdir().context("dir")?;
         let paths = marks(dir.path());
-        record_epoch(&paths[..1], 4, OLD).context("record")?;
-        let before = begin_rekey(&paths, OLD, NEW, 9).context("begin")?;
+        record_epoch(&paths[..1], 4, &k.old_pin).context("record")?;
+        let before = begin_rekey(&paths, &k.old_pin, &k.new_pin, 9).context("begin")?;
         abort_rekey(&before).context("abort")?;
         assert_eq!(high_water(&paths).highest, Some(4));
-        assert_eq!(accepted_roots(&paths), Some(vec![OLD.to_string()]));
+        assert_eq!(accepted_roots(&paths), Some(vec![k.old_pin.clone()]));
         assert!(!paths[1].exists());
         Ok(())
     }
 
     #[test]
     fn marks_that_disagree_accept_only_what_they_share() -> anyhow::Result<()> {
+        let k = keys()?;
         let dir = tempfile::tempdir().context("dir")?;
         let paths = marks(dir.path());
-        record_epoch(&paths[..1], 4, OLD).context("record")?;
-        record_epoch(&paths[1..], 4, NEW).context("record")?;
+        record_epoch(&paths[..1], 4, &k.old_pin).context("record")?;
+        record_epoch(&paths[1..], 4, &k.new_pin).context("record")?;
         assert_eq!(accepted_roots(&paths), Some(vec![]));
-        assert!(!root_recognised(&paths, OLD) && !root_recognised(&paths, NEW));
+        assert!(!root_recognised(&paths, &k.old) && !root_recognised(&paths, &k.new));
         // Marks from before fingerprints say nothing either way.
         std::fs::write(&paths[1], "sekret-seal-epoch 4\n").context("old mark")?;
-        assert!(root_recognised(&paths, OLD));
+        assert!(root_recognised(&paths, &k.old));
         Ok(())
+    }
+
+    #[test]
+    fn marks_from_before_pins_still_name_their_key_by_fingerprint() -> anyhow::Result<()> {
+        let k = keys()?;
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        record_epoch(&paths[..1], 4, &k.old.fingerprint()).context("short")?;
+        record_epoch(&paths[1..], 4, &k.old_pin).context("pin")?;
+        assert_eq!(marks_name(&paths, &k.old), Some(true), "one key, recorded both ways");
+        assert_eq!(marks_name(&paths, &k.new), Some(false));
+        // Recording again moves the old mark to the pin.
+        record_epoch(&paths, 4, &k.old_pin).context("record")?;
+        assert_eq!(accepted_roots(&paths), Some(vec![k.old_pin.clone()]));
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_marks_count_as_a_rollback_once_a_configuration_says_they_existed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let paths = marks(dir.path());
+        let config = SealConfig {
+            mode: SealMode::KeyFile,
+            wrapped: None,
+            unlock_policy: UnlockPolicy::Manual,
+            remembered: None,
+            epoch: 3,
+            mac: None,
+            flags: SealFlags {
+                wrap_form_signed: true,
+                ..SealFlags::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        };
+        let none = high_water(&paths);
+        assert!(none.absent && none.lost_for(&config));
+        assert!(!none.lost_for(&SealConfig {
+            epoch: 0,
+            ..config.clone()
+        }));
+        assert!(
+            !none.lost_for(&SealConfig {
+                flags: SealFlags::default(),
+                ..config.clone()
+            }),
+            "signed before marks were tied to the wrap form"
+        );
+        // Where no mark could ever be written, nothing is inferred.
+        let nowhere = vec![dir.path().join("missing/sekret.db.epoch")];
+        assert!(!high_water(&nowhere).absent);
+        assert!(!high_water(&[]).absent);
+        record_epoch(&paths[..1], 3, "0123456789abcdef").context("record")?;
+        assert!(!high_water(&paths).absent);
+        Ok(())
+    }
+
+    #[test]
+    fn the_mode_comes_from_what_opened_the_key() {
+        let config = |mode| SealConfig {
+            mode,
+            wrapped: None,
+            unlock_policy: UnlockPolicy::Manual,
+            remembered: None,
+            epoch: 1,
+            mac: None,
+            flags: SealFlags::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        // A database writer flipped the mode; a passphrase still proves passphrase mode.
+        assert_eq!(
+            proven_mode(&config(SealMode::KeyFile), UnsealedBy::Passphrase, false),
+            SealMode::Passphrase
+        );
+        assert_eq!(
+            proven_mode(&config(SealMode::KeyFile), UnsealedBy::Remember, true),
+            SealMode::Passphrase
+        );
+        // A key file proves nothing about a wrap, so only a trusted configuration says passphrase.
+        assert_eq!(
+            proven_mode(&config(SealMode::Passphrase), UnsealedBy::KeyFile, false),
+            SealMode::KeyFile
+        );
+        assert_eq!(
+            proven_mode(&config(SealMode::Passphrase), UnsealedBy::KeyFile, true),
+            SealMode::Passphrase
+        );
     }
 
     #[tokio::test]
@@ -2310,18 +2619,24 @@ mod tests {
         std::fs::create_dir(&fresh).context("fresh")?;
         let existing = vec![fixed.join("sekret.db.epoch")];
         let never_written = vec![fresh.join("root.key.epoch")];
-        record_epoch(&existing, 1, OLD).context("record")?;
+        let k = keys()?;
+        record_epoch(&existing, 1, &k.old_pin).context("record")?;
         for locked in [&fixed, &fresh] {
             std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o500)).context("chmod")?;
         }
-        let stale = record_epoch(&existing, 2, OLD);
-        let skipped = record_epoch(&never_written, 2, OLD);
+        let stale = record_epoch(&existing, 2, &k.old_pin);
+        let skipped = record_epoch(&never_written, 2, &k.old_pin);
+        let read_only = high_water(&never_written);
         for locked in [&fixed, &fresh] {
             std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
         }
         assert!(stale.is_err(), "a mark left behind would go stale unnoticed");
         skipped.context("a mark that never existed, such as beside a read-only key file, is skipped")?;
-        assert!(begin_rekey(&existing, OLD, NEW, 2).is_ok());
+        assert!(
+            !read_only.absent,
+            "no mark could ever be written there, so none was deleted"
+        );
+        assert!(begin_rekey(&existing, &k.old_pin, &k.new_pin, 2).is_ok());
         Ok(())
     }
 }

@@ -1,15 +1,61 @@
+import { useQuery } from "@tanstack/react-query";
 import { ChevronRight } from "lucide-react";
 import { useEffect } from "react";
 import { Link, Outlet, useLocation, useParams } from "react-router";
+import { api } from "@/api/endpoints";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { ProjectLogo } from "@/components/project-logo";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import { useMe, useProjects } from "@/hooks/queries";
+import { keys, useMe, useProjects } from "@/hooks/queries";
 import { broadcast } from "@/lib/tab-sync";
+import { cn } from "@/lib/utils";
 import { AppSidebar } from "./app-sidebar";
 import { ThemeToggle, UserMenu } from "./user-menu";
 
 const MAIN_CONTENT_ID = "main-content";
+
+const ORG_SECTIONS: Record<string, string> = {
+  identities: "Machine identities",
+  users: "Users",
+  access: "Access control",
+  audit: "Audit log",
+  server: "Server",
+};
+
+/** The organisation page in view, and the identity on an identity's own page. */
+function OrgCrumbs({ section }: { section: string }) {
+  const { id } = useParams();
+  const identity = useQuery({ queryKey: keys.identity(id ?? ""), queryFn: () => api.identity(id ?? ""), enabled: !!id });
+  const label = ORG_SECTIONS[section];
+  if (!label) return null;
+  // On phones an item's page drops the section, so the item's own name has room.
+  return (
+    <>
+      <ChevronRight className={cn("size-3.5 shrink-0", id && "hidden sm:block")} />
+      {id ? (
+        <Link
+          to={`/org/${section}`}
+          className="-my-2 hidden min-w-0 truncate py-3 hover:text-foreground sm:inline"
+          data-testid="topbar-section"
+        >
+          {label}
+        </Link>
+      ) : (
+        <span className="truncate font-medium text-foreground" data-testid="topbar-section">
+          {label}
+        </span>
+      )}
+      {id && identity.data && (
+        <>
+          <ChevronRight className="size-3.5 shrink-0" />
+          <span className="truncate font-medium text-foreground" data-testid="topbar-item">
+            {identity.data.name}
+          </span>
+        </>
+      )}
+    </>
+  );
+}
 
 function TopbarTitle() {
   const { project } = useParams();
@@ -18,6 +64,7 @@ function TopbarTitle() {
   const current = projects?.find((p) => p.slug === project || p.id === project);
   // Once the list has loaded, a slug that is not in it is not shown as if it were a project.
   const name = current?.name ?? (projects ? undefined : project);
+  const orgSection = pathname.startsWith("/org/") ? pathname.split("/")[2] : undefined;
   const scope = pathname.startsWith("/org") ? "Organisation" : "Projects";
 
   return (
@@ -29,6 +76,7 @@ function TopbarTitle() {
       >
         {scope}
       </Link>
+      {orgSection && <OrgCrumbs section={orgSection} />}
       {project && name && (
         <>
           <ChevronRight className="size-3.5 shrink-0" />

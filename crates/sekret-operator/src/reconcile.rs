@@ -978,6 +978,20 @@ mod tests {
         code.sort_unstable();
         assert_eq!(chart, code);
         assert!(policy.contains(&format!("k.startsWith(\"{RESERVED_ANNOTATION_PREFIX}\")")));
+        assert!(
+            policy.contains(&format!(
+                "object.metadata.labels[\"{MANAGED_BY_LABEL}\"] == \"{MANAGED_BY_VALUE}\""
+            )),
+            "the policy requires the label desired_secret sets"
+        );
+        assert!(policy.contains(&format!(
+            "variables.controller[0].apiVersion.startsWith(\"{}/\")",
+            <SekretSecret as Resource>::group(&())
+        )));
+        assert!(policy.contains(&format!(
+            "variables.controller[0].kind == \"{}\"",
+            <SekretSecret as Resource>::kind(&())
+        )));
         Ok(())
     }
 

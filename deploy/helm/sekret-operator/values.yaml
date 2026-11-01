@@ -35,7 +35,11 @@ tokenServiceAccounts: []
 
 # ValidatingAdmissionPolicies that only let the operator request tokens with the `sekret`
 # audience, for at most 600 seconds, outside kube-system, and only write Secrets of the types
-# the operator supports, never service account tokens. Needs Kubernetes 1.30 or later.
+# the operator supports, never service account tokens. Writes are also limited to Secrets
+# labelled as the operator's and controlled by a SekretSecret, and an update may not change that
+# owner, so the operator cannot overwrite other Secrets. This protects integrity only: RBAC
+# cannot limit reads by label, so the operator can still read every Secret it can reach.
+# Needs Kubernetes 1.30 or later.
 tokenPolicy:
   enabled: true
 

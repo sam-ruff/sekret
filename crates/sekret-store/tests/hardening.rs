@@ -392,3 +392,104 @@ async fn a_custom_backup_reader_role_is_renamed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A database at migration 0001, made with that migration alone.
+async fn database_at_0001(database: &str, backend: &str) -> anyhow::Result<(tempfile::TempDir, sqlx::AnyPool)> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join(backend);
+    for entry in std::fs::read_dir(&source).context("read migrations")? {
+        let entry = entry.context("entry")?;
+        if entry.file_name().to_string_lossy().starts_with("0001") {
+            std::fs::copy(entry.path(), dir.path().join(entry.file_name())).context("copy")?;
+        }
+    }
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(database).await.context("pool")?;
+    sqlx::migrate::Migrator::new(dir.path())
+        .await
+        .context("migrator")?
+        .run(&pool)
+        .await
+        .context("migration 0001")?;
+    Ok((dir, pool))
+}
+
+/// Machine tokens minted before 0002 name no credential, so revoking the client secret or auth
+/// method they came from would miss them. The upgrade revokes them; nothing else changes.
+async fn machine_tokens_without_a_source_are_revoked_on_upgrade(database: &str, backend: &str) -> anyhow::Result<()> {
+    let (_migrations, pool) = database_at_0001(database, backend).await?;
+    for (id, kind, principal_kind) in [
+        ("m1", "machine", "identity"),
+        ("c1", "cli", "user"),
+        ("a1", "admin", "user"),
+    ] {
+        sqlx::query(
+            "INSERT INTO access_tokens (id, token_hash, kind, principal_kind, principal_id, description, created_at, \
+             expires_at, max_expires_at, revoked) VALUES ($1, $2, $3, $4, 'p1', '', 1, 4000000000, 4000000000, 0)",
+        )
+        .bind(id)
+        .bind(format!("hash-{id}"))
+        .bind(kind)
+        .bind(principal_kind)
+        .execute(&pool)
+        .await
+        .context("token")?;
+    }
+    pool.close().await;
+    let store = SqlStore::connect(database).await.context("upgrade")?;
+    let found = |id: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .find_token(&format!("hash-{id}"))
+                .await
+                .context("find")?
+                .context(id)
+        }
+    };
+    assert!(found("m1").await?.revoked, "a machine token with no source");
+    for id in ["c1", "a1"] {
+        let token = found(id).await?;
+        assert!(!token.revoked, "{id} names no credential by design");
+        assert_eq!(token.mac, None, "{id} waits for the first unlock to be vouched for");
+        assert_eq!(
+            token.sealed_hash,
+            Some(format!("hash-{id}")),
+            "{id} keeps working on the routes open while sealed"
+        );
+    }
+    let unsigned: Vec<String> = store
+        .list_unsigned_tokens()
+        .await
+        .context("unsigned")?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(unsigned, ["a1", "c1"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_machine_tokens_without_a_source_are_revoked_on_upgrade() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    machine_tokens_without_a_source_are_revoked_on_upgrade(&url(dir.path()), "sqlite").await
+}
+
+/// Needs Docker. Skipped with a message when it is unavailable unless SEKRET_REQUIRE_POSTGRES is set.
+#[tokio::test]
+async fn postgres_machine_tokens_without_a_source_are_revoked_on_upgrade() -> anyhow::Result<()> {
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    let container = match testcontainers_modules::postgres::Postgres::default().start().await {
+        Ok(container) => container,
+        Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
+            eprintln!("skipping postgres test: {error}");
+            return Ok(());
+        }
+        Err(error) => anyhow::bail!("postgres container failed: {error}"),
+    };
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
+    let database = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    machine_tokens_without_a_source_are_revoked_on_upgrade(&database, "postgres").await
+}

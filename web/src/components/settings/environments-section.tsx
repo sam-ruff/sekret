@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 import { api } from "@/api/endpoints";
 import type { Environment } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { FormBlocker } from "@/components/form-blocker";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,11 +37,19 @@ function EnvironmentDialog({
   const current = editing.mode === "rename" ? editing.env : undefined;
   const [name, setName] = useState(current?.name ?? "");
   const [slug, setSlug] = useState(current?.slug ?? "");
-  const valid = name.trim() !== "" && /^[a-z0-9][a-z0-9-]*$/.test(slug);
+  const slugValid = /^[a-z0-9][a-z0-9-]*$/.test(slug);
+  const blocker =
+    name.trim() === ""
+      ? "Give the environment a name to continue."
+      : slug === ""
+        ? "Enter an ID to continue."
+        : !slugValid
+          ? "IDs use lowercase letters, digits and dashes, starting with a letter or digit."
+          : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (valid) onSubmit(name.trim(), slug);
+    if (!blocker) onSubmit(name.trim(), slug);
   };
 
   return (
@@ -50,7 +59,7 @@ function EnvironmentDialog({
           <DialogHeader>
             <DialogTitle>{current ? `Rename ${current.name}` : "New environment"}</DialogTitle>
             <DialogDescription>
-              {current ? "The slug stays the same so the CLI and integrations keep working." : "Environments hold their own copy of every secret."}
+              {current ? "The ID stays the same so the CLI and integrations keep working." : "Each environment has its own values for every secret."}
             </DialogDescription>
           </DialogHeader>
           <FieldGroup>
@@ -74,17 +83,29 @@ function EnvironmentDialog({
                 value={slug}
                 disabled={!!current}
                 className="font-mono"
+                aria-invalid={slug !== "" && !slugValid}
                 data-testid="env-slug"
                 onChange={(e) => setSlug(e.target.value.toLowerCase())}
               />
               <FieldDescription>Used with --env on the command line. It cannot change later.</FieldDescription>
             </Field>
           </FieldGroup>
-          <DialogFooter>
+          <DialogFooter className="sm:items-center">
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!valid || busy} data-testid="env-save">
+            {/* Under the submit button on phones, at the left on wider screens. */}
+            {blocker && (
+              <FormBlocker id="env-blocker" testId="env-blocker" className="sm:order-first sm:mr-auto">
+                {blocker}
+              </FormBlocker>
+            )}
+            <Button
+              type="submit"
+              disabled={!!blocker || busy}
+              aria-describedby={blocker ? "env-blocker" : undefined}
+              data-testid="env-save"
+            >
               {busy && <Spinner />}
               {current ? "Save" : "Add environment"}
             </Button>

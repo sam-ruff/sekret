@@ -48,7 +48,9 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
       ? "Fix the key to continue."
       : generatorProblem
         ? "Fix the length to continue."
-        : null;
+        : valueHidden && !draft.generator && draft.value === ""
+          ? "Enter a replacement value to continue."
+          : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();

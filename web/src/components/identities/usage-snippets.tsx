@@ -19,7 +19,7 @@ export function UsageSnippets({ identity }: { identity: Identity }) {
         <Info />
         <AlertDescription>
           These are templates. Replace the placeholders in angle brackets, and make sure the identity is a member of the
-          project with a suitable role. Identity id: <code className="font-mono" data-testid="usage-identity-id">{identity.id}</code>
+          project with a suitable role, as listed under Project access. Identity id: <code className="font-mono" data-testid="usage-identity-id">{identity.id}</code>
         </AlertDescription>
       </Alert>
       <Snippet

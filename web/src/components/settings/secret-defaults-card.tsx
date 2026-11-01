@@ -30,8 +30,9 @@ export function SecretDefaultsCard({ project, canEdit }: { project: string; canE
       <CardHeader>
         <CardTitle>Secret defaults</CardTitle>
         <CardDescription>
-          How sekret generates and rotates values for secrets that do not set their own policy. Off by default. Automatic
-          rotation only ever replaces values sekret generated, never ones that were typed or imported.
+          How sekret generates and rotates values for secrets that do not set their own policy. When off, sekret only stores
+          values you type. Automatic rotation only ever replaces values sekret generated, never ones that were typed or
+          imported.
         </CardDescription>
       </CardHeader>
       {policy.isPending && (

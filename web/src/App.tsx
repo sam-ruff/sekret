@@ -88,10 +88,24 @@ function forgetEverything(): void {
   forgetAllButStatus(queryClient);
 }
 
-/** On phones drawers fill the screen and keep their buttons at the bottom, so toasts go to the top instead. */
+/** Clears the header of a full-screen drawer. */
+const TOAST_TOP_MOBILE = 84;
+
+/**
+ * On phones drawers fill the screen and keep their buttons at the bottom, so toasts go to the top
+ * instead, below a drawer's title and close button.
+ */
 function AppToaster() {
   const mobile = useIsMobile();
-  return <Toaster richColors closeButton position={mobile ? "top-center" : "bottom-right"} />;
+  return (
+    <Toaster
+      richColors
+      closeButton
+      position={mobile ? "top-center" : "bottom-right"}
+      offset={mobile ? { top: TOAST_TOP_MOBILE } : undefined}
+      mobileOffset={{ top: TOAST_TOP_MOBILE }}
+    />
+  );
 }
 
 export function App() {

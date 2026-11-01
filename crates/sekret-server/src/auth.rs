@@ -4,8 +4,9 @@ use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use ipnet::IpNet;
-use sekret_core::crypto::{generate_token, hash_token};
-use sekret_store::{AccessToken, PrincipalKind};
+use sekret_core::crypto::{IntegrityKey, generate_token, hash_token};
+use sekret_core::seal::SealState;
+use sekret_store::{AccessToken, AuthMethod, ClientSecret, PrincipalKind, Store};
 use zeroize::Zeroizing;
 
 use crate::admin::BOOTSTRAP_SUBJECT;
@@ -249,7 +250,32 @@ pub fn ip_allowed(cidrs: &[String], ip: IpAddr) -> bool {
         .any(|net| net.contains(&ip))
 }
 
+/// Routes a token may reach while sealed. None of them reads or changes anything a database
+/// writer could not already, so the plain hash is enough there.
+const SEALED_TOKEN_ROUTES: [&str; 3] = ["/api/v1/sys/status/detail", "/api/v1/auth/token/revoke", "/auth/logout"];
+
 pub async fn authenticate(state: &AppState, method: &Method, headers: &HeaderMap, ip: IpAddr) -> ApiResult<Principal> {
+    authenticate_on(state, method, headers, ip, false).await
+}
+
+/// The stored token for a bearer secret: checked under the integrity key while unsealed, or by
+/// its plain hash while sealed on a route that allows it.
+async fn token_for(state: &AppState, token: &str, sealed_route: bool) -> ApiResult<Option<AccessToken>> {
+    match state.keyring.state() {
+        SealState::Unsealed => find_token(state, token).await,
+        SealState::Sealed if sealed_route => Ok(state.store.find_sealed_token(&hash_token(token)).await?),
+        SealState::Sealed => Err(ApiError::sealed()),
+        SealState::Uninitialised => Err(ApiError::uninitialised()),
+    }
+}
+
+async fn authenticate_on(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    ip: IpAddr,
+    sealed_route: bool,
+) -> ApiResult<Principal> {
     let cookie = cookie_value(headers, session_cookie_name(&state.config));
     let (token, from_cookie) = match (bearer(headers), cookie) {
         (Some(token), _) => (token, false),
@@ -273,9 +299,7 @@ pub async fn authenticate(state: &AppState, method: &Method, headers: &HeaderMap
         return Err(ApiError::unauthorised());
     }
     let now = state.clock.now();
-    let record = state
-        .store
-        .find_token(&hash_token(token))
+    let record = token_for(state, token, sealed_route)
         .await?
         .ok_or_else(ApiError::unauthorised)?;
     let kind_ok = (record.kind == TokenKind::Session.as_str()) == from_cookie;
@@ -377,7 +401,8 @@ impl FromRequestParts<AppState> for Principal {
             return Ok(principal.clone());
         }
         let ClientIp(ip) = ClientIp::from_request_parts(parts, state).await?;
-        authenticate(state, &parts.method, &parts.headers, ip).await
+        let sealed_route = SEALED_TOKEN_ROUTES.contains(&parts.uri.path());
+        authenticate_on(state, &parts.method, &parts.headers, ip, sealed_route).await
     }
 }
 
@@ -400,12 +425,13 @@ pub struct TokenRequest<'a> {
 }
 
 pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResult<MintedToken> {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
     let now = state.clock.now();
     let token = generate_token(TOKEN_PREFIX)?;
     let max_expires_at = now.saturating_add(request.max_ttl.max(request.ttl));
-    let record = AccessToken {
+    let mut record = AccessToken {
         id: uuid::Uuid::new_v4().to_string(),
-        token_hash: hash_token(&token),
+        token_hash: token_lookup(&key, &token)?,
         kind: request.kind.as_str().to_string(),
         principal_kind: request.principal_kind,
         principal_id: request.principal_id.to_string(),
@@ -417,9 +443,234 @@ pub async fn mint_token(state: &AppState, request: TokenRequest<'_>) -> ApiResul
         revoked: false,
         last_used_at: None,
         auth_time: request.auth_time,
+        mac: None,
+        sealed_hash: Some(hash_token(&token)),
     };
+    record.mac = Some(token_mac(&key, &record, Form::Current)?);
     state.store.create_token(record.clone()).await?;
     Ok(MintedToken { token, record })
+}
+
+const TOKEN_LOOKUP: &str = "sekret/token-lookup/v1";
+const TOKEN_ROW: &str = "sekret/token/v1";
+const TOKEN_LEGACY: &str = "sekret/token-legacy/v1";
+const SECRET_LOOKUP: &str = "sekret/client-secret-lookup/v1";
+const SECRET_ROW: &str = "sekret/client-secret/v1";
+const SECRET_LEGACY: &str = "sekret/client-secret-legacy/v1";
+const AUTH_METHOD_ROW: &str = "sekret/auth-method/v1";
+const CLI_APPROVAL: &str = "sekret/cli-approval/v1";
+
+/// Which form a stored credential is in: found by a lookup under the integrity key, or by the
+/// plain SHA-256 used before it, which the first unlock after the upgrade vouched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    Current,
+    Legacy,
+}
+
+fn number(value: i64) -> Vec<u8> {
+    value.to_string().into_bytes()
+}
+
+fn optional(value: Option<i64>) -> Vec<u8> {
+    value.map(number).unwrap_or_default()
+}
+
+fn verified(key: &IntegrityKey, purpose: &str, fields: &[Vec<u8>], mac: Option<&str>) -> bool {
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    mac.is_some_and(|mac| key.verify(purpose, &fields, mac))
+}
+
+fn sign(key: &IntegrityKey, purpose: &str, fields: &[Vec<u8>]) -> ApiResult<String> {
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    Ok(key.mac(purpose, &fields)?)
+}
+
+/// Everything about a token that never changes once it is minted. Expiry within
+/// `max_expires_at`, use times and revocation do change, so they are left out.
+fn token_fields(record: &AccessToken) -> Vec<Vec<u8>> {
+    vec![
+        record.id.clone().into_bytes(),
+        record.token_hash.clone().into_bytes(),
+        record.kind.clone().into_bytes(),
+        record.principal_kind.as_str().as_bytes().to_vec(),
+        record.principal_id.clone().into_bytes(),
+        record.source.clone().into_bytes(),
+        number(record.created_at),
+        number(record.max_expires_at),
+        optional(record.auth_time),
+    ]
+}
+
+fn token_purpose(form: Form) -> &'static str {
+    match form {
+        Form::Current => TOKEN_ROW,
+        Form::Legacy => TOKEN_LEGACY,
+    }
+}
+
+/// What a token is stored and found under.
+pub fn token_lookup(key: &IntegrityKey, token: &str) -> ApiResult<String> {
+    Ok(key.lookup(TOKEN_LOOKUP, token)?)
+}
+
+pub fn token_mac(key: &IntegrityKey, record: &AccessToken, form: Form) -> ApiResult<String> {
+    sign(key, token_purpose(form), &token_fields(record))
+}
+
+/// The stored token a presented one stands for, when its MAC holds. One in the old form is moved
+/// to the new form the first time it is used.
+pub async fn find_token(state: &AppState, token: &str) -> ApiResult<Option<AccessToken>> {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    let lookup = token_lookup(&key, token)?;
+    if let Some(record) = state.store.find_token(&lookup).await? {
+        let ok = verified(&key, TOKEN_ROW, &token_fields(&record), record.mac.as_deref());
+        return Ok(ok.then_some(record));
+    }
+    let legacy = hash_token(token);
+    let Some(record) = state.store.find_token(&legacy).await? else {
+        return Ok(None);
+    };
+    if !verified(&key, TOKEN_LEGACY, &token_fields(&record), record.mac.as_deref()) {
+        return Ok(None);
+    }
+    let moved = AccessToken {
+        token_hash: lookup,
+        ..record
+    };
+    let mac = token_mac(&key, &moved, Form::Current)?;
+    // Another request may have moved it first, which is just as good.
+    state
+        .store
+        .rekey_token(&moved.id, &legacy, &moved.token_hash, &mac)
+        .await?;
+    Ok(Some(AccessToken {
+        mac: Some(mac),
+        ..moved
+    }))
+}
+
+fn client_secret_fields(record: &ClientSecret) -> Vec<Vec<u8>> {
+    vec![
+        record.id.clone().into_bytes(),
+        record.secret_hash.clone().into_bytes(),
+        record.identity_id.clone().into_bytes(),
+        number(record.created_at),
+        optional(record.expires_at),
+    ]
+}
+
+fn client_secret_purpose(form: Form) -> &'static str {
+    match form {
+        Form::Current => SECRET_ROW,
+        Form::Legacy => SECRET_LEGACY,
+    }
+}
+
+/// What a new client secret is stored under.
+pub fn client_secret_lookup(key: &IntegrityKey, secret: &str) -> ApiResult<String> {
+    Ok(key.lookup(SECRET_LOOKUP, secret)?)
+}
+
+pub fn client_secret_mac(key: &IntegrityKey, record: &ClientSecret, form: Form) -> ApiResult<String> {
+    sign(key, client_secret_purpose(form), &client_secret_fields(record))
+}
+
+/// As [`find_token`], for a client secret.
+pub async fn find_client_secret(state: &AppState, secret: &str) -> ApiResult<Option<ClientSecret>> {
+    let key = state.keyring.integrity(state.store.as_ref()).await?;
+    let lookup = client_secret_lookup(&key, secret)?;
+    if let Some(record) = state.store.find_client_secret(&lookup).await? {
+        let ok = verified(&key, SECRET_ROW, &client_secret_fields(&record), record.mac.as_deref());
+        return Ok(ok.then_some(record));
+    }
+    let legacy = hash_token(secret);
+    let Some(record) = state.store.find_client_secret(&legacy).await? else {
+        return Ok(None);
+    };
+    if !verified(
+        &key,
+        SECRET_LEGACY,
+        &client_secret_fields(&record),
+        record.mac.as_deref(),
+    ) {
+        return Ok(None);
+    }
+    let moved = ClientSecret {
+        secret_hash: lookup,
+        ..record
+    };
+    let mac = client_secret_mac(&key, &moved, Form::Current)?;
+    state
+        .store
+        .rekey_client_secret(&moved.id, &legacy, &moved.secret_hash, &mac)
+        .await?;
+    Ok(Some(ClientSecret {
+        mac: Some(mac),
+        ..moved
+    }))
+}
+
+fn auth_method_fields(identity_id: &str, kind: &str, config: &serde_json::Value) -> ApiResult<Vec<Vec<u8>>> {
+    let config = serde_json::to_vec(config).map_err(|e| ApiError::internal("auth method config", e))?;
+    Ok(vec![identity_id.as_bytes().to_vec(), kind.as_bytes().to_vec(), config])
+}
+
+/// Signs an auth method before it is stored, so a database writer cannot add one or point one at
+/// an issuer or cluster of their own.
+pub fn sign_auth_method(key: &IntegrityKey, method: AuthMethod) -> ApiResult<AuthMethod> {
+    let mac = sign(
+        key,
+        AUTH_METHOD_ROW,
+        &auth_method_fields(&method.identity_id, &method.kind, &method.config)?,
+    )?;
+    Ok(AuthMethod {
+        mac: Some(mac),
+        ..method
+    })
+}
+
+pub fn auth_method_verified(key: &IntegrityKey, method: &AuthMethod) -> bool {
+    auth_method_fields(&method.identity_id, &method.kind, &method.config)
+        .is_ok_and(|fields| verified(key, AUTH_METHOD_ROW, &fields, method.mac.as_deref()))
+}
+
+fn cli_approval_fields(device_code_hash: &str, user_id: &str) -> Vec<Vec<u8>> {
+    vec![device_code_hash.as_bytes().to_vec(), user_id.as_bytes().to_vec()]
+}
+
+/// Binds a CLI login's approval to the user who gave it, so a database writer cannot approve a
+/// login of their own as someone else.
+pub fn cli_approval_mac(key: &IntegrityKey, device_code_hash: &str, user_id: &str) -> ApiResult<String> {
+    sign(key, CLI_APPROVAL, &cli_approval_fields(device_code_hash, user_id))
+}
+
+pub fn cli_approval_verified(key: &IntegrityKey, device_code_hash: &str, user_id: &str, mac: Option<&str>) -> bool {
+    verified(key, CLI_APPROVAL, &cli_approval_fields(device_code_hash, user_id), mac)
+}
+
+/// Vouches for the tokens, client secrets and auth methods stored before the integrity key, so
+/// they keep working; anything in the old form added after this is refused. Only ever run once,
+/// recorded in the signed seal configuration. Returns how many rows were signed.
+pub async fn vouch_for_legacy_credentials(store: &dyn Store, key: &IntegrityKey) -> ApiResult<usize> {
+    let mut signed = 0;
+    for token in store.list_unsigned_tokens().await? {
+        store
+            .set_token_mac(&token.id, &token_mac(key, &token, Form::Legacy)?)
+            .await?;
+        signed += 1;
+    }
+    for secret in store.list_unsigned_client_secrets().await? {
+        store
+            .set_client_secret_mac(&secret.id, &client_secret_mac(key, &secret, Form::Legacy)?)
+            .await?;
+        signed += 1;
+    }
+    for method in store.list_unsigned_auth_methods().await? {
+        store.put_auth_method(sign_auth_method(key, method)?).await?;
+        signed += 1;
+    }
+    Ok(signed)
 }
 
 #[cfg(test)]
@@ -604,6 +855,157 @@ mod tests {
         assert_eq!(session_cookie_name(&config), SESSION_COOKIE);
         config.public_url = "https://sekret.example".into();
         assert_eq!(session_cookie_name(&config), SECURE_SESSION_COOKIE);
+    }
+
+    fn token(key: &IntegrityKey) -> anyhow::Result<AccessToken> {
+        let mut record = AccessToken {
+            id: "t1".into(),
+            token_hash: key.lookup(TOKEN_LOOKUP, "skt_secret").context("lookup")?,
+            kind: "cli".into(),
+            principal_kind: PrincipalKind::User,
+            principal_id: "u1".into(),
+            description: "laptop".into(),
+            source: String::new(),
+            created_at: 10,
+            expires_at: 20,
+            max_expires_at: 30,
+            revoked: false,
+            last_used_at: None,
+            auth_time: Some(5),
+            mac: None,
+            sealed_hash: None,
+        };
+        record.mac = Some(token_mac(key, &record, Form::Current).map_err(|e| anyhow::anyhow!("{e:?}"))?);
+        Ok(record)
+    }
+
+    fn token_ok(key: &IntegrityKey, record: &AccessToken, form: Form) -> bool {
+        verified(key, token_purpose(form), &token_fields(record), record.mac.as_deref())
+    }
+
+    #[test]
+    fn a_token_row_cannot_be_moved_or_made_without_the_key() -> anyhow::Result<()> {
+        let key = IntegrityKey::generate().context("key")?;
+        let record = token(&key)?;
+        assert!(token_ok(&key, &record, Form::Current));
+        assert!(
+            !token_ok(&key, &record, Form::Legacy),
+            "the forms do not stand in for each other"
+        );
+        let moved: [AccessToken; 6] = [
+            AccessToken {
+                principal_id: "admin".into(),
+                ..record.clone()
+            },
+            AccessToken {
+                principal_kind: PrincipalKind::Identity,
+                ..record.clone()
+            },
+            AccessToken {
+                kind: "admin".into(),
+                ..record.clone()
+            },
+            AccessToken {
+                max_expires_at: i64::MAX,
+                ..record.clone()
+            },
+            AccessToken {
+                source: "client-secret:other".into(),
+                ..record.clone()
+            },
+            AccessToken {
+                token_hash: hash_token("skt_secret"),
+                ..record.clone()
+            },
+        ];
+        for tampered in &moved {
+            assert!(!token_ok(&key, tampered, Form::Current), "{tampered:?}");
+        }
+        // What changes in normal use is left out.
+        let used = AccessToken {
+            expires_at: 25,
+            revoked: true,
+            last_used_at: Some(12),
+            description: "renamed".into(),
+            ..record.clone()
+        };
+        assert!(token_ok(&key, &used, Form::Current));
+        let stranger = IntegrityKey::generate().context("key")?;
+        assert!(!token_ok(&stranger, &record, Form::Current));
+        assert!(!token_ok(&key, &AccessToken { mac: None, ..record }, Form::Current));
+        Ok(())
+    }
+
+    #[test]
+    fn client_secret_auth_method_and_approval_macs_bind_their_fields() -> anyhow::Result<()> {
+        let key = IntegrityKey::generate().context("key")?;
+        let api = |e: ApiError| anyhow::anyhow!("{e:?}");
+        let mut secret = ClientSecret {
+            id: "c1".into(),
+            identity_id: "i1".into(),
+            description: String::new(),
+            secret_hash: client_secret_lookup(&key, "sks_x").map_err(api)?,
+            prefix: "sks_x".into(),
+            created_at: 1,
+            expires_at: Some(100),
+            uses_remaining: Some(3),
+            revoked: false,
+            last_used_at: None,
+            mac: None,
+        };
+        secret.mac = Some(client_secret_mac(&key, &secret, Form::Current).map_err(api)?);
+        let ok = |s: &ClientSecret| verified(&key, SECRET_ROW, &client_secret_fields(s), s.mac.as_deref());
+        assert!(ok(&secret));
+        assert!(!ok(&ClientSecret {
+            identity_id: "i2".into(),
+            ..secret.clone()
+        }));
+        assert!(!ok(&ClientSecret {
+            expires_at: None,
+            ..secret.clone()
+        }));
+        assert!(ok(&ClientSecret {
+            uses_remaining: Some(2),
+            ..secret.clone()
+        }));
+        assert_ne!(
+            secret.secret_hash,
+            key.lookup(TOKEN_LOOKUP, "sks_x").context("lookup")?,
+            "tokens and client secrets are looked up apart"
+        );
+
+        let method = sign_auth_method(
+            &key,
+            AuthMethod {
+                identity_id: "i1".into(),
+                kind: "oidc".into(),
+                config: serde_json::json!({"kind": "oidc", "issuer": "https://issuer.example"}),
+                created_at: 1,
+                mac: None,
+            },
+        )
+        .map_err(api)?;
+        assert!(auth_method_verified(&key, &method));
+        let repointed = AuthMethod {
+            config: serde_json::json!({"kind": "oidc", "issuer": "https://attacker.example"}),
+            ..method.clone()
+        };
+        assert!(!auth_method_verified(&key, &repointed));
+        assert!(!auth_method_verified(
+            &key,
+            &AuthMethod {
+                identity_id: "i2".into(),
+                ..method.clone()
+            }
+        ));
+        assert!(!auth_method_verified(&key, &AuthMethod { mac: None, ..method }));
+
+        let approval = cli_approval_mac(&key, "dc", "u1").map_err(api)?;
+        assert!(cli_approval_verified(&key, "dc", "u1", Some(&approval)));
+        assert!(!cli_approval_verified(&key, "dc", "admin", Some(&approval)));
+        assert!(!cli_approval_verified(&key, "other", "u1", Some(&approval)));
+        assert!(!cli_approval_verified(&key, "dc", "u1", None));
+        Ok(())
     }
 
     #[test]

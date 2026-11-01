@@ -153,7 +153,8 @@ function DangerSection({ project, perms }: { project: string; perms: Permissions
         title={`Delete ${query.data?.name ?? slug}?`}
         description={
           <>
-            Type <span className="font-mono font-semibold">{slug}</span> to confirm.
+            Every environment, secret, version, snapshot, member and custom role goes with it. There is no undo. Type{" "}
+            <span className="font-mono font-semibold">{slug}</span> to confirm.
           </>
         }
         confirmLabel="Delete project"
@@ -162,7 +163,15 @@ function DangerSection({ project, perms }: { project: string; perms: Permissions
         onConfirm={() => remove.mutateAsync()}
         testId="delete-project-confirm"
       >
-        <Input value={typed} onChange={(e) => setTyped(e.target.value)} className="font-mono" data-testid="delete-project-slug" />
+        <Input
+          value={typed}
+          onChange={(e) => setTyped(e.target.value)}
+          className="font-mono"
+          aria-label="Project ID to confirm deletion"
+          autoComplete="off"
+          spellCheck={false}
+          data-testid="delete-project-slug"
+        />
       </ConfirmDialog>
     </Card>
   );

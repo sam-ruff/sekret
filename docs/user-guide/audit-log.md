@@ -33,7 +33,7 @@ curl -fsS -H "Authorization: Bearer $SEKRET_TOKEN" \
 
 Each response holds `entries`, the `total` matching the filters, and a `next_cursor` when there is another page. Paging by cursor never skips or repeats entries that share a timestamp.
 
-A match or a count can give away a hidden name even when the entries themselves are redacted, so readers with some secrets hidden from them are limited in the project log. For them, `q` only searches the action, actor and address, and `key` and `path` are refused with `filter_hidden` unless `environment` names an environment whose secrets they can all read. Filtering on an environment they cannot list is refused. The web interface says so in place of the results, with a button to drop the key and folder filters, and its search box leaves keys out of its hint. The organisation log is not limited this way.
+A match or a count can give away a hidden name even when the entries themselves are redacted, so readers with some secrets hidden from them are limited in the project log. For them, `q` only searches the action, actor and address, and `key` and `path` are refused with `filter_hidden` unless `environment` names an environment whose secrets they can all read. Filtering on an environment they cannot list is refused. The web interface says so in place of the results, with a button to drop the key and folder filters, and its search box leaves keys out of its hint. A search in that position also says that key names and folders were not searched, and suggests picking an environment whose secrets you can all read. The organisation log is not limited this way.
 
 ## Actions
 

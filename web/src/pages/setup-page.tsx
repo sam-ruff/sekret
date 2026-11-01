@@ -53,6 +53,11 @@ function SetupForm({ status, onCreated }: { status: SysStatus; onCreated: (creat
   const [confirm, setConfirm] = useState("");
   const [policy, setPolicy] = useState<UnlockPolicy>("manual");
   const strength = usePassphraseStrength(keyFile ? "" : passphrase);
+  useIdle(setupCode !== "" || passphrase !== "" || confirm !== "", () => {
+    setSetupCode("");
+    setPassphrase("");
+    setConfirm("");
+  });
 
   const init = useMutation({
     mutationFn: () =>

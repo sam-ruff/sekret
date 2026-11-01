@@ -93,7 +93,7 @@ function DateRange({ from, to, onChange }: { from: string; to: string; onChange:
             );
           })}
         </div>
-        <div className="grid grid-cols-2 gap-2 border-t pt-3">
+        <div className="grid gap-2 border-t pt-3 sm:grid-cols-2">
           <Field className="gap-1.5">
             <FieldLabel htmlFor="audit-from" className="text-xs">
               From

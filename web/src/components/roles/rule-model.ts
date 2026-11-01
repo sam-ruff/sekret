@@ -61,6 +61,11 @@ export function toRules(rows: readonly EditableRule[]): Rule[] {
     });
 }
 
+/** A role made only of deny rules takes access away and grants nothing on its own. */
+export function onlyDenies(rules: readonly Rule[]): boolean {
+  return rules.length > 0 && rules.every((r) => r.effect === "deny");
+}
+
 export function describeConditions(rule: EditableRule): string {
   const parts: string[] = [];
   if (rule.environments.length) parts.push(`in ${rule.environments.join(", ")}`);

@@ -38,6 +38,7 @@ import {
   blankRule,
   describeConditions,
   hasConditions,
+  onlyDenies,
   toEditable,
   toRules,
   type EditableRule,
@@ -284,7 +285,8 @@ export function RoleEditor({
   };
 
   const firstOfSubject = new Set<string>();
-  const grantCount = toRules(rows).length;
+  const rules = toRules(rows);
+  const grantCount = rules.length;
   const blocker = !name.trim() ? "Give the role a name to save it." : !slug ? "Give the role an ID to save it." : null;
 
   return (
@@ -295,7 +297,7 @@ export function RoleEditor({
         data-testid="role-editor"
       >
         <form onSubmit={submit} className="flex max-h-[92svh] flex-col">
-          <DialogHeader className="border-b p-6">
+          <DialogHeader className="border-b p-4 sm:p-6">
             <DialogTitle>{readOnly ? role?.name : isNew ? "New role" : `Edit ${role?.name}`}</DialogTitle>
             <DialogDescription>
               {readOnly
@@ -303,7 +305,8 @@ export function RoleEditor({
                 : "Tick what the role may do. Deny rules always win over allow rules."}
             </DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-6">
+          {/* Relative, so the checkboxes' hidden inputs stay inside the scrolling area rather than stretching the dialog. */}
+          <div className="relative min-h-0 flex-1 space-y-6 overflow-y-auto p-4 sm:p-6">
             {!readOnly && (
               <div className="grid gap-4 md:grid-cols-3">
                 <Field>
@@ -352,6 +355,16 @@ export function RoleEditor({
                       Untick the extra permissions or ask an administrator to create this role.
                     </p>
                   )}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {onlyDenies(rules) && (
+              <Alert data-testid="role-deny-only">
+                <Ban />
+                <AlertDescription>
+                  This role only takes access away. On its own it grants nothing, so give it alongside a role that allows
+                  access.
                 </AlertDescription>
               </Alert>
             )}
@@ -406,16 +419,17 @@ export function RoleEditor({
               </div>
             )}
           </div>
-          <DialogFooter className="m-0 border-t p-4 sm:items-center">
+          {/* One row on phones too, so the rules keep as much of the screen as possible. */}
+          <DialogFooter className="m-0 flex-row flex-wrap justify-end border-t p-3 sm:items-center sm:p-4">
             <span className="mr-auto hidden text-sm text-muted-foreground sm:order-first sm:inline">
               <Badge variant="secondary">{grantCount}</Badge> {grantCount === 1 ? "rule" : "rules"}
             </span>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
               {readOnly ? "Close" : "Cancel"}
             </Button>
-            {/* Under the save button on phones, beside the rule count on wider screens. */}
+            {/* Under the buttons on phones, beside the rule count on wider screens. */}
             {!readOnly && blocker && (
-              <FormBlocker id="role-blocker" testId="role-blocker" className="sm:order-first">
+              <FormBlocker id="role-blocker" testId="role-blocker" className="order-last w-full text-right sm:order-first sm:w-auto sm:text-left">
                 {blocker}
               </FormBlocker>
             )}

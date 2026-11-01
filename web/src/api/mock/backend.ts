@@ -610,7 +610,10 @@ export class MockBackend {
       secret.versions.push({
         version: current.version + 1,
         value: generateValue(generator),
-        comment: "rotated automatically",
+        // Same wording as the server: the secret's own comment is kept.
+        comment: current.comment
+          ? `rotated automatically: ${current.comment.replace(/^rotated automatically: /, "")}`
+          : "rotated automatically",
         tags: current.tags,
         actor: ROTATION_ACTOR.name,
         created_at: this.now(),
@@ -1767,6 +1770,13 @@ export class MockBackend {
   changePassphrase(request: ChangePassphrase, check: StrengthChecker): void {
     this.requireOrgAdmin();
     this.requirePassphraseMode();
+    if (this.state.sys.unsealedBy === "key-file") {
+      throw new MockError(
+        409,
+        "root_key_file_in_use",
+        "this server reads its root key from seal.root_key_file, which would still hold the old key after a passphrase change and stop the server starting; remove that file, restart, unseal with the passphrase and change it then",
+      );
+    }
     this.requireStrong(request.new, check);
     if (!this.verifyPassphrase(request.current)) {
       throw new MockError(401, "invalid_passphrase", "the passphrase is wrong");

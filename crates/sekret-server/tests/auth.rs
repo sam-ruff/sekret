@@ -294,12 +294,7 @@ async fn browser_login_sessions_csrf_and_cli_flow() -> anyhow::Result<()> {
     let cli_token = token["access_token"].as_str().context("token")?;
     let (_, me) = h.get("/api/v1/me", cli_token).await?;
     assert_eq!(me["email"], "alice@example.com");
-    let record = h
-        .state
-        .store
-        .find_token(&sekret_core::crypto::hash_token(cli_token))
-        .await?
-        .context("cli token")?;
+    let record = h.token_record(cli_token).await?;
     assert_eq!(
         record.max_expires_at - record.created_at,
         h.state.config.cli_token_ttl,
@@ -337,11 +332,11 @@ async fn stored_session(h: &Harness, subject: &str, groups: &[&str]) -> anyhow::
         })
         .await?;
     let token = format!("skt_{}", uuid::Uuid::new_v4().simple());
-    h.state
-        .store
-        .create_token(sekret_store::AccessToken {
+    h.store_token(
+        &token,
+        sekret_store::AccessToken {
             id: uuid::Uuid::new_v4().to_string(),
-            token_hash: sekret_core::crypto::hash_token(&token),
+            token_hash: String::new(),
             kind: "session".into(),
             principal_kind: sekret_store::PrincipalKind::User,
             principal_id: user.id.clone(),
@@ -353,8 +348,11 @@ async fn stored_session(h: &Harness, subject: &str, groups: &[&str]) -> anyhow::
             revoked: false,
             last_used_at: None,
             auth_time: Some(now),
-        })
-        .await?;
+            mac: None,
+            sealed_hash: None,
+        },
+    )
+    .await?;
     Ok((user.id, token))
 }
 
@@ -593,12 +591,7 @@ async fn sessions_from_before_the_sign_in_lists_narrowed_stop_working() -> anyho
         .await
         .map_err(common::api_error("revoke"))?;
     assert_eq!(revoked, 2);
-    let record = h
-        .state
-        .store
-        .find_token(&sekret_core::crypto::hash_token(&outsider))
-        .await?
-        .context("token")?;
+    let record = h.token_record(&outsider).await?;
     assert!(record.revoked, "revoked at start, not just refused");
     assert_eq!(me(&allowed).await?.0, StatusCode::OK);
     Ok(())

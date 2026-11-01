@@ -1,5 +1,5 @@
 import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
-import { EyeOff, ScrollText, SearchX, X } from "lucide-react";
+import { EyeOff, Info, ScrollText, SearchX, X } from "lucide-react";
 import { useCallback, useMemo } from "react";
 import { useSearchParams } from "react-router";
 import { ApiError } from "@/api/client";
@@ -79,6 +79,9 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
   const clear = () => setFilters({ ...EMPTY_AUDIT_FILTERS, order: filters.order });
   const filterHidden = pages.error instanceof ApiError && pages.error.code === "filter_hidden";
   const searchesSecrets = seesEverything?.(filters.environment || undefined) ?? true;
+  const keysSkipped = filters.q.trim() !== "" && !searchesSecrets;
+  const keysSkippedText =
+    "Search here covers actions, people and addresses. Key names and folders are not searched because some secrets in this log are hidden from you. Pick an environment whose secrets you can all read to search them.";
 
   return (
     <div className="space-y-4">
@@ -136,13 +139,19 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
           </AlertDescription>
         </Alert>
       )}
+      {keysSkipped && !(pages.isSuccess && entries.length === 0) && (
+        <p className="flex items-start gap-1.5 text-xs text-muted-foreground" data-testid="audit-keys-skipped">
+          <Info className="mt-0.5 size-3.5 shrink-0" />
+          {keysSkippedText}
+        </p>
+      )}
       {pages.error && !filterHidden && <ErrorState error={pages.error} onRetry={() => void pages.refetch()} />}
       {pages.isPending && <ListSkeleton rows={6} />}
       {pages.isSuccess && entries.length === 0 && filtered && (
         <EmptyState
           icon={<SearchX />}
           title="No matching activity"
-          description={noMatchHint(filters)}
+          description={keysSkipped ? `${noMatchHint(filters)} ${keysSkippedText}` : noMatchHint(filters)}
           action={
             <Button variant="outline" size="sm" onClick={clear}>
               Clear filters

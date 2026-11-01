@@ -121,3 +121,19 @@ test("explains when a role would escalate access", async ({ page }) => {
     ignoreCase: true,
   });
 });
+
+test("says when a role only takes access away", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  await editor.getByTestId("role-name").fill("No values");
+  await expect(editor.getByTestId("role-deny-only")).toHaveCount(0);
+
+  await editor.getByTestId("add-rule").click();
+  await page.getByTestId("add-rule-secrets").click();
+  await editor.getByTestId("rule-secrets-extra").getByTestId("rule-secrets-extra-read-value").click();
+  await expect(editor.getByTestId("role-deny-only")).toContainText("On its own it grants nothing");
+
+  await editor.getByTestId("rule-secrets-read").click();
+  await expect(editor.getByTestId("role-deny-only")).toHaveCount(0);
+});

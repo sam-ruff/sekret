@@ -28,6 +28,9 @@ const MAX_REFERENCE_DEPTH: usize = 8;
 const RENDER_BUDGET: u64 = 20_000;
 const PATH_COST: u64 = 1;
 const DASH_COST: u64 = 8;
+/// Dashes the whole drawing may be cut into. Each dash is stroked as a path of its own, and one
+/// path can otherwise ask for a million.
+const MAX_DASHES: f64 = 100_000.0;
 const GRADIENT_COST: u64 = 40;
 /// An offscreen canvas, composited back: isolated groups, clip paths, masks, patterns and images.
 const LAYER_COST: u64 = 30;
@@ -269,6 +272,7 @@ fn is_filter_element(name: &str) -> bool {
 /// Walks the tree the way resvg renders it, stopping as soon as `budget` is spent. The walk
 /// uses its own stack and never costs more than the budget, however deep the nesting.
 fn within_render_budget(root: &usvg::Group, budget: u64) -> bool {
+    let mut dashed = 0.0;
     let mut left = budget;
     let mut spend = |cost: u64| match left.checked_sub(cost) {
         Some(rest) => {
@@ -323,8 +327,14 @@ fn within_render_budget(root: &usvg::Group, budget: u64) -> bool {
                             return false;
                         }
                     }
-                    if path.stroke().is_some_and(|s| s.dasharray().is_some()) && !spend(DASH_COST) {
-                        return false;
+                    if let Some(dashes) = path.stroke().and_then(usvg::Stroke::dasharray) {
+                        if !spend(DASH_COST) {
+                            return false;
+                        }
+                        dashed += expected_dashes(path.data(), dashes);
+                        if dashed.is_nan() || dashed > MAX_DASHES {
+                            return false;
+                        }
                     }
                 }
                 usvg::Node::Image(image) => {
@@ -340,6 +350,50 @@ fn within_render_budget(root: &usvg::Group, budget: u64) -> bool {
         }
     }
     true
+}
+
+/// How many dashes tiny-skia cuts `path` into: its length over the dash pattern's length, times
+/// the dashes in one pattern, plus one per contour. The length is measured along the control
+/// points, which is never shorter than the curve. Dashing happens before the transform, so the
+/// path's own coordinates are the right ones. Anything not finite counts as too many.
+fn expected_dashes(path: &tiny_skia::Path, dasharray: &[f32]) -> f64 {
+    let interval: f64 = dasharray.iter().map(|d| f64::from(*d)).sum();
+    if !interval.is_finite() || dasharray.iter().any(|d| !d.is_finite() || *d < 0.0) {
+        return f64::INFINITY;
+    }
+    if interval <= 0.0 {
+        return 0.0;
+    }
+    let mut length = 0.0;
+    let mut contours = 0.0;
+    let mut start = tiny_skia::Point::zero();
+    let mut at = start;
+    let mut step = |from: tiny_skia::Point, to: tiny_skia::Point| {
+        length += f64::from(from.distance(to));
+        to
+    };
+    for segment in path.segments() {
+        at = match segment {
+            tiny_skia::PathSegment::MoveTo(p) => {
+                contours += 1.0;
+                start = p;
+                p
+            }
+            tiny_skia::PathSegment::LineTo(p) => step(at, p),
+            tiny_skia::PathSegment::QuadTo(c, p) => {
+                let c = step(at, c);
+                step(c, p)
+            }
+            tiny_skia::PathSegment::CubicTo(c1, c2, p) => {
+                let c1 = step(at, c1);
+                let c2 = step(c1, c2);
+                step(c2, p)
+            }
+            tiny_skia::PathSegment::Close => step(at, start),
+        };
+    }
+    let per_pattern = (dasharray.len() / 2).max(1) as f64;
+    length / interval * per_pattern + contours
 }
 
 fn render_svg(data: &[u8]) -> Result<DynamicImage, ImageError> {
@@ -510,7 +564,8 @@ mod tests {
 
     const HEAD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#;
 
-    /// Refused, and quickly: each of these took seconds to minutes to render before.
+    /// Refused, and quickly: each of these took seconds to minutes to render before. The bound is
+    /// loose because CI runners are slow; the budget tests count the work itself.
     fn refused_quickly(attack: &str) {
         let started = std::time::Instant::now();
         let result = normalise_logo(attack.as_bytes());
@@ -520,7 +575,7 @@ mod tests {
             &attack[..attack.len().min(120)]
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(10),
             "took {:?}",
             started.elapsed()
         );
@@ -606,6 +661,71 @@ mod tests {
         for attack in [&opacity, &gradients, &masks] {
             refused_quickly(attack);
         }
+    }
+
+    /// The audit's file: 2,221 dashed lines that each cut into a million dashes took about 100 s
+    /// of CPU while the flat dash charge let it through.
+    fn dash_bomb() -> String {
+        let mut svg =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">"#);
+        for i in 0..2221 {
+            let y = (i % 512) as f32 + 0.5;
+            svg.push_str(&format!(
+                r##"<path d="M0 {y}H1000000" stroke="black" stroke-dasharray="0.5"/>"##
+            ));
+        }
+        svg.push_str("</svg>");
+        svg
+    }
+
+    #[test]
+    fn dashes_are_charged_by_how_many_there_will_be() -> anyhow::Result<()> {
+        let line = |d: &str| -> anyhow::Result<tiny_skia::Path> {
+            let svg = format!(r#"{HEAD}<path d="{d}" stroke="black"/></svg>"#);
+            let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).context("parse")?;
+            let Some(usvg::Node::Path(path)) = tree.root().children().first() else {
+                anyhow::bail!("no path");
+            };
+            Ok(path.data().clone())
+        };
+        let long = line("M0 0H1000000")?;
+        let dashes = expected_dashes(&long, &[0.5, 0.5]);
+        assert!((999_000.0..1_001_000.0).contains(&dashes), "{dashes}");
+        assert!(dashes > MAX_DASHES, "one such line is already over the whole budget");
+        let short = line("M0 0H100V100")?;
+        let dashes = expected_dashes(&short, &[5.0, 5.0, 2.0, 3.0]);
+        assert!((27.0..=28.5).contains(&dashes), "{dashes}");
+        let curve = line("M0 0C0 100 100 100 100 0")?;
+        assert!(
+            expected_dashes(&curve, &[1.0, 1.0]) >= 100.0,
+            "a curve is never undercounted"
+        );
+        assert_eq!(expected_dashes(&short, &[f32::NAN, 1.0]), f64::INFINITY);
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_cut_into_millions_of_dashes_is_refused() {
+        refused_quickly(&dash_bomb());
+        refused_quickly(&format!(
+            r#"{HEAD}<path d="M0 0H1000000" stroke="black" stroke-dasharray="0.5"/></svg>"#
+        ));
+        // Many modest lines add up across the drawing.
+        refused_quickly(&format!(
+            "{HEAD}{}</svg>",
+            r#"<path d="M0 0H10000" stroke="black" stroke-dasharray="0.5"/>"#.repeat(20)
+        ));
+    }
+
+    #[test]
+    fn ordinary_dashed_outlines_still_render() -> anyhow::Result<()> {
+        let svg = format!(
+            r#"{HEAD}<circle cx="50" cy="50" r="40" fill="none" stroke="black" stroke-dasharray="4 2"/>
+            <rect x="10" y="10" width="80" height="80" fill="none" stroke="red" stroke-dasharray="1"/></svg>"#
+        );
+        let image = decoded(&normalise_logo(svg.as_bytes()).context("logo")?)?;
+        assert_eq!((image.width(), image.height()), (LOGO_SIZE, LOGO_SIZE));
+        Ok(())
     }
 
     #[test]

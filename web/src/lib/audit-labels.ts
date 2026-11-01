@@ -1,3 +1,5 @@
+import { formatBytes } from "./format";
+
 /** Plain names for the actions the server records. Unknown actions show their raw code. */
 const ACTION_LABELS: Record<string, string> = {
   "auth.cli-approve": "Approved a CLI sign-in",
@@ -128,6 +130,8 @@ const SUMMARISED = new Set([
   "principal_id",
   "role",
   "snapshot",
+  "content_type",
+  "bytes",
 ]);
 
 function summary(action: string, detail: Detail): string[] {
@@ -145,6 +149,10 @@ function summary(action: string, detail: Detail): string[] {
   if (detail.automatic === true) parts.push("Automatic");
   if ("policy" in detail) parts.push(policySummary(detail.policy));
   if (typeof detail.snapshot === "string") parts.push(`From snapshot ${detail.snapshot}`);
+  if (typeof detail.content_type === "string" && typeof detail.bytes === "number") {
+    const format = detail.content_type.replace(/^image\//, "").replace(/\+xml$/, "").toUpperCase();
+    parts.push(`${format} image, ${formatBytes(detail.bytes)}`);
+  }
   if (typeof detail.role === "string" && typeof detail.principal_id === "string") {
     const kind = KIND_NAMES[String(detail.principal_kind)] ?? "principal";
     const removed = action.endsWith("remove");

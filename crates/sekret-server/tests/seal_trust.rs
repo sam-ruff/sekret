@@ -264,6 +264,7 @@ async fn a_rotation_past_an_unreadable_project_key_still_unlocks(db: String) -> 
             auth_methods: vec![],
             fingerprint: root(&h)?.fingerprint(),
             seal: None,
+            integrity_key: None,
         })
         .await?;
 
@@ -321,7 +322,7 @@ async fn a_copy_from_before_a_key_change_is_a_rollback_meanwhile(db: String) -> 
         "{actions:?}"
     );
     assert!(stored(&restarted).await?.epoch > epoch);
-    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![old.fingerprint()]));
+    assert_eq!(accepted_roots(&settings.epoch_files), Some(vec![old.pin()?]));
     Ok(())
 }
 

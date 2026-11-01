@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Rule } from "@/api/types";
-import { actionsFor, describeConditions, SUBJECT_ACTIONS, toEditable, toRules } from "./rule-model";
+import { actionsFor, describeConditions, onlyDenies, SUBJECT_ACTIONS, toEditable, toRules } from "./rule-model";
 
 describe("rule model", () => {
   it("creates one empty row per subject without rules", () => {
@@ -59,5 +59,13 @@ describe("rule model", () => {
       ["secrets"],
     );
     expect(describeConditions(row)).toBe("in dev; under /app/**; tagged db");
+  });
+
+  it("spots a role that only takes access away", () => {
+    const deny: Rule = { effect: "deny", subject: "secrets", actions: ["read-value"] };
+    const allow: Rule = { effect: "allow", subject: "secrets", actions: ["read"] };
+    expect(onlyDenies([deny])).toBe(true);
+    expect(onlyDenies([deny, allow])).toBe(false);
+    expect(onlyDenies([])).toBe(false);
   });
 });

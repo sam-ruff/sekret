@@ -61,6 +61,19 @@ test("creates an identity and configures every auth method", async ({ page }) =>
   await expect(page.getByTestId("snippet-github-actions")).toContainText("id-token: write");
 });
 
+test("the usage tab lists the identity's projects and links to where access is granted", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-usage").click();
+  await expect(page.getByTestId("topbar-section")).toHaveText("Machine identities");
+  await expect(page.getByTestId("topbar-item")).toHaveText("github-deploy");
+  const card = page.getByTestId("identity-projects");
+  await expect(card.getByTestId("identity-project-storefront")).toContainText("viewer");
+  await expect(card.getByTestId("identity-project-payments-api")).toContainText("No access");
+  await card.getByTestId("identity-project-manage-payments-api").click();
+  await expect(page).toHaveURL(/\/projects\/payments-api\/settings\/members$/);
+});
+
 test("long OIDC subjects wrap inside the form instead of widening it", async ({ page }) => {
   await page.goto("/org/identities");
   await page.getByTestId("identity-link-github-deploy").click();

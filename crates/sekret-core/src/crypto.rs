@@ -2,6 +2,8 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -9,10 +11,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 const BLOB_VERSION: u8 = 1;
+const FINGERPRINT_HEX_LEN: usize = 16;
+const PIN_INFO: &[u8] = b"sekret/fingerprint/v1";
+const INTEGRITY_KEY_AAD: &[u8] = b"sekret:integrity-key:v1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
-    #[error("key must be 32 bytes, raw, base64 or hex encoded")]
+    #[error("key must be 32 random bytes, raw, base64 or hex encoded; a 32-character password is not a key")]
     InvalidKey,
     #[error("ciphertext is malformed")]
     Malformed,
@@ -30,9 +35,19 @@ pub struct RootKey([u8; KEY_LEN]);
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DataKey([u8; KEY_LEN]);
 
+/// Whether 32 bytes of key material are printable text, such as a password, rather than raw
+/// random bytes. Random bytes are all printable about once in 10^14.
+fn printable_text(material: &[u8]) -> bool {
+    material.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+}
+
 /// Decodes key material straight into `out`, so no stray copy of the key is left on the stack.
+/// Raw material must be exactly 32 bytes that are not printable text.
 pub(crate) fn fill_from_material(material: &[u8], out: &mut [u8; KEY_LEN]) -> Result<(), CryptoError> {
     if material.len() == KEY_LEN {
+        if printable_text(material) {
+            return Err(CryptoError::InvalidKey);
+        }
         out.copy_from_slice(material);
         return Ok(());
     }
@@ -96,6 +111,26 @@ impl RootKey {
     pub fn fingerprint(&self) -> String {
         let digest = Sha256::digest(self.0);
         hex::encode(&digest[..8])
+    }
+
+    /// A full-length identifier derived from the key, recorded in the epoch marks, where a short
+    /// fingerprint could be matched by searching for another key.
+    pub fn pin(&self) -> Result<String, CryptoError> {
+        let mut out = [0u8; KEY_LEN];
+        Hkdf::<Sha256>::new(None, &self.0)
+            .expand(PIN_INFO, &mut out)
+            .map_err(|_| CryptoError::Kdf)?;
+        Ok(hex::encode(out))
+    }
+
+    /// Whether `recorded`, a pin or a fingerprint from before pins, names this key.
+    pub fn is_named_by(&self, recorded: &str) -> bool {
+        match recorded.len() {
+            FINGERPRINT_HEX_LEN => constant_time_eq(recorded.as_bytes(), self.fingerprint().as_bytes()),
+            _ => self
+                .pin()
+                .is_ok_and(|pin| constant_time_eq(recorded.as_bytes(), pin.as_bytes())),
+        }
     }
 
     pub fn to_base64(&self) -> Zeroizing<String> {
@@ -244,8 +279,71 @@ pub fn generate_token(prefix: &str) -> Result<Zeroizing<String>, CryptoError> {
     Ok(Zeroizing::new(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(*bytes))))
 }
 
+/// How tokens and client secrets were stored before [`IntegrityKey`]; still used for CLI device
+/// codes, whose approval is authenticated separately.
 pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+/// Authenticates the rows that grant access, so someone who can write the database but does not
+/// hold the root key cannot add a credential or move one to another principal. It is random and
+/// kept wrapped under the root key, so replacing the root key keeps every credential working.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct IntegrityKey([u8; KEY_LEN]);
+
+impl IntegrityKey {
+    pub fn generate() -> Result<Self, CryptoError> {
+        let mut key = Self([0u8; KEY_LEN]);
+        fill_random(&mut key.0)?;
+        Ok(key)
+    }
+
+    /// The key sealed under `root`, as base64.
+    pub fn wrap(&self, root: &RootKey) -> Result<String, CryptoError> {
+        Ok(STANDARD.encode(seal(&root.0, &self.0, INTEGRITY_KEY_AAD)?))
+    }
+
+    pub fn unwrap(root: &RootKey, wrapped: &str) -> Result<Self, CryptoError> {
+        let blob = STANDARD.decode(wrapped).map_err(|_| CryptoError::Malformed)?;
+        let plain = open(&root.0, &blob, INTEGRITY_KEY_AAD)?;
+        if plain.len() != KEY_LEN {
+            return Err(CryptoError::Malformed);
+        }
+        let mut key = Self([0u8; KEY_LEN]);
+        key.0.copy_from_slice(&plain);
+        Ok(key)
+    }
+
+    fn hmac(&self, purpose: &str, fields: &[&[u8]]) -> Result<Hmac<Sha256>, CryptoError> {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.0).map_err(|_| CryptoError::InvalidKey)?;
+        for field in std::iter::once(purpose.as_bytes()).chain(fields.iter().copied()) {
+            mac.update(&(field.len() as u64).to_be_bytes());
+            mac.update(field);
+        }
+        Ok(mac)
+    }
+
+    /// What a bearer secret is stored and found under: the same for the same secret, and
+    /// impossible to compute without this key.
+    pub fn lookup(&self, purpose: &str, secret: &str) -> Result<String, CryptoError> {
+        Ok(hex::encode(
+            self.hmac(purpose, &[secret.as_bytes()])?.finalize().into_bytes(),
+        ))
+    }
+
+    /// Authenticates `fields`, which are length-prefixed, under `purpose`, as hex.
+    pub fn mac(&self, purpose: &str, fields: &[&[u8]]) -> Result<String, CryptoError> {
+        Ok(hex::encode(self.hmac(purpose, fields)?.finalize().into_bytes()))
+    }
+
+    /// Checks a MAC from [`IntegrityKey::mac`] in constant time.
+    pub fn verify(&self, purpose: &str, fields: &[&[u8]], mac: &str) -> bool {
+        let Ok(expected) = hex::decode(mac) else {
+            return false;
+        };
+        self.hmac(purpose, fields)
+            .is_ok_and(|hmac| hmac.verify_slice(&expected).is_ok())
+    }
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -369,6 +467,70 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), c.fingerprint());
         assert!(RootKey::parse(b"too short").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_32_character_password_is_not_a_raw_key() -> anyhow::Result<()> {
+        let password = b"correct horse battery staple 123";
+        assert_eq!(password.len(), KEY_LEN);
+        assert_eq!(RootKey::parse(password).err(), Some(CryptoError::InvalidKey));
+        assert_eq!(RootKey::parse(&[b'a'; 32]).err(), Some(CryptoError::InvalidKey));
+        let mut raw = [b'a'; 32];
+        raw[5] = 0xfe;
+        RootKey::parse(&raw).context("one byte outside text makes it raw")?;
+        // The same text as base64 is a real key, so encoded keys are unaffected.
+        RootKey::parse(STANDARD.encode(password).as_bytes()).context("base64")?;
+        Ok(())
+    }
+
+    #[test]
+    fn pins_are_full_length_and_name_only_their_key() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let other = RootKey::generate().context("root")?;
+        let pin = root.pin().context("pin")?;
+        assert_eq!(pin.len(), 64);
+        assert_eq!(pin, root.pin().context("pin")?);
+        assert!(!pin.starts_with(&root.fingerprint()), "not the fingerprint lengthened");
+        assert!(root.is_named_by(&pin));
+        assert!(root.is_named_by(&root.fingerprint()), "marks from before pins");
+        assert!(!other.is_named_by(&pin));
+        assert!(!other.is_named_by(&root.fingerprint()));
+        assert!(!root.is_named_by(&pin[..32]));
+        Ok(())
+    }
+
+    #[test]
+    fn integrity_keys_wrap_under_the_root_and_authenticate_fields() -> anyhow::Result<()> {
+        let root = RootKey::generate().context("root")?;
+        let key = IntegrityKey::generate().context("key")?;
+        let wrapped = key.wrap(&root).context("wrap")?;
+        let opened = IntegrityKey::unwrap(&root, &wrapped).context("unwrap")?;
+        assert_eq!(
+            key.lookup("t", "skt_x").context("lookup")?,
+            opened.lookup("t", "skt_x").context("lookup")?
+        );
+        let other_root = RootKey::generate().context("root")?;
+        assert_eq!(
+            IntegrityKey::unwrap(&other_root, &wrapped).err(),
+            Some(CryptoError::Decrypt)
+        );
+        assert_eq!(IntegrityKey::unwrap(&root, "%%").err(), Some(CryptoError::Malformed));
+
+        let lookup = key.lookup("token", "skt_x").context("lookup")?;
+        assert_eq!(lookup.len(), 64);
+        assert_ne!(lookup, hash_token("skt_x"), "not computable without the key");
+        assert_ne!(lookup, key.lookup("client-secret", "skt_x").context("lookup")?);
+        let stranger = IntegrityKey::generate().context("key")?;
+        assert_ne!(lookup, stranger.lookup("token", "skt_x").context("lookup")?);
+
+        let mac = key.mac("row", &[b"ab", b"c"]).context("mac")?;
+        assert!(key.verify("row", &[b"ab", b"c"], &mac));
+        assert!(!key.verify("row", &[b"a", b"bc"], &mac), "fields are length-prefixed");
+        assert!(!key.verify("other", &[b"ab", b"c"], &mac));
+        assert!(!stranger.verify("row", &[b"ab", b"c"], &mac));
+        assert!(!key.verify("row", &[b"ab", b"c"], "not hex"));
+        assert!(!key.verify("row", &[b"ab", b"c"], &mac[..62]));
         Ok(())
     }
 

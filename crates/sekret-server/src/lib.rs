@@ -38,7 +38,7 @@ use axum::{Json, Router};
 use sekret_core::seal::SealState;
 use sekret_store::Store;
 use serde_json::{Value, json};
-use tower_http::timeout::RequestBodyTimeoutLayer;
+use tower_http::timeout::{RequestBodyDeadlineLayer, RequestBodyTimeoutLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::body::MAX_BODY;
@@ -103,8 +103,26 @@ async fn seal_gate(State(state): State<AppState>, request: Request, next: Next) 
     }
 }
 
-/// How long a client may take to send its body.
-const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request body may take to arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyTimeouts {
+    /// The longest pause between two parts of the body.
+    pub gap: Duration,
+    /// The whole body, however steadily it trickles in. The detached system routes have no
+    /// request time limit, so without this a client sending a byte now and then holds a
+    /// connection for days.
+    pub total: Duration,
+}
+
+impl Default for BodyTimeouts {
+    fn default() -> Self {
+        Self {
+            gap: Duration::from_secs(30),
+            // As long as any other request may take, so no upload loses time it had before.
+            total: REQUEST_TIMEOUT,
+        }
+    }
+}
 /// How long any request may take, and a backup, which reads and encrypts the whole database.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKUP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -167,12 +185,24 @@ async fn write_gate(State(state): State<AppState>, request: Request, next: Next)
         return body::too_large().into_response();
     };
     parts.extensions.insert(principal);
-    let _writing = state.keyring.writing().await;
+    let _writing = if uses_root_key(parts.uri.path()) {
+        Some(state.keyring.writing().await)
+    } else {
+        None
+    };
     if let Err(error) = state.keyring.check_fingerprint(state.store.as_ref()).await {
         return error.into_response();
     }
     next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
         .await
+}
+
+/// Whether a write may encrypt under the root key, and so must not overlap its rotation. A logo
+/// is stored as it is, and its upload can wait a long while for a decode slot, which would
+/// otherwise hold every rotation up.
+fn uses_root_key(path: &str) -> bool {
+    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    !matches!(segments.as_slice(), ["", "api", "v1", "projects", _, "logo"])
 }
 
 /// System changes that write under the root key. Sealing is left out so it always works.
@@ -233,6 +263,10 @@ fn logged_path(uri: &axum::http::Uri) -> &str {
 }
 
 pub fn app(state: AppState) -> Router {
+    app_with(state, BodyTimeouts::default())
+}
+
+pub fn app_with(state: AppState, body: BodyTimeouts) -> Router {
     let (api, openapi) = api::router().split_for_parts();
     Router::new()
         .merge(api)
@@ -248,7 +282,8 @@ pub fn app(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
         // Outside tracing, so a sealed server does not log every refused request as an error.
         .layer(middleware::from_fn_with_state(state.clone(), seal_gate))
-        .layer(RequestBodyTimeoutLayer::new(BODY_TIMEOUT))
+        .layer(RequestBodyTimeoutLayer::new(body.gap))
+        .layer(RequestBodyDeadlineLayer::new(body.total))
         .layer(middleware::from_fn(request_timeout))
         .layer(middleware::from_fn_with_state(state.clone(), security_headers))
         .layer(middleware::from_fn(peer::record_peer))
@@ -427,5 +462,25 @@ mod tests {
         assert_eq!(time_limit("/api/v1/sys/backup"), Some(BACKUP_TIMEOUT));
         assert_eq!(time_limit("/api/v1/projects"), Some(REQUEST_TIMEOUT));
         assert_eq!(time_limit("/api/v1/sys/passphrase/"), Some(REQUEST_TIMEOUT));
+    }
+
+    #[test]
+    fn every_body_has_a_total_deadline() {
+        let timeouts = BodyTimeouts::default();
+        assert!(timeouts.total <= REQUEST_TIMEOUT && timeouts.gap <= timeouts.total);
+    }
+
+    #[test]
+    fn only_logo_uploads_skip_the_rotation_lock() {
+        assert!(!uses_root_key("/api/v1/projects/app/logo"));
+        assert!(!uses_root_key("/api/v1/projects/app/logo/"));
+        for writes in [
+            "/api/v1/projects/logo",
+            "/api/v1/projects",
+            "/api/v1/projects/app/environments/prod/secrets/logo",
+            "/api/v1/projects/app/roles/logo",
+        ] {
+            assert!(uses_root_key(writes), "{writes}");
+        }
     }
 }

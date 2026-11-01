@@ -232,6 +232,12 @@ fn fingerprint_in(path: &Path) -> anyhow::Result<String> {
     Ok(RootKey::parse(&text).context("parse")?.fingerprint())
 }
 
+/// What the epoch marks record for the key in `path`.
+fn pin_in(path: &Path) -> anyhow::Result<String> {
+    let text = std::fs::read(path).context("key file")?;
+    RootKey::parse(&text).context("parse")?.pin().context("pin")
+}
+
 /// Switching mode replaces the root key, so whatever opened the database before, an old key
 /// file or the old passphrase with an old wrap, opens nothing in it afterwards.
 #[tokio::test]
@@ -265,7 +271,14 @@ async fn switching_the_seal_mode_replaces_the_root_key() -> anyhow::Result<()> {
         Some(second.clone())
     );
     let marks = sekret_server::config::epoch_files(&fixture.db, None, Some(&fixture.path().join("root.key")), None);
-    assert_eq!(accepted_roots(&marks), Some(vec![second.clone()]));
+    assert_eq!(
+        accepted_roots(&marks),
+        Some(vec![pin_in(&fixture.path().join("root.key"))?])
+    );
+    assert!(
+        !fixture.path().join("root.key.new").exists(),
+        "the new key was staged and moved into place"
+    );
     let wrapped = unwrap_root_key(&old_wrap, PASSPHRASE).context("the old wrap still opens")?;
     assert_ne!(wrapped.fingerprint(), second, "but only the old key");
 
@@ -316,12 +329,13 @@ fn copy_database(from: &Path, to: &Path) -> anyhow::Result<()> {
 #[tokio::test]
 async fn only_reset_epoch_adopt_root_key_accepts_a_key_the_marks_do_not_name() -> anyhow::Result<()> {
     let (fixture, granting) = rolled_forward().await?;
-    let first = Fixture::root(&granting)?.fingerprint();
+    let first_key = Fixture::root(&granting)?;
+    let first = first_key.fingerprint();
     let live = fixture.path().join("sekret.db");
     let saved = fixture.path().join("saved.db");
     copy_database(&live, &saved)?;
     fixture.admin(&["rotate-root-key"])?;
-    let rotated = Fixture::root(&fixture.config().await?)?.fingerprint();
+    let rotated = Fixture::root(&fixture.config().await?)?.pin()?;
     assert_eq!(accepted_roots(&fixture.marks()), Some(vec![rotated]));
 
     copy_database(&saved, &live)?;
@@ -336,7 +350,7 @@ async fn only_reset_epoch_adopt_root_key_accepts_a_key_the_marks_do_not_name() -
     }
     let printed = fixture.admin(&["reset-epoch", "--adopt-root-key"])?;
     assert!(printed.contains(&first), "{printed}");
-    assert_eq!(accepted_roots(&fixture.marks()), Some(vec![first]));
+    assert_eq!(accepted_roots(&fixture.marks()), Some(vec![first_key.pin()?]));
     let config = fixture.config().await?;
     assert_eq!(high_water(&fixture.marks()).highest, Some(config.epoch));
     fixture.admin(&["bootstrap"])?;
@@ -379,7 +393,7 @@ async fn an_epoch_file_is_raised_by_the_offline_commands() -> anyhow::Result<()>
     let config = fixture.config().await?;
     assert_eq!(high_water(std::slice::from_ref(&extra)).highest, Some(config.epoch));
     let root = Fixture::root(&config)?;
-    assert_eq!(accepted_roots(&[extra]), Some(vec![root.fingerprint()]));
+    assert_eq!(accepted_roots(&[extra]), Some(vec![root.pin()?]));
     Ok(())
 }
 
@@ -467,6 +481,87 @@ async fn rotating_in_passphrase_mode_replaces_the_key_file() -> anyhow::Result<(
     let new = Fixture::root(&fixture.config().await?)?;
     assert_ne!(new.fingerprint(), old.fingerprint());
     assert_eq!(fingerprint_in(&fixture.path().join("root.key"))?, new.fingerprint());
+    assert!(
+        !fixture.path().join("root.key.new").exists(),
+        "the staged key was moved into place"
+    );
     fixture.admin(&["bootstrap", "--root-key-file", "root.key"])?;
+    Ok(())
+}
+
+/// A rotation that fails before the commit leaves the key file and the database as they were,
+/// and takes away the key it staged; one left by an earlier run is replaced, never trusted.
+#[tokio::test]
+async fn a_rotation_that_fails_leaves_no_staged_key_behind() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let old = fixture.with_key_file().await?;
+    std::fs::write(fixture.path().join("root.key.new"), b"left by a crash").context("stale")?;
+    // A value that no longer decrypts makes the rotation refuse before it commits.
+    let store = fixture.store().await?;
+    let root = Fixture::root(&fixture.config().await?)?;
+    let dek = sekret_core::crypto::DataKey::generate()?;
+    let project = sekret_store::Project {
+        id: "p1".into(),
+        slug: "app".into(),
+        name: "app".into(),
+        description: String::new(),
+        wrapped_key: sekret_core::crypto::wrap_data_key(&RootKey::generate()?, &dek, "p1")?,
+        created_at: 0,
+        logo_updated_at: None,
+        secret_policy: None,
+    };
+    store.create_project(project, vec![]).await?;
+    drop(store);
+    let refused = fixture.admin_output(&["rotate-root-key", "--root-key-file", "root.key"])?;
+    assert!(
+        !refused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!fixture.path().join("root.key.new").exists(), "nothing staged is left");
+    assert_eq!(fingerprint_in(&fixture.path().join("root.key"))?, old.fingerprint());
+    assert_eq!(
+        Fixture::root(&fixture.config().await?)?.fingerprint(),
+        root.fingerprint()
+    );
+    Ok(())
+}
+
+/// Switching to key-file mode refuses a key file that is already there before changing anything,
+/// rather than after the database has moved to a key it then cannot write.
+#[tokio::test]
+async fn set_seal_mode_refuses_an_existing_key_file_before_changing_anything() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let before = fixture.config().await?;
+    std::fs::write(fixture.path().join("root.key"), b"someone else's file").context("key file")?;
+    let refused = fixture.admin_output(&["set-seal-mode", "key-file", "--root-key-file", "root.key"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("already exists"), "{shown}");
+    assert_eq!(fixture.config().await?, before, "the database was not touched");
+    assert_eq!(
+        std::fs::read(fixture.path().join("root.key")).context("key file")?,
+        b"someone else's file"
+    );
+    assert!(!fixture.path().join("root.key.new").exists());
+
+    std::fs::remove_file(fixture.path().join("root.key")).context("remove")?;
+    fixture.admin(&["set-seal-mode", "key-file", "--root-key-file", "root.key"])?;
+    let config = fixture.config().await?;
+    assert_eq!(config.mode, SealMode::KeyFile);
+    assert!(!fixture.path().join("root.key.new").exists(), "moved into place");
+    fixture.admin(&["bootstrap", "--root-key-file", "root.key"])?;
+    Ok(())
+}
+
+/// A 32-character password in a key file is refused rather than taken as 32 raw key bytes.
+#[tokio::test]
+async fn a_password_is_not_accepted_as_a_raw_root_key() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    std::fs::write(fixture.path().join("root.key"), b"correct horse battery staple 123").context("key file")?;
+    let refused = fixture.admin_output(&["bootstrap", "--root-key-file", "root.key"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("password is not a key"), "{shown}");
     Ok(())
 }

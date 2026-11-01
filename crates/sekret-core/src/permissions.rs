@@ -142,47 +142,57 @@ pub enum Decision {
     Deny,
 }
 
+/// Most path and key patterns one role may hold, so checking it stays cheap.
+pub const MAX_ROLE_PATTERNS: usize = 200;
+/// Most path and key patterns across every role one principal is bound to in a project.
+pub const MAX_PRINCIPAL_PATTERNS: usize = 400;
+
+/// The path and key patterns in `rules`, which are what make a check cost anything.
+pub fn pattern_count(rules: &[Rule]) -> usize {
+    rules
+        .iter()
+        .map(|r| r.conditions.paths.len() + r.conditions.keys.len())
+        .sum()
+}
+
+/// One condition list against one field. `unknown` is the answer when the field is unset.
+fn condition_hits(list: &[String], field: Option<&str>, unknown: bool, hit: impl Fn(&str, &str) -> bool) -> bool {
+    if list.is_empty() {
+        return true;
+    }
+    field.map_or(unknown, |value| list.iter().any(|item| hit(item, value)))
+}
+
+fn tags_hit(list: &[String], tags: Option<&[String]>, unknown: bool) -> bool {
+    if list.is_empty() {
+        return true;
+    }
+    tags.map_or(unknown, |tags| tags.iter().any(|t| list.contains(t)))
+}
+
+/// Whether every condition holds, checking the cheap ones first and stopping at the first miss.
+/// An unknown field counts as `unknown`.
+fn conditions_hold(conditions: &Conditions, resource: &Resource<'_>, unknown: bool) -> bool {
+    condition_hits(&conditions.environments, resource.environment, unknown, |e, env| {
+        e == env
+    }) && tags_hit(&conditions.tags, resource.tags, unknown)
+        && condition_hits(&conditions.keys, resource.key, unknown, |g, key| {
+            glob_match(g, key, None)
+        })
+        && condition_hits(&conditions.paths, resource.path, unknown, |g, path| {
+            glob_match(g, path, Some('/'))
+        })
+}
+
 /// For an allow rule every non-empty condition must positively match.
 fn allow_applies(conditions: &Conditions, resource: &Resource<'_>) -> bool {
-    let env_ok = conditions.environments.is_empty()
-        || resource
-            .environment
-            .is_some_and(|env| conditions.environments.iter().any(|e| e == env));
-    let path_ok = conditions.paths.is_empty()
-        || resource
-            .path
-            .is_some_and(|path| conditions.paths.iter().any(|g| glob_match(g, path, Some('/'))));
-    let key_ok = conditions.keys.is_empty()
-        || resource
-            .key
-            .is_some_and(|key| conditions.keys.iter().any(|g| glob_match(g, key, None)));
-    let tags_ok = conditions.tags.is_empty()
-        || resource
-            .tags
-            .is_some_and(|tags| tags.iter().any(|t| conditions.tags.contains(t)));
-    env_ok && path_ok && key_ok && tags_ok
+    conditions_hold(conditions, resource, false)
 }
 
 /// A deny rule applies unless the resource is known to fall outside it, so a deny scoped to
 /// `prod` still blocks a request whose environment is unknown.
 fn deny_applies(conditions: &Conditions, resource: &Resource<'_>) -> bool {
-    let env_hit = conditions.environments.is_empty()
-        || resource
-            .environment
-            .is_none_or(|env| conditions.environments.iter().any(|e| e == env));
-    let path_hit = conditions.paths.is_empty()
-        || resource
-            .path
-            .is_none_or(|path| conditions.paths.iter().any(|g| glob_match(g, path, Some('/'))));
-    let key_hit = conditions.keys.is_empty()
-        || resource
-            .key
-            .is_none_or(|key| conditions.keys.iter().any(|g| glob_match(g, key, None)));
-    let tags_hit = conditions.tags.is_empty()
-        || resource
-            .tags
-            .is_none_or(|tags| tags.iter().any(|t| conditions.tags.contains(t)));
-    env_hit && path_hit && key_hit && tags_hit
+    conditions_hold(conditions, resource, true)
 }
 
 pub fn authorise(rules: &[Rule], subject: Subject, action: Action, resource: &Resource<'_>) -> Decision {
@@ -726,6 +736,88 @@ mod tests {
             arb_conditions(),
         )
             .prop_map(|(allow, actions, c)| scoped(if allow { Effect::Allow } else { Effect::Deny }, &actions, c))
+    }
+
+    #[test]
+    fn only_path_and_key_patterns_are_counted() {
+        let conditions = Conditions {
+            environments: vec!["prod".into(), "dev".into()],
+            paths: vec!["/a/**".into(), "/b/*".into()],
+            keys: vec!["DB_*".into()],
+            tags: vec!["pii".into()],
+        };
+        let rules = vec![
+            scoped(Effect::Allow, &[Action::Read], conditions.clone()),
+            scoped(Effect::Deny, &[Action::Edit], conditions),
+            Rule::allow(Subject::Secrets, &[Action::Read]),
+        ];
+        assert_eq!(pattern_count(&rules), 6);
+        assert_eq!(pattern_count(&[]), 0);
+    }
+
+    /// Every condition list must hit, whichever misses first, and an unknown field misses an
+    /// allow but hits a deny.
+    #[test]
+    fn any_missing_condition_stops_the_rule() {
+        let conditions = Conditions {
+            environments: vec!["prod".into()],
+            paths: vec!["/app/**".into()],
+            keys: vec!["DB_*".into()],
+            tags: vec!["pii".into()],
+        };
+        let tags = ["pii".to_string()];
+        let full = Resource {
+            environment: Some("prod"),
+            path: Some("/app/x"),
+            key: Some("DB_URL"),
+            tags: Some(&tags),
+        };
+        assert!(allow_applies(&conditions, &full));
+        assert!(deny_applies(&conditions, &full));
+        let misses = [
+            Resource {
+                environment: Some("dev"),
+                ..full.clone()
+            },
+            Resource {
+                path: Some("/other"),
+                ..full.clone()
+            },
+            Resource {
+                key: Some("API_KEY"),
+                ..full.clone()
+            },
+            Resource {
+                tags: Some(&[]),
+                ..full.clone()
+            },
+        ];
+        for miss in &misses {
+            assert!(!allow_applies(&conditions, miss), "{miss:?}");
+            assert!(!deny_applies(&conditions, miss), "{miss:?}");
+        }
+        let unknowns = [
+            Resource {
+                environment: None,
+                ..full.clone()
+            },
+            Resource {
+                path: None,
+                ..full.clone()
+            },
+            Resource {
+                key: None,
+                ..full.clone()
+            },
+            Resource {
+                tags: None,
+                ..full.clone()
+            },
+        ];
+        for unknown in &unknowns {
+            assert!(!allow_applies(&conditions, unknown), "{unknown:?}");
+            assert!(deny_applies(&conditions, unknown), "{unknown:?}");
+        }
     }
 
     fn arb_resource() -> impl Strategy<Value = (String, String)> {

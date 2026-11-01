@@ -14,6 +14,7 @@ import { PassphraseInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
 import { keys } from "@/hooks/queries";
 import { useCountdown } from "@/hooks/use-countdown";
+import { useIdle } from "@/hooks/use-idle";
 import { backoffSeconds, errorMessage } from "@/lib/errors";
 import { signOut } from "@/lib/session";
 
@@ -28,6 +29,7 @@ export function UnlockPage() {
   const [empty, setEmpty] = useState(false);
   const [backoffUntil, setBackoffUntil] = useState(0);
   const waitSeconds = useCountdown(backoffUntil);
+  useIdle(passphrase !== "", () => setPassphrase(""));
 
   const unseal = useMutation({
     mutationFn: () => api.unseal(passphrase),

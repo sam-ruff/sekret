@@ -29,9 +29,11 @@ pub struct ClientArgs {
     /// other users in the process list; prefer SEKRET_TOKEN.
     #[arg(long, global = true, env = "SEKRET_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
-    #[arg(long, short = 'p', global = true, env = "SEKRET_PROJECT")]
+    /// Project slug. Defaults to SEKRET_PROJECT, then the project file.
+    #[arg(long, short = 'p', global = true)]
     pub project: Option<String>,
-    #[arg(long = "env", short = 'e', global = true, env = "SEKRET_ENVIRONMENT")]
+    /// Environment slug. Defaults to SEKRET_ENVIRONMENT, then the project file.
+    #[arg(long = "env", short = 'e', global = true)]
     pub environment: Option<String>,
     /// Folder path within the environment.
     #[arg(long, global = true, env = "SEKRET_PATH")]
@@ -330,12 +332,16 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
         eprintln!("sekret: {warning}");
     }
     let credentials = read_credentials(&config::credentials_path()?)?;
+    let var = |name: &str| std::env::var(name).ok();
     config::resolve(
         Overrides {
             server: args.server.clone(),
             token: args.token.clone(),
             project: args.project.clone(),
             environment: args.environment.clone(),
+            env_project: var("SEKRET_PROJECT").filter(|v| !v.is_empty()),
+            env_environment: var("SEKRET_ENVIRONMENT").filter(|v| !v.is_empty()),
+            loaded_file: var(config::LOADED_FILE_VAR),
             path: args.path.clone(),
         },
         file,
@@ -1010,6 +1016,8 @@ pub struct EnvUse<'a> {
     pub policy: &'a shell::LoadPolicy,
     /// Keys the previous switch loaded, to unset first.
     pub previous: &'a [String],
+    /// The project file in force, recorded so another folder's file is not overridden.
+    pub project_file: Option<&'a std::path::Path>,
 }
 
 /// Writes shell code that switches to `at`, and a summary for the person or agent on `notes`.
@@ -1025,6 +1033,10 @@ pub async fn env_use(
         project: at.project,
         environment: at.environment,
         path: at.path,
+        project_file: options
+            .project_file
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     };
     let switch = shell::switch_script(
         options.shell,
@@ -1351,7 +1363,7 @@ mod tests {
                 environment: "dev".into(),
                 secrets: vec![RawSecret {
                     path: "/".into(),
-                    key: "GREETING".into(),
+                    key: "APP_GREETING".into(),
                     value: "hello world".into(),
                 }],
             })
@@ -1367,9 +1379,9 @@ mod tests {
         )
         .await
         .context("export")?;
-        assert_eq!(out, b"GREETING=\"hello world\"\n");
+        assert_eq!(out, b"APP_GREETING=\"hello world\"\n");
 
-        let args = run_args("test \"$GREETING\" = 'hello world' && exit 7");
+        let args = run_args("test \"$APP_GREETING\" = 'hello world' && exit 7");
         assert_eq!(
             run_command(&api, at(), &args, &strict(), &mut Vec::new())
                 .await
@@ -1403,17 +1415,17 @@ mod tests {
                 secrets: vec![
                     RawSecret {
                         path: "/".into(),
-                        key: "PLAIN".into(),
+                        key: "PLAIN_VALUE".into(),
                         value: "fine".into(),
                     },
                     RawSecret {
                         path: "/".into(),
-                        key: "TRAP".into(),
+                        key: "TRAP_VALUE".into(),
                         value: HOSTILE.into(),
                     },
                     RawSecret {
                         path: "/".into(),
-                        key: "BIDI".into(),
+                        key: "BIDI_VALUE".into(),
                         value: "a\u{202e}b".into(),
                     },
                 ],
@@ -1499,7 +1511,7 @@ mod tests {
             project: "app".into(),
             environment: "dev".into(),
             secrets: vec![
-                secret("GREETING", "hi"),
+                secret("APP_GREETING", "hi"),
                 secret("SEKRET_URL", "https://evil.test"),
                 secret("HTTPS_PROXY", "http://evil.test:3128"),
                 secret("GIT_ASKPASS", "/tmp/evil"),
@@ -1513,7 +1525,7 @@ mod tests {
         let mut api = MockSekretApi::new();
         api.expect_raw().returning(|_, _| Ok(hostile_raw()));
         let args = run_args(
-            "test \"$GREETING\" = hi && test \"${HTTPS_PROXY-}\" != http://evil.test:3128 \
+            "test \"$APP_GREETING\" = hi && test \"${HTTPS_PROXY-}\" != http://evil.test:3128 \
              && test \"${GIT_ASKPASS-}\" != /tmp/evil \
              && test \"${SEKRET_URL-unset}\" != https://evil.test && exit 7",
         );
@@ -1534,7 +1546,7 @@ mod tests {
                 .await
                 .context("export")?;
             let out = String::from_utf8(out).context("utf8")?;
-            assert!(out.contains("GREETING"), "{format:?}");
+            assert!(out.contains("APP_GREETING"), "{format:?}");
             for hidden in ["SEKRET_URL", "HTTPS_PROXY", "GIT_ASKPASS", "bad.key"] {
                 assert!(!out.contains(hidden), "{format:?}: {hidden} in {out}");
             }
@@ -1620,6 +1632,8 @@ mod tests {
             allow: vec![],
             unconfirmed_allow: None,
             chosen_by_file: None,
+            project_file: None,
+            stale_shell: None,
         }
     }
 
@@ -1850,6 +1864,7 @@ mod tests {
             recursive: false,
             policy: &strict(),
             previous: &["OLD".into()],
+            project_file: Some(std::path::Path::new("/repo/.sekret.toml")),
         };
         env_use(&api, prod, options, &mut out, &mut notes)
             .await
@@ -1859,6 +1874,7 @@ mod tests {
         assert!(script.starts_with("unset OLD\n"));
         assert!(script.contains("export DB_PASSWORD='hunter2'"));
         assert!(script.contains("export SEKRET_ENVIRONMENT='prod'"));
+        assert!(script.contains("export SEKRET_LOADED_FILE='/repo/.sekret.toml'"));
         assert!(notes.contains("loaded 1 secrets from app/prod"));
         assert!(notes.contains("bad.key"));
         assert!(!notes.contains("hunter2"), "values never reach the notes");
@@ -1882,6 +1898,7 @@ mod tests {
             recursive: false,
             policy: &strict(),
             previous: &[],
+            project_file: None,
         };
         let result = env_use(&api, at(), options, &mut out, &mut notes).await;
         assert!(result.is_err());

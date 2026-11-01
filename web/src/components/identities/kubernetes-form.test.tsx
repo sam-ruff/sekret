@@ -1,8 +1,17 @@
-import { render, screen } from "@testing-library/react";
+import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { REDACTED_CREDENTIAL, type KubernetesAuthConfig } from "@/api/types";
+import { renderWithProviders } from "@/test/render";
 import { KubernetesForm } from "./kubernetes-form";
+
+// Lets a test say the page has gone idle without waiting three minutes.
+const idle = vi.hoisted(() => ({ fire: undefined as (() => void) | undefined }));
+vi.mock("@/hooks/use-idle", () => ({
+  useIdle: (active: boolean, onIdle: () => void) => {
+    idle.fire = active ? onIdle : undefined;
+  },
+}));
 
 const config = (reviewer_jwt: string | null): KubernetesAuthConfig => ({
   mode: "token-review",
@@ -15,12 +24,29 @@ const config = (reviewer_jwt: string | null): KubernetesAuthConfig => ({
 
 function renderForm(initial?: KubernetesAuthConfig) {
   const onSave = vi.fn<(config: KubernetesAuthConfig) => void>();
-  render(<KubernetesForm initial={initial} busy={false} onSave={onSave} />);
+  renderWithProviders(<KubernetesForm initial={initial} busy={false} onSave={onSave} />);
   const saved = () => onSave.mock.calls.at(-1)?.[0];
   return { onSave, saved };
 }
 
 describe("KubernetesForm reviewer token", () => {
+  it("drops a pasted token after the page sits idle and goes back to the stored one", async () => {
+    renderForm(config(REDACTED_CREDENTIAL));
+    await userEvent.click(screen.getByTestId("k8s-reviewer-jwt-replace"));
+    await userEvent.type(screen.getByTestId("k8s-reviewer-jwt"), "eyJ.pasted.token");
+    expect(idle.fire).toBeDefined();
+
+    act(() => idle.fire?.());
+    expect(screen.queryByTestId("k8s-reviewer-jwt")).toBeNull();
+    expect(screen.getByTestId("k8s-reviewer-jwt-stored")).toHaveTextContent("Token stored");
+    expect(screen.queryByDisplayValue("eyJ.pasted.token")).toBeNull();
+  });
+
+  it("does not watch for idle while no token is typed", () => {
+    renderForm(config(null));
+    expect(idle.fire).toBeUndefined();
+  });
+
   it("shows a stored token without echoing the marker and sends the marker back", async () => {
     const { saved } = renderForm(config(REDACTED_CREDENTIAL));
     expect(screen.getByTestId("k8s-reviewer-jwt-stored")).toHaveTextContent("Token stored");

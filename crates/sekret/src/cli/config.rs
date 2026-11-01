@@ -253,13 +253,24 @@ pub fn read_text(path: &Path) -> anyhow::Result<String> {
     read_open(file, path)
 }
 
+/// TOML errors quote the offending line, so escape sequences in the file are made harmless.
+fn parse_toml<T: serde::de::DeserializeOwned>(text: &str, path: &Path) -> anyhow::Result<T> {
+    toml::from_str(text).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {}: {}",
+            sekret_client::terminal_safe(&path.display().to_string()),
+            sekret_client::terminal_safe(&e.to_string())
+        )
+    })
+}
+
 /// The project file and where it was found.
 pub fn load_project_file(start: &Path, warnings: &mut Vec<String>) -> anyhow::Result<(ProjectFile, Option<PathBuf>)> {
     let Some((path, opened)) = find_project_file(start, warnings) else {
         return Ok((ProjectFile::default(), None));
     };
     let text = read_open(opened, &path)?;
-    let mut file: ProjectFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let mut file: ProjectFile = parse_toml(&text, &path)?;
     file.location = Some(std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
     Ok((file, Some(path)))
 }
@@ -331,7 +342,7 @@ pub fn load_credentials(path: &Path, warnings: &mut Vec<String>) -> anyhow::Resu
     #[cfg(not(unix))]
     let _ = (&meta, &warnings);
     let text = zeroize::Zeroizing::new(read_open(file, path)?);
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    parse_toml(&text, path)
 }
 
 /// Writes the credentials file readable only by the current user, in a directory only they can
@@ -370,15 +381,89 @@ pub struct Resolved {
     pub unconfirmed_allow: Option<(AllowScope, Vec<String>)>,
     /// The project file chose the project or environment, rather than a flag or variable.
     pub chosen_by_file: Option<PathBuf>,
+    /// The nearest trusted project file, which `env use` records in the shell.
+    pub project_file: Option<PathBuf>,
+    /// Why the project or environment `env use` left in this shell must not be used here.
+    pub stale_shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub server: Option<String>,
     pub token: Option<String>,
+    /// From `--project`; `env_project` holds `SEKRET_PROJECT`.
     pub project: Option<String>,
+    /// From `--env`; `env_environment` holds `SEKRET_ENVIRONMENT`.
     pub environment: Option<String>,
+    pub env_project: Option<String>,
+    pub env_environment: Option<String>,
+    /// [`LOADED_FILE_VAR`]: set by `env use` to the project file it loaded under, empty for none.
+    pub loaded_file: Option<String>,
     pub path: Option<String>,
+}
+
+/// Records which project file the last `env use` ran under, so another one can tell the shell's
+/// `SEKRET_PROJECT` and `SEKRET_ENVIRONMENT` were not meant for it.
+pub const LOADED_FILE_VAR: &str = "SEKRET_LOADED_FILE";
+
+/// Refuses a project or environment that `env use` exported under a different project file, when
+/// the nearer file here names another one. Values set by hand or by CI are not checked.
+fn stale_shell_choice(overrides: &Overrides, file: &ProjectFile) -> Option<String> {
+    let loaded_in = overrides.loaded_file.as_deref()?;
+    let here = file
+        .location
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if loaded_in == here {
+        return None;
+    }
+    let here = sekret_client::terminal_safe(&here);
+    let clash = |flag: &Option<String>, env: &Option<String>, in_file: &Option<String>, name: &str| {
+        let (None, Some(env), Some(in_file)) = (flag, env, in_file) else {
+            return None;
+        };
+        (env != in_file).then(|| {
+            format!(
+                "{name} is {} in this shell but {here} says {}",
+                sekret_client::terminal_safe(env),
+                sekret_client::terminal_safe(in_file)
+            )
+        })
+    };
+    let clashes: Vec<String> = [
+        clash(
+            &overrides.project,
+            &overrides.env_project,
+            &file.project,
+            "SEKRET_PROJECT",
+        ),
+        clash(
+            &overrides.environment,
+            &overrides.env_environment,
+            &file.environment,
+            "SEKRET_ENVIRONMENT",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if clashes.is_empty() {
+        return None;
+    }
+    let shown_from = if loaded_in.is_empty() {
+        "no project file".to_string()
+    } else {
+        sekret_client::terminal_safe(loaded_in)
+    };
+    Some(
+        format!(
+            "{}; these were loaded by `sekret-env` under {shown_from}, so not using them here. Run `sekret-env off` \
+             to use this folder's file, or pass --project and --env to choose",
+            clashes.join(" and ")
+        )
+        .replace(['\n', '\t'], " "),
+    )
 }
 
 /// Flags (which already include environment variables via clap) win over the project file,
@@ -389,6 +474,7 @@ pub fn resolve(
     credentials: &Credentials,
     now: i64,
 ) -> anyhow::Result<Resolved> {
+    let stale_shell = stale_shell_choice(&overrides, &file);
     let from_flag = overrides.server.is_some();
     let Some(server) = overrides.server.or(file.server) else {
         bail!("no server configured; pass --server, set SEKRET_URL or add `server` to {PROJECT_FILE}");
@@ -416,11 +502,13 @@ pub fn resolve(
             .filter(|stored| stored.expires_at > now)
             .map(|stored| stored.token.clone())
     });
-    let chosen_by_file = ((overrides.project.is_none() && file.project.is_some())
-        || (overrides.environment.is_none() && file.environment.is_some()))
+    let flag_or_env_project = overrides.project.or(overrides.env_project);
+    let flag_or_env_environment = overrides.environment.or(overrides.env_environment);
+    let chosen_by_file = ((flag_or_env_project.is_none() && file.project.is_some())
+        || (flag_or_env_environment.is_none() && file.environment.is_some()))
     .then(|| file.location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)));
-    let project = overrides.project.or(file.project);
-    let environment = overrides.environment.or(file.environment);
+    let project = flag_or_env_project.or(file.project);
+    let environment = flag_or_env_environment.or(file.environment);
     let path = overrides.path.or(file.path).unwrap_or_else(|| "/".into());
     // A cloned repository's file must not unblock names on its own say-so.
     let scope = AllowScope {
@@ -447,6 +535,8 @@ pub fn resolve(
         allow,
         unconfirmed_allow,
         chosen_by_file,
+        project_file: file.location,
+        stale_shell,
     })
 }
 
@@ -483,7 +573,18 @@ impl Resolved {
         self.source != ServerSource::ProjectFile
     }
 
+    /// The project, unless it came from a shell loaded for another project file.
+    pub fn checked_project(&self) -> anyhow::Result<Option<String>> {
+        if let Some(reason) = &self.stale_shell {
+            bail!("{reason}");
+        }
+        Ok(self.project.clone())
+    }
+
     pub fn require_project(&self) -> anyhow::Result<(String, String)> {
+        if let Some(reason) = &self.stale_shell {
+            bail!("{reason}");
+        }
         let project = self
             .project
             .clone()
@@ -962,6 +1063,134 @@ mod tests {
         };
         let flagged = resolve(chosen, file, &Credentials::default(), 0)?;
         assert_eq!(flagged.chosen_by_file, None);
+        Ok(())
+    }
+
+    fn repo_b() -> anyhow::Result<ProjectFile> {
+        let mut file: ProjectFile = toml::from_str("server = \"https://s\"\nproject = \"b\"\nenvironment = \"dev\"\n")?;
+        file.location = Some("/repo-b/.sekret.toml".into());
+        Ok(file)
+    }
+
+    /// What `sekret-env prod` in repository A leaves in the shell.
+    fn shell_from_a(loaded_file: &str) -> Overrides {
+        Overrides {
+            env_project: Some("a".into()),
+            env_environment: Some("prod".into()),
+            loaded_file: Some(loaded_file.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_shell_loaded_for_another_project_file_does_not_override_this_one() -> anyhow::Result<()> {
+        let stale = resolve(
+            shell_from_a("/repo-a/.sekret.toml"),
+            repo_b()?,
+            &Credentials::default(),
+            0,
+        )?;
+        let reason = stale.stale_shell.clone().context("the clash is reported")?;
+        assert!(
+            reason.contains("SEKRET_PROJECT is a") && reason.contains("says b"),
+            "{reason}"
+        );
+        assert!(reason.contains("SEKRET_ENVIRONMENT is prod") && reason.contains("sekret-env off"));
+        let refused = stale.require_project().err().context("run and export are refused")?;
+        assert!(refused.to_string().contains("/repo-a/.sekret.toml"), "{refused}");
+        assert!(stale.checked_project().is_err(), "policy changes are refused too");
+
+        let none = resolve(shell_from_a(""), repo_b()?, &Credentials::default(), 0)?;
+        assert!(
+            none.stale_shell
+                .as_deref()
+                .is_some_and(|r| r.contains("no project file")),
+            "loaded outside any repository, then moved into one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_shell_choice_is_kept_where_it_was_made_or_when_chosen_by_flag() -> anyhow::Result<()> {
+        let same = resolve(
+            shell_from_a("/repo-b/.sekret.toml"),
+            repo_b()?,
+            &Credentials::default(),
+            0,
+        )?;
+        assert_eq!(same.stale_shell, None, "sekret-env prod inside B keeps prod");
+        assert_eq!(same.require_project()?, ("a".to_string(), "prod".to_string()));
+
+        let mut flagged = shell_from_a("/repo-a/.sekret.toml");
+        flagged.project = Some("a".into());
+        flagged.environment = Some("prod".into());
+        let flagged = resolve(flagged, repo_b()?, &Credentials::default(), 0)?;
+        assert_eq!(flagged.stale_shell, None, "flags are a deliberate choice");
+        assert_eq!(flagged.require_project()?, ("a".to_string(), "prod".to_string()));
+
+        let mut by_hand = shell_from_a("/repo-a/.sekret.toml");
+        by_hand.loaded_file = None;
+        let by_hand = resolve(by_hand, repo_b()?, &Credentials::default(), 0)?;
+        assert_eq!(by_hand.stale_shell, None, "variables set by hand or by CI still win");
+        assert_eq!(by_hand.require_project()?, ("a".to_string(), "prod".to_string()));
+
+        let mut agreeing = repo_b()?;
+        agreeing.project = Some("a".into());
+        agreeing.environment = None;
+        let agreeing = resolve(
+            shell_from_a("/repo-a/.sekret.toml"),
+            agreeing,
+            &Credentials::default(),
+            0,
+        )?;
+        assert_eq!(agreeing.stale_shell, None, "nothing in the file is overridden");
+
+        let outside = resolve(
+            shell_from_a("/repo-a/.sekret.toml"),
+            ProjectFile {
+                server: Some("https://s".into()),
+                ..Default::default()
+            },
+            &Credentials::default(),
+            0,
+        )?;
+        assert_eq!(outside.stale_shell, None, "no project file here to override");
+        Ok(())
+    }
+
+    #[test]
+    fn project_file_parse_errors_carry_no_escape_sequences() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        }
+        std::fs::write(
+            dir.path().join(PROJECT_FILE),
+            "project = 5 # \u{1b}]52;c;cm0gLXJmIH4=\u{7}\u{1b}]0;PWNED\u{7}\u{1b}[2J\n",
+        )
+        .context("write")?;
+        let error = load_project_file(dir.path(), &mut Vec::new())
+            .err()
+            .context("a bad file is refused")?;
+        let shown = format!("{error:#}");
+        assert!(shown.contains("parsing"), "{shown}");
+        assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'), "{shown:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn credentials_parse_errors_carry_no_escape_sequences() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("sekret").join("credentials.toml");
+        save_credentials(&path, &Credentials::default()).context("save")?;
+        std::fs::write(&path, "servers = 5 # \u{1b}]0;PWNED\u{7}\n").context("write")?;
+        let error = load_credentials(&path, &mut Vec::new())
+            .err()
+            .context("a bad file is refused")?;
+        let shown = format!("{error:#}");
+        assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'), "{shown:?}");
         Ok(())
     }
 

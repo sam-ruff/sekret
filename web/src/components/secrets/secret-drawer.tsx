@@ -50,9 +50,6 @@ function VersionDiff({ versions }: { versions: SecretVersion[] }) {
   const toText = versionText(versions.find((v) => String(v.version) === to));
   const lines = useMemo(() => diffLines(fromText, toText), [fromText, toText]);
 
-  if (choices.length < 2) {
-    return <p className="text-sm text-muted-foreground">There is only one version to compare.</p>;
-  }
   const hidden = versions.some((v) => v.value_hidden);
   const shown = lines?.slice(0, MAX_SHOWN_LINES) ?? [];
 
@@ -283,7 +280,7 @@ export function SecretDrawer({
               <>
                 <section className="space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h3 className="text-sm font-semibold">Compare versions</h3>
+                    <h3 className="text-sm font-semibold">History</h3>
                     <Button
                       variant="outline"
                       size="sm"
@@ -297,15 +294,12 @@ export function SecretDrawer({
                   </div>
                   {!showValues && (
                     <p className="text-sm text-muted-foreground" data-testid="history-values-hidden">
-                      Values are hidden. Showing them is recorded in the audit log.
+                      Values are hidden. Show them to see each version and compare versions. Showing them is recorded in
+                      the audit log.
                     </p>
                   )}
                   {withValues?.isPending && <ListSkeleton rows={1} />}
                   {withValues?.error && <ErrorState error={withValues.error} onRetry={() => void withValues.refetch()} />}
-                  {revealed && <VersionDiff key={currentVersion} versions={revealed} />}
-                </section>
-                <section className="space-y-3">
-                  <h3 className="text-sm font-semibold">History</h3>
                   <ol className="space-y-2" data-testid="version-list">
                     {list.map((v) => (
                       <VersionItem
@@ -320,6 +314,12 @@ export function SecretDrawer({
                     ))}
                   </ol>
                 </section>
+                {revealed && revealed.filter((v) => !v.deleted).length > 1 && (
+                  <section className="space-y-3" data-testid="compare-section">
+                    <h3 className="text-sm font-semibold">Compare versions</h3>
+                    <VersionDiff key={currentVersion} versions={revealed} />
+                  </section>
+                )}
               </>
             )}
             {secretKey && (
@@ -331,7 +331,7 @@ export function SecretDrawer({
           open={target !== null}
           onOpenChange={(open) => !open && setTarget(null)}
           title={`Roll back to version ${target}?`}
-          description={`This writes a new version of ${secretKey} with the value and tags from version ${target}. Nothing is lost; the current value stays in history.`}
+          description={`This writes a new version of ${secretKey} with the value and tags from version ${target}. Its comment becomes "rolled back to version ${target}" followed by that version's comment. Nothing is lost; the current value stays in history.`}
           confirmLabel="Roll back"
           onConfirm={() => rollback.mutateAsync(target ?? 0)}
           testId="rollback-confirm"

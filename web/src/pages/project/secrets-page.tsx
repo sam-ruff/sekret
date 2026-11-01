@@ -1,5 +1,5 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
+import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, Lock, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, Navigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -108,6 +108,35 @@ function NewFolderDialog({
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Stands in for the editor until the current value has loaded, or says why it could not. */
+function ValueLoadState({
+  secretKey,
+  error,
+  onRetry,
+  onCancel,
+}: {
+  secretKey: string;
+  error: Error | null;
+  onRetry: () => void;
+  onCancel: () => void;
+}) {
+  if (!error) return <ListSkeleton rows={1} />;
+  return (
+    <div className="space-y-3" data-testid={`edit-load-failed-${secretKey}`}>
+      <ErrorState error={error} onRetry={onRetry} />
+      <p className="text-sm text-muted-foreground">
+        The editor opens once the current value of <span className="font-mono">{secretKey}</span> has loaded, so a save
+        cannot replace it with an empty one.
+      </p>
+      <div className="flex justify-end">
+        <Button variant="outline" size="sm" onClick={onCancel} data-testid="edit-load-cancel">
+          Cancel
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -256,7 +285,9 @@ function SecretsView() {
   });
 
   const rotate = useApiMutation({
-    mutationFn: (key: string) => api.generateSecret(at, key, { comment: "rotated by hand" }),
+    // The comment describes the secret, so a rotation carries it forward; the audit log records the rotation.
+    mutationFn: (key: string) =>
+      api.generateSecret(at, key, { comment: list.data?.secrets.find((s) => s.key === key)?.comment ?? "" }),
     invalidate: [...invalidate, ["project", project, "policy"]],
     success: (_, key) => `Rotated ${key}`,
   });
@@ -307,6 +338,8 @@ function SecretsView() {
   const canCreateSecret = perms.canSomewhere("secrets", "create");
   const canCreateFolder = perms.canSomewhere("folders", "create");
   const canRollback = perms.canSomewhere("secrets", "edit");
+  const hiddenCount = secrets.filter((s) => s.value_hidden).length;
+  const nothingToReveal = secrets.length > 0 && hiddenCount === secrets.length;
   const isRevealed = (key: string) => (revealAll ? !hiddenFromAll.has(key) : revealed.has(key));
 
   const toggle = (set: Set<string>, key: string) => {
@@ -391,7 +424,7 @@ function SecretsView() {
                   }}
                   aria-label={revealAll ? "Hide all values" : "Reveal all values"}
                   data-testid="reveal-all"
-                  disabled={!perms.canSomewhere("secrets", "read-value")}
+                  disabled={!perms.canSomewhere("secrets", "read-value") || nothingToReveal}
                 >
                   {revealAll ? <EyeOff /> : <Eye />}
                 </Button>
@@ -515,8 +548,14 @@ function SecretsView() {
               {shownSecrets.map((secret) =>
                 editing === secret.key ? (
                   <div key={secret.key} className="border-b p-3 last:border-b-0">
-                    {singleQuery(secret.key)?.isPending !== false && !secret.value_hidden ? (
-                      <ListSkeleton rows={1} />
+                    {/* The update replaces the value, so the editor waits for it rather than starting empty. */}
+                    {!secret.value_hidden && valueOf(secret.key) === undefined ? (
+                      <ValueLoadState
+                        secretKey={secret.key}
+                        error={singleQuery(secret.key)?.error ?? null}
+                        onRetry={() => void singleQuery(secret.key)?.refetch()}
+                        onCancel={() => setEditing(null)}
+                      />
                     ) : (
                       <SecretEditor
                         isNew={false}
@@ -554,7 +593,7 @@ function SecretsView() {
                     key={secret.key}
                     secret={secret}
                     revealed={isRevealed(secret.key)}
-                    value={valueOf(secret.key)}
+                    value={isRevealed(secret.key) ? valueOf(secret.key) : undefined}
                     abilities={{
                       edit: perms.can("secrets", "edit", resourceFor(secret)),
                       remove: perms.can("secrets", "delete", resourceFor(secret)),
@@ -574,6 +613,13 @@ function SecretsView() {
                     }}
                   />
                 ),
+              )}
+              {hiddenCount > 0 && (
+                <p className="flex items-start gap-1.5 px-4 py-2.5 text-xs text-muted-foreground" data-testid="hidden-values-note">
+                  <Lock className="mt-0.5 size-3.5 shrink-0" />
+                  {nothingToReveal ? "Your roles do not let you read the values here." : `Your roles do not let you read ${hiddenCount === 1 ? "one of these values" : `${hiddenCount} of these values`}.`}{" "}
+                  Roles add up, but a deny rule in any of them wins over every role that allows the same thing.
+                </p>
               )}
               {hiddenRows > 0 && (
                 <div className="flex flex-wrap items-center justify-center gap-3 border-t px-4 py-3 text-sm text-muted-foreground">

@@ -25,6 +25,17 @@ function cellHref(project: string, env: string, path: string, missingKey?: strin
   return `/projects/${project}/secrets/${env}${query ? `?${query}` : ""}`;
 }
 
+/** Lets a long key wrap after each underscore before it has to break inside a word. */
+function BreakableKey({ value }: { value: string }) {
+  const parts = value.split(/(?<=_)/);
+  return parts.map((part, i) => (
+    <span key={i}>
+      {part}
+      {i < parts.length - 1 && <wbr />}
+    </span>
+  ));
+}
+
 export function OverviewPage() {
   const { project = "" } = useParams();
   const [search] = useSearchParams();
@@ -123,7 +134,8 @@ export function OverviewPage() {
           {incomplete.length > 0 ? (
             <>
               <AlertTriangle className="size-4 text-warning" />
-              {incomplete.length} of {rows.length} keys are missing from at least one environment.
+              {incomplete.length} of {rows.length} keys {incomplete.length === 1 ? "is" : "are"} missing from at least one
+              environment.
             </>
           ) : (
             <>
@@ -181,8 +193,8 @@ export function OverviewPage() {
                           <span className="size-3.5 shrink-0" aria-hidden />
                         )}
                         {/* Wraps rather than cuts off, so long keys can be told apart on a phone. */}
-                        <span className="max-w-[38vw] min-w-0 break-all md:max-w-sm" data-testid="overview-key">
-                          {row.key}
+                        <span className="max-w-[38vw] min-w-0 wrap-anywhere md:max-w-sm" data-testid="overview-key">
+                          <BreakableKey value={row.key} />
                         </span>
                       </span>
                     </td>

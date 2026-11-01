@@ -397,7 +397,8 @@ test.describe("server page", () => {
     await expect(page.getByTestId("server-status")).toContainText("Protected by");
     await expect(page.getByTestId("server-unsealed-by")).toHaveText("Passphrase, typed by a person");
     await expect(page.getByTestId("server-version")).toHaveText("0.0.0-mock");
-    await expect(page.getByTestId("server-status")).toContainText("Lock (seal) the server");
+    await expect(page.getByTestId("server-status")).toContainText("Lock the server");
+    await expect(page.getByTestId("lock-help")).toContainText("The CLI and the docs call this sealing.");
     await expect(page.getByTestId("lock-help")).toContainText("Locking drops the key from memory straight away.");
     await expect(page.getByTestId("server-key-file-override")).toHaveCount(0);
 
@@ -421,6 +422,21 @@ test.describe("server page", () => {
     await page.goto("/org/server?mock-unsealed-by=key-file");
     await expect(page.getByTestId("server-unsealed-by")).toHaveText("Root key file");
     await expect(page.getByTestId("server-key-file-override")).toContainText("A key file unlocked this server");
+  });
+
+  test("says the passphrase is changed on the host when a key file unlocked the server", async ({ page }) => {
+    await page.goto("/org/server?mock-unsealed-by=key-file");
+    const card = page.getByTestId("server-passphrase");
+    await card.getByTestId("current-passphrase").fill(PASSPHRASE);
+    await card.getByTestId("change-passphrase").fill(STRONG);
+    await card.getByTestId("change-confirm").fill(STRONG);
+    await card.getByTestId("change-submit").click();
+    await page.getByTestId("change-passphrase-dialog").getByTestId("confirm-action").click();
+    const alert = card.getByTestId("change-key-file");
+    await expect(alert).toContainText("This server also starts from a root key file");
+    await expect(alert).toContainText("sekret sys change-passphrase");
+    await expect(card.getByTestId("change-key-file-docs")).toHaveAttribute("href", /security\/#changing-the-passphrase$/);
+    await expect(card.getByTestId("change-error")).toHaveCount(0);
   });
 
   test("changes the passphrase", async ({ page }) => {

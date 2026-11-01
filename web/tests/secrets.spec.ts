@@ -227,4 +227,55 @@ test("hides values the role cannot read", async ({ page }) => {
   const row = secretRow(page, "HSM_PIN");
   await expect(row.getByTestId("secret-value")).toContainText("No access to value");
   await expect(row.getByTestId("secret-reveal")).toBeDisabled();
+  await expect(page.getByTestId("hidden-values-note")).toContainText("a deny rule in any of them wins");
+  await expect(page.getByTestId("reveal-all")).toBeDisabled();
+});
+
+test("a value the reader cannot see is only replaced by a typed one", async ({ page }) => {
+  await page.goto("/projects/payments-api/secrets/prod");
+  await secretAction(page, "HSM_PIN", "secret-edit");
+  const editor = page.getByTestId("edit-secret-HSM_PIN");
+  await editor.getByTestId("secret-comment-input").fill("only the comment");
+  await expect(editor.getByTestId("secret-blocker")).toHaveText("Enter a replacement value to continue.");
+  await expect(editor.getByTestId("secret-save")).toBeDisabled();
+});
+
+test("a value that fails to load never opens an empty editor", async ({ page }) => {
+  await expect(secretRow(page, "REDIS_URL")).toBeVisible();
+  await page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as {
+      mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
+    };
+    // The first read and both retries fail.
+    for (let i = 0; i < 3; i++) mock.mockFailNext("GET", "/secrets/REDIS_URL$", 500, "internal", "the database is busy");
+  });
+  await secretAction(page, "REDIS_URL", "secret-edit");
+  const failed = page.getByTestId("edit-load-failed-REDIS_URL");
+  await expect(failed).toContainText("so a save cannot replace it with an empty one", { timeout: 15_000 });
+  await expect(page.getByTestId("edit-secret-REDIS_URL")).toHaveCount(0);
+
+  await failed.getByRole("button", { name: "Try again" }).click();
+  const editor = page.getByTestId("edit-secret-REDIS_URL");
+  await expect(editor.getByTestId("secret-value-input")).toHaveValue("redis://localhost:6379/0");
+  await editor.getByTestId("secret-comment-input").fill("only the comment");
+  await editor.getByTestId("secret-save").click();
+  await expectToast(page, "Saved REDIS_URL");
+  await secretRow(page, "REDIS_URL").getByTestId("secret-reveal").click();
+  await expect(secretRow(page, "REDIS_URL").getByTestId("secret-value")).toHaveText("redis://localhost:6379/0");
+});
+
+test("cancelling a failed value load closes the editor slot", async ({ page }) => {
+  await expect(secretRow(page, "REDIS_URL")).toBeVisible();
+  await page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as {
+      mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
+    };
+    mock.mockFailNext("GET", "/secrets/REDIS_URL$", 403, "forbidden", "you cannot read this value");
+  });
+  await secretAction(page, "REDIS_URL", "secret-edit");
+  await expect(page.getByTestId("edit-load-failed-REDIS_URL")).toBeVisible();
+  await page.getByTestId("edit-load-cancel").click();
+  await expect(secretRow(page, "REDIS_URL")).toBeVisible();
 });

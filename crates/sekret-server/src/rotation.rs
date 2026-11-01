@@ -86,6 +86,15 @@ pub async fn plan_generated(
 }
 
 /// The actor recorded on automatic rotations.
+/// Keeps the secret's own comment, so rotation does not lose what the secret is for.
+fn rotation_comment(current: &str) -> String {
+    if current.is_empty() {
+        return "rotated automatically".into();
+    }
+    let kept = current.strip_prefix("rotated automatically: ").unwrap_or(current);
+    format!("rotated automatically: {kept}")
+}
+
 fn rotation_principal() -> Principal {
     Principal {
         kind: PrincipalKind::Identity,
@@ -139,7 +148,8 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
                         path: &s.secret.path,
                         key: &s.secret.key,
                     };
-                    let planned = plan_generated(&ctx, &rules, target, None, "rotated automatically".into()).await?;
+                    let comment = rotation_comment(&s.version.comment);
+                    let planned = plan_generated(&ctx, &rules, target, None, comment).await?;
                     apply(&ctx, planned).await
                 }
                 .await;
@@ -166,4 +176,22 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
         }
     }
     Ok(rotated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rotation_comment;
+
+    #[test]
+    fn rotation_keeps_the_secrets_comment_without_stacking_prefixes() {
+        assert_eq!(rotation_comment(""), "rotated automatically");
+        assert_eq!(
+            rotation_comment("stripe live key"),
+            "rotated automatically: stripe live key"
+        );
+        assert_eq!(
+            rotation_comment("rotated automatically: stripe live key"),
+            "rotated automatically: stripe live key"
+        );
+    }
 }

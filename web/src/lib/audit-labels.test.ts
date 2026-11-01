@@ -23,6 +23,11 @@ describe("describeDetail", () => {
     );
   });
 
+  it("describes an uploaded logo by format and size", () => {
+    expect(describeDetail("project.logo", { content_type: "image/png", bytes: 186 })).toBe("PNG image, 186 bytes");
+    expect(describeDetail("project.logo", { content_type: "image/svg+xml", bytes: 20_480 })).toBe("SVG image, 20.0 KB");
+  });
+
   it("describes policies instead of dumping JSON", () => {
     const policy = { generator: { length: 40, charset: "symbols" }, rotation_days: 30 };
     expect(describeDetail("project.secret-policy", { policy })).toBe("Generates 40 characters of symbols, rotates every 30 days");

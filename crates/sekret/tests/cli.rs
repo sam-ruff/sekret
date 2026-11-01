@@ -290,12 +290,17 @@ async fn cli_end_to_end(mode: Mode) -> anyhow::Result<()> {
 
     // Only a terminal is protected from escape sequences; a pipe or file gets the value exactly,
     // with or without --raw.
-    ok(run(&["secrets", "set", "TRAP=-"], &env, h, Some("x\u{1b}[2Jy\n"))?)?;
+    ok(run(
+        &["secrets", "set", "TRAP_VALUE=-"],
+        &env,
+        h,
+        Some("x\u{1b}[2Jy\n"),
+    )?)?;
     for args in [vec!["export"], vec!["export", "--raw"]] {
         let piped = ok(run(&args, &env, h, None)?)?;
-        assert!(piped.contains("TRAP=\"x\u{1b}[2Jy\""), "{args:?}: {piped:?}");
+        assert!(piped.contains("TRAP_VALUE=\"x\u{1b}[2Jy\""), "{args:?}: {piped:?}");
     }
-    ok(run(&["secrets", "delete", "TRAP"], &env, h, None)?)?;
+    ok(run(&["secrets", "delete", "TRAP_VALUE"], &env, h, None)?)?;
 
     let status = run(
         &["run", "--", "sh", "-c", "test \"$DB_URL\" = postgres://one && exit 3"],
@@ -663,6 +668,173 @@ impl Pki {
     fn path(&self, name: &str) -> String {
         self.dir.path().join(name).display().to_string()
     }
+}
+
+/// `sekret-env` in one repository must not quietly carry its project and environment into
+/// another repository whose project file names different ones.
+#[tokio::test]
+async fn a_shell_loaded_in_one_repository_is_refused_in_another() -> anyhow::Result<()> {
+    let server = start_server(Mode::KeyFile).await?;
+    for (slug, env, url) in [
+        ("app", "prod", "postgres://app-prod"),
+        ("other", "dev", "postgres://other-dev"),
+    ] {
+        api(
+            &server,
+            reqwest::Method::POST,
+            "/api/v1/projects",
+            json!({"slug": slug, "name": slug}),
+        )
+        .await?;
+        api(
+            &server,
+            reqwest::Method::POST,
+            &format!("/api/v1/projects/{slug}/environments/{env}/secrets/batch"),
+            json!({"upserts": [{"key": "DB_URL", "value": url}]}),
+        )
+        .await?;
+    }
+    let home = tempfile::tempdir().context("home")?;
+    for (dir, project) in [("a", "app"), ("b", "other")] {
+        let repo = home.path().join(dir);
+        std::fs::create_dir(&repo).context("repo dir")?;
+        std::fs::write(
+            repo.join(".sekret.toml"),
+            format!("project = \"{project}\"\nenvironment = \"dev\"\n"),
+        )
+        .context("project file")?;
+    }
+    let bin_dir = Path::new(BIN).parent().context("bin dir")?.display().to_string();
+    let script = r#"
+        eval "$(sekret shell-init bash)"
+        cd a && sekret-env prod
+        sekret run -- sh -c 'echo "1:$DB_URL"'
+        cd ../b
+        sekret run -- sh -c 'echo "2:$DB_URL"'
+        echo "2rc:$?"
+        sekret export --format dotenv
+        echo "3rc:$?"
+        sekret-env off
+        sekret run -- sh -c 'echo "4:$DB_URL:${SEKRET_PROJECT-unset}"'
+        sekret-env
+        echo "5:$SEKRET_PROJECT/$SEKRET_ENVIRONMENT"
+    "#;
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default()),
+        )
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("SEKRET_URL", &server.url)
+        .env("SEKRET_TOKEN", &server.admin)
+        .current_dir(home.path())
+        .output()
+        .context("bash")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("1:postgres://app-prod"), "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("2:"),
+        "B's command never runs with A's secrets: {stdout}"
+    );
+    assert!(
+        stdout.contains("2rc:1") && stdout.contains("3rc:1"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("app-prod\"\n"), "export is refused too: {stdout}");
+    assert!(
+        stderr.contains("SEKRET_PROJECT is app") && stderr.contains("sekret-env off"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("4:postgres://other-dev:unset"), "{stdout}\n{stderr}");
+    assert!(stdout.contains("5:/"), "nothing is left loaded: {stdout}");
+    Ok(())
+}
+
+/// Tool settings and unknown single-word names stay out of `run` and `export`, while ordinary
+/// app config still loads.
+#[tokio::test]
+async fn run_and_export_hold_back_tool_settings() -> anyhow::Result<()> {
+    let server = start_server(Mode::KeyFile).await?;
+    api(
+        &server,
+        reqwest::Method::POST,
+        "/api/v1/projects",
+        json!({"slug": "app", "name": "App"}),
+    )
+    .await?;
+    let home = tempfile::tempdir().context("home")?;
+    let h = home.path();
+    let marker = h.join("pwned");
+    let shell = format!("/bin/sh -c touch${{IFS}}{}", marker.display());
+    api(
+        &server,
+        reqwest::Method::POST,
+        "/api/v1/projects/app/environments/dev/secrets/batch",
+        json!({"upserts": [
+            {"key": "DATABASE_URL", "value": "postgres://db"},
+            {"key": "STRIPE_SECRET", "value": "sk"},
+            {"key": "PORT", "value": "8080"},
+            {"key": "CONFIG_SHELL", "value": shell},
+            {"key": "CLOUDSDK_PYTHON", "value": "/tmp/evil"},
+            {"key": "SED", "value": "/tmp/evil"},
+            {"key": "TMPDIR", "value": "/tmp/evil"},
+        ]}),
+    )
+    .await?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", server.admin.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "dev"),
+    ];
+    let probe = "test \"$DATABASE_URL\" = postgres://db && test \"$STRIPE_SECRET\" = sk && test \"$PORT\" = 8080 \
+                 && test -z \"${CONFIG_SHELL-}${CLOUDSDK_PYTHON-}${SED-}\" && test \"${TMPDIR-}\" != /tmp/evil \
+                 && ${CONFIG_SHELL:-true} && exit 7";
+    let ran = run(&["run", "--", "sh", "-c", probe], &env, h, None)?;
+    let notes = String::from_utf8_lossy(&ran.stderr).into_owned();
+    assert_eq!(ran.status.code(), Some(7), "{notes}");
+    assert!(!marker.exists());
+    assert!(
+        notes.contains("CONFIG_SHELL") && notes.contains("CLOUDSDK_PYTHON") && notes.contains("SED, TMPDIR"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("without an underscore") && !notes.contains("/tmp/evil"),
+        "{notes}"
+    );
+
+    let dotenv = ok(run(&["export"], &env, h, None)?)?;
+    assert!(dotenv.contains("DATABASE_URL=") && dotenv.contains("PORT="), "{dotenv}");
+    for held in ["CONFIG_SHELL", "CLOUDSDK_PYTHON", "SED=", "TMPDIR"] {
+        assert!(!dotenv.contains(held), "{held}: {dotenv}");
+    }
+
+    let allowed = run(
+        &[
+            "run",
+            "--allow",
+            "TMPDIR",
+            "--",
+            "sh",
+            "-c",
+            "test \"$TMPDIR\" = /tmp/evil && test -z \"${SED-}\" && exit 8",
+        ],
+        &env,
+        h,
+        None,
+    )?;
+    assert_eq!(
+        allowed.status.code(),
+        Some(8),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    Ok(())
 }
 
 #[tokio::test]

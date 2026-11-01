@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router";
 import { api } from "@/api/endpoints";
 import type { CreateEnvironment } from "@/api/types";
+import { FormBlocker } from "@/components/form-blocker";
 import { PageHeader } from "@/components/page-header";
 import { ProjectLogo } from "@/components/project-logo";
 import { EmptyState, ErrorState } from "@/components/states";
@@ -71,13 +72,22 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
   const updateEnv = (index: number, patch: Partial<CreateEnvironment>) =>
     setEnvs((current) => current.map((e, i) => (i === index ? { ...e, ...patch } : e)));
 
+  const validId = (id: string) => /^[a-z0-9][a-z0-9-]*$/.test(id);
+  const blocker =
+    name.trim() === ""
+      ? "Give the project a name to continue."
+      : !validId(slug)
+        ? "Fix the ID to continue: lowercase letters, digits and dashes, starting with a letter or digit."
+        : custom && envs.length === 0
+          ? "Add at least one environment to continue."
+          : custom && !envs.every((e) => e.name.trim() && validId(e.slug))
+            ? "Give every environment a name and a valid ID to continue."
+            : null;
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    create.mutate();
+    if (!blocker) create.mutate();
   };
-
-  const envsValid = !custom || (envs.length > 0 && envs.every((e) => e.name.trim() && /^[a-z0-9][a-z0-9-]*$/.test(e.slug)));
-  const valid = name.trim() !== "" && /^[a-z0-9][a-z0-9-]*$/.test(slug) && envsValid;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -175,11 +185,22 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
               </div>
             )}
           </FieldGroup>
-          <DialogFooter>
+          <DialogFooter className="sm:items-center">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!valid || create.isPending} data-testid="create-project-submit">
+            {/* Under the submit button on phones, at the left on wider screens. */}
+            {blocker && (
+              <FormBlocker id="project-blocker" testId="project-blocker" className="sm:order-first sm:mr-auto">
+                {blocker}
+              </FormBlocker>
+            )}
+            <Button
+              type="submit"
+              disabled={!!blocker || create.isPending}
+              aria-describedby={blocker ? "project-blocker" : undefined}
+              data-testid="create-project-submit"
+            >
               {create.isPending && <Spinner />}
               Create project
             </Button>

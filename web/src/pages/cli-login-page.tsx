@@ -52,12 +52,17 @@ function forgetReauth(): void {
   }
 }
 
-function Detail({ label, children, testId }: { label: ReactNode; children: ReactNode; testId: string }) {
+function Detail({ label, children, note, testId }: { label: ReactNode; children: ReactNode; note?: string; testId: string }) {
   return (
     <div className="flex flex-col gap-0.5 py-2 sm:flex-row sm:gap-4">
       <dt className="text-sm text-muted-foreground sm:w-40 sm:shrink-0">{label}</dt>
-      <dd className="min-w-0 text-sm break-words" data-testid={testId}>
-        {children}
+      <dd className="min-w-0 text-sm break-words">
+        <div data-testid={testId}>{children}</div>
+        {note && (
+          <p className="text-xs text-muted-foreground" data-testid={`${testId}-note`}>
+            {note}
+          </p>
+        )}
       </dd>
     </div>
   );
@@ -70,14 +75,7 @@ function RequestDetails({ request }: { request: PendingCliLogin }) {
       <Detail label="Requested from" testId="cli-request-ip">
         <span className="font-mono">{request.requested_from_ip}</span>
       </Detail>
-      <Detail
-        label={
-          <>
-            Program <span className="text-xs">(reported by the requester, can be faked)</span>
-          </>
-        }
-        testId="cli-request-agent"
-      >
+      <Detail label="Program" note="Reported by the requester, so it can be faked." testId="cli-request-agent">
         <span className="font-mono">{request.user_agent || "Not given"}</span>
       </Detail>
       <Detail label="Started" testId="cli-request-age">

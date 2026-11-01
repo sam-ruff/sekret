@@ -4,6 +4,7 @@ import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { SysStatus } from "@/api/types";
 import { keys } from "@/hooks/queries";
+import { REVEAL_IDLE_MS } from "@/hooks/use-idle";
 import { renderWithProviders, testQueryClient } from "@/test/render";
 import { UnlockPage } from "./unlock-page";
 
@@ -83,6 +84,19 @@ describe("UnlockPage", () => {
     expect(screen.getByTestId("unlock-empty")).toHaveTextContent("Enter the passphrase to unlock.");
     expect(screen.getByTestId("unlock-passphrase")).toHaveFocus();
     expect(unseal).not.toHaveBeenCalled();
+  });
+
+  it("clears a typed passphrase once the page has sat idle", async () => {
+    renderUnlock();
+    fireEvent.change(screen.getByTestId("unlock-passphrase"), { target: { value: "near miss" } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REVEAL_IDLE_MS - 10_000);
+    });
+    expect(screen.getByTestId("unlock-passphrase")).toHaveValue("near miss");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(screen.getByTestId("unlock-passphrase")).toHaveValue("");
   });
 
   it("points the input at the wrong-passphrase error", async () => {

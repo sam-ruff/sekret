@@ -4,7 +4,7 @@ A machine identity is an account for software: a CI pipeline, a pod, an Ansible 
 
 Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. Renewals follow the identity's lifetimes as they are now, so lowering `token_max_ttl` also shortens tokens already issued. An identity can also have trusted CIDRs, shown as *Allowed networks* in the web interface, which limit where it can log in from and where its tokens can be used.
 
-Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Disabling an identity revokes its tokens straight away.
+Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. The identity's *Usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. Disabling an identity revokes its tokens straight away.
 
 There are three auth methods, and an identity can have any of them.
 
@@ -59,7 +59,7 @@ Tokens that live longer than `max_token_lifetime` seconds, counted from `iat` to
 
 ## Universal auth
 
-A client id (the identity's id) and a client secret, for machines with no token of their own, such as a host running Ansible. Client secrets start with `sks_`, are shown once at creation, and are stored only as a hash. Each can have a lifetime of up to ten years and a maximum number of uses; leave the lifetime out for a secret that never expires. A token from a secret with a lifetime never lasts, or renews, past the secret's own expiry, so a five-minute bootstrap secret gives at most five minutes of access.
+A client id (the identity's id) and a client secret, for machines with no token of their own, such as a host running Ansible. Client secrets start with `sks_`, are shown once at creation, and are stored only as a keyed hash that someone with write access to the database cannot make for a secret of their own. Each can have a lifetime of up to ten years and a maximum number of uses; leave the lifetime out for a secret that never expires. A token from a secret with a lifetime never lasts, or renews, past the secret's own expiry, so a five-minute bootstrap secret gives at most five minutes of access.
 
 ```sh
 sekret login --client-id "$IDENTITY_ID" --client-secret-file /etc/app/sekret-secret
