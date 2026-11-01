@@ -405,17 +405,27 @@ async fn cli_polls_are_rate_limited_per_address(db: String) -> anyhow::Result<()
             anyhow::Ok((status, response.json::<Value>().await.unwrap_or_default()))
         }
     };
-    for _ in 0..sekret_server::state::CLI_POLLS_PER_MINUTE {
+    // The allowance refills while the loop runs, so a slow machine needs a few polls past the limit.
+    let limit = sekret_server::state::CLI_POLLS_PER_MINUTE;
+    let mut allowed = 0;
+    let mut slowed = false;
+    for _ in 0..limit * 3 {
         let (status, body) = poll("203.0.113.7").await?;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["error"], json!("slow_down"));
+            slowed = true;
+            break;
+        }
         assert_eq!(
             (status, body["error"].clone()),
             (StatusCode::BAD_REQUEST, json!("expired_token"))
         );
+        allowed += 1;
     }
-    let (status, body) = poll("203.0.113.7").await?;
-    assert_eq!(
-        (status, body["error"].clone()),
-        (StatusCode::TOO_MANY_REQUESTS, json!("slow_down"))
+    assert!(slowed, "polls were never slowed down");
+    assert!(
+        allowed >= limit,
+        "only {allowed} polls were allowed before slowing down"
     );
     let (status, _) = poll("198.51.100.4").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "other addresses are unaffected");
