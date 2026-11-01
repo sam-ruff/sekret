@@ -42,4 +42,22 @@ describe("AuthMethods", () => {
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
     expect(k8s).toBeInTheDocument();
   });
+
+  it("lets go of the reviewer token after a failed save too, keeping it in the form to retry", async () => {
+    mocked.putAuthMethod.mockRejectedValue(new Error("the cluster refused the token"));
+    const client = testQueryClient();
+    client.setDefaultOptions({ ...client.getDefaultOptions(), mutations: { gcTime: 0 } });
+    renderWithProviders(<AuthMethods identityId="id-1" canEdit />, { client });
+
+    await screen.findByTestId("auth-method-kubernetes");
+    await userEvent.type(screen.getByTestId("k8s-host"), "https://k8s.example:6443");
+    await userEvent.type(screen.getByTestId("k8s-reviewer-jwt"), TOKEN);
+    await userEvent.type(screen.getByTestId("k8s-namespaces-input"), "billing{Enter}");
+    await userEvent.type(screen.getByTestId("k8s-service-accounts-input"), "worker{Enter}");
+    await userEvent.click(screen.getByTestId("k8s-save"));
+
+    await waitFor(() => expect(mocked.putAuthMethod).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
+    expect(screen.getByTestId("k8s-reviewer-jwt")).toHaveValue(TOKEN);
+  });
 });

@@ -1539,6 +1539,53 @@ async fn login_rate_per_minute_limits_attempts() -> anyhow::Result<()> {
     let key = sb.root_key("root.key")?;
     let server = sb.keyed(&key).start().await?;
     assert_eq!(allowed_in_a_row(&server, 31).await?, 30, "the default is 30");
+    assert!(!server.log().contains(HIGH_LOGIN_RATE), "{}", server.log());
+    Ok(())
+}
+
+const HIGH_LOGIN_RATE: &str = "also lets each address try that many unseal and setup passphrases";
+
+/// A high login rate is also a high passphrase guessing rate, so it starts with a warning, and the
+/// limit it warns about really applies.
+#[tokio::test]
+async fn a_high_login_rate_is_warned_about() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    for way in WAYS {
+        let server = sb
+            .keyed(&key)
+            .set(way, "auth.login_rate_per_minute", "301")
+            .start()
+            .await?;
+        let log = server.log();
+        assert!(
+            log.contains(HIGH_LOGIN_RATE) && log.contains("is 301"),
+            "{way:?}: {log}"
+        );
+        assert_eq!(
+            allowed_in_a_row(&server, 40).await?,
+            40,
+            "{way:?}: the higher rate applies"
+        );
+        drop(server);
+        let server = sb
+            .keyed(&key)
+            .set(way, "auth.login_rate_per_minute", "300")
+            .start()
+            .await?;
+        assert!(!server.log().contains(HIGH_LOGIN_RATE), "{way:?}: {}", server.log());
+    }
+    let server = sb
+        .keyed(&key)
+        .set(Way::File, "auth.login_rate_per_minute", "1000")
+        .set(Way::Flag, "auth.login_rate_per_minute", "30")
+        .start()
+        .await?;
+    assert!(
+        !server.log().contains(HIGH_LOGIN_RATE),
+        "the flag wins: {}",
+        server.log()
+    );
     Ok(())
 }
 
@@ -1790,6 +1837,84 @@ async fn oidc_defaults_apply_with_only_an_issuer() -> anyhow::Result<()> {
     assert_eq!(code, StatusCode::NOT_FOUND, "no issuer, no browser sign-in");
     let (_, config) = server.get("/api/v1/auth/config", Auth::None).await?;
     assert_eq!(config["oidc_enabled"], false);
+    Ok(())
+}
+
+const OPEN_SIGN_IN: &str = "OIDC sign-in is open to every account at";
+
+/// The warning matches the behaviour: anyone at the provider gets in while it shows, and any one
+/// of the restrictions, set in any way, both removes it and keeps strangers out.
+#[tokio::test]
+async fn oidc_open_to_everyone_at_the_provider_is_warned_about() -> anyhow::Result<()> {
+    let issuer = Issuer::start().await?;
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let open = sb.keyed(&key).oidc(&issuer)?.start().await?;
+    let log = open.log();
+    assert!(log.contains(OPEN_SIGN_IN) && log.contains("org-member"), "{log}");
+    let stranger = sign_in(&open, &issuer, json!({"sub": "stranger"})).await?;
+    assert!(stranger.session.is_some(), "anyone at the provider signs in");
+    drop(open);
+
+    let explicit_empty = sb
+        .keyed(&key)
+        .oidc(&issuer)?
+        .raw_config("oidc:\n  required_groups: []\n  allowed_subjects: []\n")
+        .start()
+        .await?;
+    assert!(explicit_empty.log().contains(OPEN_SIGN_IN), "[] is no restriction");
+    drop(explicit_empty);
+
+    for way in WAYS {
+        for (option, value) in [("oidc.required_groups", "staff"), ("oidc.allowed_subjects", "owner")] {
+            let server = sb
+                .keyed(&key)
+                .oidc(&issuer)?
+                .set_list(way, option, &[value])
+                .start()
+                .await?;
+            assert!(
+                !server.log().contains(OPEN_SIGN_IN),
+                "{way:?} {option}: {}",
+                server.log()
+            );
+            let stranger = sign_in(&server, &issuer, json!({"sub": "stranger"})).await?;
+            assert!(stranger.session.is_none(), "{way:?} {option}: strangers are kept out");
+        }
+        let no_role = sb
+            .keyed(&key)
+            .oidc(&issuer)?
+            .set(way, "auth.default_org_role", "")
+            .start()
+            .await?;
+        assert!(!no_role.log().contains(OPEN_SIGN_IN), "{way:?}: {}", no_role.log());
+        let session = session_of(&no_role, &issuer, json!({"sub": format!("newcomer-{way:?}")})).await?;
+        let (code, _) = no_role.get("/api/v1/identities", Auth::Session(&session)).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{way:?}: a stranger gets no role");
+    }
+
+    // Only the winning value counts: the environment's role beats the file's empty one.
+    let overridden = sb
+        .keyed(&key)
+        .oidc(&issuer)?
+        .set(Way::File, "auth.default_org_role", "")
+        .set(Way::Env, "auth.default_org_role", "org-member")
+        .start()
+        .await?;
+    assert!(overridden.log().contains(OPEN_SIGN_IN), "{}", overridden.log());
+    drop(overridden);
+    let flag_wins = sb
+        .keyed(&key)
+        .oidc(&issuer)?
+        .set(Way::Env, "auth.default_org_role", "org-member")
+        .set(Way::Flag, "auth.default_org_role", "")
+        .start()
+        .await?;
+    assert!(!flag_wins.log().contains(OPEN_SIGN_IN), "{}", flag_wins.log());
+    drop(flag_wins);
+
+    let no_oidc = sb.keyed(&key).start().await?;
+    assert!(!no_oidc.log().contains(OPEN_SIGN_IN), "no issuer, no warning");
     Ok(())
 }
 

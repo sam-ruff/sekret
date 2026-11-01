@@ -40,13 +40,23 @@ fn asset(path: &str) -> Option<Response> {
     Some(response)
 }
 
-/// A page that opened this one, or that this one opens, gets no handle on its window.
+/// A page that opened this one, or that this one opens, gets no handle on its window, and the
+/// interface asks for no device features.
 fn isolate_window(headers: &mut HeaderMap) {
     headers.insert(
         HeaderName::from_static("cross-origin-opener-policy"),
         HeaderValue::from_static("same-origin"),
     );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(PERMISSIONS_POLICY),
+    );
 }
+
+/// Clipboard writes stay allowed, since copying a value is a core action.
+const PERMISSIONS_POLICY: &str = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), \
+     serial=(), hid=(), bluetooth=(), midi=(), display-capture=(), clipboard-read=(), \
+     clipboard-write=(self)";
 
 /// Serves the embedded frontend, falling back to `index.html` for client-side routes.
 pub async fn static_handler(uri: Uri) -> Response {
@@ -110,6 +120,14 @@ mod tests {
         assert_eq!(
             headers.get("cross-origin-opener-policy").and_then(|v| v.to_str().ok()),
             Some("same-origin")
+        );
+        let policy = headers
+            .get("permissions-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            policy.contains("camera=()") && policy.contains("clipboard-write=(self)"),
+            "{policy}"
         );
     }
 

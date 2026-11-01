@@ -29,7 +29,7 @@ export function FolderBreadcrumbs({ path, hrefFor }: { path: string; hrefFor: (p
                   </BreadcrumbPage>
                 ) : (
                   <BreadcrumbLink asChild>
-                    <Link to={hrefFor(crumb.path)} className="flex items-center gap-1.5" data-testid={`crumb-${crumb.name}`}>
+                    <Link to={hrefFor(crumb.path)} className="flex items-center gap-1.5" data-testid={index === 0 ? "crumb-root" : `crumb-${crumb.name}`}>
                       {index === 0 && <Folder className="size-3.5" />}
                       {crumb.name}
                     </Link>

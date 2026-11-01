@@ -28,6 +28,8 @@ interface RolesPanelProps {
   canDelete: boolean;
   onSave: (slug: string, body: PutRole) => Promise<unknown>;
   onDelete: (slug: string) => Promise<unknown>;
+  /** What custom roles can do at this scope. */
+  intro: string;
 }
 
 type EditorState = { mode: "new" } | { mode: "edit" | "view"; role: Role } | null;
@@ -44,6 +46,7 @@ export function RolesPanel({
   canDelete,
   onSave,
   onDelete,
+  intro,
 }: RolesPanelProps) {
   const [editor, setEditor] = useState<EditorState>(null);
   const [deleting, setDeleting] = useState<Role | null>(null);
@@ -54,8 +57,8 @@ export function RolesPanel({
   return (
     <div className="space-y-4">
       <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-muted-foreground">
-          Built-in roles cover common needs. Custom roles can narrow access by environment, folder, key or tag.
+        <p className="text-sm text-muted-foreground" data-testid="roles-intro">
+          {intro}
         </p>
         {canCreate && (
           <Button onClick={() => setEditor({ mode: "new" })} data-testid="new-role">

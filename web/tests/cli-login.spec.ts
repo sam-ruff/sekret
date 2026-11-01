@@ -49,16 +49,26 @@ test("a request from another network needs a strong warning and an extra tick", 
   await page.goto(`/cli-login?code=${ELSEWHERE}`);
   const warning = page.getByTestId("cli-other-address");
   await expect(warning).toContainText("This sign-in came from a different network");
+  const blocker = page.getByTestId("cli-approve-blocker");
+  await expect(blocker).toHaveText("Type the code from your terminal to approve.");
   await typeCode(page, ELSEWHERE);
   await expect(page.getByTestId("cli-approve")).toBeDisabled();
+  // The disabled button says what is holding it up.
+  await expect(blocker).toHaveText('Tick "I started this sign-in myself" to approve.');
+  await expect(page.getByTestId("cli-approve")).toHaveAccessibleDescription('Tick "I started this sign-in myself" to approve.');
   await page.getByTestId("cli-code-input").press("Enter");
   await expect(page.getByTestId("cli-approved")).toHaveCount(0);
 
   await warning.getByText("I started this sign-in myself on that machine").click();
   await expect(page.getByTestId("cli-confirm-own")).toHaveAttribute("data-state", "checked");
   await expect(page.getByTestId("cli-approve")).toBeEnabled();
+  await expect(blocker).toHaveCount(0);
   await page.getByTestId("cli-approve").click();
   await expect(page.getByTestId("cli-approved")).toBeVisible();
+  // The header follows the outcome rather than still asking for approval.
+  await expect(page.getByTestId("standalone-title")).toHaveText("Command line sign-in approved");
+  await expect(page.getByTestId("cli-login")).toContainText("The CLI now acts as");
+  await expect(page).toHaveTitle("CLI sign-in approved · sekret");
 });
 
 test("a phishing link cannot be approved with a code that is not the link's", async ({ page }) => {
@@ -121,6 +131,8 @@ test("cancelling refuses the request on the server", async ({ page }) => {
   await expect(page.getByTestId("cli-cancelled")).toContainText("Denied");
   await expect(page.getByTestId("cli-cancelled")).toContainText("the terminal that asked is told the sign-in was refused");
   await expect(page.getByTestId("cli-approve")).toHaveCount(0);
+  await expect(page.getByTestId("standalone-title")).toHaveText("Command line sign-in denied");
+  await expect(page.getByTestId("cli-login")).not.toContainText("will act as");
   expect(await requests(page)).toContain("POST /api/v1/auth/cli/deny");
   // The request is gone, so the same link now says it has ended.
   await page.goto(`/cli-login?code=${SAME}`);
@@ -133,6 +145,7 @@ test("a request that has ended says only that, with nothing to type or approve",
   await expect(ended).toHaveText(
     "This sign-in request has endedIt expired, was already used or refused, or the link is wrong. Run sekret login again to get a new link.",
   );
+  await expect(page.getByTestId("standalone-title")).toHaveText("Sign-in request ended");
   await page.getByTestId("cli-go-home").click();
   await expect(page).not.toHaveURL(/cli-login/);
   await expect(page.getByTestId("cli-code-input")).toHaveCount(0);

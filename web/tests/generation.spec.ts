@@ -79,18 +79,33 @@ test("rotates a generated secret on demand", async ({ page }) => {
   await expect(secretRow(page, "SESSION_SECRET").getByTestId("secret-rotation-badge")).toContainText("Rotates in 30d");
 });
 
-test("warns before rotating a value someone typed, and not before rotating a generated one", async ({ page }) => {
-  await secretAction(page, "LOG_LEVEL", "secret-rotate");
+test("offers Rotate now in the row menu only for generated values", async ({ page }) => {
+  await secretRow(page, "LOG_LEVEL").getByTestId("secret-actions").click();
+  await expect(page.getByTestId("secret-edit")).toBeVisible();
+  await expect(page.getByTestId("secret-rotate")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await secretAction(page, "SESSION_SECRET", "secret-rotate");
+  const confirm = page.getByTestId("rotate-confirm");
+  await expect(confirm.getByTestId("rotate-typed-warning")).toHaveCount(0);
+  await expect(confirm.getByTestId("confirm-action")).toHaveText("Rotate now");
+  await expect(confirm.getByTestId("confirm-action")).toHaveAttribute("data-variant", "default");
+  await confirm.getByTestId("confirm-cancel").click();
+  // Focus goes back to the row's menu button, which opened the dialog.
+  await expect(secretRow(page, "SESSION_SECRET").getByTestId("secret-actions")).toBeFocused();
+});
+
+test("warns before rotating a typed value from the drawer, and says no generator is set", async ({ page }) => {
+  const drawer = await openDrawer(page, "LOG_LEVEL");
+  await expect(drawer.getByTestId("policy-effective-generator")).toHaveText(
+    "No generator set; Rotate now would use the built-in default of 32 alphanumeric characters",
+  );
+  await drawer.getByTestId("policy-rotate-now").click();
   const confirm = page.getByTestId("rotate-confirm");
   await expect(confirm.getByTestId("rotate-typed-warning")).toContainText("The current value was typed or imported, not generated.");
   await expect(confirm.getByTestId("confirm-action")).toHaveText("Replace with a generated value");
+  await expect(confirm.getByTestId("confirm-action")).toHaveAttribute("data-variant", "destructive");
   await confirm.getByTestId("confirm-cancel").click();
-  // Focus goes back to the row's menu button, which opened the dialog.
-  await expect(secretRow(page, "LOG_LEVEL").getByTestId("secret-actions")).toBeFocused();
-
-  await secretAction(page, "SESSION_SECRET", "secret-rotate");
-  await expect(confirm.getByTestId("rotate-typed-warning")).toHaveCount(0);
-  await expect(confirm.getByTestId("confirm-action")).toHaveText("Rotate now");
 });
 
 test("sets a custom policy that applies once the value is generated", async ({ page }) => {

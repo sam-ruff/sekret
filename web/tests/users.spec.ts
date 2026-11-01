@@ -104,7 +104,7 @@ test("the member picker searches users on the server", async ({ page }) => {
   const dialog = page.getByTestId("add-member-dialog");
   await expect(dialog.getByTestId("member-add-submit")).toBeDisabled();
   await expect(dialog.getByTestId("member-blocker")).toHaveText("Choose a user to continue.");
-  await expect(page.getByTestId("members-help")).toContainText("To change someone's role");
+  await expect(page.getByTestId("members-help")).not.toContainText("add them again");
   await dialog.getByTestId("member-principal").click();
   await expect(page.getByTestId("principal-more")).toContainText("Showing 20 of");
 
@@ -116,6 +116,44 @@ test("the member picker searches users on the server", async ({ page }) => {
   await dialog.getByTestId("member-add-submit").click();
   await expectToast(page, "Member added");
   await expect(page.getByTestId("member-row-zara.hughes@example.com")).toBeVisible();
+});
+
+test("changes a member's role in one step and shows role names", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/members");
+  const row = page.getByTestId("member-row-github-deploy");
+  await expect(row.getByTestId("role-label-name")).toHaveText("viewer");
+  await row.getByTestId("member-change-role").click();
+  const dialog = page.getByTestId("change-role-dialog");
+  await expect(dialog.getByTestId("confirm-action")).toBeDisabled();
+  await dialog.getByTestId("change-role-select").click();
+  await page.getByTestId("change-role-option-developer").click();
+  await dialog.getByTestId("confirm-action").click();
+  await expectToast(page, "github-deploy now has the developer role");
+  // The old role is gone rather than held alongside the new one.
+  await expect(page.getByTestId("member-row-github-deploy")).toHaveCount(1);
+  await expect(page.getByTestId("member-row-github-deploy").getByTestId("role-label-name")).toHaveText("developer");
+});
+
+test("says clearly when a role change only half finished", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/members");
+  await expect(page.getByTestId("member-row-github-deploy")).toBeVisible();
+  await page.evaluate(async () => {
+    const path = "/src/api/mock/server.ts";
+    const mock = (await import(/* @vite-ignore */ path)) as {
+      mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
+    };
+    mock.mockFailNext("DELETE", "/members/", 500, "internal", "the database is busy");
+  });
+  await page.getByTestId("member-row-github-deploy").getByTestId("member-change-role").click();
+  const dialog = page.getByTestId("change-role-dialog");
+  await dialog.getByTestId("change-role-select").click();
+  await page.getByTestId("change-role-option-developer").click();
+  await dialog.getByTestId("confirm-action").click();
+  await expectToast(page, /github-deploy now has the developer role, but the viewer role could not be removed/);
+  await expectToast(page, "They hold both until you remove viewer from the list.");
+  await expect(dialog).toHaveCount(0);
+  // Both rows show, so the old one can be removed by hand.
+  await expect(page.getByTestId("member-row-github-deploy")).toHaveCount(2);
 });
 
 test("the member picker finds machine identities beyond the first page", async ({ page }) => {

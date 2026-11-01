@@ -17,6 +17,7 @@ import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel } from "@/lib/paths";
 import { cn } from "@/lib/utils";
+import { sameContent } from "@/lib/versions";
 import { PolicySection } from "./policy-section";
 
 interface SecretDrawerProps {
@@ -134,6 +135,7 @@ function VersionItem({
   current,
   shown,
   canRollback,
+  sameAsCurrent,
   onRollback,
 }: {
   version: SecretVersion;
@@ -141,6 +143,8 @@ function VersionItem({
   /** Values were fetched after the reader asked for them. */
   shown: boolean;
   canRollback: boolean;
+  /** Rolling back would change nothing; only known once values are shown. */
+  sameAsCurrent: boolean;
   onRollback: () => void;
 }) {
   return (
@@ -160,7 +164,12 @@ function VersionItem({
             {version.actor} · {formatRelative(version.created_at)}
           </div>
         </div>
-        {!current && !version.deleted && canRollback && (
+        {!current && !version.deleted && canRollback && sameAsCurrent && (
+          <span className="shrink-0 pt-1 text-xs text-muted-foreground" data-testid={`same-as-current-${version.version}`}>
+            Same as current
+          </span>
+        )}
+        {!current && !version.deleted && canRollback && !sameAsCurrent && (
           <Button variant="outline" size="sm" onClick={onRollback} data-testid={`rollback-${version.version}`}>
             <RotateCcw />
             Roll back
@@ -305,6 +314,7 @@ export function SecretDrawer({
                         current={v.version === currentVersion}
                         shown={revealed !== undefined}
                         canRollback={canRollback}
+                        sameAsCurrent={revealed !== undefined && sameContent(v, revealed[0])}
                         onRollback={() => setTarget(v.version)}
                       />
                     ))}

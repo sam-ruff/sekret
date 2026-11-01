@@ -86,6 +86,11 @@ export function AuthMethods({ identityId, canEdit }: { identityId: string; canEd
       // The finished mutation still holds the reviewer token as its variables.
       put.reset();
     },
+    onError: () => {
+      // Same after a failure, once the error toast has its message.
+      queueMicrotask(() => put.reset());
+      return false;
+    },
   });
   const remove = useApiMutation({
     mutationFn: (kind: AuthMethodKind) => api.deleteAuthMethod(identityId, kind),

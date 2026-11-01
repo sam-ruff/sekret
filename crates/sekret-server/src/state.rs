@@ -18,12 +18,22 @@ pub struct Inner {
     pub http: Arc<dyn OidcHttp>,
     pub jwt: JwtVerifier,
     pub token_reviewer: Arc<dyn TokenReviewer>,
+    /// Browser sign-in. Kept apart from machine logins and the CLI flow, so a CI fleet or
+    /// anonymous junk behind the same address cannot lock a person out.
     pub login_limiter: RateLimiter<IpAddr>,
+    /// Machine logins through any auth method.
+    pub machine_login_limiter: RateLimiter<IpAddr>,
+    /// Starting, listing, approving and denying CLI logins.
+    pub cli_login_limiter: RateLimiter<IpAddr>,
+    /// Bytes and concurrent writes the write gate may buffer.
+    pub write_budget: crate::body::WriteBudget,
     /// Setup, unlock and passphrase attempts, kept apart from sign-in so exhausting one cannot
     /// lock anyone out of the other.
     pub sys_limiter: RateLimiter<IpAddr>,
     /// Wrong passphrases slow later attempts from the same source down.
     pub passphrase_backoff: FailureBackoff,
+    /// Wrong passphrases through the host socket, which the network limits do not cover.
+    pub host_backoff: crate::ratelimit::HostBackoff,
     /// Passphrase attempts, right or wrong, per IPv4 /24 or IPv6 /48.
     pub passphrase_attempts: RateLimiter<IpAddr>,
     /// Places in line for a key derivation, for network sources with no recent failures.
@@ -58,6 +68,8 @@ pub struct Dependencies {
 pub fn build_state(deps: Dependencies) -> AppState {
     let jwt = JwtVerifier::new(deps.http.clone(), deps.clock.clone());
     let login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
+    let machine_login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
+    let cli_login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let sys_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let passphrase_attempts = RateLimiter::new(deps.config.login_rate_per_minute);
     Arc::new(Inner {
@@ -69,8 +81,12 @@ pub fn build_state(deps: Dependencies) -> AppState {
         jwt,
         token_reviewer: deps.token_reviewer,
         login_limiter,
+        machine_login_limiter,
+        cli_login_limiter,
+        write_budget: crate::body::WriteBudget::default(),
         sys_limiter,
         passphrase_backoff: FailureBackoff::default(),
+        host_backoff: crate::ratelimit::HostBackoff::default(),
         passphrase_attempts,
         kdf_queue: Arc::new(tokio::sync::Semaphore::new(KDF_QUEUE_DEPTH)),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),

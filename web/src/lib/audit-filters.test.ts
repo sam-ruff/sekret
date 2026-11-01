@@ -7,10 +7,19 @@ import {
   dayStart,
   EMPTY_AUDIT_FILTERS,
   hasActiveFilters,
+  noMatchHint,
   parseAuditFilters,
   presetRange,
   DATE_PRESETS,
 } from "./audit-filters";
+
+describe("noMatchHint", () => {
+  it("suggests a wider date range only when a date is set", () => {
+    expect(noMatchHint({ ...EMPTY_AUDIT_FILTERS, action: "secret." })).not.toContain("date range");
+    expect(noMatchHint({ ...EMPTY_AUDIT_FILTERS, from: "2026-01-01" })).toContain("wider date range");
+    expect(noMatchHint({ ...EMPTY_AUDIT_FILTERS, to: "2026-01-01" })).toContain("wider date range");
+  });
+});
 
 describe("audit filters", () => {
   it("round-trips through the URL, leaving defaults out", () => {

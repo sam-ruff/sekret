@@ -128,6 +128,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::Server(args) => server::run_server(*args, env_secrets, sources).await?,
         Command::Admin(command) => server::run_admin(command, sources).await?,
         Command::Sys(command) if command.socket().is_some() => {
+            cli::sys::refuse_binary_to_terminal(&command, std::io::IsTerminal::is_terminal(&out))?;
             let (path, owner) = command
                 .socket()
                 .map(|(path, owner)| (path.to_path_buf(), owner.map(String::from)))
@@ -136,6 +137,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }
         Command::Sys(command) => {
+            cli::sys::refuse_binary_to_terminal(&command, std::io::IsTerminal::is_terminal(&out))?;
             let api = cli::sys_client(&cli.client)?;
             return cli::sys::run(&api, command, &prompt::Terminal, &mut out).await;
         }

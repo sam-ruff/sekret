@@ -33,8 +33,9 @@ clusterWide: false
 # watched namespace. Empty allows any service account there that has opted in.
 tokenServiceAccounts: []
 
-# A ValidatingAdmissionPolicy that only lets the operator request tokens with the `sekret`
-# audience, for at most 600 seconds, outside kube-system. Needs Kubernetes 1.30 or later.
+# ValidatingAdmissionPolicies that only let the operator request tokens with the `sekret`
+# audience, for at most 600 seconds, outside kube-system, and only write Secrets of the types
+# the operator supports, never service account tokens. Needs Kubernetes 1.30 or later.
 tokenPolicy:
   enabled: true
 

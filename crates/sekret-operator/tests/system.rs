@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine;
+use k8s_openapi::api::admissionregistration::v1::{ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding};
 use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::{Namespace, Secret, ServiceAccount};
-use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleRef, Subject};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -36,9 +37,13 @@ const NAMESPACE: &str = "apps";
 const SERVICE_ACCOUNT: &str = "reader";
 /// Exists in the namespace but has not opted in to SekretSecrets.
 const UNAPPROVED_ACCOUNT: &str = "payments";
+/// Where the chart is installed; the controller runs as its service account.
+const OPERATOR_NAMESPACE: &str = "sekret-system";
+const OPERATOR_USER: &str = "system:serviceaccount:sekret-system:sekret-sekret-operator";
 
 struct Cluster {
     client: Client,
+    config: Config,
     url: String,
     ca_pem: String,
     _container: ContainerAsync<K3s>,
@@ -81,14 +86,133 @@ async fn start_cluster() -> anyhow::Result<Cluster> {
     config.cluster_url = url.parse().context("url")?;
     // k3s is on loopback, so a proxy from HTTPS_PROXY could never reach it.
     config.proxy_url = None;
-    let client = Client::try_from(config).context("kube client")?;
+    let client = Client::try_from(config.clone()).context("kube client")?;
     Ok(Cluster {
         client,
+        config,
         url,
         ca_pem,
         _container: container,
         _conf_dir: conf_dir,
     })
+}
+
+/// A client that acts as the operator's service account, so the chart's RBAC and admission
+/// policies apply to it.
+fn operator_client(cluster: &Cluster) -> anyhow::Result<Client> {
+    let mut config = cluster.config.clone();
+    config.auth_info.impersonate = Some(OPERATOR_USER.into());
+    Client::try_from(config).context("operator client")
+}
+
+/// Installs the chart's service account, RBAC and admission policies as `helm template` renders
+/// them. Set HELM when helm is not on PATH.
+async fn install_chart(client: &Client) -> anyhow::Result<()> {
+    let helm = std::env::var("HELM").unwrap_or_else(|_| "helm".into());
+    let chart = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/helm/sekret-operator");
+    let output = std::process::Command::new(&helm)
+        .args(["template", "sekret", chart, "--namespace", OPERATOR_NAMESPACE])
+        .args(["--set", "sekret.serverUrl=https://sekret.example.com"])
+        .arg("--set")
+        .arg(format!("watchNamespaces={{{NAMESPACE}}}"))
+        .args(["--show-only", "templates/serviceaccount.yaml"])
+        .args(["--show-only", "templates/rbac.yaml"])
+        .args(["--show-only", "templates/token-policy.yaml"])
+        .output()
+        .with_context(|| format!("run {helm}; the operator system test needs helm"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "helm template failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8(output.stdout).context("helm output")?;
+    let documents: Vec<Value> = serde_saphyr::from_multiple(&rendered).context("parse the rendered chart")?;
+    for document in documents.into_iter().filter(|d| !d.is_null()) {
+        let kind = document["kind"].as_str().context("kind")?.to_string();
+        let namespace = document["metadata"]["namespace"].as_str().map(str::to_string);
+        let namespaced = || namespace.clone().with_context(|| format!("{kind} has no namespace"));
+        match kind.as_str() {
+            "ServiceAccount" => {
+                let api = Api::<ServiceAccount>::namespaced(client.clone(), &namespaced()?);
+                create_named(&api, serde_json::from_value(document)?).await?;
+            }
+            "Role" => {
+                let api = Api::<Role>::namespaced(client.clone(), &namespaced()?);
+                create_named(&api, serde_json::from_value(document)?).await?;
+            }
+            "RoleBinding" => {
+                let api = Api::<RoleBinding>::namespaced(client.clone(), &namespaced()?);
+                create_named(&api, serde_json::from_value(document)?).await?;
+            }
+            "ValidatingAdmissionPolicy" => {
+                let api = Api::<ValidatingAdmissionPolicy>::all(client.clone());
+                create_named(&api, serde_json::from_value(document)?).await?;
+            }
+            "ValidatingAdmissionPolicyBinding" => {
+                let api = Api::<ValidatingAdmissionPolicyBinding>::all(client.clone());
+                create_named(&api, serde_json::from_value(document)?).await?;
+            }
+            other => anyhow::bail!("unexpected {other} in the rendered chart"),
+        }
+    }
+    Ok(())
+}
+
+fn plain_secret(name: &str, secret_type: &str, annotations: &[(&str, &str)]) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            annotations: Some(
+                annotations
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..ObjectMeta::default()
+        },
+        type_: Some(secret_type.into()),
+        ..Secret::default()
+    }
+}
+
+/// The admission policy stops the operator from writing a Secret the token controller would fill
+/// with a long-lived token, whatever its RBAC allows.
+async fn operator_cannot_write_token_secrets(admin: &Client, operator: &Client) -> anyhow::Result<()> {
+    let as_operator: Api<Secret> = Api::namespaced(operator.clone(), NAMESPACE);
+    let as_admin: Api<Secret> = Api::namespaced(admin.clone(), NAMESPACE);
+    let token_secret = plain_secret(
+        "minted",
+        "kubernetes.io/service-account-token",
+        &[("kubernetes.io/service-account.name", SERVICE_ACCOUNT)],
+    );
+    // Policies take a moment to load, so retry until the denial shows up.
+    let denial = wait_for("the Secret policy to load", Duration::from_secs(90), || async {
+        match as_operator.create(&PostParams::default(), &token_secret).await {
+            Ok(_) => {
+                let _ = as_admin.delete("minted", &Default::default()).await;
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        }
+    })
+    .await;
+    assert!(denial.contains("only write Secrets that carry data"), "{denial}");
+
+    let annotated = plain_secret(
+        "annotated",
+        "Opaque",
+        &[("kubernetes.io/service-account.name", SERVICE_ACCOUNT)],
+    );
+    let denial = as_operator
+        .create(&PostParams::default(), &annotated)
+        .await
+        .err()
+        .context("an Opaque Secret with a service account annotation must be refused")?;
+    assert!(
+        denial.to_string().contains("may not write service account annotations"),
+        "{denial}"
+    );
+    Ok(())
 }
 
 async fn get_json(client: &Client, path: &str) -> anyhow::Result<Value> {
@@ -342,17 +466,22 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
         resources.list(&Default::default()).await.ok()
     })
     .await;
-    create_named(
-        &Api::<Namespace>::all(client.clone()),
-        Namespace {
-            metadata: ObjectMeta {
-                name: Some(NAMESPACE.into()),
-                ..ObjectMeta::default()
+    for name in [NAMESPACE, OPERATOR_NAMESPACE] {
+        create_named(
+            &Api::<Namespace>::all(client.clone()),
+            Namespace {
+                metadata: ObjectMeta {
+                    name: Some(name.into()),
+                    ..ObjectMeta::default()
+                },
+                ..Namespace::default()
             },
-            ..Namespace::default()
-        },
-    )
-    .await?;
+        )
+        .await?;
+    }
+    install_chart(&client).await?;
+    let operator = operator_client(&cluster)?;
+    operator_cannot_write_token_secrets(&client, &operator).await?;
     let accounts = Api::<ServiceAccount>::namespaced(client.clone(), NAMESPACE);
     create_named(
         &accounts,
@@ -405,10 +534,10 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
 
     let factory = HttpSekretFactory::new(sekret.base.clone(), ClientOptions::default()).context("factory")?;
     let ctx = Arc::new(Context::new(
-        Arc::new(KubeClient::new(client.clone())),
+        Arc::new(KubeClient::new(operator.clone())),
         Arc::new(factory),
     ));
-    let controller = tokio::spawn(run_controller(client.clone(), ctx, Some(NAMESPACE), 2));
+    let controller = tokio::spawn(run_controller(operator.clone(), ctx, Some(NAMESPACE), 2));
 
     let resource = SekretSecret::new(
         "app-config",
@@ -465,6 +594,22 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
     .await;
     assert_eq!(status.secret_count, Some(2));
     assert!(status.last_synced_at.is_some());
+
+    let mut relabelled = secrets.get("app-env").await.context("synced secret")?;
+    relabelled
+        .metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert("kubernetes.io/service-account.name".into(), SERVICE_ACCOUNT.into());
+    let denial = Api::<Secret>::namespaced(operator.clone(), NAMESPACE)
+        .replace("app-env", &PostParams::default(), &relabelled)
+        .await
+        .err()
+        .context("the operator must not add a service account annotation to a Secret")?;
+    assert!(
+        denial.to_string().contains("may not write service account annotations"),
+        "{denial}"
+    );
 
     let refused = wait_for(
         "the unapproved account to be refused",

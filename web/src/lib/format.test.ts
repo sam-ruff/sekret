@@ -93,16 +93,16 @@ describe("paths", () => {
 
   it("builds breadcrumbs from the root", () => {
     expect(crumbs("/a/b")).toEqual([
-      { name: "root", path: "/" },
+      { name: "/", path: "/" },
       { name: "a", path: "/a" },
       { name: "b", path: "/a/b" },
     ]);
   });
 
-  it("names the top folder root in copy", () => {
-    expect(folderLabel("/")).toBe("root");
-    expect(folderLabel("")).toBe("root");
-    expect(folderLabel("/app/db")).toBe("/app/db");
+  it("names the top folder / in copy, like its subfolders", () => {
+    expect(folderLabel("/")).toBe("/");
+    expect(folderLabel("")).toBe("/");
+    expect(folderLabel("/app/db/")).toBe("/app/db");
   });
 
   it("validates folder names", () => {

@@ -314,6 +314,28 @@ fn project_files_in_world_writable_directories_are_ignored() -> anyhow::Result<(
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn project_files_others_can_edit_are_ignored() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let trap = Trap::new()?;
+    let dir = tempfile::tempdir().context("dir")?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+    let path = dir.path().join(".sekret.toml");
+    std::fs::write(&path, format!("server = \"{}\"\n", trap.url)).context("write")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+    let output = run(&["whoami"], &[], dir.path())?;
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains("ignoring") && text.contains("it is writable by every user"),
+        "{text}"
+    );
+    assert!(text.contains("no server configured"), "{text}");
+    assert!(trap.untouched());
+    Ok(())
+}
+
 #[test]
 fn plain_http_to_another_host_is_refused_unless_allowed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("dir")?;

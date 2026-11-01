@@ -7,11 +7,13 @@ import { PageHeader } from "@/components/page-header";
 import { FolderBreadcrumbs } from "@/components/project/folder-breadcrumbs";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { folderQuery } from "@/hooks/use-project-env";
 import { keys, useEnvironments } from "@/hooks/queries";
 import { normalisePath } from "@/lib/paths";
+import { ROW_PAGE } from "@/lib/secret-limits";
 import { cn } from "@/lib/utils";
 
 /** A present key opens its environment; a missing one also opens the add form with the key filled in. */
@@ -28,6 +30,14 @@ export function OverviewPage() {
   const [search] = useSearchParams();
   const path = normalisePath(search.get("path") ?? "/");
   const [onlyMissing, setOnlyMissing] = useState(false);
+  const [shownRows, setShownRows] = useState(ROW_PAGE);
+  const [shownFolderCount, setShownFolderCount] = useState(ROW_PAGE);
+  const [pageFor, setPageFor] = useState(path);
+  if (pageFor !== path) {
+    setPageFor(path);
+    setShownRows(ROW_PAGE);
+    setShownFolderCount(ROW_PAGE);
+  }
 
   const overview = useQuery({ queryKey: keys.overview(project, path), queryFn: () => api.overview(project, path) });
   const environments = useEnvironments(project);
@@ -52,7 +62,11 @@ export function OverviewPage() {
   const envs = overview.data?.environments ?? [];
   const rows = overview.data?.rows ?? [];
   const incomplete = rows.filter((r) => envs.some((e) => r.environments[e.slug] === undefined));
-  const shown = onlyMissing ? incomplete : rows;
+  const matching = onlyMissing ? incomplete : rows;
+  // Rows and folder chips are paged, so a folder holding a huge number of keys cannot hang the tab.
+  const shown = matching.slice(0, shownRows);
+  const hiddenRows = matching.length - shown.length;
+  const shownFolders = subfolders.slice(0, shownFolderCount);
   const href = (p: string) => `/projects/${project}/overview${folderQuery(p)}`;
 
   return (
@@ -71,7 +85,7 @@ export function OverviewPage() {
 
       {subfolders.length > 0 && (
         <div className="flex flex-wrap gap-2" data-testid="overview-folders">
-          {subfolders.map((name) => (
+          {shownFolders.map((name) => (
             <Link
               key={name}
               to={href(`${prefix}${name}`)}
@@ -82,6 +96,16 @@ export function OverviewPage() {
               {name}
             </Link>
           ))}
+          {subfolders.length > shownFolders.length && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShownFolderCount(shownFolderCount + ROW_PAGE)}
+              data-testid="overview-folders-more"
+            >
+              Show {Math.min(ROW_PAGE, subfolders.length - shownFolders.length)} more folders
+            </Button>
+          )}
         </div>
       )}
 
@@ -140,14 +164,14 @@ export function OverviewPage() {
                 return (
                   <tr
                     key={`${row.path}:${row.key}`}
-                    className={cn("border-b last:border-b-0", missing && "bg-warning/5")}
+                    className={cn("border-b last:border-b-0", missing && "bg-warning/5 dark:bg-warning/12")}
                     data-testid={`overview-row-${row.key}`}
                     data-missing={missing}
                   >
                     <td
                       className={cn(
                         "sticky left-0 z-10 max-w-[45vw] bg-card px-4 py-2.5 font-mono font-medium shadow-[inset_-1px_0_0_var(--color-border)] md:max-w-sm",
-                        missing && "bg-linear-to-r from-warning/5 to-warning/5",
+                        missing && "bg-linear-to-r from-warning/5 to-warning/5 dark:from-warning/12 dark:to-warning/12",
                       )}
                     >
                       <span className="flex min-w-0 items-center gap-2">
@@ -156,7 +180,8 @@ export function OverviewPage() {
                         ) : (
                           <span className="size-3.5 shrink-0" aria-hidden />
                         )}
-                        <span className="truncate" title={row.key}>
+                        {/* Wraps rather than cuts off, so long keys can be told apart on a phone. */}
+                        <span className="max-w-[38vw] min-w-0 break-all md:max-w-sm" data-testid="overview-key">
                           {row.key}
                         </span>
                       </span>
@@ -193,6 +218,16 @@ export function OverviewPage() {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+      {hiddenRows > 0 && (
+        <div className="flex flex-wrap items-center justify-center gap-3 text-sm text-muted-foreground">
+          <span data-testid="overview-more-count">
+            Showing {shown.length} of {matching.length}
+          </span>
+          <Button variant="outline" size="sm" onClick={() => setShownRows(shownRows + ROW_PAGE)} data-testid="overview-show-more">
+            Show {Math.min(ROW_PAGE, hiddenRows)} more
+          </Button>
         </div>
       )}
       {overview.isSuccess && onlyMissing && rows.length > 0 && incomplete.length === 0 && (

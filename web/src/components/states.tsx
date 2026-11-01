@@ -14,14 +14,23 @@ interface EmptyStateProps {
   description?: ReactNode;
   action?: ReactNode;
   testId?: string;
+  /** Renders the title as a heading, for states that stand in for a whole page. */
+  headingLevel?: 1 | 2;
 }
 
-export function EmptyState({ icon, title, description, action, testId }: EmptyStateProps) {
+export function EmptyState({ icon, title, description, action, testId, headingLevel }: EmptyStateProps) {
+  const Heading = headingLevel === 1 ? "h1" : "h2";
   return (
     <Empty className="border bg-card/50 py-12" data-testid={testId}>
       <EmptyHeader>
         <EmptyMedia variant="icon">{icon}</EmptyMedia>
-        <EmptyTitle>{title}</EmptyTitle>
+        {headingLevel ? (
+          <Heading data-slot="empty-title" className="font-heading text-base font-medium tracking-tight">
+            {title}
+          </Heading>
+        ) : (
+          <EmptyTitle>{title}</EmptyTitle>
+        )}
         {description && <EmptyDescription>{description}</EmptyDescription>}
       </EmptyHeader>
       {action && <EmptyContent>{action}</EmptyContent>}
@@ -43,17 +52,21 @@ export function MissingState({
   backTo,
   backLabel,
   testId = "missing",
+  headingLevel = 1,
 }: {
   title: string;
   description: string;
   backTo: string;
   backLabel: string;
   testId?: string;
+  /** 1 when this stands in for the whole page, 2 inside a page that has its own title. */
+  headingLevel?: 1 | 2;
 }) {
   return (
     <EmptyState
       icon={<Compass />}
       title={title}
+      headingLevel={headingLevel}
       description={description}
       action={
         <Button asChild>

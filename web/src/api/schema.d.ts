@@ -1344,6 +1344,12 @@ export interface components {
             issuer: string;
             /** @description Overrides discovery when the issuer does not publish `.well-known/openid-configuration`. */
             jwks_url?: string | null;
+            /**
+             * Format: int64
+             * @description Longest token accepted, from `iat` to `exp`, in seconds; 3600 when left out, and at most
+             *     ten years. Tokens without `iat` are refused.
+             */
+            max_token_lifetime?: number;
         };
         OrgBinding: {
             principal_id: string;

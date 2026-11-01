@@ -29,6 +29,7 @@ export function hostileState(realNow: number): MockState {
       kind: "oidc",
       issuer: X.js,
       jwks_url: X.js,
+      max_token_lifetime: 3600,
       bindings: { audiences: [X.img], subjects: [X.script], claims: { [X.svg]: [X.img] } },
     },
     {

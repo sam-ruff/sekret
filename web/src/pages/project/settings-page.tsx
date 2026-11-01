@@ -73,7 +73,7 @@ function GeneralForm({ project: details, perms }: { project: Project; perms: Per
         <CardHeader>
           <CardTitle>Project details</CardTitle>
           <CardDescription>
-            The slug <span className="font-mono">{details.slug}</span> cannot change.
+            The ID <span className="font-mono">{details.slug}</span> cannot change.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -193,6 +193,7 @@ function RolesSection({ project, perms }: { project: string; perms: Permissions 
       error={roles.error}
       onRetry={() => void roles.refetch()}
       subjects={PROJECT_SUBJECTS}
+      intro="Built-in roles cover common needs. Custom roles can narrow access by environment, folder, key or tag."
       environments={(envs.data ?? []).map((e) => e.slug)}
       canCreate={perms.can("roles", "create")}
       canEdit={perms.can("roles", "edit")}

@@ -85,7 +85,7 @@ describe("KubernetesForm reviewer token", () => {
     await userEvent.type(field, "0");
     expect(screen.getByTestId("k8s-save")).toBeDisabled();
     const error = screen.getByTestId("k8s-max-lifetime-error");
-    expect(error).toHaveTextContent("Enter a whole number of seconds, 1 or more.");
+    expect(error).toHaveTextContent("Enter a whole number of seconds, from 1 up to 10 years.");
     expect(error).toHaveAttribute("role", "alert");
     expect(field).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
     await userEvent.clear(field);
@@ -93,6 +93,16 @@ describe("KubernetesForm reviewer token", () => {
     await userEvent.click(screen.getByTestId("k8s-save"));
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(saved()?.max_token_lifetime).toBe(900);
+  });
+
+  it("flags an API server at a cloud metadata address before saving", async () => {
+    renderForm(config(REDACTED_CREDENTIAL));
+    const host = screen.getByTestId("k8s-host");
+    await userEvent.clear(host);
+    await userEvent.type(host, "https://169.254.169.254");
+    expect(screen.getByTestId("k8s-host-error")).toHaveTextContent("That is a cloud metadata address");
+    expect(host).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByTestId("k8s-save")).toBeDisabled();
   });
 
   it("takes the reviewer token in a masked text field that password managers leave alone", async () => {

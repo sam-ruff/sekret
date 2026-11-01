@@ -77,7 +77,7 @@ pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater
         Ok(false) => return config,
         Ok(true) => {
             return SealConfig {
-                flags: cautious_flags(config.flags, false),
+                flags: cautious_flags(config.flags),
                 ..config
             };
         }
@@ -90,7 +90,7 @@ pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater
     SealConfig {
         unlock_policy: UnlockPolicy::Manual,
         remembered: None,
-        flags: cautious_flags(config.flags, false),
+        flags: cautious_flags(config.flags),
         ..config
     }
 }

@@ -1,6 +1,34 @@
 import { expect, test } from "@playwright/test";
 import { unique } from "./helpers";
 
+test("saves the longest OIDC token lifetime and flags a cloud metadata URL", async ({ page }) => {
+  const name = unique("e2e-oidc");
+  await page.goto("/org/identities");
+  await page.getByTestId("new-identity").click();
+  await page.getByTestId("identity-name").fill(name);
+  await page.getByTestId("identity-create-submit").click();
+  await expect(page).toHaveURL(/\/org\/identities\/[^/]+\/auth$/);
+
+  const oidc = page.getByTestId("auth-method-oidc");
+  await oidc.getByTestId("oidc-preset-github").click();
+  await expect(oidc.getByTestId("oidc-max-lifetime")).toHaveValue("3600");
+  await oidc.getByTestId("oidc-jwks-url").fill("http://169.254.169.254/latest/meta-data");
+  await expect(oidc.getByTestId("oidc-jwks-url-error")).toContainText("cloud metadata address");
+  await expect(oidc.getByTestId("oidc-save")).toBeDisabled();
+  await oidc.getByTestId("oidc-jwks-url").fill("");
+  await oidc.getByTestId("oidc-max-lifetime").fill("600");
+  await oidc.getByTestId("oidc-save").click();
+  await expect(oidc.getByTestId("auth-method-oidc-status")).toHaveText(/^\s*Configured/);
+
+  await page.reload();
+  await expect(page.getByTestId("auth-method-oidc").getByTestId("oidc-max-lifetime")).toHaveValue("600");
+
+  await page.getByTestId("identity-tab-details").click();
+  await page.getByTestId("identity-delete").click();
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/org\/identities$/);
+});
+
 test("creates an identity with universal auth and a client secret", async ({ page }) => {
   const name = unique("e2e-bot");
   await page.goto("/org/identities");

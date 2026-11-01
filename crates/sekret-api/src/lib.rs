@@ -504,6 +504,11 @@ pub struct OidcAuthConfig {
     #[serde(default)]
     pub jwks_url: Option<String>,
     pub bindings: ClaimBindings,
+    /// Longest token accepted, from `iat` to `exp`, in seconds; 3600 when left out, and at most
+    /// ten years. Tokens without `iat` are refused.
+    #[serde(default = "default_max_token_lifetime")]
+    #[schema(minimum = 1, maximum = 315_360_000)]
+    pub max_token_lifetime: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -698,7 +698,8 @@ impl Sources {
             .filter_map(|(name, _)| name.into_string().ok())
             .collect();
         Self {
-            argv: std::env::args().collect(),
+            // args() panics on an argument that is not UTF-8, such as a path.
+            argv: std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect(),
             env: Box::new(move |name| present.contains(name)),
         }
     }
@@ -1626,6 +1627,42 @@ fn server_warnings(config: &ServerConfig, warnings: &mut Vec<String>) {
         ));
     }
     warnings.extend(sekret_server::auth::proxy_range_warnings(&config.trusted_proxies));
+    if let Some(warning) = open_sign_in_warning(config.oidc.as_ref(), &config.default_org_role) {
+        warnings.push(warning);
+    }
+    if config.login_rate_per_minute > LOGIN_RATE_USUAL_MOST {
+        warnings.push(format!(
+            "auth.login_rate_per_minute is {}, which also lets each address try that many unseal and setup \
+             passphrases a minute; keep it at {LOGIN_RATE_USUAL_MOST} or below unless that is really intended",
+            config.login_rate_per_minute
+        ));
+    }
+}
+
+/// Past this, the passphrase guessing rate the same setting allows is worth a warning.
+const LOGIN_RATE_USUAL_MOST: u32 = 300;
+
+/// With no restriction, every account at the provider can sign in and gets the default role.
+/// Not refused, since a single-tenant provider is already a restriction sekret cannot see.
+fn open_sign_in_warning(oidc: Option<&HumanOidcConfig>, default_org_role: &str) -> Option<String> {
+    let oidc = oidc?;
+    if !oidc.required_groups.is_empty() || !oidc.allowed_subjects.is_empty() || default_org_role.is_empty() {
+        return None;
+    }
+    let admins = match (oidc.group_claims.is_empty(), oidc.admin_groups.is_empty()) {
+        (false, false) => format!(
+            ", and anyone whose {} claim holds {} becomes an organisation admin",
+            oidc.group_claims.join(" or "),
+            oidc.admin_groups.join(" or ")
+        ),
+        _ => String::new(),
+    };
+    Some(format!(
+        "OIDC sign-in is open to every account at {}: oidc.required_groups and oidc.allowed_subjects are empty, \
+         so anyone the provider signs in becomes {default_org_role}{admins}; set oidc.required_groups or \
+         oidc.allowed_subjects, or set auth.default_org_role to \"\" (an empty list means no restriction, not no one)",
+        oidc.issuer,
+    ))
 }
 
 /// Giving every signed-in person a powerful organisation role is almost never meant.
@@ -2001,6 +2038,54 @@ mod tests {
         assert!(default_role_warning("backup-reader").is_some());
         assert!(default_role_warning("org-member").is_none());
         Ok(())
+    }
+
+    #[test]
+    fn oidc_open_to_everyone_at_the_provider_is_warned_about() {
+        let open = HumanOidcConfig {
+            issuer: "https://accounts.example.com".into(),
+            client_id: "sekret".into(),
+            client_secret: "s".into(),
+            scopes: strings(&["openid"]),
+            group_claims: strings(&["roles", "groups"]),
+            admin_groups: strings(&["sekret-admin"]),
+            required_groups: Vec::new(),
+            allowed_subjects: Vec::new(),
+        };
+        let warning = open_sign_in_warning(Some(&open), "org-member").unwrap_or_default();
+        for expected in [
+            "https://accounts.example.com",
+            "org-member",
+            "roles or groups",
+            "sekret-admin",
+        ] {
+            assert!(warning.contains(expected), "{expected} missing from {warning}");
+        }
+        assert!(
+            open_sign_in_warning(None, "org-member").is_none(),
+            "no OIDC, no warning"
+        );
+        assert!(
+            open_sign_in_warning(Some(&open), "").is_none(),
+            "no default role is a restriction"
+        );
+
+        let grouped = HumanOidcConfig {
+            required_groups: strings(&["staff"]),
+            ..open.clone()
+        };
+        assert!(open_sign_in_warning(Some(&grouped), "org-member").is_none());
+        let pinned = HumanOidcConfig {
+            allowed_subjects: strings(&["owner"]),
+            ..open.clone()
+        };
+        assert!(open_sign_in_warning(Some(&pinned), "org-member").is_none());
+        let no_admins = HumanOidcConfig {
+            admin_groups: Vec::new(),
+            ..open
+        };
+        let warning = open_sign_in_warning(Some(&no_admins), "org-member").unwrap_or_default();
+        assert!(!warning.contains("organisation admin"), "{warning}");
     }
 
     #[test]

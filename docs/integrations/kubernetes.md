@@ -36,7 +36,7 @@ helm install sekret-operator deploy/helm/sekret-operator \
 | `tokenServiceAccounts` | all | Names of the only service accounts the operator may read and mint tokens for, in every watched namespace. |
 | `serviceAccount.create` | `true` | Creates the operator's own service account. With `false`, name an existing account in `serviceAccount.name`. |
 | `serviceAccount.name` | the release name | The operator's service account. Required when `serviceAccount.create` is `false`. The chart refuses `default`, since every pod in the namespace that names no account runs as it and would get the operator's rights. |
-| `tokenPolicy.enabled` | `true` | Installs a `ValidatingAdmissionPolicy` that lets the operator request only tokens with the `sekret` audience that expire within ten minutes, and none in `kube-system`. Needs Kubernetes 1.30 or later; set it to `false` on older clusters. |
+| `tokenPolicy.enabled` | `true` | Installs two `ValidatingAdmissionPolicy` objects. One lets the operator request only tokens with the `sekret` audience that expire within ten minutes, and none in `kube-system`. The other lets it write only the `Secret` types listed below and no `kubernetes.io/service-account.*` annotations, so it cannot have the cluster fill in a long-lived service account token instead. Needs Kubernetes 1.30 or later; set it to `false` on older clusters. |
 
 !!! warning "Cluster-wide mode is close to cluster-admin"
     With `clusterWide: true` the operator can read and write every `Secret` in the cluster and mint a token for any service account, including powerful ones in `kube-system`. Anyone who takes over the operator's pod or token gets the same reach. The token policy narrows what those tokens can be used for, but prefer listing namespaces in `watchNamespaces` unless you really need every one.
@@ -94,6 +94,6 @@ web-config   web-env   True    2      2026-10-30T12:00:00Z
 
 The operator owns the `Secret` it creates and refuses to overwrite one it did not create. Deleting the `SekretSecret` deletes the `Secret`. When a sync fails, the `Ready` condition says why, and the last good copy of the `Secret` stays in place.
 
-The `type` can be `Opaque`, `kubernetes.io/tls`, `kubernetes.io/basic-auth`, `kubernetes.io/ssh-auth`, `kubernetes.io/dockercfg` or `kubernetes.io/dockerconfigjson`. Types that make the cluster act on the Secret, such as service account tokens, are refused.
+The `type` can be `Opaque`, `kubernetes.io/tls`, `kubernetes.io/basic-auth`, `kubernetes.io/ssh-auth`, `kubernetes.io/dockercfg` or `kubernetes.io/dockerconfigjson`. Types that make the cluster act on the Secret, such as service account tokens, are refused, and so are `annotations` starting with `kubernetes.io/service-account.`.
 
 The operator runs from the same binary as everything else, as `sekret operator`. `sekret operator crd` prints the CustomResourceDefinition.

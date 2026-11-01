@@ -218,6 +218,21 @@ fn ask_unlock(prompter: &dyn Prompter) -> anyhow::Result<UnlockPolicy> {
     }
 }
 
+fn is_printable_token(token: &str) -> bool {
+    !token.is_empty() && !token.chars().any(char::is_whitespace) && sekret_client::terminal_safe(token) == token
+}
+
+/// Raw backup bytes would be read by the terminal as escape sequences.
+pub fn refuse_binary_to_terminal(command: &SysCommand, stdout_is_terminal: bool) -> anyhow::Result<()> {
+    let SysCommand::Backup { output } = command else {
+        return Ok(());
+    };
+    if output.as_os_str() == "-" && stdout_is_terminal {
+        anyhow::bail!("a backup is binary; redirect it to a file or name one with -o FILE");
+    }
+    Ok(())
+}
+
 /// Runs a `sekret sys` command and returns the process exit code.
 pub async fn run(
     api: &dyn SekretApi,
@@ -262,7 +277,11 @@ pub async fn run(
                     unlock_policy,
                 })
                 .await?;
-            writeln!(out, "{}", response.admin_token)?;
+            let token = &response.admin_token;
+            if !is_printable_token(token) {
+                anyhow::bail!("the server sent an admin token that is not a single printable word; not printing it");
+            }
+            writeln!(out, "{token}")?;
             eprintln!(
                 "sekret is set up in {} mode. The line above is a break-glass admin token, valid for an hour \
                  and shown only once; use it with SEKRET_TOKEN, or sign in with `sekret login`.",
@@ -530,6 +549,57 @@ mod tests {
         };
         run(&api, command, &Scripted::new(&[]), &mut Vec::new()).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_admin_token_with_control_characters_is_not_printed() -> anyhow::Result<()> {
+        let init = || SysCommand::Init {
+            setup_code: Some("ABCD".into()),
+            setup_code_file: None,
+            key_file_mode: true,
+            passphrase_file: None,
+            unlock: None,
+        };
+        for hostile in [
+            "skt_\u{1b}]52;c;cm0gLXJm\u{7}",
+            "skt_a\nrm -rf ~",
+            "skt_\u{9b}2J",
+            "skt_\u{202e}x",
+            "",
+        ] {
+            let mut api = MockSekretApi::new();
+            api.expect_sys_init().returning(move |_| {
+                Ok(InitResponse {
+                    admin_token: hostile.into(),
+                    ..init_response()
+                })
+            });
+            let mut out = Vec::new();
+            let refused = run(&api, init(), &Scripted::new(&[]), &mut out)
+                .await
+                .err()
+                .with_context(|| format!("{hostile:?} must be refused"))?;
+            assert!(refused.to_string().contains("not printing it"), "{refused}");
+            assert!(out.is_empty(), "{hostile:?}");
+        }
+        let mut api = MockSekretApi::new();
+        api.expect_sys_init().returning(|_| Ok(init_response()));
+        let mut out = Vec::new();
+        run(&api, init(), &Scripted::new(&[]), &mut out).await?;
+        assert_eq!(out, b"skt_admin\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_backup_is_never_written_to_a_terminal() {
+        let to_stdout = SysCommand::Backup { output: "-".into() };
+        assert!(refuse_binary_to_terminal(&to_stdout, true).is_err());
+        assert!(refuse_binary_to_terminal(&to_stdout, false).is_ok(), "a pipe is fine");
+        let to_file = SysCommand::Backup {
+            output: "backup.bin".into(),
+        };
+        assert!(refuse_binary_to_terminal(&to_file, true).is_ok());
+        assert!(refuse_binary_to_terminal(&SysCommand::Seal, true).is_ok());
     }
 
     #[test]

@@ -56,24 +56,29 @@ export function ListInput({
   };
 
   return (
-    <div className="space-y-1">
+    <div className="min-w-0 space-y-1">
       <div
         className={cn(
-          "flex min-h-8 flex-wrap items-center gap-1 rounded-lg border border-input bg-transparent px-1.5 py-1 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30",
+          "flex min-h-8 min-w-0 flex-wrap items-center gap-1 rounded-lg border border-input bg-transparent px-1.5 py-1 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30",
           problem && "border-destructive",
           disabled && "opacity-50",
         )}
         data-testid={testId}
       >
         {value.map((entry) => (
-          <Badge key={entry} variant="secondary" className={cn("h-6 gap-1 pr-1", mono && "font-mono")}>
-            {entry}
+          <Badge
+            key={entry}
+            variant="secondary"
+            className={cn("h-auto min-h-6 max-w-full shrink gap-1 rounded-md pr-1 whitespace-normal", mono && "font-mono")}
+            data-testid={testId ? `${testId}-chip` : undefined}
+          >
+            <span className="min-w-0 break-all">{entry}</span>
             {!disabled && (
               <button
                 type="button"
                 onClick={() => onChange(value.filter((v) => v !== entry))}
                 aria-label={`Remove ${entry}`}
-                className="relative rounded-sm opacity-60 after:absolute after:-inset-1.5 after:content-[''] hover:opacity-100"
+                className="relative shrink-0 rounded-sm opacity-60 after:absolute after:-inset-1.5 after:content-[''] hover:opacity-100"
               >
                 <X className="size-3" />
               </button>

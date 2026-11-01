@@ -24,15 +24,28 @@ test("previews and restores a snapshot", async ({ page }) => {
   const changes = sheet.getByTestId("snapshot-changes");
   await expect(changes.getByTestId("change-LOG_LEVEL")).toContainText("Changed");
   await expect(changes.getByTestId("change-FEATURE_FLAGS")).toContainText("Removed");
+  // Removal reads as removing the secret, not deleting a version.
+  await expect(changes.getByTestId("change-FEATURE_FLAGS").getByTestId("change-detail")).toHaveText(
+    /^Would be removed \(currently version \d+\)$/,
+  );
   await expect(changes.getByTestId("change-WEBHOOK_SECRET")).toBeVisible();
 
   await sheet.getByTestId("restore-path").fill("/payments");
   await expect(changes.getByTestId("change-LOG_LEVEL")).toHaveCount(0);
   await expect(changes.getByTestId("change-WEBHOOK_SECRET")).toBeVisible();
   await sheet.getByTestId("restore-path").fill("/");
+  await expect(changes.getByTestId("change-LOG_LEVEL")).toBeVisible();
 
-  await sheet.getByTestId("restore-snapshot").click();
-  await page.getByTestId("restore-confirm").getByTestId("confirm-action").click();
+  // A restore that removes secrets is styled and described as one.
+  const restore = sheet.getByTestId("restore-snapshot");
+  await expect(restore).toHaveAttribute("data-variant", "destructive");
+  await restore.click();
+  const confirm = page.getByTestId("restore-confirm");
+  await expect(confirm).toContainText(/Restoring \/ in Development removes .*FEATURE_FLAGS/);
+  await expect(confirm).toContainText("removed secrets keep their history");
+  await expect(confirm).not.toContainText("will be written as new versions");
+  await expect(confirm.getByTestId("confirm-action")).toHaveAttribute("data-variant", "destructive");
+  await confirm.getByTestId("confirm-action").click();
   await expectToast(page, /Restored \d+ secrets/);
 
   await navigate(page, "nav-secrets");

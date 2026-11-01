@@ -14,10 +14,13 @@ import {
   credentialPayload,
   DEFAULT_MAX_TOKEN_LIFETIME,
   initialCredential,
+  outboundUrlProblem,
   parseJwks,
   parseLifetime,
   type WriteOnlyCredential,
 } from "./identity-model";
+import { MaxLifetimeField } from "./max-lifetime-field";
+import { UrlField } from "./url-field";
 
 interface KubernetesFormProps {
   initial?: KubernetesAuthConfig;
@@ -109,7 +112,9 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
   const jwks = parseJwks(jwksText);
   const maxLifetime = parseLifetime(lifetime);
   const modeValid =
-    mode === "token-review" ? host.trim() !== "" : issuer.trim() !== "" && !jwks.error && (!!jwks.value || jwksUrl.trim() !== "");
+    mode === "token-review"
+      ? host.trim() !== "" && !outboundUrlProblem(host)
+      : issuer.trim() !== "" && !jwks.error && (!!jwks.value || jwksUrl.trim() !== "") && !outboundUrlProblem(jwksUrl);
   const valid =
     modeValid && namespaces.length > 0 && serviceAccounts.length > 0 && audiences.length > 0 && maxLifetime !== null;
 
@@ -157,18 +162,14 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
       </Field>
       {mode === "token-review" ? (
         <div className="grid gap-4 md:grid-cols-2">
-          <Field>
-            <FieldLabel htmlFor="k8s-host">API server URL</FieldLabel>
-            <Input
-              id="k8s-host"
-              value={host}
-              disabled={disabled}
-              placeholder="https://kubernetes.example.com:6443"
-              className="font-mono"
-              onChange={(e) => setHost(e.target.value)}
-              data-testid="k8s-host"
-            />
-          </Field>
+          <UrlField
+            id="k8s-host"
+            label="API server URL"
+            value={host}
+            disabled={disabled}
+            placeholder="https://kubernetes.example.com:6443"
+            onChange={setHost}
+          />
           <Field>
             <FieldLabel htmlFor="k8s-ca">CA certificate (optional)</FieldLabel>
             <Textarea
@@ -198,18 +199,14 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
               data-testid="k8s-issuer"
             />
           </Field>
-          <Field>
-            <FieldLabel htmlFor="k8s-jwks-url">JWKS URL</FieldLabel>
-            <Input
-              id="k8s-jwks-url"
-              value={jwksUrl}
-              disabled={disabled}
-              placeholder="Or paste the keys below"
-              className="font-mono"
-              onChange={(e) => setJwksUrl(e.target.value)}
-              data-testid="k8s-jwks-url"
-            />
-          </Field>
+          <UrlField
+            id="k8s-jwks-url"
+            label="JWKS URL"
+            value={jwksUrl}
+            disabled={disabled}
+            placeholder="Or paste the keys below"
+            onChange={setJwksUrl}
+          />
           <Field className="md:col-span-2">
             <FieldLabel htmlFor="k8s-jwks">Inline JWKS</FieldLabel>
             <Textarea
@@ -271,30 +268,19 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
         </Field>
       </div>
       <p className="text-xs text-muted-foreground">Namespaces and service accounts accept globs, such as team-*.</p>
-      <Field data-invalid={maxLifetime === null}>
-        <FieldLabel htmlFor="k8s-max-lifetime">Longest Kubernetes token accepted (seconds)</FieldLabel>
-        <Input
-          id="k8s-max-lifetime"
-          inputMode="numeric"
-          value={lifetime}
-          disabled={disabled}
-          className="w-full font-mono sm:w-40"
-          aria-invalid={maxLifetime === null}
-          aria-describedby={maxLifetime === null ? "k8s-max-lifetime-error" : "k8s-max-lifetime-help"}
-          onChange={(e) => setLifetime(e.target.value)}
-          data-testid="k8s-max-lifetime"
-        />
-        {maxLifetime === null ? (
-          <FieldError id="k8s-max-lifetime-error" data-testid="k8s-max-lifetime-error">
-            Enter a whole number of seconds, 1 or more.
-          </FieldError>
-        ) : (
-          <FieldDescription id="k8s-max-lifetime-help" data-testid="k8s-max-lifetime-help">
-            Kubernetes tokens valid for longer than this are refused: {formatDurationWords(maxLifetime)}. Keep pods&apos;
+      <MaxLifetimeField
+        idPrefix="k8s"
+        label="Longest Kubernetes token accepted (seconds)"
+        value={lifetime}
+        disabled={disabled}
+        onChange={setLifetime}
+        help={(seconds) => (
+          <>
+            Kubernetes tokens valid for longer than this are refused: {formatDurationWords(seconds)}. Keep pods&apos;
             projected token <code className="font-mono text-xs">expirationSeconds</code> at or below it.
-          </FieldDescription>
+          </>
         )}
-      </Field>
+      />
       {!disabled && (
         <div className="flex justify-end">
           <Button type="submit" disabled={!valid || busy} data-testid="k8s-save">

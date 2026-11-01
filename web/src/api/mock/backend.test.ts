@@ -79,6 +79,44 @@ describe("mock backend", () => {
     ).toThrow(MockError);
   });
 
+  describe("OIDC auth method", () => {
+    const oidc = (overrides: Partial<Extract<AuthMethodConfig, { kind: "oidc" }>> = {}): AuthMethodConfig => ({
+      kind: "oidc",
+      issuer: "https://issuer.example.com",
+      jwks_url: null,
+      bindings: { audiences: ["sekret"], subjects: ["ci:*"], claims: {} },
+      ...overrides,
+    });
+    const setup = () => {
+      const b = backend();
+      const { id } = b.createIdentity({ name: "ci", description: "" });
+      const lifetime = () => {
+        const method = b.listAuthMethods(id).find((m) => m.kind === "oidc");
+        return method?.kind === "oidc" ? method.max_token_lifetime : undefined;
+      };
+      return { b, id, lifetime };
+    };
+
+    it("stores the token lifetime, defaulting to an hour, between a second and ten years", () => {
+      const { b, id, lifetime } = setup();
+      b.putAuthMethod(id, "oidc", oidc());
+      expect(lifetime()).toBe(3600);
+      b.putAuthMethod(id, "oidc", oidc({ max_token_lifetime: 900 }));
+      expect(lifetime()).toBe(900);
+      expect(() => b.putAuthMethod(id, "oidc", oidc({ max_token_lifetime: 0 }))).toThrow(/between 1 second and 10 years/);
+      expect(() => b.putAuthMethod(id, "oidc", oidc({ max_token_lifetime: 315_360_001 }))).toThrow(MockError);
+    });
+
+    it.each(["https://169.254.169.254", "http://[::ffff:169.254.169.254]/", "https://[fd00:ec2::254]/", "https://100.100.100.200"])(
+      "refuses a URL at the cloud metadata address %s",
+      (url) => {
+        const { b, id } = setup();
+        expect(() => b.putAuthMethod(id, "oidc", oidc({ jwks_url: url }))).toThrow(`url not allowed: ${url}`);
+        expect(() => b.putAuthMethod(id, "oidc", oidc({ issuer: url }))).toThrow(/url not allowed/);
+      },
+    );
+  });
+
   describe("Kubernetes reviewer token", () => {
     const k8s = (reviewer_jwt?: string | null, max_token_lifetime?: number): AuthMethodConfig => ({
       kind: "kubernetes",
@@ -124,6 +162,21 @@ describe("mock backend", () => {
       b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL));
       expect(lifetime()).toBe(3600);
       expect(() => b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL, 0))).toThrow(MockError);
+      expect(() => b.putAuthMethod(id, "kubernetes", k8s(REDACTED_CREDENTIAL, 315_360_001))).toThrow(MockError);
+    });
+
+    it("refuses an API server at a cloud metadata address", () => {
+      const { b, id } = setup();
+      const metadataHost: AuthMethodConfig = {
+        kind: "kubernetes",
+        mode: "token-review",
+        host: "https://169.254.169.254",
+        reviewer_jwt: "eyJ.real.token",
+        namespaces: ["billing"],
+        service_accounts: ["worker"],
+        audiences: ["sekret"],
+      };
+      expect(() => b.putAuthMethod(id, "kubernetes", metadataHost)).toThrow(/url not allowed/);
     });
 
     it("clears the token when it is empty or omitted", () => {

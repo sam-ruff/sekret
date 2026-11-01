@@ -10,6 +10,7 @@ import { forgetAllButStatus } from "@/hooks/queries";
 import { StatusGate } from "@/components/sys/status-gate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { beginLeaving } from "@/lib/leaving";
 import { forgetWhenHidden } from "@/lib/page-lifecycle";
 import { ThemeProvider } from "@/lib/theme";
@@ -87,6 +88,12 @@ function forgetEverything(): void {
   forgetAllButStatus(queryClient);
 }
 
+/** On phones drawers fill the screen and keep their buttons at the bottom, so toasts go to the top instead. */
+function AppToaster() {
+  const mobile = useIsMobile();
+  return <Toaster richColors closeButton position={mobile ? "top-center" : "bottom-right"} />;
+}
+
 export function App() {
   useEffect(() => forgetWhenHidden(forgetEverything), []);
   return (
@@ -100,7 +107,7 @@ export function App() {
               </StatusGate>
             </BrowserRouter>
           </ErrorBoundary>
-          <Toaster richColors closeButton position="bottom-right" />
+          <AppToaster />
         </TooltipProvider>
       </QueryClientProvider>
     </ThemeProvider>

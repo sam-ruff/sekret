@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -57,14 +58,54 @@ pub trait TokenReviewer: Send + Sync {
     async fn review(&self, request: TokenReviewRequest) -> Result<TokenReviewResult, NetError>;
 }
 
-/// Refuses anything but https (or http when explicitly allowed) and URLs carrying credentials.
+/// Cloud instance metadata services: IPv4 link-local, which holds AWS, GCP and Azure's
+/// 169.254.169.254, Alibaba's 100.100.100.200 and AWS's IPv6 fd00:ec2::254.
+pub fn is_metadata_address(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_link_local() || v4 == Ipv4Addr::new(100, 100, 100, 200),
+        IpAddr::V6(v6) => v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    }
+}
+
+/// Refuses anything but https (or http when explicitly allowed), URLs carrying credentials and
+/// cloud metadata addresses.
 pub fn check_outbound_url(raw: &str, allow_http: bool) -> Result<url::Url, NetError> {
     let parsed = url::Url::parse(raw).map_err(|_| NetError::UrlNotAllowed(raw.to_string()))?;
     let scheme_ok = parsed.scheme() == "https" || (allow_http && parsed.scheme() == "http");
-    if !scheme_ok || !parsed.username().is_empty() || parsed.password().is_some() || parsed.host().is_none() {
+    if !scheme_ok || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(NetError::UrlNotAllowed(raw.to_string()));
+    }
+    let metadata = match parsed.host() {
+        None => true,
+        Some(url::Host::Ipv4(v4)) => is_metadata_address(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => is_metadata_address(IpAddr::V6(v6)),
+        Some(url::Host::Domain(_)) => false,
+    };
+    if metadata {
         return Err(NetError::UrlNotAllowed(raw.to_string()));
     }
     Ok(parsed)
+}
+
+/// Resolves names as the system does, leaving out metadata addresses, so a name pointed at one,
+/// before or after it was checked, connects nowhere.
+struct NoMetadata;
+
+impl reqwest::dns::Resolve for NoMetadata {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| !is_metadata_address(a.ip()))
+                .collect();
+            if addresses.is_empty() {
+                return Err(format!("{host} resolves only to refused addresses").into());
+            }
+            let addresses: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addresses)
+        })
+    }
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
@@ -72,6 +113,7 @@ fn client_builder() -> reqwest::ClientBuilder {
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(NoMetadata))
         .user_agent(format!("sekret/{}", sekret_core::VERSION))
 }
 
@@ -194,6 +236,39 @@ mod tests {
         assert!(check_outbound_url("file:///etc/passwd", true).is_err());
         assert!(check_outbound_url("https://user:pass@host", false).is_err());
         assert!(check_outbound_url("not a url", true).is_err());
+    }
+
+    #[test]
+    fn cloud_metadata_addresses_are_refused() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://169.254.170.2",
+            "http://2852039166/",
+            "http://[fd00:ec2::254]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://100.100.100.200/",
+        ] {
+            assert!(check_outbound_url(url, true).is_err(), "{url}");
+        }
+        assert!(
+            check_outbound_url("https://10.0.0.1:6443", false).is_ok(),
+            "private clusters still work"
+        );
+        assert!(check_outbound_url("http://127.0.0.1:8080", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_resolver_drops_metadata_addresses() -> anyhow::Result<()> {
+        use reqwest::dns::Resolve;
+        let name = |host: &str| host.parse::<reqwest::dns::Name>().map_err(|_| anyhow::anyhow!("name"));
+        let local: Vec<SocketAddr> = NoMetadata
+            .resolve(name("localhost")?)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .collect();
+        assert!(!local.is_empty());
+        assert!(NoMetadata.resolve(name("169.254.169.254")?).await.is_err());
+        Ok(())
     }
 
     #[test]

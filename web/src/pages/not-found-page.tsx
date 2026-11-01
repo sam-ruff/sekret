@@ -10,6 +10,7 @@ export function NotFoundPage() {
     <EmptyState
       icon={<Compass />}
       title="Nothing lives here"
+      headingLevel={1}
       description="This page does not exist, or it moved somewhere more secret."
       action={
         <Button asChild>

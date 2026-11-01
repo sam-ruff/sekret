@@ -8,7 +8,7 @@ test.describe("on a 390 pixel phone", () => {
     await page.goto("/projects/storefront/secrets/staging");
     await secretAction(page, "CSRF_SECRET", "secret-history");
     const drawer = page.getByTestId("secret-drawer");
-    await expect(drawer.getByTestId("secret-drawer-where")).toHaveText("Staging · root");
+    await expect(drawer.getByTestId("secret-drawer-where")).toHaveText("Staging · /");
     await drawer.getByTestId("history-values-toggle").click();
     await expect(drawer.getByTestId("diff-output")).toBeVisible();
 
@@ -105,6 +105,10 @@ test("hides history values until asked, then diffs versions and rolls back", asy
   await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rolled LOG_LEVEL back to version 1");
   await expect(drawer.getByTestId("version-4")).toContainText("rolled back to version 1");
+  // Rolling back to a version that matches the current one would change nothing, so it is not offered.
+  await expect(drawer.getByTestId("same-as-current-1")).toHaveText("Same as current");
+  await expect(drawer.getByTestId("rollback-1")).toHaveCount(0);
+  await expect(drawer.getByTestId("rollback-2")).toBeVisible();
 
   await drawer.getByRole("button", { name: "Close" }).click();
   await expect(drawer).toBeHidden();

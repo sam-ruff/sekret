@@ -29,6 +29,7 @@ import type {
   UpdateProject,
   UserSort,
 } from "../types";
+import { MAX_LOGO_BYTES } from "@/lib/images";
 import { CSRF_HEADER } from "../client";
 import type { AuditQuery, IdentityQuery, UserQuery } from "../endpoints";
 import { MockBackend, MockError } from "./backend";
@@ -326,12 +327,53 @@ export function mockRequestLog(): string[] {
   return [...requestLog];
 }
 
+const MAX_BODY = 4 * 1024 * 1024;
+const LARGE_BODY = 1024 * 1024;
+const DEFAULT_BODY = 256 * 1024;
+
+/** Mirrors the server's per-route write limits. */
+export function mockBodyLimit(path: string): number {
+  const segments = path.replace(/\/+$/, "").split("/");
+  const [last, previous] = [segments[segments.length - 1], segments[segments.length - 2]];
+  if (previous === "secrets" && last === "batch") return MAX_BODY;
+  if (last === "logo") return MAX_LOGO_BYTES;
+  if (previous === "secrets" || previous === "roles" || previous === "auth") return LARGE_BODY;
+  return DEFAULT_BODY;
+}
+
+function limitedWrite(path: string): boolean {
+  return path.startsWith("/api/v1/") && !path.startsWith("/api/v1/sys/") && !path.startsWith("/api/v1/auth/");
+}
+
+interface PlannedFailure {
+  method: string;
+  path: RegExp;
+  status: number;
+  code: string;
+  message: string;
+}
+
+const plannedFailures: PlannedFailure[] = [];
+
+/** Makes the next request matching `method` and the `path` pattern fail, for tests of partial failures. */
+export function mockFailNext(method: string, path: string, status: number, code: string, message: string): void {
+  plannedFailures.push({ method: method.toUpperCase(), path: new RegExp(path), status, code, message });
+}
+
+function takePlannedFailure(method: string, path: string): PlannedFailure | undefined {
+  const index = plannedFailures.findIndex((f) => f.method === method && f.path.test(path));
+  if (index < 0) return undefined;
+  return plannedFailures.splice(index, 1)[0];
+}
+
 /** Answers a request the way the real server would, against in-memory state. */
 export async function mockFetch(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
   requestLog.push(`${method} ${url.pathname}${url.search}`);
   await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
+  const planned = takePlannedFailure(method, url.pathname);
+  if (planned) return json(planned.status, { error: planned.code, message: planned.message });
   const match = routes
     .filter((r) => r.method === method)
     .map((r) => ({ r, m: url.pathname.match(r.pattern) }))
@@ -347,6 +389,9 @@ export async function mockFetch(request: Request): Promise<Response> {
     }
     if (b.rotateDue(Math.floor(Date.now() / 1000)).length > 0) save();
     const raw = method === "GET" ? new Uint8Array() : new Uint8Array(await request.arrayBuffer());
+    if (method !== "GET" && limitedWrite(url.pathname) && raw.byteLength > mockBodyLimit(url.pathname)) {
+      throw new MockError(413, "too_large", "the request body is too large or arrived too slowly");
+    }
     const text = match.r.raw ? "" : new TextDecoder().decode(raw);
     const ctx: Ctx = {
       params: match.m.slice(1).map(decodeURIComponent),

@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::Context;
 use sekret_core::crypto::RootKey;
-use sekret_core::seal::{SealFlags, UnlockPolicy, unwrap_root_key};
+use sekret_core::seal::{SealFlags, SealMode, UnlockPolicy, unwrap_root_key, wrap_root_key};
 use sekret_server::seal::{Signature, accepted_roots, check_signature, high_water, record_epoch, signed};
 use sekret_store::{SealConfig, SqlStore, Store};
 
@@ -62,10 +62,21 @@ impl Fixture {
     }
 
     fn admin(&self, args: &[&str]) -> anyhow::Result<String> {
+        ok(self.admin_output(args)?)
+    }
+
+    fn admin_output(&self, args: &[&str]) -> anyhow::Result<Output> {
         let mut full = vec!["admin"];
         full.extend_from_slice(args);
         full.extend_from_slice(&["--database-url", &self.db, "--passphrase-file", "pass"]);
-        ok(run(&full, self.path())?)
+        run(&full, self.path())
+    }
+
+    /// Writes the live root key to `root.key`, as a passphrase-mode server may also have.
+    async fn with_key_file(&self) -> anyhow::Result<RootKey> {
+        let root = Self::root(&self.config().await?)?;
+        std::fs::write(self.path().join("root.key"), root.to_key_file_text().as_bytes()).context("key file")?;
+        Ok(root)
     }
 }
 
@@ -369,5 +380,93 @@ async fn an_epoch_file_is_raised_by_the_offline_commands() -> anyhow::Result<()>
     assert_eq!(high_water(std::slice::from_ref(&extra)).highest, Some(config.epoch));
     let root = Fixture::root(&config)?;
     assert_eq!(accepted_roots(&[extra]), Some(vec![root.fingerprint()]));
+    Ok(())
+}
+
+/// A database writer swaps the passphrase wrap for one of their own. Repairing with the key file
+/// must not sign it as trusted, which would lock the owner's passphrase out for good.
+#[tokio::test]
+async fn reset_epoch_with_a_key_file_never_signs_a_planted_wrap() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let root = fixture.with_key_file().await?;
+    let planted = SealConfig {
+        wrapped: Some(wrap_root_key(&RootKey::generate()?, "attacker chosen words here")?),
+        ..fixture.config().await?
+    };
+    fixture.store().await?.update_seal_config(planted.clone()).await?;
+
+    let refused = fixture.admin_output(&["reset-epoch", "--root-key-file", "root.key"])?;
+    let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(!refused.status.success(), "{shown}");
+    assert!(shown.contains("--drop-passphrase-wrap"), "{shown}");
+    assert_eq!(fixture.config().await?, planted, "nothing was signed");
+
+    fixture.admin(&["reset-epoch", "--root-key-file", "root.key", "--drop-passphrase-wrap"])?;
+    let repaired = fixture.config().await?;
+    assert_eq!(repaired.mode, SealMode::KeyFile);
+    assert!(repaired.wrapped.is_none());
+    assert_eq!(check_signature(&root, &repaired), Signature::Valid);
+    fixture.admin(&["bootstrap", "--root-key-file", "root.key"])?;
+    Ok(())
+}
+
+/// When only other fields were changed, the owner's passphrase proves the wrap and it is kept.
+#[tokio::test]
+async fn reset_epoch_with_a_key_file_keeps_a_wrap_the_passphrase_opens() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let root = fixture.with_key_file().await?;
+    let refused = fixture.admin_output(&["reset-epoch", "--root-key-file", "root.key", "--drop-passphrase-wrap"])?;
+    assert!(!refused.status.success(), "a sound wrap is never dropped");
+    let tampered = SealConfig {
+        unlock_policy: UnlockPolicy::Remember,
+        ..fixture.config().await?
+    };
+    fixture.store().await?.update_seal_config(tampered.clone()).await?;
+
+    fixture.admin(&["reset-epoch", "--root-key-file", "root.key"])?;
+    let repaired = fixture.config().await?;
+    assert_eq!(repaired.mode, SealMode::Passphrase);
+    assert_eq!(repaired.wrapped, tampered.wrapped);
+    assert_eq!(repaired.unlock_policy, UnlockPolicy::Manual);
+    assert_eq!(check_signature(&root, &repaired), Signature::Valid);
+    Ok(())
+}
+
+/// A database writer clears the flag that keeps a remember secret required. Every repair sets it
+/// again, so only `forget-unlock` can lift it.
+#[tokio::test]
+async fn repairs_keep_the_remember_secret_required() -> anyhow::Result<()> {
+    for command in [&["reset-epoch"][..], &["rotate-root-key"][..]] {
+        let (fixture, _) = rolled_forward().await?;
+        let config = fixture.config().await?;
+        assert!(!config.flags.remember_secret);
+        let tampered = SealConfig {
+            flags: SealFlags {
+                remember_secret: false,
+                ..config.flags
+            },
+            unlock_policy: UnlockPolicy::Remember,
+            ..config
+        };
+        fixture.store().await?.update_seal_config(tampered).await?;
+        fixture.admin(command)?;
+        let repaired = fixture.config().await?;
+        assert!(repaired.flags.remember_secret, "{command:?}");
+    }
+    Ok(())
+}
+
+/// A passphrase-mode server with a key file reads the file first, so rotating must leave it
+/// holding the new key, not the old one that opens every earlier backup.
+#[tokio::test]
+async fn rotating_in_passphrase_mode_replaces_the_key_file() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let old = fixture.with_key_file().await?;
+    let printed = fixture.admin(&["rotate-root-key", "--root-key-file", "root.key"])?;
+    assert!(printed.contains("wrote the new root key"), "{printed}");
+    let new = Fixture::root(&fixture.config().await?)?;
+    assert_ne!(new.fingerprint(), old.fingerprint());
+    assert_eq!(fingerprint_in(&fixture.path().join("root.key"))?, new.fingerprint());
+    fixture.admin(&["bootstrap", "--root-key-file", "root.key"])?;
     Ok(())
 }

@@ -39,7 +39,8 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { useProjects } from "@/hooks/queries";
+import { useProject, useProjects } from "@/hooks/queries";
+import { isNotFound } from "@/lib/errors";
 import { useIsOrgAdmin, useOrgPermissions } from "@/hooks/use-permissions";
 import { DOCS_URL } from "@/lib/links";
 
@@ -136,8 +137,10 @@ export function AppSidebar() {
   const { project } = useParams();
   const org = useOrgPermissions();
   const orgAdmin = useIsOrgAdmin();
+  const projectQuery = useProject(project ?? "", !!project);
 
-  const projectItems: NavItem[] = project
+  // A project that does not exist gets no project links, which would all lead to another not-found page.
+  const projectItems: NavItem[] = project && !isNotFound(projectQuery.error)
     ? [
         { to: `/projects/${project}/secrets`, label: "Secrets", icon: KeyRound, testId: "nav-secrets" },
         { to: `/projects/${project}/overview`, label: "Overview", icon: Layers, testId: "nav-overview" },

@@ -3,11 +3,49 @@ import {
   credentialPayload,
   githubActionsSnippet,
   initialCredential,
+  MAX_TOKEN_LIFETIME_LIMIT,
+  outboundUrlProblem,
   parseJwks,
+  parseLifetime,
   ttlProblem,
   type IdentityDraft,
 } from "./identity-model";
 import { REDACTED_CREDENTIAL } from "@/api/types";
+
+describe("parseLifetime", () => {
+  it("takes whole seconds from one up to ten years", () => {
+    expect(parseLifetime(" 900 ")).toBe(900);
+    expect(parseLifetime(String(MAX_TOKEN_LIFETIME_LIMIT))).toBe(MAX_TOKEN_LIFETIME_LIMIT);
+    expect(MAX_TOKEN_LIFETIME_LIMIT).toBe(315_360_000);
+  });
+
+  it.each(["0", "-5", "1.5", "soon", "", String(MAX_TOKEN_LIFETIME_LIMIT + 1)])("refuses %j", (text) => {
+    expect(parseLifetime(text)).toBeNull();
+  });
+});
+
+describe("outboundUrlProblem", () => {
+  it.each([
+    "https://169.254.169.254/latest/meta-data",
+    "https://169.254.170.2",
+    "http://[::ffff:169.254.169.254]/",
+    "https://[fd00:ec2::254]/",
+    "https://100.100.100.200",
+  ])("flags the cloud metadata address %s", (url) => {
+    expect(outboundUrlProblem(url)).toMatch(/cloud metadata address/);
+  });
+
+  it("flags credentials in the URL and text that is not a URL", () => {
+    expect(outboundUrlProblem("https://user:pw@issuer.example.com")).toMatch(/username and password/);
+    expect(outboundUrlProblem("issuer.example.com")).toMatch(/full URL/);
+  });
+
+  it("accepts ordinary addresses and leaves an empty field alone", () => {
+    expect(outboundUrlProblem("https://token.actions.githubusercontent.com")).toBeUndefined();
+    expect(outboundUrlProblem("https://10.0.0.5:6443")).toBeUndefined();
+    expect(outboundUrlProblem("  ")).toBeUndefined();
+  });
+});
 
 const draft = (tokenTtl: string, tokenMaxTtl: string): IdentityDraft => ({
   name: "ci",

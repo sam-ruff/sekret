@@ -97,7 +97,8 @@ pub async fn device_login(
         writeln!(out, "Open {shown_url} to continue.")?;
     }
     let mut interval = Duration::from_secs(start.interval.max(1) as u64).min(max_interval);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(start.expires_in.max(1) as u64);
+    let lifetime = Duration::from_secs(start.expires_in.max(1) as u64).min(LONGEST_LOGIN_WAIT);
+    let deadline = tokio::time::Instant::now() + lifetime;
     loop {
         let wait = match api.cli_poll(start.device_code.clone()).await {
             Ok(token) => return Ok(token),
@@ -112,12 +113,16 @@ pub async fn device_login(
             }
             Err(error) => return Err(error).context("waiting for approval"),
         };
-        if tokio::time::Instant::now() + wait >= deadline {
+        // Subtracting, not adding, so a huge Retry-After cannot overflow the clock.
+        if wait >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
             bail!("timed out waiting for approval")
         }
         tokio::time::sleep(wait).await;
     }
 }
+
+/// However long the server says its code lasts, the CLI stops waiting after this.
+const LONGEST_LOGIN_WAIT: Duration = Duration::from_secs(3600);
 
 /// How much longer to wait between polls each time the server answers `slow_down`.
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
@@ -275,6 +280,38 @@ mod tests {
         assert!(error.to_string().contains("timed out"), "{error}");
         // 0, then +7, +12, +17 would reach 36; the next wait of 22 would pass 40.
         assert_eq!(polled_at(&seen), [0, 7, 19, 36]);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_huge_retry_after_ends_the_login_instead_of_panicking() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| Ok(start()));
+        let seen = timed_polls(&mut api, vec![Err(slow_down(Some(u64::MAX)))]);
+        let Err(error) = device_login(&api, SERVER, &mut Vec::new(), &|_| false, Duration::from_secs(10)).await else {
+            anyhow::bail!("a Retry-After past the code's lifetime must end the login");
+        };
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(polled_at(&seen), [0]);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_huge_expiry_is_capped() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_cli_start().returning(|| {
+            Ok(CliStartResponse {
+                expires_in: i64::MAX,
+                ..start()
+            })
+        });
+        let seen = timed_polls(&mut api, Vec::new());
+        let Err(error) = device_login(&api, SERVER, &mut Vec::new(), &|_| false, Duration::from_secs(10)).await else {
+            anyhow::bail!("endless slow_down answers must end the login");
+        };
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let last = polled_at(&seen).last().copied().unwrap_or_default();
+        assert!(last <= LONGEST_LOGIN_WAIT.as_secs(), "polled at {last}");
         Ok(())
     }
 

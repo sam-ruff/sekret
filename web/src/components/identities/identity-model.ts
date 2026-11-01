@@ -18,15 +18,54 @@ export function ttlProblem(draft: IdentityDraft): string | undefined {
   return undefined;
 }
 
-/** The server's cap on a service account token's `exp - iat` when none is set. */
+/** The server's cap on a machine token's `exp - iat` when none is set. */
 export const DEFAULT_MAX_TOKEN_LIFETIME = 3600;
 
-/** Whole seconds of at least one, or null when the text is not that. */
+/** The longest `max_token_lifetime` the server accepts: ten years. */
+export const MAX_TOKEN_LIFETIME_LIMIT = 10 * 365 * 86_400;
+
+/** Whole seconds from one up to ten years, or null when the text is not that. */
 export function parseLifetime(text: string): number | null {
   const trimmed = text.trim();
   if (!/^\d+$/.test(trimmed)) return null;
   const seconds = Number(trimmed);
-  return Number.isSafeInteger(seconds) && seconds >= 1 ? seconds : null;
+  return Number.isSafeInteger(seconds) && seconds >= 1 && seconds <= MAX_TOKEN_LIFETIME_LIMIT ? seconds : null;
+}
+
+/** IPv4 dotted quad from the last 32 bits of an IPv4-mapped IPv6 address, as URL parsing writes it. */
+function mappedIpv4(host: string): string | null {
+  const match = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/i.exec(host);
+  if (!match) return null;
+  const [high, low] = [parseInt(match[1], 16), parseInt(match[2], 16)];
+  return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+}
+
+function isMetadataHost(rawHost: string): boolean {
+  const host = mappedIpv4(rawHost) ?? rawHost.toLowerCase();
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (host === "100.100.100.200") return true;
+  return host === "[fd00:ec2::254]";
+}
+
+/**
+ * Why the server would refuse an auth method URL, checked before saving so the reason shows by
+ * the field. Mirrors the server: no credentials in the URL and no cloud metadata addresses.
+ * The scheme is left to the server, which may allow http for testing.
+ */
+export function outboundUrlProblem(raw: string): string | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return "Enter a full URL, such as https://issuer.example.com.";
+  }
+  if (url.username || url.password) return "Leave the username and password out of the URL.";
+  if (isMetadataHost(url.hostname)) {
+    return "That is a cloud metadata address, which sekret never contacts. Use the service's own address.";
+  }
+  return undefined;
 }
 
 export function parseJwks(text: string): { value: unknown; error?: string } {

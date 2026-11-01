@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   daysUntil,
+  describeEffectiveGenerator,
   describeGenerator,
   describeRotation,
   draftFromPolicy,
@@ -19,6 +20,13 @@ describe("generation model", () => {
     expect(describeRotation(null)).toBe("Not rotated automatically");
     expect(describeRotation(1)).toBe("Rotated every day");
     expect(describeRotation(90)).toBe("Rotated every 90 days");
+  });
+
+  it("does not claim a generator is set when only the built-in default applies", () => {
+    expect(describeEffectiveGenerator(null)).toBe(
+      "No generator set; Rotate now would use the built-in default of 32 alphanumeric characters",
+    );
+    expect(describeEffectiveGenerator({ length: 64, charset: "hex" })).toBe("Generates 64 hex characters");
   });
 
   it("treats no generator and no rotation as off", () => {

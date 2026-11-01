@@ -36,4 +36,43 @@ metadata:
 spec:
   policyName: {{ $fullname }}-tokens
   validationActions: ["Deny"]
+---
+# A Secret of type service-account-token would get a non-expiring token from the cluster, so the
+# operator may only write the types reconcile.rs ALLOWED_SECRET_TYPES lists.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-secrets
+  labels:
+    {{- include "sekret-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  matchConditions:
+    - name: written-by-the-operator
+      expression: request.userInfo.username == {{ $username | quote }}
+  validations:
+    - expression: >-
+        has(object.type) && object.type in ["Opaque", "kubernetes.io/basic-auth", "kubernetes.io/dockercfg",
+        "kubernetes.io/dockerconfigjson", "kubernetes.io/ssh-auth", "kubernetes.io/tls"]
+      message: the sekret operator may only write Secrets that carry data, not service account tokens
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !object.metadata.annotations.exists(k, k.startsWith("kubernetes.io/service-account."))
+      message: the sekret operator may not write service account annotations
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-secrets
+  labels:
+    {{- include "sekret-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-secrets
+  validationActions: ["Deny"]
 {{- end }}

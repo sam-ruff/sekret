@@ -19,8 +19,10 @@ import { useProjectEnv } from "@/hooks/use-project-env";
 import { keys, useApiMutation } from "@/hooks/queries";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { formatDateTime, formatRelative } from "@/lib/format";
-import { folderLabel, normalisePath } from "@/lib/paths";
-import { snapshotTitle } from "@/lib/snapshots";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
+import { normalisePath } from "@/lib/paths";
+import { ROW_PAGE } from "@/lib/secret-limits";
+import { restoreSummary, snapshotTitle } from "@/lib/snapshots";
 import { cn } from "@/lib/utils";
 
 const KIND_STYLE: Record<SnapshotChange["kind"], { label: string; className: string; icon: typeof Plus }> = {
@@ -42,10 +44,11 @@ function ChangeRow({ change }: { change: SnapshotChange }) {
           <span className="text-muted-foreground">{where}</span>
           {change.key}
         </div>
-        <div className="text-xs text-muted-foreground">
-          {change.kind === "removed" && `Version ${change.current_version} would be deleted`}
-          {change.kind === "added" && `Comes back as version ${change.snapshot_version}`}
-          {change.kind === "changed" && `Version ${change.current_version} goes back to version ${change.snapshot_version}`}
+        <div className="text-xs text-muted-foreground" data-testid="change-detail">
+          {change.kind === "removed" && `Would be removed (currently version ${change.current_version})`}
+          {change.kind === "added" && `Comes back with the value from version ${change.snapshot_version}`}
+          {change.kind === "changed" &&
+            `Goes back to the value from version ${change.snapshot_version} (currently version ${change.current_version})`}
         </div>
       </div>
     </li>
@@ -69,8 +72,10 @@ function SnapshotSheet({
 }) {
   const [folder, setFolder] = useState("/");
   const [confirming, setConfirming] = useState(false);
+  const [shownRows, setShownRows] = useState(ROW_PAGE);
   const content = useRef<HTMLDivElement>(null);
-  const path = normalisePath(folder);
+  // Each keystroke would otherwise ask the server for a full recursive comparison.
+  const path = normalisePath(useDebouncedValue(folder, 400));
   const id = snapshot?.id ?? "";
 
   const detail = useQuery({
@@ -90,6 +95,9 @@ function SnapshotSheet({
   });
 
   const changes = detail.data?.changes ?? [];
+  const settling = normalisePath(folder) !== path;
+  const removes = changes.some((c) => c.kind === "removed");
+  const hiddenRows = Math.max(0, changes.length - shownRows);
 
   return (
     <Sheet
@@ -124,12 +132,15 @@ function SnapshotSheet({
                 id="restore-path"
                 value={folder}
                 className="font-mono"
-                onChange={(e) => setFolder(e.target.value || "/")}
+                onChange={(e) => {
+                  setFolder(e.target.value || "/");
+                  setShownRows(ROW_PAGE);
+                }}
                 data-testid="restore-path"
               />
               <FieldDescription>
                 Only secrets in this folder and below are compared and restored. <span className="font-mono">/</span> is
-                the root folder, so it covers everything.
+                the top folder, so it covers everything.
               </FieldDescription>
             </Field>
             <section className="space-y-2">
@@ -143,17 +154,32 @@ function SnapshotSheet({
               )}
               {changes.length > 0 && (
                 <ul className="space-y-2" data-testid="snapshot-changes">
-                  {changes.map((c) => (
+                  {changes.slice(0, shownRows).map((c) => (
                     <ChangeRow key={`${c.path}:${c.key}`} change={c} />
                   ))}
                 </ul>
+              )}
+              {hiddenRows > 0 && (
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-1 text-sm text-muted-foreground">
+                  <span data-testid="changes-more-count">
+                    Showing {shownRows} of {changes.length}
+                  </span>
+                  <Button variant="outline" size="sm" onClick={() => setShownRows(shownRows + ROW_PAGE)} data-testid="changes-show-more">
+                    Show {Math.min(ROW_PAGE, hiddenRows)} more
+                  </Button>
+                </div>
               )}
             </section>
           </div>
         </ScrollArea>
         {canRestore && (
           <SheetFooter className="border-t">
-            <Button onClick={() => setConfirming(true)} disabled={changes.length === 0} data-testid="restore-snapshot">
+            <Button
+              variant={removes ? "destructive" : "default"}
+              onClick={() => setConfirming(true)}
+              disabled={changes.length === 0 || settling || !detail.isSuccess}
+              data-testid="restore-snapshot"
+            >
               <Undo2 />
               Restore {changes.length > 0 ? `${changes.length} ${changes.length === 1 ? "change" : "changes"}` : ""}
             </Button>
@@ -163,8 +189,9 @@ function SnapshotSheet({
           open={confirming}
           onOpenChange={setConfirming}
           title="Restore this snapshot?"
-          description={`${changes.length} ${changes.length === 1 ? "secret" : "secrets"} under ${folderLabel(path)} in ${envName} will be written as new versions. History is kept, so this can be undone with another restore.`}
+          description={restoreSummary(changes, path, envName)}
           confirmLabel="Restore"
+          destructive={removes}
           onConfirm={() => restore.mutateAsync()}
           testId="restore-confirm"
         />
@@ -228,14 +255,16 @@ export function SnapshotsPage() {
                   >
                     <History className="size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0 flex-1">
-                      <div className="line-clamp-2 text-sm font-medium break-words" title={s.reason} data-testid="snapshot-title">
-                        {snapshotTitle(s.reason)}
+                      <div className="flex items-start gap-2">
+                        <div className="line-clamp-2 min-w-0 flex-1 text-sm font-medium break-words" title={s.reason} data-testid="snapshot-title">
+                          {snapshotTitle(s.reason)}
+                        </div>
+                        {index === 0 && <Badge variant="secondary">Latest</Badge>}
                       </div>
-                      <div className="truncate text-xs text-muted-foreground" title={formatDateTime(s.created_at)}>
+                      <div className="text-xs break-words text-muted-foreground" title={formatDateTime(s.created_at)} data-testid="snapshot-meta">
                         {s.actor} · {formatRelative(s.created_at)} · {s.secret_count} {s.secret_count === 1 ? "secret" : "secrets"}
                       </div>
                     </div>
-                    {index === 0 && <Badge variant="secondary">Latest</Badge>}
                     <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
                   </button>
                 </li>

@@ -4,6 +4,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod authz;
+pub mod body;
 pub mod clock;
 pub mod config;
 pub mod error;
@@ -40,6 +41,7 @@ use serde_json::{Value, json};
 use tower_http::timeout::RequestBodyTimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::body::MAX_BODY;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -101,8 +103,6 @@ async fn seal_gate(State(state): State<AppState>, request: Request, next: Next) 
     }
 }
 
-/// The largest body any route accepts, read in full before a change may wait on a rotation.
-const MAX_BODY: usize = 4 * 1024 * 1024;
 /// How long a client may take to send its body.
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long any request may take, and a backup, which reads and encrypts the whole database.
@@ -134,7 +134,9 @@ fn time_limit(path: &str) -> Option<Duration> {
 /// while it is being replaced. The caller is authenticated from the headers before the body is
 /// read, so an anonymous client cannot make the server buffer one, and the wait only starts once
 /// the body has arrived, so a slow request cannot hold a rotation, and every writer queued behind
-/// it, up. Before writing, the database must still hold this server's root key.
+/// it, up. Each route reads only what it needs, and all writes share one byte budget, so tokens
+/// cannot add up to more memory than the server has. Before writing, the database must still hold
+/// this server's root key.
 async fn write_gate(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let writes = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
@@ -142,18 +144,27 @@ async fn write_gate(State(state): State<AppState>, request: Request, next: Next)
     if !writes || exempt || !path.starts_with("/api/v1/") {
         return next.run(request).await;
     }
+    let limit = body::body_limit(path);
     let (mut parts, body) = request.into_parts();
     let principal = match auth::Principal::from_request_parts(&mut parts, &state).await {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
-        return ApiError::new(
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "too_large",
-            "the request body is too large or arrived too slowly",
-        )
-        .into_response();
+    let declared = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|len| len > limit) {
+        return body::too_large().into_response();
+    }
+    let reserved = declared.unwrap_or(limit);
+    let _permit = match state.write_budget.reserve(&principal.id, reserved).await {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
+    };
+    let Ok(bytes) = axum::body::to_bytes(body, reserved).await else {
+        return body::too_large().into_response();
     };
     parts.extensions.insert(principal);
     let _writing = state.keyring.writing().await;

@@ -36,6 +36,12 @@ export function describeGenerator(generator: Generator | null | undefined): stri
   return `${g.length} ${CHARSET_NOUNS[g.charset ?? "alphanumeric"]} characters`;
 }
 
+/** The drawer's generator line, which must not claim a generator is set when only the built-in default would apply. */
+export function describeEffectiveGenerator(generator: Generator | null | undefined): string {
+  if (generator) return `Generates ${describeGenerator(generator)}`;
+  return `No generator set; Rotate now would use the built-in default of ${describeGenerator(null)}`;
+}
+
 export function describeRotation(days: number | null | undefined): string {
   if (!days) return "Not rotated automatically";
   return days === 1 ? "Rotated every day" : `Rotated every ${days} days`;

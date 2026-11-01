@@ -16,6 +16,7 @@ import {
   auditSearchParams,
   EMPTY_AUDIT_FILTERS,
   hasActiveFilters,
+  noMatchHint,
   parseAuditFilters,
   type AuditFilters,
 } from "@/lib/audit-filters";
@@ -106,7 +107,8 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
         {filters.path && (
           <FilterChip label="Path" value={filters.path} onClear={() => setFilters({ ...filters, path: "" })} testId="audit-chip-path" />
         )}
-        {filtered && (
+        {/* An empty result has its own Clear filters button. */}
+        {filtered && !(pages.isSuccess && entries.length === 0) && (
           <Button variant="ghost" size="sm" className="ml-auto" onClick={clear} data-testid="audit-clear">
             Clear filters
           </Button>
@@ -140,7 +142,7 @@ export function AuditLog({ queryKey, fetchPage, scope, environments, seesEveryth
         <EmptyState
           icon={<SearchX />}
           title="No matching activity"
-          description="Nothing in the log matches these filters. Try a wider date range or fewer filters."
+          description={noMatchHint(filters)}
           action={
             <Button variant="outline" size="sm" onClick={clear}>
               Clear filters

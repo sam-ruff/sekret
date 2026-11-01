@@ -299,6 +299,16 @@ fn user_labels(claims: &serde_json::Value, subject: &str) -> (String, String) {
     (email, name)
 }
 
+/// OIDC Core 3.1.3.7: a token for several audiences must name this client as `azp`, and any
+/// `azp` given must be this client.
+fn issued_to(claims: &serde_json::Value, client_id: &str) -> bool {
+    let several = claims["aud"].as_array().is_some_and(|a| a.len() > 1);
+    match claims.get("azp") {
+        Some(azp) => azp.as_str() == Some(client_id),
+        None => !several,
+    }
+}
+
 /// Caller-supplied text cut short for a log line; log it with `?` so control characters are escaped.
 fn loggable(value: &str) -> String {
     value.chars().take(64).collect()
@@ -419,6 +429,10 @@ async fn finish_login(
             ApiError::login_failed()
         })?;
     if claims["nonce"].as_str() != Some(saved.nonce.as_str()) {
+        return Err(ApiError::login_failed());
+    }
+    if !issued_to(&claims, &config.client_id) {
+        tracing::warn!("id token was issued to another client");
         return Err(ApiError::login_failed());
     }
     let auth_time = claims["auth_time"].as_i64();
@@ -590,7 +604,7 @@ pub async fn cli_start(
     ClientIp(ip): ClientIp,
     headers: HeaderMap,
 ) -> ApiResult<Json<CliStartResponse>> {
-    if !state.login_limiter.allow_ip(ip) {
+    if !state.cli_login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let now = state.clock.now();
@@ -647,7 +661,7 @@ pub async fn cli_pending(
     Query(query): Query<PendingQuery>,
 ) -> ApiResult<Json<PendingCliLogin>> {
     require_browser_session(&principal)?;
-    if !state.login_limiter.allow_ip(ip) {
+    if !state.cli_login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let login = state
@@ -678,7 +692,7 @@ pub async fn cli_deny(
     Json(request): Json<CliDenyRequest>,
 ) -> ApiResult<StatusCode> {
     require_browser_session(&principal)?;
-    if !state.login_limiter.allow_ip(ip) {
+    if !state.cli_login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let code = normalise_user_code(&request.code);
@@ -722,7 +736,7 @@ pub async fn cli_approve(
     Json(request): Json<CliApproveRequest>,
 ) -> ApiResult<StatusCode> {
     require_browser_session(&principal)?;
-    if !state.login_limiter.allow_ip(ip) {
+    if !state.cli_login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let code = normalise_user_code(&request.code);
@@ -913,6 +927,19 @@ mod tests {
             required_groups: strings(required_groups),
             allowed_subjects: strings(allowed_subjects),
         }
+    }
+
+    #[test]
+    fn id_tokens_must_be_issued_to_this_client() {
+        assert!(issued_to(&json!({"aud": "sekret"}), "sekret"));
+        assert!(issued_to(&json!({"aud": "sekret", "azp": "sekret"}), "sekret"));
+        assert!(issued_to(
+            &json!({"aud": ["sekret", "other"], "azp": "sekret"}),
+            "sekret"
+        ));
+        assert!(!issued_to(&json!({"aud": "sekret", "azp": "other"}), "sekret"));
+        assert!(!issued_to(&json!({"aud": ["sekret", "other"]}), "sekret"));
+        assert!(!issued_to(&json!({"aud": "sekret", "azp": 7}), "sekret"));
     }
 
     #[test]

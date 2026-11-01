@@ -1,5 +1,5 @@
 import { AlertTriangle, FileUp, FolderOpen, Info } from "lucide-react";
-import { useMemo, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { toast } from "sonner";
 import { api } from "@/api/endpoints";
 import { Badge } from "@/components/ui/badge";
@@ -70,6 +70,11 @@ export function ImportEnvDialog({
       write.reset();
     },
   });
+  // A failed import still holds the parsed values; drop them once the dialog closes, by any route.
+  const { reset: resetWrite, isPending: writing } = write;
+  useEffect(() => {
+    if (!open && !writing) resetWrite();
+  }, [open, writing, resetWrite]);
 
   const chooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -88,8 +93,8 @@ export function ImportEnvDialog({
         <DialogHeader>
           <DialogTitle>Import from .env</DialogTitle>
           <DialogDescription data-testid="import-env-where">
-            Secrets are written to {envName}, in the <span className="font-mono">{folderLabel(path)}</span> folder, as
-            one change. Existing keys are updated.
+            Secrets are written to {envName}, in folder <span className="font-mono">{folderLabel(path)}</span>, as one
+            change. Existing keys are updated.
           </DialogDescription>
         </DialogHeader>
         <div className="flex justify-end">

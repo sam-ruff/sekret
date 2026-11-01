@@ -468,6 +468,32 @@ async fn tampered_fields_are_never_signed_without_proof(db: String) -> anyhow::R
     Ok(())
 }
 
+/// A database writer clears the remember-secret flag. Repairing the configuration on the next
+/// unlock, with the secret no longer configured, must set it again rather than trust the writer.
+async fn a_repair_never_clears_the_remember_secret_requirement(db: String) -> anyhow::Result<()> {
+    let db = persistent(&db)?;
+    let first = fresh(&db.url, with_secret(db.dir.path())?).await?;
+    init(&first, "remember").await?;
+    let config = stored(&first).await?;
+    assert!(config.flags.remember_secret);
+    let cleared = SealConfig {
+        flags: SealFlags {
+            remember_secret: false,
+            ..config.flags
+        },
+        ..config
+    };
+    h_update(&first, cleared).await?;
+
+    let h = fresh(&db.url, marked(db.dir.path())).await?;
+    assert_eq!(state_of(&h).await?, "sealed");
+    assert_eq!(unseal(&h).await?, StatusCode::OK);
+    let repaired = stored(&h).await?;
+    assert_eq!(check_signature(root(&h)?.as_ref(), &repaired), Signature::Valid);
+    assert!(repaired.flags.remember_secret, "only forget-unlock lifts it");
+    Ok(())
+}
+
 async fn h_update(h: &Harness, config: SealConfig) -> anyhow::Result<()> {
     h.state.store.update_seal_config(config).await.context("update")
 }
@@ -726,6 +752,7 @@ on_both_backends!(
     damaged_epoch_marks_count_as_a_rollback,
     a_wiped_database_never_lowers_the_marks,
     tampered_fields_are_never_signed_without_proof,
+    a_repair_never_clears_the_remember_secret_requirement,
     unreadable_values_are_listed_or_skipped,
     a_database_writer_cannot_swap_in_their_own_root_key,
     a_forged_root_key_must_open_the_existing_data,

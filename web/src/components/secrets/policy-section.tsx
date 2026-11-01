@@ -12,7 +12,7 @@ import { keys, useApiMutation } from "@/hooks/queries";
 import { formatDateTime } from "@/lib/format";
 import {
   daysUntil,
-  describeGenerator,
+  describeEffectiveGenerator,
   describeRotation,
   draftFromPolicy,
   draftProblem,
@@ -75,7 +75,7 @@ function PolicyForm({ at, secretKey, view, canEdit, onRotate }: PolicySectionPro
           <Sparkles className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0">
             <dt className="sr-only">Generator</dt>
-            <dd data-testid="policy-effective-generator">Generates {describeGenerator(effective.generator)}</dd>
+            <dd data-testid="policy-effective-generator">{describeEffectiveGenerator(effective.generator)}</dd>
           </div>
         </div>
         <div className="flex items-start gap-2">

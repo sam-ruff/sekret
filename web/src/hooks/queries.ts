@@ -121,8 +121,8 @@ export function useProjects() {
   return useQuery({ queryKey: keys.projects, queryFn: api.projects });
 }
 
-export function useProject(project: string) {
-  return useQuery({ queryKey: keys.project(project), queryFn: () => api.project(project) });
+export function useProject(project: string, enabled = true) {
+  return useQuery({ queryKey: keys.project(project), queryFn: () => api.project(project), enabled });
 }
 
 export function useEnvironments(project: string) {

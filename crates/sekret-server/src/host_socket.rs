@@ -149,11 +149,77 @@ fn listen(_socket: &UnixSocketSettings) -> std::io::Result<tokio::net::UnixListe
     ))
 }
 
+/// Users other than the server's own in group `gid`, by name, from the text of `/etc/group` and
+/// `/etc/passwd`: the group's listed members and everyone whose primary group it is.
+pub fn other_group_members(group: &str, passwd: &str, gid: u32, server_uid: u32) -> Vec<String> {
+    let gid = gid.to_string();
+    let server_uid = server_uid.to_string();
+    let users: Vec<Vec<&str>> = passwd.lines().map(|line| line.split(':').collect()).collect();
+    let server_name = users
+        .iter()
+        .find(|fields| fields.get(2) == Some(&server_uid.as_str()))
+        .and_then(|fields| fields.first().copied());
+    let listed = group
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.get(2) == Some(&gid.as_str()))
+        .flat_map(|fields| fields.get(3).copied().unwrap_or_default().split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let primary = users
+        .iter()
+        .filter(|fields| fields.get(3) == Some(&gid.as_str()))
+        .filter_map(|fields| fields.first().copied());
+    let mut others: Vec<String> = listed
+        .chain(primary)
+        .filter(|name| Some(*name) != server_name)
+        .map(str::to_string)
+        .collect();
+    others.sort();
+    others.dedup();
+    others
+}
+
+/// A group-accessible socket lets every member guess passphrases with no rate limit, which is
+/// only intended when the group holds sekret's user alone or a few trusted operators.
+#[cfg(unix)]
+fn warn_about_group_access(socket: &UnixSocketSettings) {
+    use std::os::unix::fs::MetadataExt;
+    if socket.mode & 0o060 == 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(&socket.path) else {
+        return;
+    };
+    let path = socket.path.display();
+    let (Ok(group), Ok(passwd)) = (
+        std::fs::read_to_string("/etc/group"),
+        std::fs::read_to_string("/etc/passwd"),
+    ) else {
+        tracing::warn!(%path, gid = meta.gid(), "could not tell who is in the unseal socket's group; each member can try passphrases on it without rate limits");
+        return;
+    };
+    let others = other_group_members(&group, &passwd, meta.gid(), meta.uid());
+    if others.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        %path,
+        gid = meta.gid(),
+        members = others.join(","),
+        "the unseal socket's group holds other users, and each of them can try passphrases on it without rate limits; use unix_socket_mode 0600 or a group of trusted operators"
+    );
+}
+
+#[cfg(not(unix))]
+fn warn_about_group_access(_socket: &UnixSocketSettings) {}
+
 /// Starts serving on the socket in the background.
 pub fn spawn(state: AppState, socket: &UnixSocketSettings) -> Result<(), StartupError> {
     let listener = listen(socket).map_err(|e| StartupError::Init(format!("{}: {e}", socket.path.display())))?;
     let path = socket.path.clone();
     tracing::info!(path = %path.display(), mode = format!("{:o}", socket.mode), "unseal socket ready");
+    warn_about_group_access(socket);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, crate::api::host_router(state)).await {
             tracing::error!(%error, path = %path.display(), "the unseal socket stopped");
@@ -178,6 +244,28 @@ pub fn remove(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n\
+                          sekret:x:990:990::/var/lib/sekret:/usr/sbin/nologin\n\
+                          alice:x:1000:100::/home/alice:/bin/bash\n\
+                          bob:x:1001:1001::/home/bob:/bin/bash\n";
+    const GROUP: &str = "root:x:0:\nusers:x:100:sekret\nsekret:x:990:\nops:x:500:sekret,bob\nbob:x:1001:\n";
+
+    #[test]
+    fn group_members_besides_the_server_are_found() {
+        assert!(
+            other_group_members(GROUP, PASSWD, 990, 990).is_empty(),
+            "a private group"
+        );
+        assert_eq!(other_group_members(GROUP, PASSWD, 500, 990), ["bob"]);
+        assert_eq!(
+            other_group_members(GROUP, PASSWD, 100, 990),
+            ["alice"],
+            "users whose primary group it is count too"
+        );
+        assert!(other_group_members(GROUP, PASSWD, 4242, 990).is_empty());
+        assert!(other_group_members("", "", 100, 990).is_empty());
+    }
 
     #[test]
     fn only_a_private_directory_owned_by_the_server_may_hold_the_socket() {

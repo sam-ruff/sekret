@@ -259,6 +259,58 @@ impl FailureBackoff {
     }
 }
 
+/// Wrong passphrases through the host socket allowed before any delay.
+pub const HOST_FREE_FAILURES: u32 = 5;
+/// The longest the host socket waits. Short, since the host is how the owner recovers.
+pub const HOST_MAX_DELAY: i64 = 30;
+
+#[derive(Default)]
+struct HostFailures {
+    failures: u32,
+    until: i64,
+}
+
+/// Back-off after wrong passphrases through the host socket, shared by everyone who can reach
+/// it. Times are Unix seconds from the server's clock.
+#[derive(Default)]
+pub struct HostBackoff {
+    state: Mutex<HostFailures>,
+}
+
+impl HostBackoff {
+    /// How long the next attempt must wait, or `None` when it may go ahead.
+    pub fn wait(&self, now: i64) -> Option<Duration> {
+        let Ok(state) = self.state.lock() else {
+            return Some(Duration::from_secs(1));
+        };
+        let left = state.until.saturating_sub(now);
+        (left > 0).then(|| Duration::from_secs(left.unsigned_abs()))
+    }
+
+    pub fn failed(&self, now: i64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.failures = state.failures.saturating_add(1);
+        if state.failures <= HOST_FREE_FAILURES {
+            return;
+        }
+        let exponent = (state.failures - HOST_FREE_FAILURES - 1).min(20);
+        state.until = now.saturating_add((1i64 << exponent).min(HOST_MAX_DELAY));
+    }
+
+    pub fn succeeded(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = HostFailures::default();
+        }
+    }
+
+    /// Consecutive wrong passphrases since the last right one.
+    pub fn failures(&self) -> u32 {
+        self.state.lock().map(|s| s.failures).unwrap_or(u32::MAX)
+    }
+}
+
 /// Refusals repeated within this long are counted rather than each written.
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
 /// Callers and sources remembered at once; the least recently refused are forgotten first.
@@ -390,6 +442,29 @@ pub fn rounded_wait(wait: Duration) -> u64 {
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn host_socket_guesses_slow_down_but_never_for_long() {
+        let backoff = HostBackoff::default();
+        let now = 1_000;
+        for _ in 0..HOST_FREE_FAILURES {
+            backoff.failed(now);
+            assert_eq!(backoff.wait(now), None, "a few typos cost nothing");
+        }
+        let mut longest = 0;
+        for _ in 0..30 {
+            backoff.failed(now);
+            let wait = backoff.wait(now).map_or(0, |w| w.as_secs());
+            assert!(wait >= longest, "the delay only grows");
+            longest = wait;
+        }
+        assert_eq!(longest, HOST_MAX_DELAY.unsigned_abs(), "capped");
+        assert_eq!(backoff.wait(now + HOST_MAX_DELAY), None);
+        backoff.succeeded();
+        backoff.failed(now);
+        assert_eq!(backoff.wait(now), None, "a success starts again");
+        assert_eq!(backoff.failures(), 1);
+    }
 
     #[test]
     fn limits_and_refills() {

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, ArrowRight, ExternalLink, FileKey, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
+import { AlertCircle, ArrowRight, ExternalLink, Eye, FileKey, Info, LogIn, ShieldAlert, Terminal } from "lucide-react";
 import { useRef, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router";
 import { ApiError } from "@/api/client";
@@ -16,7 +16,8 @@ import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { SecretInput } from "@/components/secret-field";
 import { Spinner } from "@/components/ui/spinner";
-import { keys, useAuthConfig, useSysStatus } from "@/hooks/queries";
+import { keys, useAuthConfig, useSealWatch, useSysStatus } from "@/hooks/queries";
+import { useIdle } from "@/hooks/use-idle";
 import { usePassphraseStrength } from "@/hooks/use-passphrase-strength";
 import { errorMessage } from "@/lib/errors";
 import { formatExpiry } from "@/lib/format";
@@ -251,6 +252,10 @@ function AdminTokenCard({ created }: { created: Created }) {
   const noProvider = config?.oidc_enabled === false;
   const expiry = created.expiresAt ? `expires ${formatExpiry(created.expiresAt)}` : "expires after a while";
   const snippet = (token: string) => `export SEKRET_URL=${window.location.origin}\nexport SEKRET_TOKEN=${token}`;
+  // The token cannot be shown again, so idling masks it rather than dropping it; a seal still takes the page away.
+  const [masked, setMasked] = useState(false);
+  useIdle(!masked, () => setMasked(true));
+  useSealWatch(true);
   return (
     <StandalonePage className="max-w-xl">
       <Card className="shadow-lg shadow-primary/5" data-testid="setup-done">
@@ -269,8 +274,14 @@ function AdminTokenCard({ created }: { created: Created }) {
             <p className="text-sm font-medium">Admin token</p>
             <div className="flex items-center gap-1 rounded-md border bg-muted/50 py-1 pr-1 pl-3">
               <code className="min-w-0 flex-1 font-mono text-sm break-all" data-testid="admin-token">
-                {created.token}
+                {masked ? "•".repeat(24) : created.token}
               </code>
+              {masked && (
+                <Button variant="ghost" size="sm" onClick={() => setMasked(false)} data-testid="admin-token-show">
+                  <Eye />
+                  Show
+                </Button>
+              )}
               <CopyButton value={created.token} label="Copy admin token" testId="admin-token-copy" sensitive />
             </div>
           </div>

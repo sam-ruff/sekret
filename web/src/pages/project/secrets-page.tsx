@@ -206,21 +206,6 @@ function SecretsView() {
   const holdsTypedText = adding !== null || editing !== null || importing;
   const anyRevealed = revealAll || revealed.size > 0 || holdsTypedText;
   useSealWatch(anyRevealed);
-  useIdle(anyRevealed, () => {
-    setRevealAll(false);
-    setRevealed(new Set());
-    setHiddenFromAll(new Set());
-    const closed = [
-      editing !== null && `the editor for ${editing}`,
-      adding !== null && "the new secret form",
-      importing && "the import",
-    ].filter(Boolean);
-    setEditing(null);
-    setAdding(null);
-    setImporting(false);
-    if (closed.length === 0) return;
-    toast.info(`Closed ${closed.join(" and ")} after three idle minutes. Unsaved changes were dropped.`);
-  });
 
   const invalidate = [
     ["project", project, "secrets"],
@@ -246,6 +231,28 @@ function SecretsView() {
       // The finished mutation still holds the saved value as its variables.
       save.reset();
     },
+  });
+
+  // A failed save keeps the typed value as its variables until reset.
+  const forgetFailedSave = () => {
+    if (!save.isPending) save.reset();
+  };
+
+  useIdle(anyRevealed, () => {
+    setRevealAll(false);
+    setRevealed(new Set());
+    setHiddenFromAll(new Set());
+    const closed = [
+      editing !== null && `the editor for ${editing}`,
+      adding !== null && "the new secret form",
+      importing && "the import",
+    ].filter(Boolean);
+    setEditing(null);
+    setAdding(null);
+    setImporting(false);
+    forgetFailedSave();
+    if (closed.length === 0) return;
+    toast.info(`Closed ${closed.join(" and ")} after three idle minutes. Unsaved changes were dropped.`);
   });
 
   const rotate = useApiMutation({
@@ -413,7 +420,12 @@ function SecretsView() {
                 </DropdownMenu>
               )}
               {canCreateSecret && (
-                <Button onClick={() => setAdding("")} disabled={adding !== null} data-testid="add-secret">
+                <Button
+                  onClick={() => setAdding("")}
+                  disabled={adding !== null}
+                  aria-label="Add secret"
+                  data-testid="add-secret"
+                >
                   <Plus />
                   <span className="hidden sm:inline">Add secret</span>
                 </Button>
@@ -426,7 +438,10 @@ function SecretsView() {
               isNew
               initial={{ key: adding, value: "", comment: "", tags: [] }}
               busy={save.isPending}
-              onCancel={() => setAdding(null)}
+              onCancel={() => {
+                setAdding(null);
+                forgetFailedSave();
+              }}
               onSave={(draft) => save.mutate({ draft, isNew: true })}
             />
           )}
@@ -514,7 +529,10 @@ function SecretsView() {
                           tags: secret.tags,
                         }}
                         busy={save.isPending}
-                        onCancel={() => setEditing(null)}
+                        onCancel={() => {
+                          setEditing(null);
+                          forgetFailedSave();
+                        }}
                         onSave={(draft) => {
                           const unchanged =
                             !draft.generator &&
@@ -645,6 +663,7 @@ function SecretsView() {
           </>
         }
         confirmLabel={rotatingTyped ? "Replace with a generated value" : "Rotate now"}
+        destructive={rotatingTyped}
         onConfirm={() => rotate.mutateAsync(rotating ?? "")}
         onCloseAutoFocus={(event) => focusInstead(event, rotateReturnFocus.current)}
         testId="rotate-confirm"

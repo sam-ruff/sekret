@@ -13,10 +13,9 @@ export function parentPath(path: string): string {
   return `/${segments.slice(0, -1).join("/")}`;
 }
 
-/** How a folder is named in copy: the top level is "root", as in the breadcrumbs. */
+/** How a folder is named in copy. The top level is "/", matching subfolders such as "/email". */
 export function folderLabel(path: string): string {
-  const normalised = normalisePath(path);
-  return normalised === "/" ? "root" : normalised;
+  return normalisePath(path);
 }
 
 export interface Crumb {
@@ -24,11 +23,11 @@ export interface Crumb {
   path: string;
 }
 
-/** Breadcrumbs from the root down to `path`, the root named "root". */
+/** Breadcrumbs from the top folder, named "/", down to `path`. */
 export function crumbs(path: string): Crumb[] {
   const segments = normalisePath(path).split("/").filter(Boolean);
   return [
-    { name: "root", path: "/" },
+    { name: "/", path: "/" },
     ...segments.map((name, i) => ({ name, path: `/${segments.slice(0, i + 1).join("/")}` })),
   ];
 }

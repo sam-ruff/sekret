@@ -36,7 +36,9 @@ The web interface shows the same history in a drawer, with a button to roll back
 
 ## Snapshots
 
-Every write to an environment, whether one secret or a hundred, records a snapshot of that environment's state afterwards. Restoring a snapshot puts the environment, or one folder of it, back the way it was: changed secrets go back to their old values, added ones are deleted and deleted ones come back. The restore is one new write, so it can be undone by restoring the snapshot before it.
+Every write to an environment, whether one secret or a hundred, records a snapshot of that environment's state afterwards. Restoring a snapshot puts the environment, or one folder of it, back the way it was: changed secrets go back to their old values, added ones are deleted and deleted ones come back. The restore is one new write, so it can be undone by restoring the snapshot before it. Removed secrets keep their history.
+
+In the web interface, opening a snapshot lists what restoring it would change, and the confirmation names the secrets it would remove. A restore that removes anything is shown in red.
 
 ```sh
 sekret snapshots list

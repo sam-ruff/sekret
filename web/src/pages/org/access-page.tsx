@@ -12,10 +12,10 @@ import { LinkTabs } from "@/components/link-tabs";
 import { PageHeader } from "@/components/page-header";
 import { PrincipalPicker, type PrincipalOption } from "@/components/principal-picker";
 import { ResponsiveTable } from "@/components/responsive-table";
+import { RoleLabel } from "@/components/roles/role-label";
 import { RolesPanel } from "@/components/roles/roles-panel";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -175,6 +175,8 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
 function BindingsTab() {
   const org = useOrgPermissions();
   const bindings = useQuery({ queryKey: keys.orgBindings, queryFn: api.orgBindings });
+  const roles = useOrgRoles();
+  const roleName = (slug: string) => roles.data?.find((r) => r.slug === slug)?.name ?? slug;
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<OrgBinding | null>(null);
   const canCreate = org.can("org-members", "create");
@@ -227,7 +229,7 @@ function BindingsTab() {
             },
             {
               header: "Role",
-              cell: (b) => <Badge variant="secondary">{b.role}</Badge>,
+              cell: (b) => <RoleLabel name={roleName(b.role)} id={b.role} />,
             },
             {
               header: "",
@@ -239,7 +241,7 @@ function BindingsTab() {
                     variant="ghost"
                     size="icon-sm"
                     onClick={() => setRemoving(b)}
-                    aria-label={`Remove ${b.role} from ${b.principal_name}`}
+                    aria-label={`Remove ${roleName(b.role)} from ${b.principal_name}`}
                     data-testid="binding-remove"
                   >
                     <Trash2 />
@@ -253,7 +255,7 @@ function BindingsTab() {
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}
-        title={`Remove ${removing?.role} from ${removing?.principal_name}?`}
+        title={`Remove ${removing ? roleName(removing.role) : ""} from ${removing?.principal_name}?`}
         description="They lose the access this role granted across the organisation."
         confirmLabel="Remove role"
         destructive
@@ -277,6 +279,7 @@ function RolesTab() {
       error={roles.error}
       onRetry={() => void roles.refetch()}
       subjects={ORG_SUBJECTS}
+      intro="Built-in roles cover common needs. Custom roles pick which organisation areas, such as projects, machine identities or the audit log, someone can see or manage."
       canCreate={org.can("org-roles", "create")}
       canEdit={org.can("org-roles", "edit")}
       canDelete={org.can("org-roles", "delete")}

@@ -5025,6 +5025,13 @@
               "null"
             ],
             "description": "Overrides discovery when the issuer does not publish `.well-known/openid-configuration`."
+          },
+          "max_token_lifetime": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Longest token accepted, from `iat` to `exp`, in seconds; 3600 when left out, and at most\nten years. Tokens without `iat` are refused.",
+            "maximum": 315360000,
+            "minimum": 1
           }
         }
       },

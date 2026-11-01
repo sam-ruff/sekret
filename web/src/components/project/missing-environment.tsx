@@ -18,6 +18,7 @@ export function MissingEnvironment({
       backTo={hrefFor(first.slug)}
       backLabel={`Open ${first.name}`}
       testId="environment-missing"
+      headingLevel={2}
     />
   );
 }

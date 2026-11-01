@@ -35,7 +35,7 @@ Not every action means something for every subject. The role editor in the web i
 | `snapshots` | `read`, `edit` (restoring a snapshot) |
 | `folders`, `members` | `read`, `create`, `delete` |
 | `environments`, `roles`, `identities`, `org-members`, `org-roles` | `read`, `create`, `edit`, `delete` |
-| `settings` | `read`, `edit`, `delete` (deleting the project) |
+| `settings` | `read`, `edit`, `delete` (deleting the project, which also needs `delete` on secrets, folders and environments and `edit` on snapshots, with no deny on any of them) |
 | `audit-log`, `org-audit-log`, `backups` | `read` |
 | `projects` | `create` |
 
@@ -74,6 +74,10 @@ This custom role lets a team read and change everything in `dev` and `staging`, 
 The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule.
 
 ![The role editor](../assets/screenshots/roles-light.png)
+
+## Members
+
+A project's *Members* tab lists who holds which project role. Someone can hold more than one role in a project, one row each. *Change role* swaps one of those roles for another in a single step: the new role is added before the old one is removed, so a failure part way never leaves them without access. If the removal fails, the page says so and both rows stay listed until you remove the old one.
 
 ## How a decision is made
 

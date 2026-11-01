@@ -102,7 +102,7 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="project-slug">Short name</FieldLabel>
+              <FieldLabel htmlFor="project-slug">ID</FieldLabel>
               <Input
                 id="project-slug"
                 value={slug}
@@ -113,7 +113,9 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
                   setSlug(e.target.value.toLowerCase());
                 }}
               />
-              <FieldDescription>Lowercase letters, digits and dashes. Used by the CLI and in URLs.</FieldDescription>
+              <FieldDescription>
+                Lowercase letters, digits and dashes. Used by the CLI and in URLs. It cannot change later.
+              </FieldDescription>
             </Field>
             <Field>
               <FieldLabel htmlFor="project-description">Description</FieldLabel>
@@ -142,8 +144,8 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
                       onChange={(e) => updateEnv(index, { name: e.target.value, slug: slugify(e.target.value) })}
                     />
                     <Input
-                      aria-label="Environment slug"
-                      placeholder="slug"
+                      aria-label="Environment ID"
+                      placeholder="ID"
                       className="w-32 font-mono"
                       value={env.slug}
                       data-testid={`env-slug-${index}`}

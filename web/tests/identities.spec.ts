@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { expectToast, navigate } from "./helpers";
 
 const CONFIGURED = /^\s*Configured/;
@@ -59,6 +59,73 @@ test("creates an identity and configures every auth method", async ({ page }) =>
 
   await page.getByTestId("identity-tab-usage").click();
   await expect(page.getByTestId("snippet-github-actions")).toContainText("id-token: write");
+});
+
+test("long OIDC subjects wrap inside the form instead of widening it", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const oidc = page.getByTestId("auth-method-oidc");
+  const subjects = oidc.getByTestId("oidc-subjects");
+  await subjects.getByTestId("oidc-subjects-input").fill("repo:example/a-very-long-repository-name-for-wrapping:ref:refs/heads/main");
+  await subjects.getByTestId("oidc-subjects-input").press("Enter");
+  const form = await oidc.getByTestId("oidc-form").boundingBox();
+  expect(form).not.toBeNull();
+  for (const id of ["oidc-issuer", "oidc-jwks-url", "oidc-audiences", "oidc-subjects"]) {
+    const box = await oidc.getByTestId(id).boundingBox();
+    expect(box).not.toBeNull();
+    if (!box || !form) continue;
+    expect(box.x + box.width).toBeLessThanOrEqual(form.x + form.width + 1);
+  }
+});
+
+async function failNext(page: Page, method: string, path: string, status: number, code: string, message: string) {
+  await page.evaluate(
+    async ([method, path, status, code, message]) => {
+      const file = "/src/api/mock/server.ts";
+      const mock = (await import(/* @vite-ignore */ file)) as {
+        mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
+      };
+      mock.mockFailNext(method, path, status, code, message);
+    },
+    [method, path, status, code, message] as const,
+  );
+}
+
+test("sets the longest OIDC token lifetime, which survives a reload", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const oidc = page.getByTestId("auth-method-oidc");
+  const lifetime = oidc.getByLabel("Longest OIDC token accepted (seconds)");
+  await expect(lifetime).toHaveValue("900");
+  await expect(oidc.getByTestId("oidc-max-lifetime-help")).toHaveText(
+    "Tokens valid for longer than this, or without an iat claim, are refused: 15 minutes.",
+  );
+  await lifetime.fill("999999999999");
+  await expect(oidc.getByTestId("oidc-max-lifetime-error")).toHaveText("Enter a whole number of seconds, from 1 up to 10 years.");
+  await expect(oidc.getByTestId("oidc-save")).toBeDisabled();
+  await lifetime.fill("300");
+  await oidc.getByTestId("oidc-save").click();
+  await expectToast(page, "OIDC saved");
+  await page.reload();
+  await expect(page.getByTestId("auth-method-oidc").getByTestId("oidc-max-lifetime")).toHaveValue("300");
+});
+
+test("a cloud metadata URL is flagged by the field, and the server's refusal reads plainly", async ({ page }) => {
+  await page.goto("/org/identities");
+  await page.getByTestId("identity-link-github-deploy").click();
+  await page.getByTestId("identity-tab-auth").click();
+  const oidc = page.getByTestId("auth-method-oidc");
+  await oidc.getByTestId("oidc-jwks-url").fill("http://169.254.169.254/latest/meta-data");
+  await expect(oidc.getByTestId("oidc-jwks-url-error")).toContainText("That is a cloud metadata address");
+  await expect(oidc.getByTestId("oidc-save")).toBeDisabled();
+
+  // A name that resolves to a metadata address is only caught by the server.
+  await oidc.getByTestId("oidc-jwks-url").fill("https://metadata.example.internal/keys");
+  await failNext(page, "PUT", "/auth/oidc$", 400, "bad_request", "url not allowed: https://metadata.example.internal/keys");
+  await oidc.getByTestId("oidc-save").click();
+  await expectToast(page, "The server will not contact https://metadata.example.internal/keys.");
 });
 
 test("rejects an OIDC binding without a subject or claim", async ({ page }) => {
@@ -124,7 +191,7 @@ test("labels token lifetimes in plain words", async ({ page }) => {
     "Kubernetes tokens valid for longer than this are refused: 10 minutes. Keep pods' projected token expirationSeconds at or below it.",
   );
   await lifetime.fill("soon");
-  await expect(k8s.getByTestId("k8s-max-lifetime-error")).toHaveText("Enter a whole number of seconds, 1 or more.");
+  await expect(k8s.getByTestId("k8s-max-lifetime-error")).toHaveText("Enter a whole number of seconds, from 1 up to 10 years.");
   await expect(lifetime).toHaveAttribute("aria-describedby", "k8s-max-lifetime-error");
   await expect(k8s.getByTestId("k8s-save")).toHaveText("Save Kubernetes settings");
   await expect(k8s.getByTestId("k8s-save")).toBeDisabled();
@@ -189,10 +256,15 @@ test("edits identity settings and revokes tokens", async ({ page }) => {
   await page.goto("/org/identities");
   await page.getByTestId("identity-link-github-deploy").click();
   const form = page.getByTestId("identity-details-form");
+  // Nothing to save until something changes.
+  await expect(form.getByTestId("identity-save")).toBeDisabled();
   await form.getByTestId("identity-ttl").fill("1800");
+  await expect(form.getByTestId("identity-save")).toBeEnabled();
   await form.getByTestId("identity-disabled").click();
   await form.getByTestId("identity-save").click();
   await expectToast(page, /saved/i);
+  await expect(form.getByTestId("identity-save")).toBeDisabled();
+  await expect(page.getByText("Removes its auth methods, client secrets and memberships.")).toBeVisible();
 
   await page.getByTestId("revoke-tokens").click();
   await page.getByTestId("confirm-action").click();
@@ -232,6 +304,6 @@ test("the allowed networks field is named in plain words", async ({ page }) => {
   await page.getByTestId("identity-link-github-deploy").click();
   const form = page.getByTestId("identity-details-form");
   await expect(form.getByLabel("Allowed networks (CIDR ranges)")).toBeVisible();
-  await expect(form).toContainText("refuse new sign-ins");
+  await expect(form.getByLabel("Disable sign-ins for this identity")).toBeVisible();
   await expect(form).not.toContainText("CIDRs");
 });

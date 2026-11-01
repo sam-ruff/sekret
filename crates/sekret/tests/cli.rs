@@ -1238,6 +1238,30 @@ fn version_output_is_the_release_version() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn paths_that_are_not_utf8_are_reported_not_panicked_on() -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().context("dir")?;
+    let path = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.yaml"));
+    for command in [&["admin", "bootstrap", "--config"][..], &["server", "--config"]] {
+        let output = Command::new(BIN)
+            .args(command)
+            .arg(&path)
+            .env_clear()
+            .env("HOME", dir.path())
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .context("run")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{command:?}: the file does not exist");
+        assert_ne!(output.status.code(), Some(101), "{command:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{command:?}: {stderr}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn print_config_matches_the_docs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("dir")?;

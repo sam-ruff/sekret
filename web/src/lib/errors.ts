@@ -23,7 +23,16 @@ export function errorMessage(error: unknown): string {
 function apiErrorMessage(error: ApiError): string {
   const friendly = FRIENDLY[error.code];
   if (friendly) return friendly;
-  if (error.status === 413) return "That is too large for the server to accept.";
+  if (error.status === 413) {
+    return "That is too large for the server to accept. Make it smaller, or split it into several changes.";
+  }
+  const refusedUrl = error.status === 400 ? /^url not allowed: (.+)$/.exec(error.message) : null;
+  if (refusedUrl) {
+    return (
+      `The server will not contact ${refusedUrl[1]}. Use an https address with no username or password in it, ` +
+      "and not a cloud metadata address such as 169.254.169.254."
+    );
+  }
   const seconds = backoffSeconds(error);
   if (seconds !== null) return `Too many wrong passphrases. Try again in ${seconds} seconds.`;
   return capitalise(error.message);

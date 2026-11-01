@@ -189,6 +189,33 @@ export class MockError extends Error {
 }
 
 const badRequest = (message: string) => new MockError(400, "bad_request", message);
+
+/** The server's `MAX_LIFETIME`: ten years. */
+const MAX_TOKEN_LIFETIME = 10 * 365 * 86_400;
+
+function checkLifetimeSetting(seconds: number | null | undefined): void {
+  if (seconds == null) return;
+  if (seconds < 1 || seconds > MAX_TOKEN_LIFETIME) {
+    throw badRequest("max_token_lifetime must be between 1 second and 10 years");
+  }
+}
+
+/** Mirrors the server: credentials in the URL and cloud metadata addresses are refused, with the URL named. */
+function checkOutboundUrl(raw: string): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw badRequest(`url not allowed: ${raw}`);
+  }
+  const host = url.hostname.toLowerCase();
+  const metadata =
+    /^169\.254\./.test(host) ||
+    host === "100.100.100.200" ||
+    host === "[fd00:ec2::254]" ||
+    /^\[::ffff:a9fe:[0-9a-f]{1,4}\]$/.test(host);
+  if (url.username || url.password || metadata) throw badRequest(`url not allowed: ${raw}`);
+}
 const notFound = (what: string) => new MockError(404, "not_found", `${what} not found`);
 const forbidden = () => new MockError(403, "forbidden", "you do not have permission to do that");
 const escalation = (message: string) => new MockError(403, "escalation", message);
@@ -967,7 +994,11 @@ export class MockBackend {
     if (!target) throw notFound(`version ${version}`);
     this.require(rules, "secrets", action, this.resource(env, s, target.tags));
     if (target.value === null) throw badRequest("that version is a deletion");
-    s.versions.push(this.newVersion(s, target.value, `rolled back to version ${version}`, target.tags, !!target.generated));
+    // Same wording as the server: the restored version keeps its own comment.
+    const comment = target.comment
+      ? `rolled back to version ${version}: ${target.comment}`
+      : `rolled back to version ${version}`;
+    s.versions.push(this.newVersion(s, target.value, comment, target.tags, !!target.generated));
     const snapshotId = this.snapshot(env, `rolled back ${s.path === "/" ? "/" : `${s.path}/`}${s.key} to version ${version}`);
     this.audit("secret.rollback", { project_id: project.id, environment: env.slug, path, secret_key: key }, { version });
     return { created: [], updated: [key], deleted: [], unchanged: [], snapshot_id: snapshotId };
@@ -1423,6 +1454,7 @@ export class MockBackend {
 
   /** Mirrors the server: the marker keeps the stored reviewer token, and an empty value clears it. */
   private withStoredReviewer(id: string, config: AuthMethodConfig): AuthMethodConfig {
+    if (config.kind === "oidc") return { ...config, max_token_lifetime: config.max_token_lifetime ?? 3600 };
     if (config.kind !== "kubernetes") return config;
     // Left out means the server's default, as serde fills it in.
     const withLifetime = { ...config, max_token_lifetime: config.max_token_lifetime ?? 3600 };
@@ -1437,6 +1469,9 @@ export class MockBackend {
   private validateAuthMethod(config: AuthMethodConfig): void {
     if (config.kind === "oidc") {
       if (!/^https?:\/\//.test(config.issuer)) throw badRequest("issuer must be an https URL");
+      checkOutboundUrl(config.issuer);
+      if (config.jwks_url) checkOutboundUrl(config.jwks_url);
+      checkLifetimeSetting(config.max_token_lifetime);
       const b = config.bindings;
       if ((b.audiences ?? []).every((a) => !a.trim())) throw badRequest("at least one bound audience is required");
       const claims = Object.values(b.claims ?? {});
@@ -1447,12 +1482,12 @@ export class MockBackend {
     if (config.kind === "kubernetes") {
       if ((config.audiences ?? []).length === 0) throw badRequest("at least one audience is required");
       if (config.mode === "token-review" && !config.host) throw badRequest("host is required");
-      if (config.max_token_lifetime != null && config.max_token_lifetime < 1) {
-        throw badRequest("max_token_lifetime must be at least 1 second");
-      }
+      checkLifetimeSetting(config.max_token_lifetime);
+      if (config.mode === "token-review" && config.host) checkOutboundUrl(config.host);
       if (config.mode === "jwks") {
         if (!config.issuer) throw badRequest("issuer is required for JWKS mode");
         if (!config.jwks && !config.jwks_url) throw badRequest("supply jwks or jwks_url");
+        if (!config.jwks && config.jwks_url) checkOutboundUrl(config.jwks_url);
       }
     }
   }

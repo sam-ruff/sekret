@@ -1,6 +1,50 @@
 import { expect, test } from "@playwright/test";
 import { createProject, unique } from "./helpers";
 
+test("changes a member's role in one step and shows role names", async ({ page }) => {
+  const bot = unique("e2e-member");
+  await page.goto("/org/identities");
+  await page.getByTestId("new-identity").click();
+  await page.getByTestId("identity-name").fill(bot);
+  await page.getByTestId("identity-create-submit").click();
+  await expect(page).toHaveURL(/\/org\/identities\/[^/]+\/auth$/);
+  const identityUrl = page.url().replace(/\/auth$/, "");
+
+  const slug = await createProject(page, unique("E2E Members"));
+  await page.goto(`/projects/${slug}/settings/members`);
+  await page.getByTestId("add-member").click();
+  const dialog = page.getByTestId("add-member-dialog");
+  await dialog.getByTestId("member-kind-identity").click();
+  await dialog.getByTestId("member-principal").click();
+  await page.getByTestId("member-principal-search").fill(bot);
+  await page.getByTestId(`principal-option-${bot}`).click();
+  await dialog.getByTestId("member-role").click();
+  await page.getByRole("option", { name: "Viewer" }).click();
+  await dialog.getByTestId("member-add-submit").click();
+
+  const row = page.getByTestId(`member-row-${bot}`);
+  await expect(row.getByTestId("role-label-name")).toHaveText("viewer");
+  await row.getByTestId("member-change-role").click();
+  const change = page.getByTestId("change-role-dialog");
+  await change.getByTestId("change-role-select").click();
+  await page.getByTestId("change-role-option-developer").click();
+  await change.getByTestId("confirm-action").click();
+  await expect(page.getByTestId(`member-row-${bot}`)).toHaveCount(1);
+  await expect(page.getByTestId(`member-row-${bot}`).getByTestId("role-label-name")).toHaveText("developer");
+  await page.reload();
+  await expect(page.getByTestId(`member-row-${bot}`).getByTestId("role-label-name")).toHaveText("developer");
+
+  await page.goto(`/projects/${slug}/settings/danger`);
+  await page.getByTestId("delete-project").click();
+  await page.getByTestId("delete-project-slug").fill(slug);
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/projects$/);
+  await page.goto(identityUrl);
+  await page.getByTestId("identity-delete").click();
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/org\/identities$/);
+});
+
 test("saves a custom role with a conditional deny and reloads it", async ({ page }) => {
   const slug = await createProject(page, unique("E2E Roles"));
   await page.goto(`/projects/${slug}/settings/roles`);

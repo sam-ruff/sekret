@@ -110,7 +110,10 @@ test("sorts oldest first and filters to a date range", async ({ page }) => {
   await page.getByTestId("audit-to").fill("2001-01-31");
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("audit-empty")).toContainText("No matching activity");
+  await expect(page.getByTestId("audit-empty")).toContainText("Try a wider date range");
   await expect(page.getByTestId("audit-total")).toHaveText("0 entries");
+  // One Clear filters button, in the empty card, rather than two.
+  await expect(page.getByRole("button", { name: "Clear filters" })).toHaveCount(1);
   await page.getByTestId("audit-empty").getByRole("button", { name: "Clear filters" }).click();
   await expect(page.getByTestId("audit-row").first()).toBeVisible();
   await expect(page).toHaveURL(/order=asc/);

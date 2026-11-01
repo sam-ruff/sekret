@@ -37,18 +37,33 @@ pub(crate) fn fill_from_material(material: &[u8], out: &mut [u8; KEY_LEN]) -> Re
         return Ok(());
     }
     let text = std::str::from_utf8(material).map_err(|_| CryptoError::InvalidKey)?;
-    let text = text.trim();
-    // 64 hex characters are also valid base64, so hex has to be tried first.
-    let decoded = Zeroizing::new(
-        hex::decode(text)
-            .or_else(|_| STANDARD.decode(text))
-            .map_err(|_| CryptoError::InvalidKey)?,
-    );
+    let decoded = decode_key_text(text.trim(), &[&STANDARD]).ok_or(CryptoError::InvalidKey)?;
     if decoded.len() != KEY_LEN {
         return Err(CryptoError::InvalidKey);
     }
     out.copy_from_slice(&decoded);
     Ok(())
+}
+
+/// Hex, or else base64 under the first of `engines` that accepts it, decoded into a buffer
+/// allocated once at its final size, so no partly filled copy is freed without being zeroed.
+pub(crate) fn decode_key_text(text: &str, engines: &[&base64::engine::GeneralPurpose]) -> Option<Zeroizing<Vec<u8>>> {
+    // Hex text is also valid base64, so hex has to be tried first.
+    if text.len().is_multiple_of(2) {
+        let mut out = Zeroizing::new(vec![0u8; text.len() / 2]);
+        if hex::decode_to_slice(text, &mut out).is_ok() {
+            return Some(out);
+        }
+    }
+    let mut out = Zeroizing::new(vec![0u8; base64::decoded_len_estimate(text.len())]);
+    for engine in engines {
+        if let Ok(written) = engine.decode_slice(text, &mut out) {
+            // Shortening keeps the allocation, which is zeroed in full on drop.
+            out.truncate(written);
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// Base64 of a 32-byte key plus `\n`, in a buffer sized up front so no copy is ever left behind
@@ -354,6 +369,21 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), c.fingerprint());
         assert!(RootKey::parse(b"too short").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn key_text_decodes_into_a_buffer_of_its_final_size() -> anyhow::Result<()> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let raw: Vec<u8> = (0u8..48).map(|b| b.wrapping_mul(37)).collect();
+        for text in [hex::encode(&raw), STANDARD.encode(&raw), URL_SAFE_NO_PAD.encode(&raw)] {
+            let decoded = decode_key_text(&text, &[&STANDARD, &URL_SAFE_NO_PAD]).context("decode")?;
+            assert_eq!(decoded.as_slice(), raw.as_slice(), "{text}");
+            assert_eq!(decoded.capacity(), raw.len(), "never grown: {text}");
+        }
+        // Unpadded base64 is refused unless an engine accepts it.
+        assert!(decode_key_text(&URL_SAFE_NO_PAD.encode([0xfbu8; 31]), &[&STANDARD]).is_none());
+        assert!(decode_key_text("not a key!", &[&STANDARD]).is_none());
         Ok(())
     }
 

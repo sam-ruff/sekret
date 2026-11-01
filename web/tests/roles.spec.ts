@@ -85,6 +85,20 @@ test("the chosen effect stands out from the other", async ({ page }) => {
   await expect(allow.locator("svg")).toHaveCount(0);
 });
 
+test("organisation access shows role names and describes what org roles can do", async ({ page }) => {
+  await page.goto("/org/access");
+  const binding = page.getByTestId("binding-row-user-sam@example.com-org-admin");
+  await expect(binding.getByTestId("role-label-name")).toHaveText("org admin");
+  await expect(binding.getByTestId("role-label-id")).toHaveText("org-admin");
+
+  await page.getByTestId("access-tab-roles").click();
+  await expect(page.getByTestId("roles-intro")).toContainText("organisation areas");
+  await expect(page.getByTestId("roles-intro")).not.toContainText("folder, key or tag");
+
+  await page.goto("/projects/storefront/settings/roles");
+  await expect(page.getByTestId("roles-intro")).toContainText("environment, folder, key or tag");
+});
+
 test("built-in roles open read-only", async ({ page }) => {
   await page.goto("/projects/storefront/settings/roles");
   await page.getByTestId("role-actions-viewer").click();

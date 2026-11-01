@@ -3,6 +3,38 @@ import { addSecret, createProject, editSecret, revealedValue, unique } from "./h
 
 test.describe.configure({ mode: "serial" });
 
+test("a restore that removes secrets names them and keeps their history", async ({ page }) => {
+  const slug = await createProject(page, unique("E2E Restore"));
+  await addSecret(page, "KEEP_ME", "one");
+  await addSecret(page, "LATER_KEY", "two");
+
+  await page.goto(`/projects/${slug}/snapshots/dev`);
+  // The oldest snapshot is from before LATER_KEY existed.
+  await page.getByTestId("snapshot-list").locator("li").last().getByRole("button").click();
+  const sheet = page.getByTestId("snapshot-sheet");
+  await expect(sheet.getByTestId("change-LATER_KEY").getByTestId("change-detail")).toHaveText(
+    "Would be removed (currently version 1)",
+  );
+  const restore = sheet.getByTestId("restore-snapshot");
+  await expect(restore).toHaveAttribute("data-variant", "destructive");
+  await restore.click();
+  const confirm = page.getByTestId("restore-confirm");
+  await expect(confirm).toContainText("Restoring / in Development removes LATER_KEY.");
+  await expect(confirm).toContainText("removed secrets keep their history");
+  await confirm.getByTestId("confirm-action").click();
+  await expect(sheet).toBeHidden();
+
+  await page.goto(`/projects/${slug}/secrets/dev`);
+  await expect(page.getByTestId("secret-row-KEEP_ME")).toBeVisible();
+  await expect(page.getByTestId("secret-row-LATER_KEY")).toHaveCount(0);
+
+  await page.goto(`/projects/${slug}/settings/danger`);
+  await page.getByTestId("delete-project").click();
+  await page.getByTestId("delete-project-slug").fill(slug);
+  await page.getByTestId("confirm-action").click();
+  await expect(page).toHaveURL(/\/projects$/);
+});
+
 test("creates a project, adds and updates a secret, then rolls it back", async ({ page }) => {
   const name = unique("E2E Live");
   const slug = await createProject(page, name);

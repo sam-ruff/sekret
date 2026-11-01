@@ -18,6 +18,8 @@ Most commands take `--path`, and the read commands take `--recursive` to include
 
 ## Project settings
 
+Each project and environment has an ID, such as `storefront` or `prod`, used by the CLI and in URLs. It is chosen at creation and cannot change; the display name can.
+
 Project settings hold the name, description and logo, the environments, the members and roles (see [Access control](access-control.md)), the default generation and rotation policy (see [Generation and rotation](rotation.md)) and the danger zone, where the project can be deleted. Deleting a project removes all its secrets, versions, snapshots, roles and memberships at once.
 
 Logos can be PNG, JPEG, GIF, WebP or SVG, up to 512 KiB and 4096 pixels on a side. The server decodes the upload, renders SVGs, and stores a PNG of at most 512 pixels, so the original file is never served back. SVGs with filters, or with very many or deeply nested masks, clip paths and patterns, are refused.

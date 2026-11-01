@@ -42,6 +42,7 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
             if let Some(url) = &oidc.jwks_url {
                 check_outbound_url(url, allow_http).map_err(|e| ApiError::bad_request(e.to_string()))?;
             }
+            check_lifetime_setting(oidc.max_token_lifetime)?;
             oidc.bindings
                 .validate()
                 .map_err(|e| ApiError::bad_request(e.to_string()))
@@ -55,11 +56,7 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
             if k8s.audiences.is_empty() {
                 return Err(ApiError::bad_request("at least one audience is required"));
             }
-            if !(1..=MAX_LIFETIME).contains(&k8s.max_token_lifetime) {
-                return Err(ApiError::bad_request(
-                    "max_token_lifetime must be between 1 second and 10 years",
-                ));
-            }
+            check_lifetime_setting(k8s.max_token_lifetime)?;
             for list in [&k8s.namespaces, &k8s.service_accounts, &k8s.audiences] {
                 sekret_core::validate::globs(list)?;
             }
@@ -91,6 +88,15 @@ pub fn validate_config(config: &AuthMethodConfig, allow_http: bool) -> ApiResult
         }
         AuthMethodConfig::Universal => Ok(()),
     }
+}
+
+fn check_lifetime_setting(seconds: i64) -> ApiResult<()> {
+    if !(1..=MAX_LIFETIME).contains(&seconds) {
+        return Err(ApiError::bad_request(
+            "max_token_lifetime must be between 1 second and 10 years",
+        ));
+    }
+    Ok(())
 }
 
 /// Binds a sealed reviewer token to its identity and to the cluster it was entered for, so
@@ -253,6 +259,8 @@ pub async fn verify_oidc(jwt: &JwtVerifier, config: &OidcAuthConfig, token: &str
         .verify(token, &source, &expect)
         .await
         .map_err(|e| LoginError::Token(e.to_string()))?;
+    // A long-lived token leaked from a CI log could otherwise be swapped for sekret tokens.
+    check_lifetime(&claims, config.max_token_lifetime)?;
     config
         .bindings
         .check(&claims)
@@ -371,7 +379,7 @@ pub async fn verify_kubernetes(
 }
 
 async fn login_identity(state: &AppState, identity_id: &str, ip: std::net::IpAddr) -> ApiResult<Identity> {
-    if !state.login_limiter.allow_ip(ip) {
+    if !state.machine_login_limiter.allow_ip(ip) {
         return Err(ApiError::too_many_requests());
     }
     let Some(identity) = state.store.get_identity(identity_id).await? else {
@@ -456,22 +464,45 @@ pub fn client_secret_source(secret_id: &str) -> String {
     format!("client-secret:{secret_id}")
 }
 
-async fn issue(
-    state: &AppState,
-    identity: &Identity,
+/// What a machine token is minted from and how long it may last.
+struct Issue {
     method: AuthMethodKind,
     source: String,
     detail: Value,
+    /// When the credential it came from expires, which no renewal may pass.
+    credential_expires_at: Option<i64>,
+}
+
+/// The token and renewal lifetimes, cut short so neither outlives the credential.
+fn lifetimes(identity: &Identity, now: i64, credential_expires_at: Option<i64>) -> (i64, i64) {
+    let Some(at) = credential_expires_at else {
+        return (identity.token_ttl, identity.token_max_ttl);
+    };
+    let left = at.saturating_sub(now).max(1);
+    (identity.token_ttl.min(left), identity.token_max_ttl.min(left))
+}
+
+async fn issue(
+    state: &AppState,
+    identity: &Identity,
+    issue: Issue,
     ip: std::net::IpAddr,
 ) -> ApiResult<Json<TokenResponse>> {
+    let Issue {
+        method,
+        source,
+        detail,
+        credential_expires_at,
+    } = issue;
+    let (ttl, max_ttl) = lifetimes(identity, state.clock.now(), credential_expires_at);
     let minted = mint_token(
         state,
         TokenRequest {
             kind: TokenKind::Machine,
             principal_kind: PrincipalKind::Identity,
             principal_id: &identity.id,
-            ttl: identity.token_ttl,
-            max_ttl: identity.token_max_ttl,
+            ttl,
+            max_ttl,
             description: format!("{} login", method.as_str()),
             source,
             auth_time: None,
@@ -530,9 +561,13 @@ pub async fn oidc_login(
         Ok(claims) => claims,
         Err(error) => return rejected(&state, ip, &identity, error).await,
     };
-    let detail = json!({"iss": claims["iss"], "sub": claims["sub"]});
-    let source = auth_method_source(&identity.id, AuthMethodKind::Oidc.as_str());
-    issue(&state, &identity, AuthMethodKind::Oidc, source, detail, ip).await
+    let issued = Issue {
+        method: AuthMethodKind::Oidc,
+        source: auth_method_source(&identity.id, AuthMethodKind::Oidc.as_str()),
+        detail: json!({"iss": claims["iss"], "sub": claims["sub"]}),
+        credential_expires_at: None,
+    };
+    issue(&state, &identity, issued, ip).await
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/kubernetes/login", tag = "auth", request_body = JwtLoginRequest,
@@ -561,8 +596,13 @@ pub async fn kubernetes_login(
         Ok(detail) => detail,
         Err(error) => return rejected(&state, ip, &identity, error).await,
     };
-    let source = auth_method_source(&identity.id, AuthMethodKind::Kubernetes.as_str());
-    issue(&state, &identity, AuthMethodKind::Kubernetes, source, detail, ip).await
+    let issued = Issue {
+        method: AuthMethodKind::Kubernetes,
+        source: auth_method_source(&identity.id, AuthMethodKind::Kubernetes.as_str()),
+        detail,
+        credential_expires_at: None,
+    };
+    issue(&state, &identity, issued, ip).await
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/universal/login", tag = "auth", request_body = UniversalLoginRequest,
@@ -593,15 +633,13 @@ pub async fn universal_login(
     if !state.store.consume_client_secret(&secret.id, now).await? {
         return refused(&state, ip, &identity, "client secret has no uses left").await;
     }
-    issue(
-        &state,
-        &identity,
-        AuthMethodKind::Universal,
-        client_secret_source(&secret.id),
-        json!({"client_secret": secret.prefix}),
-        ip,
-    )
-    .await
+    let issued = Issue {
+        method: AuthMethodKind::Universal,
+        source: client_secret_source(&secret.id),
+        detail: json!({"client_secret": secret.prefix}),
+        credential_expires_at: secret.expires_at,
+    };
+    issue(&state, &identity, issued, ip).await
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/token/renew", tag = "auth",
@@ -614,14 +652,15 @@ pub async fn renew(
     if principal.token_kind == TokenKind::Session.as_str() {
         return Err(ApiError::bad_request("sessions cannot be renewed"));
     }
-    let ttl = match principal.kind {
+    // An identity's current lifetimes apply, so lowering them shortens tokens already issued.
+    let (ttl, max_ttl) = match principal.kind {
         PrincipalKind::Identity => state
             .store
             .get_identity(&principal.id)
             .await?
-            .map(|i| i.token_ttl)
+            .map(|i| (i.token_ttl, Some(i.token_max_ttl)))
             .ok_or_else(ApiError::unauthorised)?,
-        _ => state.config.cli_token_ttl,
+        _ => (state.config.cli_token_ttl, None),
     };
     let now = state.clock.now();
     let tokens = state.store.list_principal_tokens(principal.kind, &principal.id).await?;
@@ -630,6 +669,9 @@ pub async fn renew(
         .find(|t| t.id == principal.token_id)
         .ok_or_else(ApiError::unauthorised)?;
     let mut expires_at = now.saturating_add(ttl).min(record.max_expires_at);
+    if let Some(max_ttl) = max_ttl {
+        expires_at = expires_at.min(record.created_at.saturating_add(max_ttl));
+    }
     // Groups and the re-authentication setting may have changed since the token was minted.
     if record.kind == TokenKind::Cli.as_str() {
         let cap = record
@@ -1044,6 +1086,7 @@ mod tests {
                 subjects: vec!["repo:sam-ruff/*:ref:refs/heads/main".into()],
                 claims: Default::default(),
             },
+            max_token_lifetime: sekret_api::DEFAULT_MAX_TOKEN_LIFETIME,
         };
         let mut http = MockOidcHttp::new();
         let jwks = issuer.jwks();
@@ -1057,6 +1100,58 @@ mod tests {
             Err(LoginError::Binding(_))
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_login_refuses_long_lived_tokens_and_tokens_without_iat() -> anyhow::Result<()> {
+        let issuer = TestIssuer::new("https://token.actions.githubusercontent.com");
+        let mut config = OidcAuthConfig {
+            issuer: issuer.url.clone(),
+            jwks_url: Some(issuer.jwks_url()),
+            bindings: ClaimBindings {
+                audiences: vec!["sekret".into()],
+                subjects: vec!["ci".into()],
+                claims: Default::default(),
+            },
+            max_token_lifetime: 600,
+        };
+        let mut http = MockOidcHttp::new();
+        let jwks = issuer.jwks();
+        http.expect_get_json().returning(move |_| Ok(jwks.clone()));
+        let jwt = JwtVerifier::new(Arc::new(http), Arc::new(FixedClock::new(issuer.now)));
+        let day = issuer.sign(json!({"aud": "sekret", "sub": "ci", "exp": issuer.now + 86_400}))?;
+        assert!(matches!(
+            verify_oidc(&jwt, &config, &day).await,
+            Err(LoginError::Token(_))
+        ));
+        let no_iat = issuer.sign(json!({"aud": "sekret", "sub": "ci", "iat": null}))?;
+        assert!(matches!(
+            verify_oidc(&jwt, &config, &no_iat).await,
+            Err(LoginError::Token(_))
+        ));
+        config.max_token_lifetime = 2 * 86_400;
+        assert!(
+            verify_oidc(&jwt, &config, &day).await.is_ok(),
+            "the setting moves the limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn universal_tokens_never_outlive_their_client_secret() {
+        let identity = Identity {
+            id: "id".into(),
+            name: "ci".into(),
+            description: String::new(),
+            token_ttl: 3600,
+            token_max_ttl: 86_400 * 365,
+            trusted_cidrs: Vec::new(),
+            disabled: false,
+            created_at: 0,
+        };
+        assert_eq!(lifetimes(&identity, 1000, None), (3600, 86_400 * 365));
+        assert_eq!(lifetimes(&identity, 1000, Some(1300)), (300, 300));
+        assert_eq!(lifetimes(&identity, 1000, Some(1000 + 7200)), (3600, 7200));
     }
 
     #[test]
@@ -1077,8 +1172,14 @@ mod tests {
                 subjects: vec!["*".into()],
                 claims: Default::default(),
             },
+            max_token_lifetime: sekret_api::DEFAULT_MAX_TOKEN_LIFETIME,
         };
         assert!(validate_config(&AuthMethodConfig::Oidc(oidc.clone()), false).is_err());
-        assert!(validate_config(&AuthMethodConfig::Oidc(oidc), true).is_ok());
+        assert!(validate_config(&AuthMethodConfig::Oidc(oidc.clone()), true).is_ok());
+        let forever = OidcAuthConfig {
+            max_token_lifetime: 0,
+            ..oidc
+        };
+        assert!(validate_config(&AuthMethodConfig::Oidc(forever), true).is_err());
     }
 }

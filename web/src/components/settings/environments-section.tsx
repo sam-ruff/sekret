@@ -68,7 +68,7 @@ function EnvironmentDialog({
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="env-slug">Short name</FieldLabel>
+              <FieldLabel htmlFor="env-slug">ID</FieldLabel>
               <Input
                 id="env-slug"
                 value={slug}
@@ -77,7 +77,7 @@ function EnvironmentDialog({
                 data-testid="env-slug"
                 onChange={(e) => setSlug(e.target.value.toLowerCase())}
               />
-              <FieldDescription>Used with --env on the command line.</FieldDescription>
+              <FieldDescription>Used with --env on the command line. It cannot change later.</FieldDescription>
             </Field>
           </FieldGroup>
           <DialogFooter>

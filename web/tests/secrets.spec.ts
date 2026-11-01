@@ -121,7 +121,7 @@ test("names duplicate keys, the root folder, and imports from a chosen file", as
   await page.getByTestId("import-env").click();
   const dialog = page.getByTestId("import-env-dialog");
   await expect(dialog.getByTestId("import-env-where")).toHaveText(
-    "Secrets are written to Development, in the root folder, as one change. Existing keys are updated.",
+    "Secrets are written to Development, in folder /, as one change. Existing keys are updated.",
   );
   await dialog.getByTestId("import-env-text").fill(["API_URL=https://example.com", "B=1", "API_URL=dupe"].join("\n"));
   await expect(dialog.getByTestId("import-env-duplicates")).toContainText(
@@ -167,6 +167,19 @@ test("the add form says why it cannot be saved yet", async ({ page }) => {
   await expect(form.getByTestId("secret-save")).toBeEnabled();
 });
 
+test("an import over the server's size limit says so plainly and keeps the dialog open", async ({ page }) => {
+  // 80 values of 60,000 characters make a request of about 4.8 MB, over the 4 MiB batch limit.
+  const value = "a".repeat(60_000);
+  const lines = Array.from({ length: 80 }, (_, i) => `BIG_${i}=${value}`);
+  await page.getByTestId("secrets-more").click();
+  await page.getByTestId("import-env").click();
+  await page.getByTestId("import-env-text").fill(lines.join("\n"));
+  await page.getByTestId("import-env-submit").click();
+  await expectToast(page, "That is too large for the server to accept. Make it smaller, or split it into several changes.");
+  await expect(page.getByTestId("import-env-dialog")).toBeVisible();
+  await expect(secretRow(page, "BIG_0")).toHaveCount(0);
+});
+
 test("a huge folder is drawn a page at a time and is too big to reveal all at once", async ({ page }) => {
   const lines = Array.from({ length: 150 }, (_, i) => `BULK_${String(i).padStart(3, "0")}=value-${i}`);
   await page.getByTestId("secrets-more").click();
@@ -196,10 +209,10 @@ test("the search box fits a phone with a short placeholder", async ({ page }) =>
   await expect(search).toHaveAccessibleName("Search keys, comments and tags");
 });
 
-test("new folders say they go in the root folder by that name", async ({ page }) => {
+test("new folders name the top folder / like every other path", async ({ page }) => {
   await page.getByTestId("secrets-more").click();
   await page.getByTestId("new-folder").click();
-  await expect(page.getByTestId("new-folder-dialog")).toContainText("Created inside root.");
+  await expect(page.getByTestId("new-folder-dialog")).toContainText("Created inside /.");
 });
 
 test("switches environments with the tabs", async ({ page }) => {

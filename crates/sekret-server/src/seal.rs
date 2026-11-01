@@ -367,12 +367,13 @@ pub fn signed(root: &RootKey, mut config: SealConfig, floor: i64) -> Result<Seal
     Ok(config)
 }
 
-/// The flags for a configuration that is being reset after tampering or a rollback: whatever the
-/// stored copy says, nothing is migrated again and a configured remember secret stays required.
-pub fn cautious_flags(flags: SealFlags, remember_secret_configured: bool) -> SealFlags {
+/// The flags for a configuration that is being reset after tampering or a rollback, or signed for
+/// the first time: whatever the stored copy says, nothing is migrated again and a remember secret
+/// stays required until `forget-unlock`, since the stored flag may have been cleared.
+pub fn cautious_flags(flags: SealFlags) -> SealFlags {
     SealFlags {
         reviewer_tokens_migrated: true,
-        remember_secret: flags.remember_secret || remember_secret_configured,
+        remember_secret: true,
         wrap_form_signed: flags.wrap_form_signed,
     }
 }
@@ -756,7 +757,7 @@ pub async fn check_config(
             // A database writer can strip a signature as easily as a database from before
             // signing lacks one, so nothing unsigned may start a migration.
             let config = SealConfig {
-                flags: cautious_flags(config.flags, settings.remember_secret.is_some()),
+                flags: cautious_flags(config.flags),
                 ..config
             };
             let config = save(store, settings, root, now, config).await?;
@@ -787,7 +788,7 @@ pub async fn check_config(
     {
         tracing::warn!(%error, "could not remove the remember file");
     }
-    let flags = cautious_flags(config.flags, settings.remember_secret.is_some());
+    let flags = cautious_flags(config.flags);
     let repaired = match (distrust, proven) {
         // Every field was signed by this server at some point, so a reset copy may be signed.
         (Distrust::RolledBack, _) => Some(config.clone()),
@@ -1189,7 +1190,7 @@ pub async fn open_keyring(
         let marks = high_water(&settings.epoch_files);
         let config = match marks.highest.is_some() || marks.broken {
             true => SealConfig {
-                flags: cautious_flags(config.flags, settings.remember_secret.is_some()),
+                flags: cautious_flags(config.flags),
                 ..config
             },
             false => config,
@@ -1521,7 +1522,7 @@ pub mod ops {
     use crate::state::AppState;
 
     /// Where an attempt came from. The host socket is reached only through file permissions,
-    /// so it is not held back by the network's rate limits and back-off.
+    /// so it skips the network's limits and line, and has a short back-off of its own.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Source {
         Network(IpAddr),
@@ -1534,10 +1535,6 @@ pub mod ops {
                 Source::Network(ip) => ip,
                 Source::HostSocket => IpAddr::V4(Ipv4Addr::LOCALHOST),
             }
-        }
-
-        fn limited(self) -> bool {
-            matches!(self, Source::Network(_))
         }
 
         fn label(self) -> &'static str {
@@ -1581,12 +1578,16 @@ pub mod ops {
     /// The keyring gate and a derivation permit, taken in that order everywhere so the two can
     /// never deadlock. Network sources with no recent failures wait their turn in a short,
     /// bounded line; sources that have failed recently are refused at once when busy, and
-    /// backing-off ones are refused outright. The host socket always waits.
+    /// backing-off ones are refused outright. The host socket goes ahead of the network line,
+    /// unless it is backing off after wrong passphrases of its own.
     async fn admit(
         state: &AppState,
         source: Source,
     ) -> ApiResult<(tokio::sync::MutexGuard<'_, ()>, OwnedSemaphorePermit)> {
         let Source::Network(ip) = source else {
+            if let Some(wait) = state.host_backoff.wait(state.clock.now()) {
+                return Err(ApiError::passphrase_backoff(wait));
+            }
             let gate = state.keyring.lock_for_host().await;
             return Ok((gate, state.keyring.kdf_permit_queued().await?));
         };
@@ -1647,16 +1648,23 @@ pub mod ops {
     ) -> ApiResult<Unwrapped> {
         match unwrap_blocking(wrapped, passphrase, Some(permit)).await {
             Ok(opened) => {
-                if source.limited() {
-                    state.passphrase_backoff.succeeded(source.ip());
+                match source {
+                    Source::Network(ip) => state.passphrase_backoff.succeeded(ip),
+                    Source::HostSocket => state.host_backoff.succeeded(),
                 }
                 Ok(opened)
             }
             Err(CryptoError::Decrypt) => {
-                if source.limited() {
-                    state.passphrase_backoff.failed(source.ip());
-                }
-                let failures = state.passphrase_backoff.failures(source.ip());
+                let failures = match source {
+                    Source::Network(ip) => {
+                        state.passphrase_backoff.failed(ip);
+                        state.passphrase_backoff.failures(ip)
+                    }
+                    Source::HostSocket => {
+                        state.host_backoff.failed(state.clock.now());
+                        state.host_backoff.failures()
+                    }
+                };
                 audit(
                     state,
                     failure.principal,
@@ -2035,7 +2043,7 @@ pub mod ops {
         // An unsigned configuration's flags may be a database writer's.
         let config = match verdict {
             Ok(true) => SealConfig {
-                flags: cautious_flags(config.flags, settings.remember_secret.is_some()),
+                flags: cautious_flags(config.flags),
                 ..config
             },
             _ => config,

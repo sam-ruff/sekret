@@ -333,6 +333,14 @@ fn restored_tags(
     tags
 }
 
+/// Keeps the restored version's own comment, so a rollback does not lose why it was written.
+fn rollback_comment(version: i64, comment: &str) -> String {
+    if comment.is_empty() {
+        return format!("rolled back to version {version}");
+    }
+    format!("rolled back to version {version}: {comment}")
+}
+
 /// A new version that restores the content of `target` under `tags`.
 fn restore_change(
     key: &DataKey,
@@ -402,7 +410,7 @@ pub async fn plan_rollback(
         current,
         &target,
         restored_tags(rules, env, current, &target),
-        format!("rolled back to version {version}"),
+        rollback_comment(version, &target.comment),
         ctx,
     )?;
     let mut result = BatchResult {
@@ -604,6 +612,15 @@ mod tests {
     use sekret_core::crypto::wrap_data_key;
     use sekret_core::permissions::{BuiltinRole, Conditions, Rule};
     use sekret_store::{MockStore, Secret, SnapshotEntry};
+
+    #[test]
+    fn a_rollback_keeps_the_restored_versions_comment() {
+        assert_eq!(rollback_comment(3, ""), "rolled back to version 3");
+        assert_eq!(
+            rollback_comment(1, "rotated after the leak"),
+            "rolled back to version 1: rotated after the leak"
+        );
+    }
 
     /// `ApiError` is not a `std::error::Error`, so it cannot take `.context` directly.
     fn api<T>(result: ApiResult<T>, what: &str) -> anyhow::Result<T> {

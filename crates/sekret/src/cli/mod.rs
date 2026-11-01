@@ -690,7 +690,16 @@ pub async fn secrets(
         SecretsCommand::Get { key, json, raw } => {
             let secret = api.get_secret(at, key.clone()).await?;
             if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&secret)?)?;
+                // JSON escapes C0 controls but not C1 controls or bidi overrides.
+                let text = serde_json::to_string_pretty(&secret)?;
+                if !raw && sekret_client::terminal_safe(&text) != text {
+                    bail!(
+                        "{} holds characters that could change what this terminal shows; pipe it to a file or \
+                         pass --raw to print it anyway",
+                        format::one_line(&key)
+                    );
+                }
+                writeln!(out, "{text}")?;
                 return Ok(());
             }
             let Some(value) = secret.value else {
@@ -1205,6 +1214,50 @@ mod tests {
             .context("expected a refusal")?;
         assert!(refused.to_string().contains("--raw"), "{refused}");
         assert!(out.is_empty(), "nothing reaches the terminal");
+
+        // C1 controls and bidi overrides survive JSON escaping, so --json is checked too.
+        for hostile in ["a\u{9b}2J", "a\u{202e}gnp.exe"] {
+            let mut api = MockSekretApi::new();
+            api.expect_get_secret()
+                .returning(move |_, _| Ok(secret(Some(hostile), false)));
+            let json = |raw| SecretsCommand::Get {
+                key: "A".into(),
+                json: true,
+                raw,
+            };
+            let mut out = Vec::new();
+            let refused = secrets(&api, at(), json(false), &mut out, &mut "".as_bytes())
+                .await
+                .err()
+                .context("expected a JSON refusal")?;
+            assert!(refused.to_string().contains("--raw"), "{refused}");
+            assert!(out.is_empty());
+            secrets(&api, at(), json(true), &mut out, &mut "".as_bytes())
+                .await
+                .context("raw JSON")?;
+            assert!(String::from_utf8(out).context("utf8")?.contains(hostile));
+        }
+        let mut plain = MockSekretApi::new();
+        plain
+            .expect_get_secret()
+            .returning(|_, _| Ok(secret(Some("ok\u{1b}[2J"), false)));
+        let mut out = Vec::new();
+        secrets(
+            &plain,
+            at(),
+            SecretsCommand::Get {
+                key: "A".into(),
+                json: true,
+                raw: false,
+            },
+            &mut out,
+            &mut "".as_bytes(),
+        )
+        .await
+        .context("JSON escapes ESC itself")?;
+        assert!(String::from_utf8(out).context("utf8")?.contains("\\u001b"));
+
+        let mut out = Vec::new();
         secrets(&api, at(), get(true), &mut out, &mut "".as_bytes())
             .await
             .context("raw")?;

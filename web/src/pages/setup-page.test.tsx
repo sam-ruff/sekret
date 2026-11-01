@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
@@ -9,6 +9,14 @@ import { renderWithProviders, testQueryClient } from "@/test/render";
 import { SetupPage } from "./setup-page";
 
 vi.mock("@/api/endpoints", () => ({ api: { init: vi.fn(), sysStatus: vi.fn(), authConfig: vi.fn() } }));
+
+// Lets a test say the page has gone idle without waiting three minutes.
+const idle = vi.hoisted(() => ({ fire: undefined as (() => void) | undefined }));
+vi.mock("@/hooks/use-idle", () => ({
+  useIdle: (active: boolean, onIdle: () => void) => {
+    idle.fire = active ? onIdle : undefined;
+  },
+}));
 // The local meter likes every passphrase here, so only the server can refuse one.
 vi.mock("@/hooks/use-passphrase-strength", () => ({
   usePassphraseStrength: () => ({ score: 4, acceptable: true, warning: null, suggestions: [] }),
@@ -89,6 +97,21 @@ describe("SetupPage", () => {
     expect(screen.getByTestId("admin-token-cli")).toHaveTextContent("export SEKRET_TOKEN=<token>");
     expect(screen.getByTestId("setup-continue")).toHaveTextContent("I have saved it, continue");
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
+  });
+
+  it("masks the admin token after the page sits idle, and shows it again on request", async () => {
+    init.mockResolvedValue({ status: { ...uninitialised, state: "unsealed" }, admin_token: "skt_abc" });
+    renderSetup();
+    await submit("plum orbit gravel lantern");
+    const token = await screen.findByTestId("admin-token");
+    expect(token).toHaveTextContent("skt_abc");
+
+    act(() => idle.fire?.());
+    expect(token).not.toHaveTextContent("skt_abc");
+    // Masked, not dropped: it cannot be fetched again.
+    await userEvent.click(screen.getByTestId("admin-token-show"));
+    expect(token).toHaveTextContent("skt_abc");
+    expect(screen.queryByTestId("admin-token-show")).toBeNull();
   });
 
   it("says web sign-in is not ready and how to turn it on when the server has no sign-in provider", async () => {

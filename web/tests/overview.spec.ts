@@ -53,3 +53,31 @@ test("the swipe hint on phones sits above the grid, not under it", async ({ page
   const gridBox = await page.getByTestId("overview-grid").boundingBox();
   expect(hintBox && gridBox && hintBox.y + hintBox.height <= gridBox.y).toBe(true);
 });
+
+test("a huge folder is drawn a page at a time in the overview and the restore preview", async ({ page }) => {
+  await openProject(page);
+  const lines = Array.from({ length: 150 }, (_, i) => `BULK_${String(i).padStart(3, "0")}=value-${i}`);
+  await page.getByTestId("secrets-more").click();
+  await page.getByTestId("import-env").click();
+  await page.getByTestId("import-env-text").fill(lines.join("\n"));
+  await page.getByTestId("import-env-submit").click();
+  await expect(page.locator("[data-sonner-toast]").filter({ hasText: /Imported: 150 added/ })).toBeVisible();
+
+  await navigate(page, "nav-overview");
+  const grid = page.getByTestId("overview-grid");
+  await expect(grid.locator('[data-testid^="overview-row-"]')).toHaveCount(100);
+  await expect(page.getByTestId("overview-more-count")).toContainText("Showing 100 of");
+  await page.getByTestId("overview-show-more").click();
+  await expect(page.getByTestId("overview-show-more")).toHaveCount(0);
+  await expect(grid.getByTestId("overview-row-BULK_149")).toBeVisible();
+
+  // Restoring the snapshot from before the import would remove all 150, a page at a time.
+  await navigate(page, "nav-snapshots");
+  await page.getByTestId("snapshot-1").click();
+  const sheet = page.getByTestId("snapshot-sheet");
+  await expect(sheet.getByTestId("snapshot-changes").locator("li")).toHaveCount(100);
+  await expect(sheet.getByTestId("changes-more-count")).toHaveText("Showing 100 of 150");
+  await sheet.getByTestId("changes-show-more").click();
+  await expect(sheet.getByTestId("snapshot-changes").locator("li")).toHaveCount(150);
+  await expect(sheet.getByTestId("restore-snapshot")).toHaveText(/Restore 150 changes/);
+});

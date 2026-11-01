@@ -7,6 +7,10 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
+import { formatDurationWords } from "@/lib/format";
+import { DEFAULT_MAX_TOKEN_LIFETIME, outboundUrlProblem, parseLifetime } from "./identity-model";
+import { MaxLifetimeField } from "./max-lifetime-field";
+import { UrlField } from "./url-field";
 
 export const GITHUB_ISSUER = "https://token.actions.githubusercontent.com";
 export const GITHUB_SUBJECT_TEMPLATE = "repo:OWNER/REPO:ref:refs/heads/main";
@@ -36,6 +40,8 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
   const [audiences, setAudiences] = useState<string[]>(initial?.bindings.audiences ?? ["sekret"]);
   const [subjects, setSubjects] = useState<string[]>(initial?.bindings.subjects ?? []);
   const [claims, setClaims] = useState<ClaimRow[]>(() => claimRows(initial?.bindings.claims));
+  const [lifetime, setLifetime] = useState(String(initial?.max_token_lifetime ?? DEFAULT_MAX_TOKEN_LIFETIME));
+  const maxLifetime = parseLifetime(lifetime);
 
   const applyGithubPreset = () => {
     setIssuer(GITHUB_ISSUER);
@@ -46,14 +52,21 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
 
   const boundClaims = claims.filter((c) => c.name.trim() && c.globs.length > 0);
   const unbounded = subjects.length === 0 && boundClaims.length === 0;
-  const valid = issuer.trim() !== "" && audiences.length > 0 && !unbounded;
+  const valid =
+    issuer.trim() !== "" &&
+    !outboundUrlProblem(issuer) &&
+    !outboundUrlProblem(jwksUrl) &&
+    audiences.length > 0 &&
+    !unbounded &&
+    maxLifetime !== null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!valid) return;
+    if (!valid || maxLifetime === null) return;
     onSave({
       issuer: issuer.trim(),
       jwks_url: jwksUrl.trim() || null,
+      max_token_lifetime: maxLifetime,
       bindings: {
         audiences,
         subjects,
@@ -74,31 +87,23 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
         </Button>
         <span className="text-xs text-muted-foreground">Fills the issuer and a subject template to edit.</span>
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
-        <Field>
-          <FieldLabel htmlFor="oidc-issuer">Issuer</FieldLabel>
-          <Input
-            id="oidc-issuer"
-            value={issuer}
-            disabled={disabled}
-            placeholder="https://issuer.example.com"
-            className="font-mono"
-            onChange={(e) => setIssuer(e.target.value)}
-            data-testid="oidc-issuer"
-          />
-        </Field>
-        <Field>
-          <FieldLabel htmlFor="oidc-jwks">JWKS URL (optional)</FieldLabel>
-          <Input
-            id="oidc-jwks"
-            value={jwksUrl}
-            disabled={disabled}
-            placeholder="Discovered from the issuer when empty"
-            className="font-mono"
-            onChange={(e) => setJwksUrl(e.target.value)}
-            data-testid="oidc-jwks-url"
-          />
-        </Field>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 [&>*]:min-w-0" data-testid="oidc-fields">
+        <UrlField
+          id="oidc-issuer"
+          label="Issuer"
+          value={issuer}
+          disabled={disabled}
+          placeholder="https://issuer.example.com"
+          onChange={setIssuer}
+        />
+        <UrlField
+          id="oidc-jwks-url"
+          label="JWKS URL (optional)"
+          value={jwksUrl}
+          disabled={disabled}
+          placeholder="Discovered from the issuer when empty"
+          onChange={setJwksUrl}
+        />
         <Field>
           <FieldLabel htmlFor="oidc-audiences">Audiences</FieldLabel>
           <ListInput
@@ -176,6 +181,19 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
           Add claim
         </Button>
       </div>
+      <MaxLifetimeField
+        idPrefix="oidc"
+        label="Longest OIDC token accepted (seconds)"
+        value={lifetime}
+        disabled={disabled}
+        onChange={setLifetime}
+        help={(seconds) => (
+          <>
+            Tokens valid for longer than this, or without an <code className="font-mono text-xs">iat</code> claim, are
+            refused: {formatDurationWords(seconds)}.
+          </>
+        )}
+      />
       {unbounded && (
         <p className="flex items-start gap-2 text-sm text-muted-foreground" data-testid="oidc-unbounded">
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />

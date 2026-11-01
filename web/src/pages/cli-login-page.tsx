@@ -5,6 +5,7 @@ import { Link, useSearchParams } from "react-router";
 import { ApiError, reauthUrl, startReauth } from "@/api/client";
 import { api } from "@/api/endpoints";
 import type { PendingCliLogin } from "@/api/types";
+import { FormBlocker } from "@/components/form-blocker";
 import { SecretInput } from "@/components/secret-field";
 import { ErrorState } from "@/components/states";
 import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-page";
@@ -16,12 +17,13 @@ import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useApiMutation, useMe } from "@/hooks/queries";
-import { codesMatch, isCompleteCode, normaliseUserCode } from "@/lib/cli-code";
+import { approveBlocker, codesMatch, isCompleteCode, normaliseUserCode } from "@/lib/cli-code";
 import { formatDateTime, formatExpiry, formatRelative } from "@/lib/format";
 
 type Outcome = "pending" | "approved" | "cancelled";
 
 const CODE_ERROR_ID = "cli-code-error";
+const APPROVE_BLOCKER_ID = "cli-approve-blocker";
 /** Remembers, across the reauthentication round trip, which request it was for. */
 const REAUTH_KEY = "sekret-cli-reauth";
 
@@ -137,7 +139,8 @@ export function CliLoginPage() {
   const complete = isCompleteCode(typed);
   const mismatch = complete && linkCode !== "" && !codesMatch(typed, linkCode);
   const otherAddress = request.data?.same_address === false;
-  const ready = complete && !mismatch && request.isSuccess && (!otherAddress || confirmedOwn);
+  const blocker = approveBlocker({ typed, mismatch, loaded: request.isSuccess, otherAddress, confirmedOwn });
+  const ready = blocker === undefined;
 
   const approve = useApiMutation({
     mutationFn: (code: string) => api.approveCli(code),
@@ -179,16 +182,20 @@ export function CliLoginPage() {
   const ended = request.error instanceof ApiError && request.error.status === 404;
   const asking = outcome === "pending" && !ended;
   const busy = approve.isPending || deny.isPending || reauthenticating;
+  const who = me ? me.email || me.name : "you";
+  const header = asking
+    ? { title: "Approve command line sign-in", page: "Approve CLI sign-in", description: `The CLI will act as ${who}.` }
+    : outcome === "approved"
+      ? { title: "Command line sign-in approved", page: "CLI sign-in approved", description: `The CLI now acts as ${who}.` }
+      : outcome === "cancelled"
+        ? { title: "Command line sign-in denied", page: "CLI sign-in denied", description: "The CLI was not given access." }
+        : { title: "Sign-in request ended", page: "CLI sign-in ended", description: "Nothing can be approved from this link." };
+  const showBlocker = asking && blocker !== undefined && !request.error && !busy;
 
   return (
     <StandalonePage className="max-w-lg">
       <Card data-testid="cli-login">
-        <StandaloneHeader
-          title="Approve command line sign-in"
-          pageTitle="Approve CLI sign-in"
-          icon={<Terminal />}
-          description={me ? `The CLI will act as ${me.email || me.name}.` : "The CLI will act as you."}
-        />
+        <StandaloneHeader title={header.title} pageTitle={header.page} icon={<Terminal />} description={header.description} />
         <form onSubmit={submit} noValidate>
           <CardContent className="space-y-4">
             {outcome === "pending" && ended && (
@@ -236,7 +243,6 @@ export function CliLoginPage() {
             )}
             {asking && request.isPending && lookupCode !== "" && <Skeleton className="h-36 w-full" />}
             {asking && request.data && <RequestDetails request={request.data} />}
-            {asking && otherAddress && <OtherAddress confirmed={confirmedOwn} onConfirm={setConfirmedOwn} />}
             {asking && request.error && <ErrorState error={request.error} onRetry={() => void request.refetch()} />}
             {asking && (
               <Field data-invalid={mismatch}>
@@ -264,6 +270,8 @@ export function CliLoginPage() {
                 )}
               </Field>
             )}
+            {/* Next to the buttons, so the box that holds up Approve is hard to miss. */}
+            {asking && otherAddress && <OtherAddress confirmed={confirmedOwn} onConfirm={setConfirmedOwn} />}
             {outcome === "approved" && (
               <Alert className="border-success/50 bg-success/10" data-testid="cli-approved">
                 <CheckCircle2 className="text-success" />
@@ -293,15 +301,27 @@ export function CliLoginPage() {
             )}
           </CardContent>
           {asking && (
-            <CardFooter className="mt-6 flex justify-end gap-2">
-              <Button type="button" variant="outline" onClick={cancel} disabled={busy} data-testid="cli-cancel">
-                {deny.isPending && <Spinner />}
-                Deny
-              </Button>
-              <Button type="submit" disabled={!ready || busy} data-testid="cli-approve">
-                {(approve.isPending || reauthenticating) && <Spinner />}
-                Approve
-              </Button>
+            <CardFooter className="mt-6 flex flex-col items-stretch gap-2">
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={cancel} disabled={busy} data-testid="cli-cancel">
+                  {deny.isPending && <Spinner />}
+                  Deny
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={!ready || busy}
+                  aria-describedby={showBlocker ? APPROVE_BLOCKER_ID : undefined}
+                  data-testid="cli-approve"
+                >
+                  {(approve.isPending || reauthenticating) && <Spinner />}
+                  Approve
+                </Button>
+              </div>
+              {showBlocker && (
+                <FormBlocker id={APPROVE_BLOCKER_ID} testId="cli-approve-blocker" className="text-right">
+                  {blocker}
+                </FormBlocker>
+              )}
             </CardFooter>
           )}
         </form>

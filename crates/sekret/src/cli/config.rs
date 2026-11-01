@@ -140,6 +140,18 @@ pub fn distrust_reason(owners: &[u32], dir: Ownership, me: Me) -> Option<&'stati
     None
 }
 
+/// Why a project file others could edit is not used, since an edit could point `run` at another
+/// project or environment.
+pub fn file_writers(file: Ownership, me: Me) -> Option<&'static str> {
+    if file.mode & 0o002 != 0 {
+        return Some("it is writable by every user");
+    }
+    if me.group_can_write(file) {
+        return Some("it is writable by its group");
+    }
+    None
+}
+
 #[cfg(unix)]
 fn current_user() -> Me {
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
@@ -204,7 +216,10 @@ fn open_trusted(path: &Path) -> Result<std::fs::File, String> {
     let dir_meta = dir
         .metadata()
         .map_err(|_| "its directory cannot be inspected".to_string())?;
-    if let Some(reason) = distrust_reason(&[link.uid(), meta.uid()], ownership(&dir_meta), current_user()) {
+    let me = current_user();
+    if let Some(reason) = distrust_reason(&[link.uid(), meta.uid()], ownership(&dir_meta), me)
+        .or_else(|| file_writers(ownership(&meta), me))
+    {
         return Err(reason.to_string());
     }
     Ok(file)
@@ -613,6 +628,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_files_others_can_edit_are_distrusted() {
+        assert_eq!(file_writers(dir(1000, 0o644), ME), None);
+        assert_eq!(file_writers(dir(1000, 0o600), ME), None);
+        assert_eq!(file_writers(dir(1000, 0o666), ME), Some("it is writable by every user"));
+        assert_eq!(file_writers(dir(1000, 0o664), ME), Some("it is writable by its group"));
+        let private = Ownership {
+            gid: 1000,
+            ..dir(1000, 0o664)
+        };
+        assert_eq!(file_writers(private, ME), None, "a private group is only this user");
+    }
+
     /// A supplementary group of the current user that is not their private one, to stand in for a
     /// group shared with others.
     #[cfg(unix)]
@@ -748,6 +776,32 @@ mod tests {
             warnings.iter().any(|w| w.contains("writable by every user")),
             "{warnings:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_file_others_can_edit_is_skipped() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let top = tempfile::tempdir().context("dir")?;
+        std::fs::set_permissions(top.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        let path = top.path().join(PROJECT_FILE);
+        std::fs::write(&path, "environment = \"prod\"\n").context("write")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let mut warnings = Vec::new();
+        let (file, found) = load_project_file(top.path(), &mut warnings).context("load")?;
+        assert_eq!(file.environment, None);
+        assert_eq!(found, None);
+        assert!(
+            warnings.iter().any(|w| w.contains("it is writable by every user")),
+            "{warnings:?}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+        let mut warnings = Vec::new();
+        let (file, found) = load_project_file(top.path(), &mut warnings).context("load")?;
+        assert_eq!(file.environment.as_deref(), Some("prod"));
+        assert_eq!(found, Some(path));
         Ok(())
     }
 

@@ -71,9 +71,10 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
   });
 
   const valid = draft.name.trim() !== "" && !ttlProblem(draft);
+  const changed = disabled !== identity.disabled || JSON.stringify(draft) !== JSON.stringify(draftFrom(identity));
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (valid) save.mutate();
+    if (valid && changed) save.mutate();
   };
 
   return (
@@ -90,13 +91,13 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
               <Field orientation="horizontal">
                 <Switch id="identity-disabled" checked={disabled} onCheckedChange={setDisabled} data-testid="identity-disabled" />
                 <FieldLabel htmlFor="identity-disabled" className="font-normal">
-                  Disabled: refuse new sign-ins for this identity
+                  Disable sign-ins for this identity
                 </FieldLabel>
               </Field>
             </fieldset>
             {canEdit && (
               <div className="flex justify-end">
-                <Button type="submit" disabled={!valid || save.isPending} data-testid="identity-save">
+                <Button type="submit" disabled={!valid || !changed || save.isPending} data-testid="identity-save">
                   {save.isPending ? <Spinner /> : <Save />}
                   Save changes
                 </Button>
@@ -128,7 +129,7 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <div className="text-sm font-medium">Delete identity</div>
-                  <p className="text-sm text-muted-foreground">Removes its auth methods, secrets and memberships.</p>
+                  <p className="text-sm text-muted-foreground">Removes its auth methods, client secrets and memberships.</p>
                 </div>
                 <Button variant="destructive" onClick={() => setDeleting(true)} data-testid="identity-delete">
                   <Trash2 />

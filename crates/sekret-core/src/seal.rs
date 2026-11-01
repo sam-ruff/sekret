@@ -533,14 +533,7 @@ fn has_step_run(values: &[u8], limit: usize) -> bool {
 /// The bytes `text` decodes to as hex or base64, when that is at least [`KEY_LEN`] of them.
 fn decoded_key(text: &str) -> Option<Zeroizing<Vec<u8>>> {
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-    hex::decode(text)
-        .ok()
-        .or_else(|| {
-            [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
-                .iter()
-                .find_map(|engine| engine.decode(text).ok())
-        })
-        .map(Zeroizing::new)
+    crate::crypto::decode_key_text(text, &[&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD])
         .filter(|bytes| bytes.len() >= KEY_LEN)
 }
 

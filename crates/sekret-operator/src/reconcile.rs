@@ -119,6 +119,7 @@ async fn sync(
     validate_name("auth.serviceAccountName", &spec.auth.service_account_name)?;
     validate_name("target.name", &spec.target.name)?;
     validate_secret_type(&spec.target.secret_type)?;
+    validate_annotations(&spec.target.annotations)?;
     let owner = cr
         .controller_owner_ref(&())
         .ok_or_else(|| SyncError::InvalidSpec("SekretSecret has no uid yet".into()))?;
@@ -257,6 +258,16 @@ fn validate_secret_type(value: &str) -> Result<(), SyncError> {
         "target.type {value} is not allowed; use one of {}",
         ALLOWED_SECRET_TYPES.join(", ")
     )))
+}
+
+/// The token controller acts on these, and the chart's admission policy refuses them too.
+pub const RESERVED_ANNOTATION_PREFIX: &str = "kubernetes.io/service-account.";
+
+fn validate_annotations(annotations: &BTreeMap<String, String>) -> Result<(), SyncError> {
+    let Some(key) = annotations.keys().find(|k| k.starts_with(RESERVED_ANNOTATION_PREFIX)) else {
+        return Ok(());
+    };
+    Err(SyncError::InvalidSpec(format!("target.annotations may not set {key}")))
 }
 
 /// Accepts Kubernetes object names only, so a name cannot smuggle in another namespace.
@@ -925,6 +936,48 @@ mod tests {
 
         assert_eq!(error.reason(), "InvalidSpec");
         assert!(error.to_string().contains("service-account-token"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_account_annotations_on_the_target_are_refused() -> anyhow::Result<()> {
+        for key in [
+            "kubernetes.io/service-account.name",
+            "kubernetes.io/service-account.uid",
+        ] {
+            let mut kube = MockKubeApi::new();
+            kube.expect_request_token().never();
+            kube.expect_create_secret().never();
+            kube.expect_patch_status().returning(|_, _, _| Ok(()));
+            let mut resource = cr();
+            resource.spec.target.annotations.insert(key.into(), "admin".into());
+
+            let error = reconcile(&resource, &kube, &MockSekretApiFactory::new(), NOW)
+                .await
+                .err()
+                .with_context(|| format!("expected {key} to be refused"))?;
+
+            assert_eq!(error.reason(), "InvalidSpec", "{key}");
+            assert!(error.to_string().contains(key), "{key}");
+        }
+        Ok(())
+    }
+
+    /// The chart's admission policy must allow exactly what reconcile writes, or syncs fail.
+    #[test]
+    fn the_chart_admission_policy_matches_the_allowed_secret_types() -> anyhow::Result<()> {
+        let policy = include_str!("../../../deploy/helm/sekret-operator/templates/token-policy.yaml");
+        let list = policy
+            .split("object.type in [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .context("the chart policy lists the allowed Secret types")?;
+        let mut chart: Vec<&str> = list.split(',').map(|t| t.trim().trim_matches('"')).collect();
+        chart.sort_unstable();
+        let mut code = ALLOWED_SECRET_TYPES.to_vec();
+        code.sort_unstable();
+        assert_eq!(chart, code);
+        assert!(policy.contains(&format!("k.startsWith(\"{RESERVED_ANNOTATION_PREFIX}\")")));
         Ok(())
     }
 

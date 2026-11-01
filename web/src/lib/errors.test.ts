@@ -13,7 +13,17 @@ describe("errorMessage", () => {
   });
 
   it("explains an oversized body", () => {
-    expect(errorMessage(ApiError.from(413, undefined))).toBe("That is too large for the server to accept.");
+    const message = "That is too large for the server to accept. Make it smaller, or split it into several changes.";
+    expect(errorMessage(ApiError.from(413, undefined))).toBe(message);
+    expect(errorMessage(new ApiError("the request body is too large or arrived too slowly", 413, "too_large"))).toBe(message);
+  });
+
+  it("explains a URL the server refuses to contact", () => {
+    const error = new ApiError("url not allowed: http://169.254.169.254/latest", 400, "bad_request");
+    expect(errorMessage(error)).toBe(
+      "The server will not contact http://169.254.169.254/latest. Use an https address with no username or password in it, " +
+        "and not a cloud metadata address such as 169.254.169.254.",
+    );
   });
 
   it("gives the wait after too many wrong passphrases", () => {

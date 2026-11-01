@@ -181,7 +181,8 @@ export function SecretRow({
                 Edit
               </DropdownMenuItem>
             )}
-            {abilities.edit && (
+            {/* Typed values can still be rotated from the drawer, behind a warning. */}
+            {abilities.edit && (secret.generated || secret.next_rotation_at != null) && (
               <DropdownMenuItem onSelect={() => onRotate(actions.current)} data-testid="secret-rotate">
                 <RefreshCw />
                 Rotate now

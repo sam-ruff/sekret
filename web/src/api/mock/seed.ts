@@ -111,7 +111,7 @@ export function seededState(realNow: number): MockState {
     clock += seconds;
   };
 
-  backend.createProject({ slug: "storefront", name: "Storefront", description: "Customer facing web shop" });
+  backend.createProject({ slug: "storefront", name: "Storefront", description: "Customer-facing web shop" });
   later(3600);
   const dev = "dev";
   backend.batchWrite("storefront", dev, {
@@ -218,6 +218,8 @@ export function seededState(realNow: number): MockState {
     kind: "oidc",
     issuer: "https://token.actions.githubusercontent.com",
     jwks_url: null,
+    // GitHub Actions ID tokens last a few minutes, so a tighter cap than the default suits them.
+    max_token_lifetime: 900,
     bindings: {
       audiences: ["sekret"],
       subjects: ["repo:example/storefront:ref:refs/heads/main"],

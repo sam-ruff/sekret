@@ -390,7 +390,12 @@ export function RoleEditor({
                       Add rule
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start">
+                  <DropdownMenuContent
+                    align="start"
+                    collisionPadding={16}
+                    className="w-56 max-h-[min(var(--radix-dropdown-menu-content-available-height),20rem)]"
+                    data-testid="add-rule-menu"
+                  >
                     {subjects.map((s) => (
                       <DropdownMenuItem key={s} onSelect={() => addRule(s)} data-testid={`add-rule-${s}`}>
                         {SUBJECT_LABELS[s]}

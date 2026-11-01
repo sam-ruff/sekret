@@ -130,6 +130,12 @@ export function hasActiveFilters(filters: AuditFilters): boolean {
   return (Object.keys(PARAMS) as (keyof typeof PARAMS)[]).some((field) => filters[field] !== "");
 }
 
+/** The hint under an empty filtered result, which only suggests a wider date range when one is set. */
+export function noMatchHint(filters: AuditFilters): string {
+  if (filters.from || filters.to) return "Nothing in the log matches these filters. Try a wider date range or fewer filters.";
+  return "Nothing in the log matches these filters. Try fewer or broader filters.";
+}
+
 export interface DatePreset {
   id: string;
   label: string;

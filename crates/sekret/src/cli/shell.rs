@@ -155,6 +155,12 @@ const BLOCKED_EXACT: &[&str] = &[
     "COR_PROFILER",
     "COR_PROFILER_PATH",
     "GHC_ENVIRONMENT",
+    "FCEDIT",
+    "SSLKEYLOGFILE",
+    "AWS_CA_BUNDLE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -221,6 +227,18 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "BUN_",
     "HELM_",
     "ELECTRON_",
+    "RSYNC_",
+    "SVN_",
+    "CVS_",
+    "VK_",
+    "GIO_",
+    "GDK_",
+    "LIBGL_",
+    "EMACS",
+    "IPYTHON",
+    "JUPYTER_",
+    "AWS_ENDPOINT_URL",
+    "KRB5",
 ];
 
 /// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
@@ -241,6 +259,8 @@ const BLOCKED_SUFFIXES: &[&str] = &[
     "_WRAPPER",
     "INIT",
     "RC",
+    "_RSH",
+    "_SSH",
 ];
 
 /// `PS1`, `RPS2` and the like.
@@ -907,6 +927,44 @@ mod tests {
         let (kept, skipped) = strict().split(vars(&[("A", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["A"]);
         assert_eq!(skipped_keys(&skipped), ["HTTPS_PROXY", "SEKRET_TOKEN"]);
+    }
+
+    #[test]
+    fn remote_shells_module_paths_and_leaky_settings_are_blocked() {
+        for name in [
+            "RSYNC_RSH",
+            "RSYNC_CONNECT_PROG",
+            "SVN_SSH",
+            "CVS_RSH",
+            "FCEDIT",
+            "fcedit",
+            "GIO_EXTRA_MODULES",
+            "GDK_PIXBUF_MODULE_FILE",
+            "LIBGL_DRIVERS_PATH",
+            "VK_LAYER_PATH",
+            "VK_ADD_LAYER_PATH",
+            "VK_ICD_FILENAMES",
+            "EMACSLOADPATH",
+            "IPYTHONDIR",
+            "JUPYTER_CONFIG_DIR",
+            "SSLKEYLOGFILE",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_CA_BUNDLE",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "KRB5_CONFIG",
+            "KRB5CCNAME",
+            "SOME_TOOL_RSH",
+            "SOME_TOOL_SSH",
+        ] {
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(strict().check(name), Err(SkipReason::Blocked), "{name}");
+        }
+        for name in ["AWS_REGION", "AWS_ACCESS_KEY_ID", "DATABASE_URL", "CREDIT_LIMIT"] {
+            assert!(!is_blocked(name), "{name}");
+        }
     }
 
     #[test]

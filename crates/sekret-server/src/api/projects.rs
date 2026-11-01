@@ -244,6 +244,20 @@ async fn delete_project(
 ) -> ApiResult<StatusCode> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::Settings, Action::Delete)?;
+    // Everything in the project goes with it, so no deny may stand anywhere in what is removed.
+    let removed = [
+        Rule::allow(Subject::Secrets, &[Action::Delete]),
+        Rule::allow(Subject::Snapshots, &[Action::Edit]),
+        Rule::allow(Subject::Folders, &[Action::Delete]),
+        Rule::allow(Subject::Environments, &[Action::Delete]),
+    ];
+    if !covers(&rules, &removed) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "escalation",
+            "deleting a project needs unrestricted delete on its secrets, folders and environments",
+        ));
+    }
     state.store.delete_project(&project.id).await?;
     audit(
         &state,

@@ -73,6 +73,12 @@ jobs:
           if helm template sekret $chart --set serviceAccount.name=default > /dev/null; then exit 1; fi
           helm template sekret $chart --set serviceAccount.create=false --set serviceAccount.name=sekret-operator-sa \
             | grep -q 'serviceAccountName: sekret-operator-sa'
+      - name: The admission policies cover token requests and Secret writes
+        run: |
+          rendered=$(helm template sekret deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com)
+          for name in tokens secrets; do
+            echo "$rendered" | grep -q "policyName: sekret-sekret-operator-$name"
+          done
 
   docs-check:
     uses: sam-ruff/actions/.github/workflows/docs-pages.yml@v1
@@ -100,6 +106,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # The operator suite installs the chart's RBAC and admission policies with helm template.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
       - run: cd web && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
       - name: Keycloak, Postgres, k3s, CLI, Ansible and live browser suites
         run: scripts/system-test.sh
