@@ -61,9 +61,16 @@ The folder is `/` when nothing sets it. So `sekret env use staging` switches a r
 
 Whoever chooses the server is choosing where your credentials go, so the lookup is careful about who that is:
 
-- `sekret_url` and `sekret_ca_path` are inventory variables, and anyone who can change the inventory or a group's variables can set them. When either comes from a variable, the lookup sends a token, client secret or OIDC token only if the same playbook passed it to the lookup itself. One from `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET` or the like is refused, with an error saying why. It also never opens a browser login for such a server: run `sekret login --server=...` yourself if you trust it. A login you already saved for that server is used, since it was only ever valid there.
+- `sekret_url` and `sekret_ca_path` are inventory variables, and anyone who can change the inventory or a group's variables can set them. When either comes from a variable, the lookup sends a token, client secret or OIDC token only if the same playbook passed it to the lookup itself. One from `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET` or the like is refused, with an error saying why.
+- For a server `sekret_url` names, the lookup never opens a browser login: run `sekret login --server=...` yourself if you trust it. A login you already saved for that server is used, since it was only ever valid at that address.
+- A CA file is different: it replaces every other CA the server is checked against, so a `sekret_ca_path` of the inventory's choosing could let someone else pose as the server. The lookup sends nothing through one, not even your saved login, unless `SEKRET_CA_PATH`, `ansible.cfg`, the lookup's own `ca_path=` or the CLI's own CA file names the same file.
 - A server that only a `.sekret.toml` names is used only once you have logged in to it, and then only with that saved login, never with a token or machine identity. One you have not logged in to is refused.
-- Set the server yourself, in `url` in `ansible.cfg`, in `SEKRET_URL` or as the lookup's `url=`, when anything else is to be sent to it.
+- A `.sekret.toml` can also choose the folder. Once you have confirmed its project and environment, it may pick any folder within them without asking again; you can still only read what your login can already read there.
+- Set the server yourself, in `SEKRET_URL`, as the lookup's `url=` or in your own `ansible.cfg`, when anything else is to be sent to it.
+
+A repository's own `ansible.cfg` is code you are trusting, like its playbooks: as well as `[sekret]` it can set plugin paths and so run anything. In a repository you have not reviewed, only `SEKRET_URL`, `SEKRET_CA_PATH`, an `ansible.cfg` of your own (through `ANSIBLE_CONFIG`) and the lookup's own arguments are safe places for the server and CA.
+
+Errors and the `-v` line show anything a project file or an inventory chose with control and direction characters escaped, so such a value cannot rewrite your terminal.
 
 ## Read
 
