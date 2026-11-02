@@ -41,6 +41,17 @@ A login is cached in each worker process, so a template full of lookups logs in 
 
 The lookup runs the CLI without `SEKRET_TOKEN`, `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET`, `SEKRET_IDENTITY_ID`, the OIDC and Kubernetes token variables, the GitHub Actions token variables or `SEKRET_URL`, so `sekret login` is always your own browser login, never a machine login, and a machine credential on the controller never reaches the CLI.
 
+### Checking the server's certificate
+
+| Setting | Taken from, highest first |
+|---|---|
+| `ca_path`, a CA added to the system's | the lookup's `ca_path=`, `SEKRET_CA_PATH`, `ca_path` in `[sekret]`, then `sekret_ca_path` only when one of those names the same file (see [What may choose the server](#what-may-choose-the-server)); with your `sekret login` and none of these, the CLI's own CA file |
+| `validate_certs`, on unless turned off | the lookup's `validate_certs=`, `SEKRET_VALIDATE_CERTS`, `validate_certs` in `[sekret]`; there is no `sekret_validate_certs` variable, so an inventory cannot turn checking off |
+
+With `validate_certs` off, nothing checks that the server is the one you meant, so anyone on the network path can read your token and secrets. The lookup warns once in each worker process, and with your `sekret login` it runs the CLI with `--insecure-skip-verify` and no CA file. Use it only for a server whose certificate you cannot fix yet; a private CA belongs in `ca_path`. The module, which runs on the target, takes `validate_certs` from its own argument or `SEKRET_VALIDATE_CERTS` and warns the same way.
+
+The lookup sends plain `http://` requests, and requests to this machine, directly, never through `HTTP_PROXY` or `HTTPS_PROXY`, as the CLI does: a proxy would read a token sent in the clear. Only `https://` to another machine may use the environment's proxy.
+
 ### Runs nobody is watching
 
 A scheduled or CI run has nobody to approve a browser login. Set `cli_login = false` in `[sekret]`, or `SEKRET_CLI_LOGIN=false`, so a missing login fails at once instead of waiting, and better still give the run a machine identity of its own with universal, OIDC or Kubernetes auth.

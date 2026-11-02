@@ -132,6 +132,8 @@ Creating a project or an environment answers `conflict` when the slug is taken, 
 
 ## Transport
 
+The CLI and the Ansible collection check the server's certificate unless told not to with `--insecure-skip-verify` or `SEKRET_CLIENT_INSECURE_SKIP_VERIFY` (the CLI) or `validate_certs: false` (Ansible, never from an inventory variable). Then anyone on the network path can read tokens and secrets, so each use warns, and neither the CLI's user config nor a `.sekret.toml` can turn it on. The collection, like the CLI, never sends plain `http://` or loopback requests through a proxy.
+
 By default sekret speaks plain HTTP and expects a reverse proxy to provide TLS. It can also serve HTTPS itself and require client certificates (mutual TLS); see [Configuration](configuration.md#tls-and-mutual-tls).
 
 Outgoing requests, to OIDC issuers and Kubernetes API servers, must use HTTPS unless `--allow-insecure-http` is set, never carry credentials in the URL, and do not follow redirects. Only HTTPS requests to another machine use the `HTTPS_PROXY` or `ALL_PROXY` set in the environment (`NO_PROXY` is honoured); plain HTTP and loopback requests always go direct, so a proxy never sees a client secret or token in the clear. They may go to private and internal addresses, since an in-house identity provider or cluster is the usual target. So someone allowed to edit identities can make the server send requests to internal HTTPS hosts by pointing an issuer, JWKS URL or Kubernetes host at them. The responses are never shown to them, so this only reveals whether the host answered; keep `identities: edit` for people you would trust with that.

@@ -14,6 +14,7 @@ Every command is part of the single `sekret` binary. `sekret <command> --help` p
 | `--path` | `SEKRET_PATH` | Folder, default `/`. |
 | `--ca-file` | `SEKRET_CA_FILE` | Extra PEM CA certificates to trust. Falls back to the [user config](#where-settings-come-from). A file holding no PEM certificate is an error rather than ignored. |
 | `--client-cert`, `--client-key` | `SEKRET_CLIENT_CERT`, `SEKRET_CLIENT_KEY` | PEM client certificate and key, for servers or proxies that require mTLS. |
+| `--insecure-skip-verify` | `SEKRET_CLIENT_INSECURE_SKIP_VERIFY` | Do not check the server's TLS certificate or host name at all, and ignore any CA file. Anyone on the network path can then read your token and secrets, so every command that uses it says so on standard error, and says when it ignores a CA file. Only this flag or variable can turn it on, never the user config or a `.sekret.toml`. For a server whose certificate you cannot fix yet; `--ca-file` is the safe way to trust a private CA. `sekret token --context` reports it as `insecure_skip_verify`. |
 
 ### Where settings come from
 
