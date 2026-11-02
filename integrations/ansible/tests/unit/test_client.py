@@ -565,6 +565,10 @@ def test_only_https_to_another_host_may_use_a_proxy(url, bypass):
 
 
 def test_https_to_another_host_keeps_the_environments_proxy(monkeypatch):
+    # The runner may have its own proxy settings, and urllib prefers the lower-case names.
+    for name in ("https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
     remote = UrllibTransport(ssl_context(True, None), "https://sekret.example.com")
     local = UrllibTransport(ssl_context(True, None), "https://127.0.0.1:8443")
