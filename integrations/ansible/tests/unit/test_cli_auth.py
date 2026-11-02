@@ -319,7 +319,7 @@ class TestStuckAndFailedLogins:
     def test_a_failure_marker_that_is_a_link_is_refused(self, state, tmp_path):
         lock_dir = state.parent / "cache" / "sekret"
         lock_dir.mkdir(parents=True, mode=0o700)
-        marker = sekret_cli._marker(lock_dir, (state.cli, URL, None))
+        marker = sekret_cli._marker(lock_dir, (state.cli, URL, None, False))
         marker.symlink_to(tmp_path / "elsewhere")
         with pytest.raises(ConfigError, match="symbolic link"):
             tokens(state).token()
@@ -1029,6 +1029,34 @@ class TestSkippingCertificateChecks:
         (warning,) = lookup.shown.warnings
         assert "validate_certs is off" in warning and "can read your token" in warning
 
+    def test_each_unchecked_server_is_named_once(self, lookup):
+        lookup.server.tokens.add("static-token")
+        for url in (URL, "https://other.test", URL):
+            lookup.run(
+                [], {}, url=url, token="static-token", project="p", environment="e", validate_certs=False
+            )
+        assert len(lookup.shown.warnings) == 2
+        assert any("other.test" in w for w in lookup.shown.warnings)
+
+    def test_a_shell_export_cannot_make_the_cli_skip_checks(self, lookup, state, monkeypatch):
+        monkeypatch.setenv("SEKRET_CLIENT_INSECURE_SKIP_VERIFY", "true")
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        lookup.run([], {}, url=URL, project="p", environment="e")
+        assert all("--insecure-skip-verify" not in c for c in calls(state))
+        for seen in envs(state):
+            assert "SEKRET_CLIENT_INSECURE_SKIP_VERIFY" not in seen
+
+    def test_skipping_checks_has_its_own_lock_and_failure_record(self, state):
+        lock_dir = state.parent / "cache" / "sekret"
+        (state / "login_fails").write_text("")
+        with pytest.raises(AuthenticationError, match="did not finish"):
+            CliTokens(state.cli, URL, lock_dir=lock_dir, insecure_skip_verify=True).token()
+        (state / "login_fails").unlink()
+        # The checked login is a different attempt, not one that already failed.
+        assert CliTokens(state.cli, URL, lock_dir=lock_dir).token() == "cli-token-2"
+        assert len(list(lock_dir.glob("*.lock"))) == 2
+
     def test_checking_stays_on_by_default_with_no_warning(self, lookup, state):
         (state / "token").write_text("cli-token-saved\n")
         lookup.server.tokens = {"cli-token-saved"}
@@ -1151,7 +1179,7 @@ class TestOddSettings:
     def test_a_file_error_beside_the_lock_is_a_sekret_error(self, state):
         lock_dir = state.parent / "cache" / "sekret"
         lock_dir.mkdir(parents=True, mode=0o700)
-        sekret_cli._beside_lock(lock_dir, (state.cli, URL, None), "produced").mkdir()
+        sekret_cli._beside_lock(lock_dir, (state.cli, URL, None, False), "produced").mkdir()
         with pytest.raises(SekretError, match="could not") as caught:
             tokens(state).token()
         assert not isinstance(caught.value, OSError)
@@ -1242,7 +1270,9 @@ class TestLockPerServer:
         lock_dir.mkdir(parents=True, mode=0o700)
         other = "https://other.test"
         held = os.open(
-            sekret_cli._beside_lock(lock_dir, (state.cli, other, None), "lock"), os.O_RDWR | os.O_CREAT, 0o600
+            sekret_cli._beside_lock(lock_dir, (state.cli, other, None, False), "lock"),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
         )
         fcntl.flock(held, fcntl.LOCK_EX)
         try:

@@ -461,10 +461,11 @@ _WARNED: set[str] = set()
 
 
 def warn_skip_verify(url: str) -> None:
-    """Warns once a worker process that a server's certificate is not being checked."""
-    if "validate_certs" in _WARNED:
+    """Warns once a worker process for each server whose certificate is not being checked."""
+    key = f"validate_certs:{url}"
+    if key in _WARNED:
         return
-    _WARNED.add("validate_certs")
+    _WARNED.add(key)
     display.warning(skip_verify_warning(url))
 
 

@@ -65,6 +65,8 @@ MACHINE_CREDENTIALS = (
     "SEKRET_URL",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
+    # Only validate_certs decides that, through --insecure-skip-verify, so the lookup and the CLI agree.
+    "SEKRET_CLIENT_INSECURE_SKIP_VERIFY",
 )
 
 # Logins that failed in this process, so later lookups fail at once instead of asking again.
@@ -281,7 +283,7 @@ class CliTokens:
         self._lock_dir = lock_dir if lock_dir is not None else cache_dir()
         self._lock_wait = lock_wait
         self._clock = clock
-        self._key = (cli_path, url, ca_path)
+        self._key = (cli_path, url, ca_path, insecure_skip_verify)
 
     def _argv(self, *args: str) -> list[str]:
         # `--flag=value`, so a value starting with a dash is never read as a flag.

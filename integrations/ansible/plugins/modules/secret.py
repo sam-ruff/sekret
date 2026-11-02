@@ -253,12 +253,16 @@ def main():
     )
     try:
         settings = Settings.from_options(module.params)
+    except SekretError as e:
+        module.fail_json(msg=e.message)
+    # Before anything can fail, so a failed run still says the certificate went unchecked.
+    if not settings.validate_certs:
+        module.warn(skip_verify_warning(settings.url))
+    try:
         client = SekretClient(settings)
         result, warnings = ensure(client, module.params, module.check_mode)
     except SekretError as e:
         module.fail_json(msg=e.message)
-    if not settings.validate_certs:
-        warnings.insert(0, skip_verify_warning(settings.url))
     for warning in warnings:
         module.warn(warning)
     if not module._diff:
