@@ -137,6 +137,7 @@ in_both_seal_modes!(
     machine_login_saves_and_uses_a_token,
     shell_switches_between_environments,
     generate_and_policy_commands,
+    secret_access_commands,
 );
 
 const PASSPHRASE: &str = "violet tractor sings beneath";
@@ -1345,6 +1346,219 @@ async fn generate_and_policy_commands(mode: Mode) -> anyhow::Result<()> {
     assert!(pin.contains("created"));
     let pin = ok(run(&["secrets", "get", "PIN"], &env, h, None)?)?;
     assert!(pin.trim().len() == 8 && pin.trim().chars().all(|c| c.is_ascii_digit()));
+    Ok(())
+}
+
+fn failed(output: Output) -> String {
+    assert!(!output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A machine identity in the project with `role`, and a token for it.
+async fn project_identity(server: &Server, name: &str, role: &str) -> anyhow::Result<(String, String)> {
+    let identity = api(
+        server,
+        reqwest::Method::POST,
+        "/api/v1/identities",
+        json!({"name": name}),
+    )
+    .await?;
+    let id = identity["id"].as_str().context("id")?.to_string();
+    api(
+        server,
+        reqwest::Method::PUT,
+        &format!("/api/v1/identities/{id}/auth/universal"),
+        json!({"kind": "universal"}),
+    )
+    .await?;
+    let secret = api(
+        server,
+        reqwest::Method::POST,
+        &format!("/api/v1/identities/{id}/client-secrets"),
+        json!({}),
+    )
+    .await?;
+    api(
+        server,
+        reqwest::Method::POST,
+        "/api/v1/projects/app/members",
+        json!({"principal_kind": "identity", "principal_id": id, "role": role}),
+    )
+    .await?;
+    let token = api(
+        server,
+        reqwest::Method::POST,
+        "/api/v1/auth/universal/login",
+        json!({"client_id": id, "client_secret": secret["client_secret"]}),
+    )
+    .await?;
+    Ok((id, token["access_token"].as_str().context("token")?.to_string()))
+}
+
+async fn secret_access_commands(mode: Mode) -> anyhow::Result<()> {
+    let server = start_server(mode).await?;
+    api(
+        &server,
+        reqwest::Method::POST,
+        "/api/v1/projects",
+        json!({"slug": "app", "name": "App"}),
+    )
+    .await?;
+    let (pod_id, pod_token) = project_identity(&server, "payments-pod", "developer").await?;
+    let home = tempfile::tempdir().context("home")?;
+    let h = home.path();
+    let admin = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", server.admin.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "prod"),
+    ];
+    let pod = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", pod_token.as_str()),
+        ("SEKRET_PROJECT", "app"),
+        ("SEKRET_ENVIRONMENT", "prod"),
+    ];
+
+    // The project comes from -p as well as SEKRET_PROJECT.
+    let no_project: Vec<(&str, &str)> = admin.iter().copied().filter(|(k, _)| *k != "SEKRET_PROJECT").collect();
+    let shown = ok(run(&["-p", "app", "projects", "secret-access"], &no_project, h, None)?)?;
+    assert_eq!(shown, "per-secret access: off\nno secrets are restricted\n");
+    let refused = failed(run(
+        &["secrets", "set", "STRIPE=sk_live", "--restricted"],
+        &admin,
+        h,
+        None,
+    )?);
+    assert!(refused.contains("per-secret access is off"), "{refused}");
+    let refused = failed(run(&["projects", "secret-access", "on"], &pod, h, None)?);
+    assert!(refused.contains("only a project admin"), "{refused}");
+    let on = ok(run(&["projects", "secret-access", "on"], &admin, h, None)?)?;
+    assert!(on.starts_with("per-secret access: on"), "{on}");
+
+    let set = ok(run(
+        &["secrets", "set", "STRIPE=sk_live", "--restricted"],
+        &admin,
+        h,
+        None,
+    )?)?;
+    assert!(set.contains("created: STRIPE"), "{set}");
+    ok(run(&["secrets", "set", "WEB=open"], &admin, h, None)?)?;
+    let listed = ok(run(&["secrets", "access", "list", "STRIPE"], &admin, h, None)?)?;
+    assert_eq!(
+        listed,
+        "restricted: yes, only the principals below and admins can reach it\nno one is on the access list\n"
+    );
+
+    // Off the list, the pod cannot tell the secret is there.
+    let hidden = failed(run(&["secrets", "get", "STRIPE"], &pod, h, None)?);
+    let missing = failed(run(&["secrets", "get", "NOPE"], &pod, h, None)?);
+    assert_eq!(hidden.replace("STRIPE", "X"), missing.replace("NOPE", "X"));
+    let exported = ok(run(&["export", "--format", "json"], &pod, h, None)?)?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&exported).context("json")?,
+        json!({"WEB": "open"})
+    );
+    assert!(!ok(run(&["secrets", "list", "--values"], &pod, h, None)?)?.contains("STRIPE"));
+    let refused = failed(run(&["secrets", "access", "list", "STRIPE"], &pod, h, None)?);
+    assert!(refused.contains("only a project admin"), "{refused}");
+
+    // Granted by name, the pod reads the value through every command.
+    let granted = ok(run(
+        &[
+            "secrets",
+            "access",
+            "grant",
+            "STRIPE",
+            "--identity",
+            "payments-pod",
+            "--group",
+            "ops",
+        ],
+        &admin,
+        h,
+        None,
+    )?)?;
+    assert!(
+        granted.contains("payments-pod") && granted.contains(&pod_id),
+        "{granted}"
+    );
+    assert!(granted.contains("read, read-value"), "{granted}");
+    assert!(granted.contains("group") && granted.contains("ops"), "{granted}");
+    assert_eq!(ok(run(&["secrets", "get", "STRIPE"], &pod, h, None)?)?, "sk_live\n");
+    let exported = ok(run(&["export", "--format", "json"], &pod, h, None)?)?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&exported).context("json")?,
+        json!({"STRIPE": "sk_live", "WEB": "open"})
+    );
+    let refused = failed(run(&["secrets", "set", "STRIPE=changed"], &pod, h, None)?);
+    assert!(refused.contains("403 forbidden"), "{refused}");
+
+    // Narrowed to read, the key shows but the value does not.
+    let narrowed = ok(run(
+        &[
+            "secrets",
+            "access",
+            "grant",
+            "STRIPE",
+            "--identity",
+            &pod_id,
+            "--allow",
+            "read",
+        ],
+        &admin,
+        h,
+        None,
+    )?)?;
+    let pod_row = narrowed
+        .lines()
+        .find(|line| line.contains(&pod_id))
+        .context("the pod's entry")?;
+    assert!(pod_row.trim_end().ends_with("read"), "{narrowed}");
+    let refused = failed(run(&["secrets", "get", "STRIPE"], &pod, h, None)?);
+    assert!(refused.contains("not allowed to read its value"), "{refused}");
+    let refused = failed(run(
+        &["secrets", "access", "grant", "STRIPE", "--identity", "no-such-pod"],
+        &admin,
+        h,
+        None,
+    )?);
+    assert!(refused.contains("no machine identity"), "{refused}");
+
+    let revoked = ok(run(
+        &[
+            "secrets",
+            "access",
+            "revoke",
+            "STRIPE",
+            "--identity",
+            "payments-pod",
+            "--group",
+            "ops",
+        ],
+        &admin,
+        h,
+        None,
+    )?)?;
+    assert!(revoked.ends_with("no one is on the access list\n"), "{revoked}");
+    failed(run(&["secrets", "get", "STRIPE"], &pod, h, None)?);
+
+    // Turning the setting off waits until nothing is restricted.
+    let refused = failed(run(&["projects", "secret-access", "off"], &admin, h, None)?);
+    assert!(refused.contains("1 secret in this project is restricted"), "{refused}");
+    let status = ok(run(&["projects", "secret-access"], &admin, h, None)?)?;
+    assert!(
+        status.contains("restricted secrets: 1") && status.contains("STRIPE"),
+        "{status}"
+    );
+    let open = ok(run(&["secrets", "access", "unrestrict", "STRIPE"], &admin, h, None)?)?;
+    assert!(open.starts_with("restricted: no"), "{open}");
+    assert_eq!(ok(run(&["secrets", "get", "STRIPE"], &pod, h, None)?)?, "sk_live\n");
+    let restricted = ok(run(&["secrets", "access", "restrict", "WEB"], &admin, h, None)?)?;
+    assert!(restricted.starts_with("restricted: yes"), "{restricted}");
+    ok(run(&["secrets", "access", "unrestrict", "WEB"], &admin, h, None)?)?;
+    let off = ok(run(&["projects", "secret-access", "off"], &admin, h, None)?)?;
+    assert_eq!(off, "per-secret access: off\nno secrets are restricted\n");
     Ok(())
 }
 

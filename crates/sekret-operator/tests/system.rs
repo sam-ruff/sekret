@@ -627,11 +627,15 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
             },
             refresh_interval: "10s".into(),
             auth: AuthSpec {
-                identity_id,
+                identity_id: identity_id.clone(),
                 service_account_name: SERVICE_ACCOUNT.into(),
             },
         },
     );
+    let mut every_key = resource.clone();
+    every_key.metadata.name = Some("every-key".into());
+    every_key.spec.target.name = "every-key-env".into();
+    every_key.spec.keys = None;
     let mut unapproved = resource.clone();
     unapproved.metadata.name = Some("unapproved".into());
     unapproved.spec.target.name = "unapproved-env".into();
@@ -740,6 +744,97 @@ async fn syncs_a_sekret_path_into_a_kubernetes_secret() -> anyhow::Result<()> {
     })
     .await;
 
+    per_secret_access(&sekret, &resources, &secrets, every_key, &identity_id).await?;
+
     controller.abort();
+    Ok(())
+}
+
+/// The workload identity syncs only the restricted secrets granted to it, and a key it asks
+/// for by name that becomes restricted fails the sync rather than vanishing quietly.
+async fn per_secret_access(
+    sekret: &Sekret,
+    resources: &Api<SekretSecret>,
+    secrets: &Api<Secret>,
+    every_key: SekretSecret,
+    identity_id: &str,
+) -> anyhow::Result<()> {
+    let secret_url = |key: &str| format!("/api/v1/projects/app/environments/prod/secrets/{key}/access?path=/");
+    sekret
+        .send(
+            reqwest::Method::PUT,
+            "/api/v1/projects/app/secret-access",
+            json!({"enabled": true}),
+        )
+        .await?;
+    sekret
+        .send(
+            reqwest::Method::POST,
+            "/api/v1/projects/app/environments/prod/secrets/batch",
+            json!({"path": "/", "upserts": [
+                {"key": "PAYMENTS_KEY", "value": "pk", "restricted": true},
+                {"key": "LEDGER_KEY", "value": "lk", "restricted": true},
+            ]}),
+        )
+        .await?;
+    sekret
+        .send(
+            reqwest::Method::PATCH,
+            &secret_url("PAYMENTS_KEY"),
+            json!({"grant": [{"principal_kind": "identity", "principal_id": identity_id, "actions": ["read-value"]}]}),
+        )
+        .await?;
+    create_named(resources, every_key).await?;
+    let synced = wait_for("the open and granted keys", Duration::from_secs(60), || async {
+        let secret = secrets.get_opt("every-key-env").await.ok().flatten()?;
+        secret_value(&secret, "PAYMENTS_KEY").is_some().then_some(secret)
+    })
+    .await;
+    assert_eq!(secret_value(&synced, "PAYMENTS_KEY").as_deref(), Some("pk"));
+    assert_eq!(secret_value(&synced, "API_KEY").as_deref(), Some("k3"));
+    assert_eq!(
+        secret_value(&synced, "LEDGER_KEY"),
+        None,
+        "not granted, so never synced"
+    );
+
+    sekret
+        .send(
+            reqwest::Method::PATCH,
+            &secret_url("API_KEY"),
+            json!({"restricted": true}),
+        )
+        .await?;
+    let refused = wait_for("the named key to fail the sync", Duration::from_secs(60), || async {
+        let status = resources.get("app-config").await.ok()?.status?;
+        status
+            .ready()
+            .filter(|c| c.status == "False")
+            .map(|c| c.message.clone())
+    })
+    .await;
+    assert!(refused.contains("API_KEY"), "{refused}");
+    wait_for(
+        "the restricted key to leave the full sync",
+        Duration::from_secs(60),
+        || async {
+            let secret = secrets.get_opt("every-key-env").await.ok().flatten()?;
+            secret_value(&secret, "API_KEY").is_none().then_some(())
+        },
+    )
+    .await;
+
+    sekret
+        .send(
+            reqwest::Method::PATCH,
+            &secret_url("API_KEY"),
+            json!({"grant": [{"principal_kind": "identity", "principal_id": identity_id, "actions": ["read-value"]}]}),
+        )
+        .await?;
+    wait_for("Ready=True once granted", Duration::from_secs(60), || async {
+        let status = resources.get("app-config").await.ok()?.status?;
+        status.ready().is_some_and(|c| c.status == "True").then_some(())
+    })
+    .await;
     Ok(())
 }
