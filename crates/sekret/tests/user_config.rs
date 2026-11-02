@@ -296,7 +296,42 @@ fn a_relative_home_never_reads_a_config_from_the_current_directory() -> anyhow::
     Ok(())
 }
 
-/// Needs `setfacl` and a filesystem with POSIX ACLs; on Linux CI runners both are standard.
+/// Grants `uid` read and write on a 0600 file by writing the access ACL xattr directly, as
+/// `setfacl -m u:<uid>:rw` would, so the test needs no `acl` package.
+#[cfg(target_os = "linux")]
+fn grant_user_rw(path: &std::path::Path, uid: u32) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const UNDEFINED: u32 = u32::MAX;
+    // posix_acl_xattr: a version header, then (tag, perm, id) entries sorted by tag.
+    let entries: [(u16, u16, u32); 5] = [
+        (0x01, 6, UNDEFINED), // owner
+        (0x02, 6, uid),       // named user
+        (0x04, 0, UNDEFINED), // owning group
+        (0x10, 6, UNDEFINED), // mask
+        (0x20, 0, UNDEFINED), // other
+    ];
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).context("path")?;
+    // SAFETY: both strings are NUL-terminated and the value pointer and length describe `acl`.
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    anyhow::ensure!(result == 0, "setxattr: {}", std::io::Error::last_os_error());
+    Ok(())
+}
+
+/// Needs a filesystem with POSIX ACLs.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_acl_granting_another_user_write_is_refused() -> anyhow::Result<()> {
@@ -304,12 +339,7 @@ fn an_acl_granting_another_user_write_is_refused() -> anyhow::Result<()> {
     let home = dir.path();
     write_user_config(home, "server = \"https://user.test\"\n")?;
     let path = home.join("config/sekret/config.toml");
-    let status = Command::new("setfacl")
-        .args(["-m", "u:nobody:rw"])
-        .arg(&path)
-        .status()
-        .context("setfacl")?;
-    anyhow::ensure!(status.success(), "setfacl failed");
+    grant_user_rw(&path, 65534)?;
     let output = run(&["whoami"], &[], home)?;
     assert!(
         stderr(&output).contains("other users can change it"),
