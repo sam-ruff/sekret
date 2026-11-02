@@ -210,7 +210,8 @@ export function CliLoginPage() {
               <Alert data-testid="cli-signed-in-again">
                 <Info />
                 <AlertDescription>
-                  You are signed in again. Type the code from your terminal once more to approve.
+                  You are signed in again. For safety, confirm the code from your terminal once more, as the page does not
+                  keep it across signing in.
                 </AlertDescription>
               </Alert>
             )}

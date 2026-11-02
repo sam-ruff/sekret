@@ -516,11 +516,13 @@ async fn deleted_marks_turn_off_automatic_unlocks(db: String) -> anyhow::Result<
 }
 
 /// A database writer flips the stored mode to key-file while the server is sealed. The passphrase
-/// unseal proves passphrase mode, so sealing still works, and the untrusted configuration is
-/// never signed again.
+/// unseal proves passphrase mode, so the keyring and the repaired configuration say so, and the
+/// mode the writer chose is never signed. After a restart the server waits for the passphrase
+/// rather than refusing to start without a key file.
 async fn a_tampered_mode_never_reaches_the_keyring_or_a_signature(db: String) -> anyhow::Result<()> {
     let db = persistent(&db)?;
-    let h = fresh(&db.url, marked(db.dir.path())).await?;
+    let settings = marked(db.dir.path());
+    let h = fresh(&db.url, settings.clone()).await?;
     let admin = init(&h).await?;
     let (status, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -532,13 +534,27 @@ async fn a_tampered_mode_never_reaches_the_keyring_or_a_signature(db: String) ->
 
     assert_eq!(unseal_with(&h, PASSPHRASE).await?.0, StatusCode::OK);
     assert_eq!(h.state.keyring.mode(), Some(SealMode::Passphrase));
+    let repaired = stored(&h).await?;
+    assert_eq!(repaired.mode, SealMode::Passphrase, "the passphrase proved the mode");
+    assert_eq!(repaired.wrapped, tampered.wrapped);
+    assert!(repaired.epoch > tampered.epoch);
     let change = json!({"current": PASSPHRASE, "new": NEW_PASSPHRASE});
     let (status, body) = h.post("/api/v1/sys/passphrase", &admin, change).await?;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "seal_config_tampered");
-    assert_eq!(stored(&h).await?, tampered, "nothing the writer chose was signed");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (status, body) = h.post("/api/v1/sys/seal", &admin, json!({})).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The same change across a restart: the server starts sealed and the passphrase repairs it.
+    let flipped = SealConfig {
+        mode: SealMode::KeyFile,
+        ..stored(&h).await?
+    };
+    h.state.store.update_seal_config(flipped).await?;
+    drop(h);
+    let restarted = fresh(&db.url, settings).await?;
+    assert_eq!(restarted.state.keyring.state(), sekret_core::seal::SealState::Sealed);
+    assert_eq!(unseal_with(&restarted, NEW_PASSPHRASE).await?.0, StatusCode::OK);
+    assert_eq!(stored(&restarted).await?.mode, SealMode::Passphrase);
     Ok(())
 }
 

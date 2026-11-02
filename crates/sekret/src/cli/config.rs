@@ -37,6 +37,43 @@ pub struct Credentials {
     /// same list loading from another server, project, environment or path, needs confirming again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub confirmed_allow: BTreeMap<String, Vec<String>>,
+    /// Project and environment choices made by a project file that the person confirmed, keyed
+    /// by [`ChoiceScope::key`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub confirmed_choices: std::collections::BTreeSet<String>,
+}
+
+/// A project file picking where `run`, `env use` and `export` load secrets from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceScope {
+    pub file: PathBuf,
+    pub server: String,
+    pub project: String,
+    pub environment: String,
+}
+
+impl ChoiceScope {
+    /// A JSON array, so no value can be crafted to collide with another scope.
+    pub fn key(&self) -> String {
+        serde_json::json!([
+            self.file.display().to_string(),
+            self.server,
+            self.project,
+            self.environment
+        ])
+        .to_string()
+    }
+
+    /// `project/environment` on `server`, safe to show at a terminal.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}/{} on {}",
+            sekret_client::terminal_safe(&self.project),
+            sekret_client::terminal_safe(&self.environment),
+            sekret_client::terminal_safe(&self.server)
+        )
+        .replace(['\n', '\t'], " ")
+    }
 }
 
 /// What a project file's `allow` list is confirmed for: the file, and where secrets load from.
@@ -91,6 +128,14 @@ impl Credentials {
 
     pub fn confirm_allow(&mut self, scope: &AllowScope, names: &[String]) {
         self.confirmed_allow.insert(scope.key(), normalised_allow(names));
+    }
+
+    pub fn choice_confirmed(&self, scope: &ChoiceScope) -> bool {
+        self.confirmed_choices.contains(&scope.key())
+    }
+
+    pub fn confirm_choice(&mut self, scope: &ChoiceScope) {
+        self.confirmed_choices.insert(scope.key());
     }
 }
 
@@ -381,6 +426,8 @@ pub struct Resolved {
     pub unconfirmed_allow: Option<(AllowScope, Vec<String>)>,
     /// The project file chose the project or environment, rather than a flag or variable.
     pub chosen_by_file: Option<PathBuf>,
+    /// That choice, while the person has not yet confirmed it.
+    pub unconfirmed_choice: Option<ChoiceScope>,
     /// The nearest trusted project file, which `env use` records in the shell.
     pub project_file: Option<PathBuf>,
     /// Why the project or environment `env use` left in this shell must not be used here.
@@ -510,6 +557,16 @@ pub fn resolve(
     let project = flag_or_env_project.or(file.project);
     let environment = flag_or_env_environment.or(file.environment);
     let path = overrides.path.or(file.path).unwrap_or_else(|| "/".into());
+    // Nor may it pick, say, prod for a cloned repository's build scripts without a yes.
+    let unconfirmed_choice = chosen_by_file
+        .as_ref()
+        .map(|chosen| ChoiceScope {
+            file: chosen.clone(),
+            server: server.clone(),
+            project: project.clone().unwrap_or_default(),
+            environment: environment.clone().unwrap_or_default(),
+        })
+        .filter(|scope| file.location.is_none() || !credentials.choice_confirmed(scope));
     // A cloned repository's file must not unblock names on its own say-so.
     let scope = AllowScope {
         file: file.location.clone().unwrap_or_else(|| PathBuf::from(PROJECT_FILE)),
@@ -535,25 +592,17 @@ pub fn resolve(
         allow,
         unconfirmed_allow,
         chosen_by_file,
+        unconfirmed_choice,
         project_file: file.location,
         stale_shell,
     })
 }
 
-fn is_loopback(host: &url::Url) -> bool {
-    match host.host() {
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
-}
-
 /// Plain `http://` is only for this machine unless explicitly allowed, because tokens and secret
-/// values would cross the network unencrypted.
+/// values would cross the network unencrypted. Plain http never goes through a proxy.
 pub fn check_transport(server: &str, allow_insecure_http: bool) -> anyhow::Result<()> {
     let url = url::Url::parse(server).with_context(|| format!("the server URL {server} is not valid"))?;
-    if url.scheme() != "http" || allow_insecure_http || is_loopback(&url) {
+    if url.scheme() != "http" || allow_insecure_http || sekret_client::is_loopback(&url) {
         return Ok(());
     }
     bail!("{server} is plain http; use https, or pass --allow-insecure-http if you accept sending tokens unencrypted")
@@ -1063,6 +1112,73 @@ mod tests {
         };
         let flagged = resolve(chosen, file, &Credentials::default(), 0)?;
         assert_eq!(flagged.chosen_by_file, None);
+        assert_eq!(flagged.unconfirmed_choice, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_project_file_choice_is_confirmed_per_file_server_project_and_environment() -> anyhow::Result<()> {
+        let mut file: ProjectFile =
+            toml::from_str("server = \"https://s\"\nproject = \"payments\"\nenvironment = \"prod\"\n")?;
+        file.location = Some("/repo/.sekret.toml".into());
+        let mut credentials = Credentials::default();
+        let scope = resolve(Overrides::default(), file.clone(), &credentials, 0)?
+            .unconfirmed_choice
+            .context("a cloned file's choice starts unconfirmed")?;
+        assert_eq!(
+            scope,
+            ChoiceScope {
+                file: "/repo/.sekret.toml".into(),
+                server: "https://s".into(),
+                project: "payments".into(),
+                environment: "prod".into(),
+            }
+        );
+        credentials.confirm_choice(&scope);
+        let read: Credentials = toml::from_str(&toml::to_string(&credentials)?)?;
+        assert_eq!(
+            resolve(Overrides::default(), file.clone(), &read, 0)?.unconfirmed_choice,
+            None,
+            "the saved yes is used next time"
+        );
+
+        let env_only = Overrides {
+            environment: Some("dev".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve(env_only, file.clone(), &read, 0)?.unconfirmed_choice.is_some(),
+            "the file still picks the project, now for another environment"
+        );
+        let edited = [
+            ("/repo/.sekret.toml", "https://other", "payments", "prod"),
+            ("/repo/.sekret.toml", "https://s", "billing", "prod"),
+            ("/repo/.sekret.toml", "https://s", "payments", "staging"),
+            ("/other/.sekret.toml", "https://s", "payments", "prod"),
+        ];
+        for (location, server, project, environment) in edited {
+            let mut changed: ProjectFile = toml::from_str(&format!(
+                "server = \"{server}\"\nproject = \"{project}\"\nenvironment = \"{environment}\"\n"
+            ))?;
+            changed.location = Some(location.into());
+            let resolved = resolve(Overrides::default(), changed, &read, 0)?;
+            assert!(
+                resolved.unconfirmed_choice.is_some(),
+                "{location} {server} {project} {environment}"
+            );
+        }
+        let env_vars = Overrides {
+            env_project: Some("payments".into()),
+            env_environment: Some("prod".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(env_vars, file, &Credentials::default(), 0)?.unconfirmed_choice,
+            None,
+            "SEKRET_PROJECT and SEKRET_ENVIRONMENT are the person's choice"
+        );
+        let old: Credentials = toml::from_str("[servers]\n")?;
+        assert!(old.confirmed_choices.is_empty(), "older credentials files still load");
         Ok(())
     }
 

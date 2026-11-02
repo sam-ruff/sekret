@@ -1504,6 +1504,7 @@ impl Store for SqlStore {
             fingerprint,
             seal,
             integrity_key,
+            revoke_credentials,
         } = rekey;
         let mut tx = self.pool.begin().await?;
         if let Some(config) = seal {
@@ -1547,6 +1548,15 @@ impl Store for SqlStore {
             .bind(wrapped)
             .execute(&mut *tx)
             .await?;
+        }
+        if revoke_credentials {
+            for statement in [
+                "UPDATE access_tokens SET revoked = 1 WHERE revoked = 0",
+                "UPDATE client_secrets SET revoked = 1 WHERE revoked = 0",
+                "UPDATE cli_logins SET consumed = 1 WHERE consumed = 0",
+            ] {
+                sqlx::query(statement).execute(&mut *tx).await?;
+            }
         }
         sqlx::query(
             "INSERT INTO meta (key, value) VALUES ('root_key_fingerprint', $1) \

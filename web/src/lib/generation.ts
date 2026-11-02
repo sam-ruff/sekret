@@ -64,6 +64,15 @@ export function isPolicyOff(policy: SecretPolicy): boolean {
   return !policy.generator && !policy.rotation_days;
 }
 
+/** What "Project default" means for a secret, given the project's policy when it is known. */
+export function inheritNote(project: SecretPolicy | undefined): string {
+  if (!project) return "Follows the project's secret defaults, set in project settings.";
+  if (isPolicyOff(project)) {
+    return "The project sets no defaults, so Generate makes 32 letters and digits and nothing rotates. Change this in project settings.";
+  }
+  return "Follows the project's secret defaults, shown above. Change them in project settings.";
+}
+
 export function lengthProblem(length: string): string | undefined {
   const n = Number(length);
   if (!/^\d+$/.test(length.trim()) || n < MIN_LENGTH || n > MAX_LENGTH) {

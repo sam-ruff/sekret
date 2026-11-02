@@ -59,8 +59,13 @@ test("an environment with secrets cannot be deleted, and an empty one needs its 
   const dialog = page.getByTestId("delete-env-confirm");
   await expect(dialog).toContainText("Staging is not empty");
   await expect(dialog.getByTestId("delete-env-contents")).toContainText(/It still holds \d+ secrets?/);
+  await expect(dialog.getByTestId("delete-env-contents")).toContainText("so delete those secrets first");
   await expect(dialog.getByTestId("confirm-action")).toHaveCount(0);
-  await dialog.getByTestId("confirm-cancel").click();
+  // The dialog links to the secrets that are in the way.
+  await dialog.getByTestId("delete-env-open").click();
+  await expect(page).toHaveURL(/\/projects\/storefront\/secrets\/staging$/);
+  await expect(dialog).toHaveCount(0);
+  await page.goto("/projects/storefront/settings/environments");
 
   await page.getByTestId("add-environment").click();
   const create = page.getByTestId("environment-dialog");
@@ -93,6 +98,9 @@ test("creates a project with custom environments", async ({ page }) => {
   await page.goto("/projects");
   await page.getByTestId("new-project").click();
   await page.getByTestId("project-name").fill("Edge");
+  // The switch reads as a setting, with the defaults it replaces beside it.
+  await expect(page.getByRole("switch", { name: "Customise environments" })).toBeVisible();
+  await expect(page.getByTestId("create-project-dialog")).toContainText("Otherwise you get Development, Staging and Production.");
   await page.getByTestId("custom-envs").click();
   const list = page.getByTestId("custom-env-list");
   await list.getByRole("button", { name: "Remove Staging" }).click();

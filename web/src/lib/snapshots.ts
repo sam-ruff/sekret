@@ -37,6 +37,58 @@ export function restoreSummary(changes: SnapshotChange[], path: string, envName:
   return `${what} ${history}`;
 }
 
+export interface SnapshotEffect {
+  path: string;
+  key: string;
+  kind: "added" | "changed" | "deleted";
+}
+
+type KeyState = { present: false } | { present: true; version: number | null | undefined };
+
+const changeId = (change: { path: string; key: string }) => `${change.path}\u0000${change.key}`;
+
+/** A key's state in the snapshot a change was listed for. */
+function snapshotState(change: SnapshotChange): KeyState {
+  if (change.kind === "removed") return { present: false };
+  return { present: true, version: change.snapshot_version };
+}
+
+/** A key's state now, as any change listing it shows. */
+function currentState(change: SnapshotChange): KeyState {
+  if (change.kind === "added") return { present: false };
+  return { present: true, version: change.current_version };
+}
+
+/**
+ * What one snapshot's change did, from what restoring it and the snapshot before it would each
+ * change. A key either list leaves out is as it is now in that snapshot.
+ */
+export function snapshotEffect(before: SnapshotChange[], after: SnapshotChange[]): SnapshotEffect[] {
+  const beforeById = new Map(before.map((c) => [changeId(c), c]));
+  const afterById = new Map(after.map((c) => [changeId(c), c]));
+  const effects: SnapshotEffect[] = [];
+  for (const id of new Set([...beforeById.keys(), ...afterById.keys()])) {
+    const was = beforeById.get(id);
+    const is = afterById.get(id);
+    const listed = was ?? is;
+    if (!listed) continue;
+    const now = currentState(listed);
+    const from = was ? snapshotState(was) : now;
+    const to = is ? snapshotState(is) : now;
+    const where = { path: listed.path, key: listed.key };
+    if (!from.present && to.present) effects.push({ ...where, kind: "added" });
+    else if (from.present && !to.present) effects.push({ ...where, kind: "deleted" });
+    else if (from.present && to.present && from.version !== to.version) effects.push({ ...where, kind: "changed" });
+  }
+  return effects.sort((a, b) => a.path.localeCompare(b.path) || a.key.localeCompare(b.key));
+}
+
+/** Restore changes to secrets the snapshot's own change did not touch. */
+export function unrelatedChanges(changes: SnapshotChange[], effect: SnapshotEffect[]): number {
+  const touched = new Set(effect.map(changeId));
+  return changes.filter((c) => !touched.has(changeId(c))).length;
+}
+
 const COUNTS =/^(\d+) created, (\d+) updated, (\d+) deleted(?: in (.+))?$/;
 
 /**

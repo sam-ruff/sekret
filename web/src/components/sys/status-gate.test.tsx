@@ -165,6 +165,57 @@ describe("StatusGate", () => {
     });
   });
 
+  describe("another tab locking the server", () => {
+    const channels: BroadcastChannel[] = [];
+    afterEach(() => {
+      channels.splice(0).forEach((c) => c.close());
+    });
+
+    function renderRevealed(): QueryClient {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      client.setQueryData(VALUES_KEY, new Map([["TOKEN", "s3cret"]]));
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter initialEntries={["/projects/app/secrets"]}>
+            <StatusGate>
+              <Revealed client={client} />
+            </StatusGate>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      return client;
+    }
+
+    function sealElsewhere(): void {
+      const other = new BroadcastChannel("sekret-tabs");
+      channels.push(other);
+      other.postMessage("sealed");
+    }
+
+    it("unmounts revealed values before the status check settles", async () => {
+      sysStatus.mockResolvedValue(status("unsealed"));
+      const client = renderRevealed();
+      expect(await screen.findByTestId("revealed")).toHaveTextContent("s3cret");
+
+      sysStatus.mockReturnValue(new Promise<SysStatus>(() => undefined));
+      sealElsewhere();
+      await waitFor(() => expect(screen.queryByTestId("revealed")).toBeNull());
+      expect(screen.getByTestId("status-gate-loading")).toBeInTheDocument();
+      expect(client.getQueryData(VALUES_KEY)).toBeUndefined();
+    });
+
+    it("does not bring the old values back when the status check fails", async () => {
+      sysStatus.mockResolvedValue(status("unsealed"));
+      renderRevealed();
+      expect(await screen.findByTestId("revealed")).toHaveTextContent("s3cret");
+
+      sysStatus.mockRejectedValue(new Error("network down"));
+      sealElsewhere();
+      await waitFor(() => expect(sysStatus).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByTestId("revealed")).toHaveTextContent("none"));
+    });
+  });
+
   it("checks again and moves to unlock when a request finds the server sealed", async () => {
     sysStatus.mockResolvedValue(status("unsealed"));
     renderGate("/projects/app/secrets");

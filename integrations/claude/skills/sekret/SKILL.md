@@ -11,15 +11,15 @@ sekret is a self-hosted secrets manager. Its `sekret` CLI fetches a project envi
 
 1. Check the CLI and the login: `sekret whoami`. It prints the account and server, never secrets.
 2. If it says "not logged in", the browser-approved login needs a human. Ask the user to run `! sekret login --server <url>` themselves. Do not try to complete it yourself, and never ask them to paste a token into the conversation. A `SEKRET_TOKEN` that is already in the environment also works, together with `SEKRET_URL` or `--server`: a token is never sent to a server that only `.sekret.toml` names.
-3. Find the project and environment. A `.sekret.toml` in the repository sets defaults (`server`, `project`, `environment`). Otherwise `sekret projects` lists projects, and `-p <project>` and `-e <environment>` pick one. `sekret env status` shows what the current shell has loaded, by name only.
+3. Find the project and environment. A `.sekret.toml` in the repository sets defaults (`server`, `project`, `environment`). Otherwise `sekret projects` lists projects, and `-p <project>` and `-e <environment>` pick one. `run`, `env use` and `export` will not load from a project or environment that only `.sekret.toml` picked until someone confirms it at a terminal, so pass both `-p` and `-e` yourself, after checking with the user that the file's choice is the one they want. `sekret env status` shows what the current shell has loaded, by name only.
 
 ## Using secrets
 
 Each Bash tool call is a fresh shell, so variables loaded in one call are gone in the next. Load and use them in the same call.
 
-- **One command:** `sekret run -e dev -- npm test`. The secrets go to that process only. This is the default choice.
-- **Several commands that share secrets:** `eval "$(sekret env use dev)" && ./migrate && ./seed`.
-- **Switching environment:** run `env use` again with the other environment. It removes the keys the previous one loaded, so nothing from dev leaks into a prod run: `eval "$(sekret env use staging)" && ./smoke-test`.
+- **One command:** `sekret run -p app -e dev -- npm test`. The secrets go to that process only. This is the default choice.
+- **Several commands that share secrets:** `eval "$(sekret env use -p app dev)" && ./migrate && ./seed`.
+- **Switching environment:** run `env use` again with the other environment. It removes the keys the previous one loaded, so nothing from dev leaks into a prod run: `eval "$(sekret env use -p app staging)" && ./smoke-test`.
 - **A subfolder:** add `--path /service` (and `--recursive` for everything beneath it) to `run` or `env use`.
 
 ## Rules

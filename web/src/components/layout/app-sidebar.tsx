@@ -94,7 +94,12 @@ function ProjectSwitcher({ current }: { current?: string }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <SidebarMenuButton size="lg" data-testid="project-switcher" className="data-[state=open]:bg-sidebar-accent">
+        <SidebarMenuButton
+          size="lg"
+          aria-label={project ? `Switch project, current: ${project.name}` : "Switch project"}
+          data-testid="project-switcher"
+          className="data-[state=open]:bg-sidebar-accent"
+        >
           <div className="flex aspect-square size-8 items-center justify-center text-primary">
             <ProjectLogo
               url={project?.logo_url}

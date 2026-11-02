@@ -20,6 +20,7 @@ use crate::auth::{ClientIp, Principal};
 use crate::authz::require_any;
 use crate::error::{ApiError, ApiResult};
 use crate::images::normalise_logo;
+use crate::ratelimit::{InFlight, InFlightGuard};
 use crate::state::AppState;
 
 pub const MAX_LOGO_BYTES: usize = 512 * 1024;
@@ -39,7 +40,8 @@ impl utoipa::PartialSchema for LogoFile {
 
 impl utoipa::ToSchema for LogoFile {}
 
-/// Uploaded SVGs are served as documents nobody can script, even when opened directly.
+/// Logos are always re-encoded PNGs, but one stored by an older release could be an SVG, so
+/// anything served is a document nobody can script, even when opened directly.
 const LOGO_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -75,9 +77,11 @@ async fn get_logo(
 
 #[utoipa::path(put, path = "/api/v1/projects/{project}/logo", tag = "projects", params(("project" = String, Path)),
     request_body(content = LogoFile, content_type = "application/octet-stream",
-        description = "PNG, JPEG, GIF, WebP or SVG, at most 512 KiB"),
+        description = "PNG, JPEG, GIF or WebP, at most 512 KiB and 4096 pixels on a side. SVG is refused; convert it to PNG first."),
     responses((status = 200, body = Project), (status = 400, body = sekret_api::ErrorBody),
-        (status = 413, body = sekret_api::ErrorBody)), security(("bearer" = [])))]
+        (status = 413, body = sekret_api::ErrorBody),
+        (status = 429, description = "`rate_limited`, or `logo_busy` while the caller's previous upload is still being processed", body = sekret_api::ErrorBody)),
+    security(("bearer" = [])))]
 async fn put_logo(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -87,10 +91,7 @@ async fn put_logo(
 ) -> ApiResult<Json<Project>> {
     let (mut project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::Settings, Action::Edit)?;
-    if !state
-        .logo_limiter
-        .allow(&format!("{}:{}", principal.kind.as_str(), principal.id))
-    {
+    if !state.logo_limiter.allow(&principal_key(&principal)) {
         return Err(ApiError::too_many_requests());
     }
     if body.len() > MAX_LOGO_BYTES {
@@ -100,7 +101,14 @@ async fn put_logo(
             "logos can be at most 512 KiB",
         ));
     }
-    let png = decode_off_runtime(body.clone()).await?;
+    let Some(turn) = DECODING.claim(principal_key(&principal)) else {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "logo_busy",
+            "your previous logo is still being processed",
+        ));
+    };
+    let png = decode_off_runtime(body.clone(), turn).await?;
     let content_type = "image/png";
     let now = state.clock.now();
     state
@@ -133,21 +141,28 @@ async fn put_logo(
 /// Logos decoded at once; image work stays off the async workers and cannot occupy every thread.
 const LOGO_DECODES: usize = 2;
 static DECODE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(LOGO_DECODES)));
+/// Callers with a decode running or waiting for a slot; each may have one.
+static DECODING: LazyLock<Arc<InFlight>> = LazyLock::new(|| Arc::new(InFlight::default()));
 /// Uploads per caller per minute, refused ones included.
 pub const LOGO_UPLOADS_PER_MINUTE: u32 = 10;
 
-async fn decode_off_runtime(body: Bytes) -> ApiResult<Vec<u8>> {
-    decode_with_slots(&DECODE_SLOTS, body, |data| {
+fn principal_key(principal: &Principal) -> String {
+    format!("{}:{}", principal.kind.as_str(), principal.id)
+}
+
+async fn decode_off_runtime(body: Bytes, turn: InFlightGuard) -> ApiResult<Vec<u8>> {
+    decode_with_slots(&DECODE_SLOTS, body, turn, |data| {
         normalise_logo(data).map_err(|e| e.to_string())
     })
     .await
 }
 
-/// The slot moves into the blocking task, so a request that is dropped or times out keeps it
-/// until the decode it started has finished.
+/// The slot and the caller's turn move into the blocking task, so a request that is dropped or
+/// times out keeps both until the decode it started has finished.
 async fn decode_with_slots(
     slots: &Arc<Semaphore>,
     body: Bytes,
+    turn: InFlightGuard,
     decode: impl FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
 ) -> ApiResult<Vec<u8>> {
     let slot = slots
@@ -156,7 +171,7 @@ async fn decode_with_slots(
         .await
         .map_err(|e| ApiError::internal("logo decode", e))?;
     tokio::task::spawn_blocking(move || {
-        let _slot = slot;
+        let _held = (turn, slot);
         decode(&body)
     })
     .await
@@ -197,6 +212,7 @@ async fn delete_logo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use std::time::Duration;
 
     #[tokio::test]
@@ -205,8 +221,10 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
         let task_slots = slots.clone();
+        let callers = Arc::new(InFlight::default());
+        let turn = callers.claim("user:a".into()).context("first turn")?;
         let upload = tokio::spawn(async move {
-            decode_with_slots(&task_slots, Bytes::from_static(b"x"), move |_| {
+            decode_with_slots(&task_slots, Bytes::from_static(b"x"), turn, move |_| {
                 let _ = started_tx.send(());
                 let _ = finish_rx.recv();
                 Ok(Vec::new())
@@ -216,10 +234,15 @@ mod tests {
         started_rx.await?;
         upload.abort();
         let _ = upload.await;
-        assert_eq!(slots.available_permits(), 0, "the render still holds its slot");
+        assert_eq!(slots.available_permits(), 0, "the decode still holds its slot");
+        assert!(
+            callers.claim("user:a".into()).is_none(),
+            "and its caller cannot start another meanwhile"
+        );
         finish_tx.send(())?;
         let freed = tokio::time::timeout(Duration::from_secs(5), slots.acquire()).await;
-        assert!(freed.is_ok(), "the slot comes back once the render ends");
+        assert!(freed.is_ok(), "the slot comes back once the decode ends");
+        assert!(callers.claim("user:a".into()).is_some(), "and so does the turn");
         Ok(())
     }
 }

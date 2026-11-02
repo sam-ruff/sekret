@@ -3183,7 +3183,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description PNG, JPEG, GIF, WebP or SVG, at most 512 KiB */
+        /** @description PNG, JPEG, GIF or WebP, at most 512 KiB and 4096 pixels on a side. SVG is refused; convert it to PNG first. */
         requestBody: {
             content: {
                 "application/octet-stream": components["schemas"]["LogoFile"];
@@ -3207,6 +3207,15 @@ export interface operations {
                 };
             };
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description `rate_limited`, or `logo_busy` while the caller's previous upload is still being processed */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

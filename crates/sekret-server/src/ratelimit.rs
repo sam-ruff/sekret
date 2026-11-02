@@ -470,10 +470,58 @@ pub fn rounded_wait(wait: Duration) -> u64 {
     secs.max(1).div_ceil(step) * step
 }
 
+/// Keys with a piece of work running, so each key may have only one at a time.
+#[derive(Default)]
+pub struct InFlight {
+    held: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Holds a key's place until dropped.
+pub struct InFlightGuard {
+    owner: std::sync::Arc<InFlight>,
+    key: String,
+}
+
+impl InFlight {
+    /// The key's place, or `None` while it already has work running.
+    pub fn claim(self: &std::sync::Arc<Self>, key: String) -> Option<InFlightGuard> {
+        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !held.insert(key.clone()) {
+            return None;
+        }
+        Some(InFlightGuard {
+            owner: self.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .owner
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.remove(&self.key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn each_key_has_one_piece_of_work_in_flight() {
+        let in_flight = std::sync::Arc::new(InFlight::default());
+        let first = in_flight.claim("user:a".into());
+        assert!(first.is_some());
+        assert!(in_flight.claim("user:a".into()).is_none(), "a second is refused");
+        assert!(in_flight.claim("user:b".into()).is_some(), "others are unaffected");
+        drop(first);
+        assert!(in_flight.claim("user:a".into()).is_some(), "free again once it ends");
+    }
 
     #[test]
     fn host_socket_guesses_slow_down_but_never_for_long() {

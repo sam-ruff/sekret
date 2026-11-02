@@ -13,7 +13,8 @@ use utoipa::ToSchema;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::{
-    CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_from_material, fill_random, key_text, open, seal,
+    CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_from_material, fill_random, fill_random_key, key_text, open,
+    seal,
 };
 
 pub const MIN_PASSPHRASE_LEN: usize = 12;
@@ -468,7 +469,7 @@ pub struct DeviceKey([u8; KEY_LEN]);
 impl DeviceKey {
     pub fn generate() -> Result<Self, CryptoError> {
         let mut key = Self([0u8; KEY_LEN]);
-        fill_random(&mut key.0)?;
+        fill_random_key(&mut key.0)?;
         Ok(key)
     }
 

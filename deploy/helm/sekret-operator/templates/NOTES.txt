@@ -1,0 +1,14 @@
+The sekret operator is watching {{ if .Values.clusterWide }}every namespace{{ else }}{{ include "sekret-operator.watchNamespaces" . | fromJsonArray | join ", " }}{{ end }}.
+{{- if not .Values.tokenServiceAccounts }}
+
+WARNING: tokenServiceAccounts is empty, so RBAC lets the operator read and mint tokens for every
+service account in the watched namespaces. The sekret.sam-ruff.github.io/allow-sekretsecret
+annotation is only checked by the operator itself, not by Kubernetes, so a stolen operator token
+could mint tokens for accounts that never opted in. List the accounts in tokenServiceAccounts to
+have Kubernetes enforce it.
+{{- end }}
+{{- if and .Values.clusterWide (not .Values.tokenPolicy.enabled) }}
+
+WARNING: clusterWide is on and tokenPolicy is off, so the operator can mint any token for any
+service account in the cluster. Treat its service account as cluster-admin.
+{{- end }}

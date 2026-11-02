@@ -1,5 +1,5 @@
-use sekret_core::permissions::{Action, BuiltinRole, Decision, Resource, Rule, Subject, authorise};
-use sekret_store::{PrincipalKind, Role};
+use sekret_core::permissions::{Action, BuiltinRole, Decision, Effect, Resource, Rule, Subject, authorise};
+use sekret_store::{Membership, PrincipalKind, Role, User};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
@@ -55,6 +55,10 @@ pub async fn org_role_slugs(state: &AppState, principal: &Principal) -> ApiResul
 
 pub async fn org_rules(state: &AppState, principal: &Principal) -> ApiResult<Vec<Rule>> {
     let slugs = org_role_slugs(state, principal).await?;
+    org_rules_for(state, &slugs).await
+}
+
+async fn org_rules_for(state: &AppState, slugs: &[String]) -> ApiResult<Vec<Rule>> {
     let custom = state.store.list_roles("").await?;
     Ok(slugs
         .iter()
@@ -63,20 +67,137 @@ pub async fn org_rules(state: &AppState, principal: &Principal) -> ApiResult<Vec
         .collect())
 }
 
-/// Organisation rules plus the principal's roles in this project.
+fn holds_org_admin(slugs: &[String]) -> bool {
+    slugs.iter().any(|s| s == BuiltinRole::OrgAdmin.slug())
+}
+
+/// The rules that judge changes to organisation roles and bindings. An org admin is judged by the
+/// org-admin role alone, so no deny bound to them, by anyone, can stop them repairing access.
+pub async fn org_management_rules(state: &AppState, principal: &Principal) -> ApiResult<Vec<Rule>> {
+    let slugs = org_role_slugs(state, principal).await?;
+    if holds_org_admin(&slugs) {
+        return Ok(BuiltinRole::OrgAdmin.rules());
+    }
+    org_rules_for(state, &slugs).await
+}
+
+pub async fn is_org_admin(state: &AppState, principal: &Principal) -> ApiResult<bool> {
+    Ok(holds_org_admin(&org_role_slugs(state, principal).await?))
+}
+
+/// The rules that judge changes to a project's roles and members, given the caller's usual
+/// `rules` there. An org admin is judged by the org-admin role alone, as in
+/// [`org_management_rules`]; a project admin is not, so a deny an org admin binds to them holds.
+pub async fn project_management_rules(
+    state: &AppState,
+    principal: &Principal,
+    rules: Vec<Rule>,
+) -> ApiResult<Vec<Rule>> {
+    if is_org_admin(state, principal).await? {
+        return Ok(BuiltinRole::OrgAdmin.rules());
+    }
+    Ok(rules)
+}
+
+/// Whether `principal` holds the project's admin role, directly or through a group.
+pub fn is_project_admin(memberships: &[Membership], principal: &Principal) -> bool {
+    memberships.iter().any(|m| {
+        m.role_slug == BuiltinRole::ProjectAdmin.slug()
+            && principal_matches(m.principal_kind, &m.principal_id, principal)
+    })
+}
+
+pub type Key<'k> = (PrincipalKind, &'k str);
+
+/// For each principal a binding to (`kind`, `id`) reaches, the bindings that reach them: a user
+/// through their own and their groups' bindings, and for a group every user holding it, and the
+/// group alone for those who have not signed in yet.
+pub fn holders<'k>(users: &'k [User], kind: PrincipalKind, id: &'k str) -> Vec<Vec<Key<'k>>> {
+    let reach = |user: &'k User| -> Vec<Key<'k>> {
+        std::iter::once((PrincipalKind::User, user.id.as_str()))
+            .chain(user.groups.iter().map(|g| (PrincipalKind::Group, g.as_str())))
+            .collect()
+    };
+    match kind {
+        PrincipalKind::User => match users.iter().find(|u| u.id == id) {
+            Some(user) => vec![reach(user)],
+            None => vec![vec![(kind, id)]],
+        },
+        PrincipalKind::Identity => vec![vec![(kind, id)]],
+        PrincipalKind::Group => std::iter::once(vec![(kind, id)])
+            .chain(users.iter().filter(|u| u.groups.iter().any(|g| g == id)).map(reach))
+            .collect(),
+    }
+}
+
+/// Bindings that make someone an admin: org-admin bindings, the configured admin groups and, for
+/// a project, its admin memberships.
+pub async fn admin_bindings(state: &AppState, memberships: &[Membership]) -> ApiResult<Vec<(PrincipalKind, String)>> {
+    let mut admins: Vec<(PrincipalKind, String)> = state
+        .store
+        .list_org_bindings()
+        .await?
+        .into_iter()
+        .filter(|b| b.role_slug == BuiltinRole::OrgAdmin.slug())
+        .map(|b| (b.principal_kind, b.principal_id))
+        .collect();
+    if let Some(oidc) = &state.config.oidc {
+        admins.extend(oidc.admin_groups.iter().map(|g| (PrincipalKind::Group, g.clone())));
+    }
+    admins.extend(
+        memberships
+            .iter()
+            .filter(|m| m.role_slug == BuiltinRole::ProjectAdmin.slug())
+            .map(|m| (m.principal_kind, m.principal_id.clone())),
+    );
+    Ok(admins)
+}
+
+/// Whether a binding to (`kind`, `id`) would reach anyone holding one of `admins`.
+pub fn reaches_admin(users: &[User], admins: &[(PrincipalKind, String)], kind: PrincipalKind, id: &str) -> bool {
+    holders(users, kind, id)
+        .iter()
+        .flatten()
+        .any(|(k, i)| admins.iter().any(|(ak, ai)| ak == k && ai == i))
+}
+
+/// Whether `after` holds a deny rule that `before` lacks.
+pub fn added_denies(before: &[Rule], after: &[Rule]) -> bool {
+    after.iter().any(|r| r.effect == Effect::Deny && !before.contains(r))
+}
+
+pub fn has_denies(rules: &[Rule]) -> bool {
+    rules.iter().any(|r| r.effect == Effect::Deny)
+}
+
+/// Binding a deny to an admin is for admins only, so nobody with delegated rights can lock
+/// them out of repairing access.
+pub fn deny_needs_admin() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::FORBIDDEN,
+        "escalation",
+        "only an admin can bind deny rules to an admin",
+    )
+}
+
+/// Organisation rules plus the principal's roles in this project. A role reached more than once,
+/// directly and through a group, is counted once.
 pub async fn project_rules(state: &AppState, principal: &Principal, project_id: &str) -> ApiResult<Vec<Rule>> {
     let mut rules = org_rules(state, principal).await?;
     let memberships = state.store.list_memberships(project_id).await?;
-    let mine: Vec<_> = memberships
+    let mut mine: Vec<&str> = memberships
         .iter()
         .filter(|m| principal_matches(m.principal_kind, &m.principal_id, principal))
+        .map(|m| m.role_slug.as_str())
         .collect();
     if mine.is_empty() {
         return Ok(rules);
     }
+    mine.sort_unstable();
+    mine.dedup();
     let custom = state.store.list_roles(project_id).await?;
-    for membership in mine {
-        rules.extend(role_rules(&membership.role_slug, &custom, false).unwrap_or_default());
+    for slug in mine {
+        rules.extend(role_rules(slug, &custom, false).unwrap_or_default());
     }
     Ok(rules)
 }

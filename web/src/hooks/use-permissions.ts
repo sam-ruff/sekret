@@ -21,20 +21,35 @@ export function permissionsFrom(rules: readonly Rule[] | undefined): Permissions
   };
 }
 
+/** What the server judges by the org-admin role alone for an org admin, whatever denies they hold. */
+const ADMIN_MANAGED: readonly Subject[] = ["roles", "members", "org-roles", "org-members"];
+
+/** An org admin may always manage roles, bindings and members, as the server lets them repair access. */
+export function withAdminManagement(permissions: Permissions, orgAdmin: boolean): Permissions {
+  if (!orgAdmin) return permissions;
+  return {
+    ready: permissions.ready,
+    can: (subject, action, resource) => ADMIN_MANAGED.includes(subject) || permissions.can(subject, action, resource),
+    canSomewhere: (subject, action) => ADMIN_MANAGED.includes(subject) || permissions.canSomewhere(subject, action),
+  };
+}
+
 export function useProjectPermissions(project: string): Permissions {
   const { data } = useQuery({
     queryKey: keys.permissions(project),
     queryFn: () => api.permissions(project),
     staleTime: 30_000,
   });
+  const orgAdmin = useIsOrgAdmin();
   const rules = data?.rules;
-  return useMemo(() => permissionsFrom(rules), [rules]);
+  return useMemo(() => withAdminManagement(permissionsFrom(rules), orgAdmin), [rules, orgAdmin]);
 }
 
 export function useOrgPermissions(): Permissions {
   const { data } = useMe();
   const rules = data?.org_rules;
-  return useMemo(() => permissionsFrom(rules), [rules]);
+  const orgAdmin = data?.is_org_admin === true;
+  return useMemo(() => withAdminManagement(permissionsFrom(rules), orgAdmin), [rules, orgAdmin]);
 }
 
 /** True for organisation admins, who alone may lock the server or change how it unlocks. */

@@ -85,15 +85,6 @@ impl OperatorArgs {
     }
 }
 
-fn is_loopback(url: &url::Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
-}
-
 /// What to do about the server URL's transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -106,7 +97,7 @@ pub enum Transport {
 /// service account tokens and secret values would cross the network unencrypted.
 pub fn check_transport(server: &str, allow_insecure_http: bool) -> anyhow::Result<Transport> {
     let url = url::Url::parse(server).with_context(|| format!("the server URL {server} is not valid"))?;
-    if url.scheme() != "http" || is_loopback(&url) {
+    if url.scheme() != "http" || sekret_client::is_loopback(&url) {
         return Ok(Transport::Secure);
     }
     if allow_insecure_http {

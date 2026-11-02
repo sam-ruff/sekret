@@ -536,6 +536,7 @@ async fn unreadable_values_are_listed_or_skipped(db: String) -> anyhow::Result<(
             fingerprint: root(&h)?.fingerprint(),
             seal: None,
             integrity_key: None,
+            revoke_credentials: false,
         })
         .await?;
 

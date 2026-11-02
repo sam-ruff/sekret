@@ -56,7 +56,7 @@ Conditions narrow a rule to some secrets:
 | `keys` | Key globs, such as `DB_*`. |
 | `tags` | Secrets carrying any of these tags. |
 
-`environments` and `tags` match exactly, so they must be lowercase slugs, and a role with `prod*` or `Restricted` in them is refused rather than saved as a rule that never applies. All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters. A role may hold at most 200 path and key patterns across all its rules, deny rules included, and one member may hold at most 400 across the roles they are given directly in a project. Adding a member, or changing a role someone already holds, is refused if it would take them past that.
+`environments` and `tags` match exactly, so they must be lowercase slugs, and a role with `prod*` or `Restricted` in them is refused rather than saved as a rule that never applies. Paths and keys are checked the same way: a folder pattern must start with `/` and may not end with `/` (other than `/` itself) or contain `//`, `.` or `..` segments, and a key pattern must be able to match a key, so `payments/**`, `/payments/` and `1KEY` are refused. All conditions in one rule must hold for it to apply. Lists of patterns are limited to 50 entries of 256 characters. A role may hold at most 200 path and key patterns across all its rules, deny rules included, and one member may hold at most 400 across every role that reaches them in a project, directly or through their groups. Adding a member or group, or changing a role someone already holds, is refused if it would take anyone past that, judged by the groups people had at their last sign-in. If the identity provider later gives someone groups that take them past it, listing secrets in that project answers `too_many_patterns` until an admin simplifies their roles.
 
 This custom role lets a team read and change everything in `dev` and `staging`, read key names in `prod` but not values, and never read anything tagged `restricted`:
 
@@ -73,7 +73,7 @@ This custom role lets a team read and change everything in `dev` and `staging`, 
 }
 ```
 
-The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule. A role made only of deny rules grants nothing on its own, and the editor says so; give it alongside a role that allows access. On the secrets page, values your roles hide show as *No access to value*, with a note under the list that a deny in any role wins.
+The web interface has an editor for this, with a grid of subjects and actions and a conditions builder for each rule. The builder refuses a folder or key pattern that can never match as you add it, and the editor asks before Escape or a click outside throws away unsaved changes. An org admin sees the role, binding and member controls even where another role denies them, since the server lets them through. A role made only of deny rules grants nothing on its own, and the editor says so; give it alongside a role that allows access. On the secrets page, values your roles hide show as *No access to value*, with a note under the list that a deny in any role wins.
 
 ![The role editor](../assets/screenshots/roles-light.png)
 
@@ -92,3 +92,5 @@ A deny whose condition cannot be checked, for example a tag condition when the t
 ## Nobody can hand out more than they hold
 
 Granting a role, editing one or adding someone to a project is only allowed when everything the role allows is something you already hold, without a deny on it. Removing a restriction counts the same way, so someone held back by a deny cannot remove that deny from themselves, delete the role it comes from, or edit it away. The same applies to machine identities: you can only mint credentials for, edit or delete an identity whose access you already cover.
+
+Nobody with delegated rights can lock an admin out. Only an admin (an `org-admin`, or in a project its `admin`) may add deny rules to a role that reaches an admin, directly or through a group, or grant a role with deny rules to one. And when an `org-admin` lists, grants, edits or removes roles, bindings and members, in the organisation or any project, only the `org-admin` role is considered, so a deny bound to them through another role never stops them repairing access; it still limits what they do elsewhere until they lift it. A project `admin` is held to a deny an org admin binds to them, so an org admin can give someone a project while keeping, for example, values in `prod` out of their reach.

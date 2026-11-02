@@ -655,6 +655,15 @@ fn require_browser_session(principal: &Principal) -> ApiResult<()> {
     Ok(())
 }
 
+/// A browser session within its own allowance for looking at and answering CLI logins.
+fn require_cli_reviewer(state: &AppState, principal: &Principal) -> ApiResult<()> {
+    require_browser_session(principal)?;
+    if !state.cli_review_limiter.allow(&principal.id) {
+        return Err(ApiError::too_many_requests());
+    }
+    Ok(())
+}
+
 #[utoipa::path(get, path = "/api/v1/auth/cli/pending", tag = "auth", params(PendingQuery),
     description = "Where and when a CLI login was started, so the person can check it was them before approving.",
     responses((status = 200, body = PendingCliLogin), (status = 403, body = sekret_api::ErrorBody),
@@ -666,10 +675,7 @@ pub async fn cli_pending(
     principal: Principal,
     Query(query): Query<PendingQuery>,
 ) -> ApiResult<Json<PendingCliLogin>> {
-    require_browser_session(&principal)?;
-    if !state.cli_login_limiter.allow_ip(ip) {
-        return Err(ApiError::too_many_requests());
-    }
+    require_cli_reviewer(&state, &principal)?;
     let login = state
         .store
         .get_cli_login(&normalise_user_code(&query.code), state.clock.now())
@@ -697,10 +703,7 @@ pub async fn cli_deny(
     principal: Principal,
     Json(request): Json<CliDenyRequest>,
 ) -> ApiResult<StatusCode> {
-    require_browser_session(&principal)?;
-    if !state.cli_login_limiter.allow_ip(ip) {
-        return Err(ApiError::too_many_requests());
-    }
+    require_cli_reviewer(&state, &principal)?;
     let code = normalise_user_code(&request.code);
     let now = state.clock.now();
     let Some(login) = state.store.get_cli_login(&code, now).await? else {
@@ -741,10 +744,7 @@ pub async fn cli_approve(
     principal: Principal,
     Json(request): Json<CliApproveRequest>,
 ) -> ApiResult<StatusCode> {
-    require_browser_session(&principal)?;
-    if !state.cli_login_limiter.allow_ip(ip) {
-        return Err(ApiError::too_many_requests());
-    }
+    require_cli_reviewer(&state, &principal)?;
     let code = normalise_user_code(&request.code);
     // A session from before the subject list changed must not mint a CLI token.
     if let Some(config) = &state.config.oidc

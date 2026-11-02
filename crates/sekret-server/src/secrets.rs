@@ -189,12 +189,14 @@ pub async fn plan_batch(
         validate::secret_value(&upsert.value)?;
         validate::comment(&upsert.comment)?;
         let existing = ctx.store.get_secret(&env.id, &path, &upsert.key).await?;
-        let live = existing.as_ref().filter(|s| !s.secret.deleted);
-        if let Some(current) = live
+        // A deleted secret is judged by the tags it was deleted with, so writing over it cannot
+        // continue the history of one the caller cannot see.
+        if let Some(current) = &existing
             && !readable(rules, env, &path, &upsert.key, &current.version.tags)
         {
             return Err(not_found(&upsert.key));
         }
+        let live = existing.as_ref().filter(|s| !s.secret.deleted);
         let tags = match (upsert.tags, live) {
             (Some(tags), _) => normalise_tags(tags)?,
             (None, Some(current)) => current.version.tags.clone(),
@@ -949,6 +951,56 @@ mod tests {
                 "delete, present: {present}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_over_a_deleted_secret_hidden_by_its_tags_is_refused() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut deleted = stored(&project, &root, "K", "", 4, true)?;
+        deleted.version.tags = vec!["pci".into()];
+        let mut rules = BuiltinRole::Developer.rules();
+        rules.push(Rule {
+            effect: sekret_core::permissions::Effect::Deny,
+            subject: Subject::Secrets,
+            actions: vec![Action::Read],
+            conditions: Conditions {
+                tags: vec!["pci".into()],
+                ..Default::default()
+            },
+        });
+        let mut store = MockStore::new();
+        let hidden = deleted.clone();
+        store
+            .expect_get_secret()
+            .returning(move |_, _, _| Ok(Some(hidden.clone())));
+        let refused = plan_batch(
+            &ctx(&store, &root),
+            &rules,
+            &project,
+            &env,
+            "/",
+            vec![upsert("K", "x")],
+            vec![],
+        )
+        .await;
+        assert_eq!(refused.err().map(|e| e.status), Some(axum::http::StatusCode::NOT_FOUND));
+        // Without the deny, the same write continues the secret's history.
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                &BuiltinRole::Developer.rules(),
+                &project,
+                &env,
+                "/",
+                vec![upsert("K", "x")],
+                vec![],
+            )
+            .await,
+            "plan",
+        )?;
+        let change = &planned.batch.context("batch")?.changes[0];
+        assert_eq!((change.secret_id.as_str(), change.version.version), ("id-K", 5));
         Ok(())
     }
 

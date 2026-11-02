@@ -78,6 +78,33 @@ fn confirm_allow(home: &Path, project_file: &Path, at: [&str; 4], names: &[&str]
     Ok(())
 }
 
+/// Records the yes a person gives at a terminal to a project file choosing `project` and
+/// `environment` on `server`.
+fn confirm_choice(home: &Path, project_file: &Path, at: [&str; 3]) -> anyhow::Result<()> {
+    let dir = home.join("config").join("sekret");
+    std::fs::create_dir_all(&dir).context("config dir")?;
+    let path = dir.join("credentials.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut table: toml::Table = toml::from_str(&existing).context("credentials")?;
+    let file = std::fs::canonicalize(project_file).context("canonical")?;
+    let [server, project, environment] = at;
+    let key = json!([file.display().to_string(), server, project, environment]).to_string();
+    let choices = table
+        .entry("confirmed_choices")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    if let toml::Value::Array(list) = choices {
+        list.push(toml::Value::String(key));
+    }
+    std::fs::write(&path, toml::to_string(&table).context("serialise")?).context("write credentials")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    }
+    Ok(())
+}
+
 /// How the round-trip server keeps its root key.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -704,6 +731,33 @@ async fn a_shell_loaded_in_one_repository_is_refused_in_another() -> anyhow::Res
         )
         .context("project file")?;
     }
+    let shell_env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", server.admin.as_str()),
+    ];
+    let unconfirmed = run(
+        &["run", "--", "sh", "-c", "echo loaded:$DB_URL"],
+        &shell_env,
+        &home.path().join("b"),
+        None,
+    )?;
+    let stderr = String::from_utf8_lossy(&unconfirmed.stderr).into_owned();
+    assert!(!unconfirmed.status.success(), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&unconfirmed.stdout).contains("loaded:"),
+        "nothing runs before the file's choice is confirmed"
+    );
+    assert!(stderr.contains("other/dev") && stderr.contains("--project"), "{stderr}");
+    confirm_choice(
+        home.path(),
+        &home.path().join("a/.sekret.toml"),
+        [&server.url, "app", "prod"],
+    )?;
+    confirm_choice(
+        home.path(),
+        &home.path().join("b/.sekret.toml"),
+        [&server.url, "other", "dev"],
+    )?;
     let bin_dir = Path::new(BIN).parent().context("bin dir")?.display().to_string();
     let script = r#"
         eval "$(sekret shell-init bash)"
@@ -752,6 +806,159 @@ async fn a_shell_loaded_in_one_repository_is_refused_in_another() -> anyhow::Res
     );
     assert!(stdout.contains("4:postgres://other-dev:unset"), "{stdout}\n{stderr}");
     assert!(stdout.contains("5:/"), "nothing is left loaded: {stdout}");
+    Ok(())
+}
+
+/// Runs the CLI with stdin and stderr on a pseudo-terminal, typing `answer`. Returns the exit
+/// status, standard output and what the terminal showed.
+#[cfg(unix)]
+fn run_on_terminal(
+    args: &[&str],
+    env: &[(&str, &str)],
+    dir: &Path,
+    answer: &str,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes two new descriptors into the pointers given and reads nothing else.
+    let code = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    anyhow::ensure!(code == 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: both descriptors were just opened and nothing else owns them.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut command = Command::new(BIN);
+    command
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .current_dir(dir)
+        .stdin(Stdio::from(slave.try_clone().context("slave")?))
+        .stderr(Stdio::from(slave))
+        .stdout(Stdio::piped());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let child = command.spawn().context("spawn")?;
+    drop(command);
+    let mut terminal = std::fs::File::from(master);
+    terminal.write_all(answer.as_bytes()).context("type")?;
+    let mut reader = terminal.try_clone().context("terminal")?;
+    let shown = std::thread::spawn(move || {
+        let mut shown = Vec::new();
+        // Reading stops with EIO once the child and every copy of the slave side are gone.
+        let _ = reader.read_to_end(&mut shown);
+        String::from_utf8_lossy(&shown).into_owned()
+    });
+    let output = child.wait_with_output().context("output")?;
+    drop(terminal);
+    let shown = shown.join().map_err(|_| anyhow::anyhow!("terminal reader"))?;
+    Ok((
+        output.status,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        shown,
+    ))
+}
+
+/// A project file that picks the project and environment is asked about once at a terminal; a
+/// yes is saved, and a no or a script runs nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_project_file_choice_is_confirmed_once_at_a_terminal() -> anyhow::Result<()> {
+    let server = start_server(Mode::KeyFile).await?;
+    api(
+        &server,
+        reqwest::Method::POST,
+        "/api/v1/projects",
+        json!({"slug": "payments", "name": "payments"}),
+    )
+    .await?;
+    api(
+        &server,
+        reqwest::Method::POST,
+        "/api/v1/projects/payments/environments/prod/secrets/batch",
+        json!({"upserts": [{"key": "DB_URL", "value": "postgres://prod"}]}),
+    )
+    .await?;
+    let home = tempfile::tempdir().context("home")?;
+    let h = home.path();
+    std::fs::write(
+        h.join(".sekret.toml"),
+        "project = \"payments\"\nenvironment = \"prod\"\n",
+    )
+    .context("project file")?;
+    let env = [
+        ("SEKRET_URL", server.url.as_str()),
+        ("SEKRET_TOKEN", server.admin.as_str()),
+    ];
+    let command = ["run", "--", "sh", "-c", "echo loaded:$DB_URL"];
+
+    let (status, stdout, shown) = run_on_terminal(&command, &env, h, "n\n")?;
+    assert!(!status.success(), "{shown}");
+    assert!(!stdout.contains("loaded:"), "a no runs nothing: {stdout}");
+    assert!(
+        shown.contains("payments/prod") && shown.contains(".sekret.toml"),
+        "{shown}"
+    );
+    let script = run(&command, &env, h, None)?;
+    assert!(!script.status.success());
+    assert!(String::from_utf8_lossy(&script.stderr).contains("--project"));
+
+    let (status, stdout, shown) = run_on_terminal(&command, &env, h, "y\n")?;
+    assert!(status.success(), "{shown}");
+    assert!(stdout.contains("loaded:postgres://prod"), "{stdout}");
+    let saved = std::fs::read_to_string(h.join("config/sekret/credentials.toml")).context("credentials")?;
+    assert!(saved.contains("confirmed_choices"), "{saved}");
+    assert!(!saved.contains("postgres://prod"), "{saved}");
+
+    let again = ok(run(&command, &env, h, None)?)?;
+    assert!(
+        again.contains("loaded:postgres://prod"),
+        "the saved yes is used: {again}"
+    );
+    let exported = ok(run(&["export", "--format", "dotenv"], &env, h, None)?)?;
+    assert!(exported.contains("postgres://prod"), "{exported}");
+
+    // Pointing the file at another environment needs a new yes.
+    std::fs::write(
+        h.join(".sekret.toml"),
+        "project = \"payments\"\nenvironment = \"dev\"\n",
+    )
+    .context("edited project file")?;
+    let moved = run(&command, &env, h, None)?;
+    assert!(!moved.status.success());
+    assert!(String::from_utf8_lossy(&moved.stderr).contains("payments/dev"));
+    // Flags or variables are the person's own choice and need none.
+    let mut flagged = env.to_vec();
+    flagged.extend([("SEKRET_PROJECT", "payments"), ("SEKRET_ENVIRONMENT", "prod")]);
+    let chosen = ok(run(&command, &flagged, h, None)?)?;
+    assert!(chosen.contains("loaded:postgres://prod"), "{chosen}");
+    let by_flag = ok(run(
+        &[
+            "run",
+            "--project",
+            "payments",
+            "--env",
+            "prod",
+            "--",
+            "sh",
+            "-c",
+            "echo loaded:$DB_URL",
+        ],
+        &env,
+        h,
+        None,
+    )?)?;
+    assert!(by_flag.contains("loaded:postgres://prod"), "{by_flag}");
     Ok(())
 }
 

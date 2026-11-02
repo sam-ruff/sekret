@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { expectToast } from "./helpers";
+import { expectToast, failNext } from "./helpers";
 
 test("creates a custom project role with a conditional deny", async ({ page }) => {
   await page.goto("/projects/storefront/settings/roles");
@@ -37,6 +37,48 @@ test("creates a custom project role with a conditional deny", async ({ page }) =
   await expect(reopenedDeny.getByTestId("condition-env-secrets-prod")).toBeChecked();
   await expect(reopenedDeny.getByTestId("condition-keys-secrets")).toContainText("STRIPE_*");
   await expect(reopened.getByTestId("rule-secrets-read-value")).toBeChecked();
+});
+
+test("asks before Escape or a click outside throws away a role being written", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  // Nothing typed yet, so Escape just closes it.
+  await page.keyboard.press("Escape");
+  await expect(editor).toHaveCount(0);
+
+  await page.getByTestId("new-role").click();
+  await editor.getByTestId("role-name").fill("Half done");
+  await editor.getByTestId("rule-secrets-read").click();
+  await page.keyboard.press("Escape");
+  const discard = page.getByTestId("discard-dialog");
+  await discard.getByTestId("discard-keep").click();
+  await expect(editor.getByTestId("role-name")).toHaveValue("Half done");
+  await expect(editor.getByTestId("rule-secrets-read")).toBeChecked();
+
+  await page.mouse.click(4, 4);
+  await expect(discard).toBeVisible();
+  await discard.getByTestId("discard-confirm").click();
+  await expect(editor).toHaveCount(0);
+  await expect(page.getByTestId("role-row-half-done")).toHaveCount(0);
+});
+
+test("each permission checkbox is named after its subject", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  await expect(editor.getByRole("checkbox", { name: "Secrets: Read", exact: true })).toBeVisible();
+  await expect(editor.getByRole("checkbox", { name: "Snapshots: Read", exact: true })).toBeVisible();
+  await expect(editor.getByRole("checkbox", { name: "Read", exact: true })).toHaveCount(0);
+});
+
+test("role descriptions on phone cards sit under their label, left-aligned", async ({ page }) => {
+  test.skip((page.viewportSize()?.width ?? 1280) >= 768, "Mobile layout only");
+  await page.goto("/projects/storefront/settings/roles");
+  const row = page.getByTestId("role-row-developer");
+  const description = row.locator("td").filter({ hasText: "Description" });
+  const align = await description.locator("div").first().evaluate((el) => getComputedStyle(el).textAlign);
+  expect(align).not.toBe("right");
 });
 
 test("offers only the actions each subject uses, and explains what reading values means", async ({ page }) => {
@@ -136,9 +178,50 @@ test("built-in roles open read-only", async ({ page }) => {
   await expect(editor.getByTestId("role-save")).toHaveCount(0);
 });
 
+test("an org admin is not held back by a deny when managing roles", async ({ page }) => {
+  // The signed-in org admin may not read production values here, yet may still write any role.
+  await page.goto("/projects/payments-api/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  await editor.getByTestId("role-name").fill("Value reader");
+  await editor.getByTestId("rule-secrets-read-value").click();
+  await editor.getByTestId("role-save").click();
+  await expectToast(page, "Saved Value reader");
+});
+
+test("refuses path and key conditions that can never match before saving", async ({ page }) => {
+  await page.goto("/projects/storefront/settings/roles");
+  await page.getByTestId("new-role").click();
+  const editor = page.getByTestId("role-editor");
+  await editor.getByTestId("rule-secrets-conditions-toggle").click();
+  await editor.getByTestId("condition-paths-secrets-input").fill("payments/**");
+  await editor.getByTestId("condition-paths-secrets-input").press("Enter");
+  await expect(editor.getByTestId("condition-paths-secrets-problem")).toContainText("This can never match");
+  await editor.getByTestId("condition-keys-secrets-input").fill("1DB");
+  await editor.getByTestId("condition-keys-secrets-input").press("Enter");
+  await expect(editor.getByTestId("condition-keys-secrets-problem")).toContainText("keys start with a letter or _");
+  await expect(editor.getByTestId("condition-paths-secrets-chip")).toHaveCount(0);
+});
+
+test("says plainly that only an admin can bind deny rules to an admin", async ({ page }) => {
+  await page.goto("/org/access");
+  await page.getByTestId("binding-add").click();
+  const add = page.getByTestId("add-binding-dialog");
+  await add.getByTestId("binding-principal").click();
+  await page.getByTestId("binding-principal-search").fill("priya");
+  await page.getByTestId("principal-option-Priya Shah").click();
+  await add.getByTestId("binding-role").click();
+  await page.getByRole("option", { name: /org member/i }).click();
+  await failNext(page, "POST", "/org/bindings$", 403, "escalation", "only an admin can bind deny rules to an admin");
+  await add.getByTestId("binding-submit").click();
+  await expectToast(page, "Only an admin can give deny rules to an admin");
+  // Not mistaken for granting more than the caller holds.
+  await expect(add.getByTestId("binding-escalation")).toHaveCount(0);
+});
+
 test("explains when a role would escalate access", async ({ page }) => {
   // In this project the signed-in user may not read production values, so cannot grant reading values.
-  await page.goto("/projects/payments-api/settings/roles");
+  await page.goto("/projects/payments-api/settings/roles?mock-org-role=org-member");
   await page.getByTestId("new-role").click();
   const editor = page.getByTestId("role-editor");
   await editor.getByTestId("role-name").fill("Value reader");

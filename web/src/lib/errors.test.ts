@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "@/api/client";
-import { backoffSeconds, errorMessage } from "./errors";
+import { backoffSeconds, errorMessage, isDenyForAdmin, isEscalation } from "./errors";
 
 describe("errorMessage", () => {
   it.each([
@@ -42,6 +42,29 @@ describe("errorMessage", () => {
 
   it("capitalises anything else", () => {
     expect(errorMessage(new ApiError("not found", 404, "not_found"))).toBe("Not found");
+  });
+});
+
+describe("errors from the latest server checks", () => {
+  it("says a logo upload is still being processed in plain words", () => {
+    expect(errorMessage(new ApiError("your previous logo is still being processed", 429, "logo_busy"))).toContain(
+      "Upload one at a time",
+    );
+  });
+
+  it("shows the too many patterns refusal as the server words it", () => {
+    const error = new ApiError("your roles here hold more than 400 path and key patterns", 400, "too_many_patterns");
+    expect(errorMessage(error)).toBe("Your roles here hold more than 400 path and key patterns");
+  });
+
+  it("tells a deny bound to an admin apart from granting too much", () => {
+    const deny = new ApiError("only an admin can bind deny rules to an admin", 403, "escalation");
+    expect(isDenyForAdmin(deny)).toBe(true);
+    expect(isEscalation(deny)).toBe(false);
+    expect(errorMessage(deny)).toContain("Only an admin can give deny rules to an admin");
+    const grant = new ApiError("you cannot grant a role with more access than you have", 403, "escalation");
+    expect(isEscalation(grant)).toBe(true);
+    expect(isDenyForAdmin(grant)).toBe(false);
   });
 });
 

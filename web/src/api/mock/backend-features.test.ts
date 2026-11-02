@@ -176,9 +176,14 @@ describe("project logos", () => {
 
   it("keeps the re-encoded PNG when one is supplied", () => {
     const { b } = setup();
-    const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>');
-    b.putLogo("app", svg, PNG);
+    b.putLogo("app", PNG, PNG);
     expect(b.getLogo("app")).toEqual({ contentType: "image/png", bytes: PNG });
+  });
+
+  it("refuses an SVG, as the server does, leaving the browser to convert it", () => {
+    const { b } = setup();
+    const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>');
+    expect(status(() => b.putLogo("app", svg))).toBe(400);
   });
 
   it("refuses large and invalid files with the server's status codes", () => {

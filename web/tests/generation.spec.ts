@@ -102,6 +102,9 @@ test("warns before rotating a typed value from the drawer, and says no generator
   await expect(drawer.getByTestId("policy-effective-generator")).toHaveText(
     "No generator chosen. Rotating now makes 32 random letters and digits.",
   );
+  await expect(drawer.getByTestId("policy-inherit-note")).toContainText("The project sets no defaults");
+  // Nothing is set up to generate this typed value, so the drawer does not offer it as a routine rotation.
+  await expect(drawer.getByTestId("policy-rotate-now")).toHaveText("Replace with a generated value");
   await drawer.getByTestId("policy-rotate-now").click();
   const confirm = page.getByTestId("rotate-confirm");
   await expect(confirm.getByTestId("rotate-typed-warning")).toContainText("The current value was typed or imported, not generated.");
@@ -127,6 +130,7 @@ test("sets a custom policy that applies once the value is generated", async ({ p
   await expect(drawer.getByTestId("policy-effective-rotation")).toHaveText("Rotated every 14 days");
   await expect(drawer.getByTestId("policy-not-generated")).toContainText("Rotation applies once a value is generated");
 
+  await expect(drawer.getByTestId("policy-rotate-now")).toHaveText("Rotate now");
   await drawer.getByTestId("policy-rotate-now").click();
   await page.getByTestId("rotate-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rotated DATABASE_URL");
@@ -143,6 +147,8 @@ test("project defaults apply to secrets that inherit them", async ({ page }) => 
   const card = page.getByTestId("secret-defaults");
   await expect(card.getByTestId("defaults-enabled")).not.toBeChecked();
   await expect(card.getByTestId("defaults-summary")).toContainText("Off");
+  await expect(card).toContainText("Without project defaults, Generate makes 32 letters and digits");
+  await expect(card.getByText("Set project-wide generation and rotation")).toBeVisible();
 
   await card.getByTestId("defaults-enabled").click();
   await card.getByTestId("defaults-length").fill("24");
@@ -163,6 +169,7 @@ test("project defaults apply to secrets that inherit them", async ({ page }) => 
   await expect(drawer.getByTestId("policy-effective-generator")).toHaveText("Generates 24 letter, digit and symbol characters");
   await expect(drawer.getByTestId("policy-effective-rotation")).toHaveText("Rotated every 60 days");
   await expect(drawer.getByTestId("policy-not-generated")).toBeVisible();
+  await expect(drawer.getByTestId("policy-inherit-note")).toContainText("shown above");
 
   // A secret with its own policy keeps it.
   await closeDrawer(page);

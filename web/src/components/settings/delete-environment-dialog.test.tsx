@@ -35,7 +35,7 @@ describe("environmentDeleteText", () => {
   it("blocks an environment that still holds secrets, as the server would", () => {
     expect(environmentDeleteText(12, false)).toEqual({
       blocked: true,
-      text: "It still holds 12 secrets, counting its folders. Only an empty environment can be deleted, so delete or move them first.",
+      text: "It still holds 12 secrets, counting its folders. Only an empty environment can be deleted, so delete those secrets first.",
     });
     expect(environmentDeleteText(1, false).text).toContain("It still holds 1 secret,");
   });
@@ -78,6 +78,8 @@ describe("DeleteEnvironmentDialog", () => {
     renderWithProviders(<DeleteEnvironmentDialog project="app" env={qa} onClose={() => undefined} onDelete={vi.fn()} />);
     await waitFor(() => expect(screen.getByTestId("delete-env-contents")).toHaveTextContent("It still holds 2 secrets"));
     expect(screen.getByText("QA is not empty")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-env-contents")).not.toHaveTextContent("move");
+    expect(screen.getByTestId("delete-env-open")).toHaveAttribute("href", "/projects/app/secrets/qa");
     expect(screen.queryByTestId("confirm-action")).toBeNull();
     expect(screen.queryByTestId("delete-env-slug")).toBeNull();
   });

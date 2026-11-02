@@ -30,6 +30,8 @@ interface KubernetesFormProps {
   busy: boolean;
   disabled?: boolean;
   onSave: (config: KubernetesAuthConfig) => void;
+  /** Shown as a Cancel button, for a method still being set up. */
+  onCancel?: () => void;
 }
 
 const optional = (value: string) => value.trim() || null;
@@ -98,7 +100,7 @@ function ReviewerTokenField({ value, hadStored, disabled, onChange }: ReviewerTo
   );
 }
 
-export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFormProps) {
+export function KubernetesForm({ initial, busy, disabled, onSave, onCancel }: KubernetesFormProps) {
   const hadStoredReviewer = initial?.reviewer_jwt === REDACTED_CREDENTIAL;
   const [reviewer, setReviewer] = useState<WriteOnlyCredential>(() => initialCredential(initial?.reviewer_jwt));
   const pasted = reviewer.kind === "new" && reviewer.value !== "";
@@ -247,7 +249,7 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
             onChange={setNamespaces}
             mono
             disabled={disabled}
-            placeholder="billing then Enter"
+            placeholder="e.g. billing"
             testId="k8s-namespaces"
           />
         </Field>
@@ -259,7 +261,7 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
             onChange={setServiceAccounts}
             mono
             disabled={disabled}
-            placeholder="worker then Enter"
+            placeholder="e.g. worker"
             testId="k8s-service-accounts"
           />
         </Field>
@@ -291,7 +293,12 @@ export function KubernetesForm({ initial, busy, disabled, onSave }: KubernetesFo
         )}
       />
       {!disabled && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
+          {onCancel && (
+            <Button type="button" variant="outline" onClick={onCancel} disabled={busy} data-testid="k8s-cancel">
+              Cancel
+            </Button>
+          )}
           <Button type="submit" disabled={!valid || busy} data-testid="k8s-save">
             {busy && <Spinner />}
             Save Kubernetes settings

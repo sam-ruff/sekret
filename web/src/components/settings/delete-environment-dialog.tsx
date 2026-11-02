@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { Link } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Environment } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -42,6 +43,14 @@ export function DeleteEnvironmentDialog({ project, env, onClose, onDelete }: Del
       description={
         <>
           <span data-testid="delete-env-contents">{text}</span>
+          {blocked && (
+            <>
+              {" "}
+              <Link to={`/projects/${project}/secrets/${slug}`} onClick={onClose} data-testid="delete-env-open">
+                Open its secrets
+              </Link>
+            </>
+          )}
           {!blocked && !contents.isPending && (
             <>
               {" "}

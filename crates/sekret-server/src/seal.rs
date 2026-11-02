@@ -594,6 +594,16 @@ pub fn high_water(paths: &[PathBuf]) -> HighWater {
     marks
 }
 
+/// Whether any of `paths` holds a mark or could have one written, so a configuration signed now
+/// is recorded somewhere a database writer cannot reach. Without one, a deleted or rolled back
+/// configuration cannot be told apart from a new one.
+pub fn marks_usable(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| match read_mark(path) {
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => crate::files::can_create(path).is_ok(),
+    })
+}
+
 /// The root keys every mark that names any agrees on, as recorded, or `None` when no mark names
 /// one: there are no marks, or they were all written before keys were recorded. A mark that
 /// cannot be read says nothing here; [`high_water`] already treats it as a rollback.
@@ -992,7 +1002,22 @@ pub async fn check_config(
         Ok(true) => {
             // A database writer can strip a signature as easily as a database from before
             // signing lacks one, so nothing unsigned may start a migration.
+            // Nor may it get a wrap signed that no passphrase has just opened.
+            let (mode, wrapped) = match proven {
+                Some(wrap) => (SealMode::Passphrase, Some(wrap.clone())),
+                None => {
+                    if config.wrapped.is_some() {
+                        tracing::warn!(
+                            "dropping the unsigned passphrase wrap, which nothing vouches for; the server is now in \
+                             key-file mode. Run `sekret admin set-seal-mode passphrase` to choose a passphrase again"
+                        );
+                    }
+                    (SealMode::KeyFile, None)
+                }
+            };
             let config = SealConfig {
+                mode,
+                wrapped,
                 flags: cautious_flags(config.flags),
                 ..config
             };
@@ -1024,16 +1049,17 @@ pub async fn check_config(
     {
         tracing::warn!(%error, "could not remove the remember file");
     }
-    let mode = config.mode;
     let reset = distrusted(config, distrust, marks);
     let repaired = match (distrust, proven) {
         // Every field was signed by this server at some point, so a reset copy may be signed.
         (Distrust::RolledBack, _) => Some(reset.clone()),
-        (Distrust::Tampered, Some(wrap)) if mode == SealMode::Passphrase => Some(SealConfig {
+        // A wrap the passphrase just opened proves passphrase mode, whatever the stored mode says.
+        (Distrust::Tampered, Some(wrap)) => Some(SealConfig {
+            mode: SealMode::Passphrase,
             wrapped: Some(wrap.clone()),
             ..reset.clone()
         }),
-        (Distrust::Tampered, _) => None,
+        (Distrust::Tampered, None) => None,
     };
     let checked = match repaired {
         Some(clean) => Checked {
@@ -1208,12 +1234,10 @@ pub async fn initialise(
     // Marks left from an earlier install are never lowered by something a database wipe can
     // trigger; the new configuration starts above them instead, and migrates nothing.
     let marks = high_water(&plan.epoch_files);
-    if marks.highest.is_some() || marks.broken {
-        config.flags.reviewer_tokens_migrated = true;
-    }
-    // A database with no root key yet holds no credentials to vouch for, and once a mark says the
-    // vouching ran, a deleted configuration row must not start it again.
-    config.flags.credentials_keyed |= existing.is_none() || marks.migrated;
+    // A database with no root key yet holds nothing to migrate. One with a root key had its
+    // configuration row deleted, which must not start the migrations again.
+    config.flags.reviewer_tokens_migrated = true;
+    config.flags.credentials_keyed = true;
     if !root_recognised(&plan.epoch_files, &root) {
         // Only setup, which needs the host or the setup code, may move the marks to a new key.
         tracing::warn!("the epoch marks name the root key of an earlier install; they now name the new one");
@@ -1388,6 +1412,16 @@ pub async fn open_keyring(
         auto_initialised: false,
     };
     if let Some(config) = store.get_seal_config().await? {
+        if key.is_none() && config.mode == SealMode::KeyFile && config.wrapped.is_some() {
+            // Key-file mode never keeps a passphrase wrap, so the mode was changed in the
+            // database. Only the passphrase can show which it really is, so wait for it.
+            check_mode(settings, SealMode::Passphrase)?;
+            tracing::error!(
+                "the seal configuration says key-file mode but holds a passphrase wrap; staying sealed until it is \
+                 unsealed with the passphrase, which repairs it"
+            );
+            return Ok(opened(Keyring::sealed(UnlockPolicy::Manual, false)));
+        }
         check_mode(settings, config.mode)?;
         return match (config.mode, key) {
             (mode, Some(key)) => {
@@ -1437,6 +1471,25 @@ pub async fn open_keyring(
         check_root(store, &settings.epoch_files, &key)
             .await
             .map_err(|e| key_file_refused(e, settings))?;
+        // A deleted configuration row must not lower the marks, so this starts above them.
+        let marks = high_water(&settings.epoch_files);
+        let flags = match marks.highest.is_some() || marks.broken {
+            true => cautious_flags(SealFlags::default()),
+            // An empty database has nothing to migrate. One with data had its row deleted, since
+            // every version since sealing writes it with the fingerprint, and a database writer
+            // must not restart the vouching that way.
+            false => SealFlags {
+                reviewer_tokens_migrated: true,
+                credentials_keyed: true,
+                ..SealFlags::default()
+            },
+        };
+        if has_root {
+            tracing::error!(
+                "the database has a root key but no seal configuration, so the configuration was deleted; signing a \
+                 new one in key-file mode that starts no one-off migration"
+            );
+        }
         let config = SealConfig {
             mode: SealMode::KeyFile,
             wrapped: None,
@@ -1444,23 +1497,9 @@ pub async fn open_keyring(
             remembered: None,
             epoch: 0,
             mac: None,
-            flags: SealFlags {
-                // A database with no root key yet holds no credentials to vouch for.
-                credentials_keyed: !has_root,
-                ..SealFlags::default()
-            },
+            flags,
             created_at: now,
             updated_at: now,
-        };
-        // A deleted configuration row must not lower the marks, so this starts above them. Marks
-        // mean a configuration existed, so the row was removed and nothing is migrated again.
-        let marks = high_water(&settings.epoch_files);
-        let config = match marks.highest.is_some() || marks.broken {
-            true => SealConfig {
-                flags: cautious_flags(config.flags),
-                ..config
-            },
-            false => config,
         };
         let config = signed(&key, config, marks.floor()).map_err(|e| StartupError::Init(e.to_string()))?;
         match store.init_seal_config(config.clone(), &fingerprint).await {
@@ -1767,6 +1806,13 @@ pub async fn migrate_once(store: &dyn Store, settings: &SealSettings, now: i64, 
         // `check_config` has already ruled this out; it is checked again beside what it guards.
         if high_water(&settings.epoch_files).migrated {
             tracing::error!("an epoch mark says the one-off migrations already ran; not running them again");
+            return Ok(());
+        }
+        // With nowhere to record that they ran, an old configuration put back would run them again.
+        if !marks_usable(&settings.epoch_files) {
+            tracing::error!(
+                "no seal epoch mark can be written, so the one-off migrations are not run; set seal.epoch_file"
+            );
             return Ok(());
         }
         let key = load_integrity_key(store, root).await?;
@@ -2125,6 +2171,7 @@ pub mod ops {
             marks: high_water(&settings.epoch_files),
             skip_unreadable,
             epoch_files: &settings.epoch_files,
+            new_integrity_key: false,
         };
         let (report, still_unsealed) = {
             let _writers = state.keyring.rekeying().await?;
@@ -2506,6 +2553,32 @@ pub mod ops {
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[cfg(unix)]
+    #[test]
+    fn marks_are_usable_only_where_one_exists_or_can_be_written() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).context("locked")?;
+        let beside_key = locked.join("root.key.epoch");
+        assert!(!marks_usable(&[]));
+        assert!(marks_usable(std::slice::from_ref(&beside_key)));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).context("chmod")?;
+        let read_only = marks_usable(std::slice::from_ref(&beside_key));
+        let with_epoch_file = marks_usable(&[beside_key.clone(), dir.path().join("seal.epoch")]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        assert!(!read_only, "nothing there and nothing can be written");
+        assert!(with_epoch_file);
+        let pin = RootKey::generate().context("root")?.pin().context("pin")?;
+        record_epoch(std::slice::from_ref(&beside_key), 3, &pin).context("mark")?;
+        assert!(beside_key.exists());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).context("chmod")?;
+        let existing = marks_usable(std::slice::from_ref(&beside_key));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        assert!(existing, "a mark that exists still counts");
+        Ok(())
+    }
 
     /// Two root keys and what the marks record for each.
     struct Keys {

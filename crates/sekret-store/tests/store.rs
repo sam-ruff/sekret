@@ -800,11 +800,99 @@ async fn exercise_seal_config(store: &SqlStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A new integrity key revokes every token and client secret in the same transaction.
+async fn exercise_revoking_credentials(store: &SqlStore) -> anyhow::Result<()> {
+    store
+        .create_identity(Identity {
+            id: "i9".into(),
+            name: "deploy".into(),
+            description: String::new(),
+            token_ttl: 600,
+            token_max_ttl: 3600,
+            trusted_cidrs: vec![],
+            disabled: false,
+            created_at: 1,
+        })
+        .await
+        .context("identity")?;
+    store
+        .create_client_secret(ClientSecret {
+            id: "c9".into(),
+            identity_id: "i9".into(),
+            description: String::new(),
+            secret_hash: "h9".into(),
+            prefix: "sks_cd".into(),
+            created_at: 1,
+            expires_at: None,
+            uses_remaining: None,
+            revoked: false,
+            last_used_at: None,
+            mac: Some("m".into()),
+        })
+        .await
+        .context("secret")?;
+    let token = AccessToken {
+        id: "t9".into(),
+        token_hash: "th9".into(),
+        kind: "machine".into(),
+        principal_kind: PrincipalKind::Identity,
+        principal_id: "i9".into(),
+        description: String::new(),
+        source: String::new(),
+        created_at: 1,
+        expires_at: 4_000_000_000,
+        max_expires_at: 4_000_000_000,
+        revoked: false,
+        last_used_at: None,
+        auth_time: None,
+        mac: Some("m".into()),
+        sealed_hash: None,
+    };
+    store.create_token(token).await.context("token")?;
+    let fingerprint = store.get_meta("root_key_fingerprint").await.context("meta")?;
+    store
+        .replace_wrapped_keys(Rekey {
+            fingerprint: fingerprint.clone().unwrap_or_default(),
+            ..Rekey::default()
+        })
+        .await
+        .context("plain replace")?;
+    assert!(!store.find_token("th9").await.context("find")?.context("token")?.revoked);
+    assert!(
+        !store
+            .find_client_secret("h9")
+            .await
+            .context("find")?
+            .context("secret")?
+            .revoked
+    );
+    store
+        .replace_wrapped_keys(Rekey {
+            fingerprint: fingerprint.unwrap_or_default(),
+            revoke_credentials: true,
+            ..Rekey::default()
+        })
+        .await
+        .context("revoking replace")?;
+    assert!(store.find_token("th9").await.context("find")?.context("token")?.revoked);
+    assert!(
+        store
+            .find_client_secret("h9")
+            .await
+            .context("find")?
+            .context("secret")?
+            .revoked
+    );
+    store.delete_identity("i9").await.context("delete")?;
+    Ok(())
+}
+
 async fn exercise(store: SqlStore) -> anyhow::Result<()> {
     exercise_projects_and_secrets(&store).await?;
     exercise_identities_and_tokens(&store).await?;
     exercise_logins_and_audit(&store).await?;
     exercise_seal_config(&store).await?;
+    exercise_revoking_credentials(&store).await?;
     Ok(())
 }
 

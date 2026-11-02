@@ -23,8 +23,11 @@ pub struct Inner {
     pub login_limiter: RateLimiter<IpAddr>,
     /// Machine logins through any auth method.
     pub machine_login_limiter: RateLimiter<IpAddr>,
-    /// Starting, listing, approving and denying CLI logins.
+    /// Starting CLI logins, which anyone may do, per client address.
     pub cli_login_limiter: RateLimiter<IpAddr>,
+    /// Looking at, approving and denying CLI logins, per signed-in person, so anonymous starts
+    /// from the same address cannot use up their allowance.
+    pub cli_review_limiter: RateLimiter<String>,
     /// Bytes and concurrent writes the write gate may buffer.
     pub write_budget: crate::body::WriteBudget,
     /// Setup, unlock and passphrase attempts, kept apart from sign-in so exhausting one cannot
@@ -77,6 +80,7 @@ pub fn build_state(deps: Dependencies) -> AppState {
     let login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let machine_login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let cli_login_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
+    let cli_review_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let sys_limiter = RateLimiter::new(deps.config.login_rate_per_minute);
     let passphrase_attempts = RateLimiter::new(deps.config.login_rate_per_minute);
     Arc::new(Inner {
@@ -90,6 +94,7 @@ pub fn build_state(deps: Dependencies) -> AppState {
         login_limiter,
         machine_login_limiter,
         cli_login_limiter,
+        cli_review_limiter,
         write_budget: crate::body::WriteBudget::default(),
         sys_limiter,
         passphrase_backoff: FailureBackoff::default(),

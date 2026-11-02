@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { flushSync } from "react-dom";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
+import { toast } from "sonner";
 import { ApiError, isSealError } from "@/api/client";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { AppLayout } from "@/components/layout/app-layout";
@@ -100,7 +101,12 @@ function AppToaster() {
   const mobile = useIsMobile();
   // A full-screen drawer keeps its actions at the bottom, so toasts move up only while one is open.
   const sheetOpen = useSheetOpen();
-  if (!mobile) return <Toaster richColors closeButton position="bottom-right" />;
+  // Toasts from before a drawer opened are not about it, so they go rather than cover it.
+  useEffect(() => {
+    if (sheetOpen) toast.dismiss();
+  }, [sheetOpen]);
+  // Drawers open from the right, so toasts move to the left while one is open.
+  if (!mobile) return <Toaster richColors closeButton position={sheetOpen ? "bottom-left" : "bottom-right"} />;
   return (
     <Toaster
       richColors

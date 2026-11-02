@@ -39,6 +39,8 @@ test("an empty folder offers the next step instead of a dead end", async ({ page
   await expect(page.getByTestId("overview-add-secret")).toHaveText("Add secret to Development");
   await page.getByTestId("overview-add-secret").click();
   await expect(page.getByTestId("new-secret-form").getByTestId("secret-key-input")).toHaveValue("");
+  // A blank form starts at the key.
+  await expect(page.getByTestId("new-secret-form").getByTestId("secret-key-input")).toBeFocused();
   await expect(page).toHaveURL(/\/secrets\/dev\?path=%2Fnothing-here$/);
 });
 
@@ -50,6 +52,8 @@ test("a missing cell opens the add form with the key filled in", async ({ page }
   await expect(page).toHaveURL(/\/secrets\/prod$/);
   const form = page.getByTestId("new-secret-form");
   await expect(form.getByTestId("secret-key-input")).toHaveValue("REDIS_URL");
+  // The key is filled in, so the value is what is left to type.
+  await expect(form.getByTestId("secret-value-input")).toBeFocused();
   await form.getByTestId("secret-value-input").fill("redis://prod:6379");
   await form.getByTestId("secret-save").click();
   await expect(page.getByTestId("secret-row-REDIS_URL")).toBeVisible();

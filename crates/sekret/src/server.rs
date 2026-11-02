@@ -19,8 +19,8 @@ use sekret_server::files::{
 use sekret_server::net::{ReqwestOidcHttp, ReqwestTokenReviewer};
 use sekret_server::seal::{
     AutoInit, Distrust, HighWater, InitPlan, Keyring, StartupSecrets, audit_as, cautious_flags, check_database_root,
-    check_root, distrusted, high_water, initialise, kept_flags, lower_marks, migrations_done, open_keyring,
-    pending_key_file, record_config, root_recognised, signed, verify_config,
+    check_root, distrusted, high_water, initialise, kept_flags, lower_marks, marks_usable, migrations_done,
+    open_keyring, pending_key_file, record_config, root_recognised, signed, verify_config,
 };
 use sekret_server::state::{AppState, Dependencies, build_state};
 use sekret_store::{InstanceLock, Open, SealConfig, SqlStore, Store};
@@ -83,6 +83,10 @@ pub enum AdminCommand {
         /// and audit them, instead of refusing to rotate.
         #[arg(long)]
         skip_unreadable: bool,
+        /// Also replace the key that authenticates tokens and client secrets, revoking every one
+        /// of them. Use it when the old root key or passphrase may have leaked.
+        #[arg(long)]
+        new_integrity_key: bool,
     },
     /// Re-sign the seal configuration above every epoch mark and raise the marks to it. For after
     /// restoring an older database in place, or when a mark is damaged. Stop the server first. A
@@ -309,11 +313,21 @@ const NO_EPOCH_MARK: &str = "there is nowhere outside the database to keep the s
                              (--epoch-file or SEKRET_EPOCH_FILE) to a path on a disk the database cannot reach, \
                              the same for the server and the admin commands";
 
-/// The epoch marks, refusing a setup with none: a Postgres database without a remember file,
-/// root key file or `seal.epoch_file`.
+const NO_WRITABLE_EPOCH_MARK: &str = "no seal epoch mark exists and none can be written beside the database, the \
+                                      remember file or the root key file, such as when the key file is on a \
+                                      read-only mount, so someone who can write to the database could delete or \
+                                      roll back the seal configuration unnoticed; set seal.epoch_file \
+                                      (--epoch-file or SEKRET_EPOCH_FILE) to a path in a writable directory the \
+                                      database cannot reach, the same for the server and the admin commands";
+
+/// The epoch marks, refusing a setup with none (a Postgres database without a remember file,
+/// root key file or `seal.epoch_file`), or where none exists and none can be written.
 fn require_marks(paths: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
     if paths.is_empty() {
         bail!("{NO_EPOCH_MARK}");
+    }
+    if !marks_usable(&paths) {
+        bail!("{NO_WRITABLE_EPOCH_MARK}");
     }
     Ok(paths)
 }
@@ -514,8 +528,10 @@ async fn obtain_root(
 ) -> anyhow::Result<(RootKey, Option<SealConfig>, Option<Zeroizing<String>>)> {
     let config = store.get_seal_config().await?;
     let key_file = source.key_file.filter(|p| p.exists());
-    let passphrase_mode = config.as_ref().is_some_and(|c| c.mode == SealMode::Passphrase);
-    let (root, passphrase) = match (passphrase_mode, key_file, &config) {
+    // Any wrap, not only the stored mode, since a database writer can change the mode and only
+    // the passphrase can prove it.
+    let has_wrap = config.as_ref().is_some_and(|c| c.wrapped.is_some());
+    let (root, passphrase) = match (has_wrap, key_file, &config) {
         (_, Some(path), _) => (read_root_key(path)?, None),
         (true, None, Some(config)) => {
             let (root, passphrase) = unwrap_with_passphrase(config, source.passphrase_file, prompter)?;
@@ -661,6 +677,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
             new_root_key_file,
             passphrase_file,
             skip_unreadable,
+            new_integrity_key,
         } => {
             let (location, _lock, sql) = open_locked(&store, sources).await?;
             rotate(
@@ -670,6 +687,7 @@ pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Resu
                     new_root_key_file: new_root_key_file.as_deref(),
                     passphrase_file: passphrase_file.as_deref(),
                     skip_unreadable,
+                    new_integrity_key,
                 },
                 &prompter,
             )
@@ -737,6 +755,7 @@ struct RotateInputs<'a> {
     new_root_key_file: Option<&'a Path>,
     passphrase_file: Option<&'a Path>,
     skip_unreadable: bool,
+    new_integrity_key: bool,
 }
 
 async fn rotate(
@@ -808,15 +827,35 @@ async fn rotate(
         .and(location.root_key_file.as_deref())
         .filter(|p| p.exists());
     let staged = key_file_too.map(|path| stage_key_file(path, &new)).transpose()?;
-    let replaced = replace_root(sql, &old, &new, seal_config, &epoch_files, inputs.skip_unreadable).await;
+    let replaced = replace_root(
+        sql,
+        &old,
+        &new,
+        seal_config,
+        &epoch_files,
+        inputs.skip_unreadable,
+        inputs.new_integrity_key,
+    )
+    .await;
     let report = unstage_on_error(replaced, staged.as_deref())?;
     let count = report.projects;
     audit_admin(
         sql,
         "admin.rotate_root_key",
-        json!({"projects": count, "fingerprint": new.fingerprint(), "skipped": report.skipped}),
+        json!({
+            "projects": count,
+            "fingerprint": new.fingerprint(),
+            "skipped": report.skipped,
+            "credentials_revoked": report.credentials_revoked,
+        }),
     )
     .await;
+    if report.credentials_revoked {
+        eprintln!(
+            "replaced the integrity key and revoked every token and client secret; run `sekret admin bootstrap` for \
+             an admin token, issue machines new client secrets, and check each identity's auth methods"
+        );
+    }
     if let (Some(path), Some(staged)) = (key_file_too, &staged) {
         promote_key_file(staged, path)?;
         eprintln!("wrote the new root key to {}", path.display());
@@ -885,11 +924,13 @@ async fn replace_root(
     seal: Option<SealConfig>,
     epoch_files: &[PathBuf],
     skip_unreadable: bool,
+    new_integrity_key: bool,
 ) -> anyhow::Result<RotationReport> {
     let rotation = Rotation {
         marks: high_water(epoch_files),
         skip_unreadable,
         epoch_files,
+        new_integrity_key,
     };
     let report = sekret_server::admin::rotate_root_key(sql, old, new, seal, rotation)
         .await
@@ -909,12 +950,17 @@ struct SealModeInputs<'a> {
 /// The flags and epoch a configuration keeps when it is re-signed under a new mode. Its flags when
 /// it is signed and sound, otherwise nothing migrated again, since an unsigned configuration's
 /// flags may be a database writer's. Its epoch unless it failed its signature, when the marks
-/// decide. With no configuration, marks mean one existed.
+/// decide. With no configuration, nothing is migrated: an empty database has nothing to migrate,
+/// and one with data had its configuration deleted.
 fn carried(root: &RootKey, current: Option<&SealConfig>, marks: HighWater) -> (SealFlags, i64) {
     let Some(config) = current else {
         let flags = match marks.highest.is_some() || marks.broken {
             true => cautious_flags(SealFlags::default()),
-            false => SealFlags::default(),
+            false => SealFlags {
+                reviewer_tokens_migrated: true,
+                credentials_keyed: true,
+                ..SealFlags::default()
+            },
         };
         return (flags, 0);
     };
@@ -976,7 +1022,7 @@ async fn set_seal_mode(
                 );
             }
             let staged = stage_key_file(path, &new)?;
-            let replaced = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable).await;
+            let replaced = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable, false).await;
             let report = unstage_on_error(replaced, Some(&staged))?;
             promote_key_file(&staged, path)?;
             if let Some(remember) = &location.remember_file
@@ -1027,7 +1073,7 @@ async fn set_seal_mode(
                 updated_at: now,
                 ..stored
             };
-            let report = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable).await?;
+            let report = replace_root(sql, &old, &new, Some(seal), &epoch_files, inputs.skip_unreadable, false).await?;
             eprintln!(
                 "now in passphrase mode under a new root key; start the server without --root-key-file and unseal \
                  it. {} and every copy of it no longer open the live database, so delete them; backups taken \
@@ -1057,7 +1103,12 @@ async fn set_seal_mode(
 /// marks keeps its fields, which this root signed once, but grants nothing. One that fails its
 /// signature only keeps what the operator has just proved (the passphrase wrap, or key-file mode),
 /// grants nothing and takes its epoch from the marks.
-fn reset_config(config: SealConfig, verdict: Result<bool, Distrust>, marks: HighWater) -> SealConfig {
+fn reset_config(
+    config: SealConfig,
+    verdict: Result<bool, Distrust>,
+    marks: HighWater,
+    wrap_opened: bool,
+) -> SealConfig {
     match verdict {
         Ok(_) => SealConfig {
             flags: kept_flags(&config, verdict, marks),
@@ -1065,7 +1116,8 @@ fn reset_config(config: SealConfig, verdict: Result<bool, Distrust>, marks: High
         },
         Err(Distrust::RolledBack) => distrusted(config, Distrust::RolledBack, marks),
         Err(Distrust::Tampered) => {
-            let passphrase = config.mode == SealMode::Passphrase;
+            // A wrap the passphrase just opened proves passphrase mode whatever the stored mode.
+            let passphrase = config.mode == SealMode::Passphrase || wrap_opened;
             let wrapped = config.wrapped.clone().filter(|_| passphrase);
             SealConfig {
                 mode: match wrapped {
@@ -1190,7 +1242,7 @@ async fn reset_epoch_marks(
     };
     let base = SealConfig {
         updated_at: SystemClock.now(),
-        ..reset_config(config, verdict, marks)
+        ..reset_config(config, verdict, marks, passphrase.is_some())
     };
     let (config, lowered) = sign_reset(&root, base, marks, verdict, inputs.lower_marks)?;
     sql.update_seal_config(config.clone()).await?;

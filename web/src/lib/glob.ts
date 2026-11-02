@@ -56,3 +56,18 @@ function matches(pattern: string, text: string, separator?: string): boolean {
 
   return step(0, 0);
 }
+
+const PLAIN_SEGMENT = /^[A-Za-z0-9_.\-*?]+$/;
+
+/** Mirrors the server: whether a folder pattern could ever match a stored path such as `/a/b`. */
+export function pathPatternCanMatch(pattern: string): boolean {
+  if (!pattern.startsWith("/")) return false;
+  const rest = pattern.slice(1);
+  if (rest === "") return true;
+  return rest.split("/").every((segment) => segment !== "." && segment !== ".." && PLAIN_SEGMENT.test(segment));
+}
+
+/** Mirrors the server: whether a key pattern could ever match a key, which starts with a letter or `_`. */
+export function keyPatternCanMatch(pattern: string): boolean {
+  return /^[A-Za-z_*?][A-Za-z0-9_.\-*?]*$/.test(pattern);
+}

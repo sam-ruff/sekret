@@ -13,6 +13,8 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // Compiles the app and the mock up front, so the first pages a test opens do not time out.
+    warmup: { clientFiles: ["./src/main.tsx", "./src/api/mock/*.ts"] },
     proxy: {
       "/api": { target: backend, changeOrigin: false },
       "/auth": { target: backend, changeOrigin: false },

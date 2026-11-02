@@ -384,6 +384,27 @@ pub fn identity_from_files(
     Ok(Some(pem))
 }
 
+/// Whether `url` names this machine: `localhost` or a loopback address.
+pub fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => {
+            let name = name.strip_suffix('.').unwrap_or(name);
+            name.eq_ignore_ascii_case("localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Whether requests to `url` must ignore `http_proxy`, `HTTPS_PROXY`, `ALL_PROXY` and the like.
+///
+/// A proxy would read plain http, tokens included, and would reach its own loopback rather than
+/// ours, so only https to another host may go through one.
+pub fn bypasses_proxy(url: &url::Url) -> bool {
+    url.scheme() == "http" || is_loopback(url)
+}
+
 impl HttpClient {
     pub fn new(base: &str, token: Option<String>, options: ClientOptions) -> ClientResult<Self> {
         let base = url::Url::parse(base).map_err(|e| ClientError::Config(format!("server url: {e}")))?;
@@ -394,6 +415,9 @@ impl HttpClient {
             .timeout(options.timeout.unwrap_or(DEFAULT_TIMEOUT))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("sekret-client/{}", sekret_api::VERSION));
+        if bypasses_proxy(&base) {
+            builder = builder.no_proxy();
+        }
         if let Some(pem) = options.ca_pem {
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| ClientError::Config(format!("CA bundle: {e}")))?;
@@ -1213,6 +1237,30 @@ mod tests {
     #[test]
     fn backup_limit_matches_the_server() {
         assert_eq!(BACKUP_RESPONSE_LIMIT, sekret_core::seal::MAX_BACKUP_LEN);
+    }
+
+    #[test]
+    fn only_https_to_another_host_may_use_a_proxy() -> anyhow::Result<()> {
+        let cases = [
+            ("http://localhost:8200", true),
+            ("http://LocalHost.:8200", true),
+            ("http://127.0.0.1", true),
+            ("http://127.3.2.1", true),
+            ("http://[::1]:8200", true),
+            ("https://localhost:8200", true),
+            ("https://127.0.0.1", true),
+            ("https://[::1]", true),
+            ("http://sekret.svc.cluster.local:8200", true),
+            ("http://10.0.0.5", true),
+            ("https://sekret.example.com", false),
+            ("https://10.0.0.5", false),
+            ("https://localhost.example.com", false),
+        ];
+        for (url, bypass) in cases {
+            let parsed = url::Url::parse(url).context("url")?;
+            assert_eq!(bypasses_proxy(&parsed), bypass, "{url}");
+        }
+        Ok(())
     }
 
     #[test]

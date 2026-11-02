@@ -144,7 +144,8 @@ pub enum Decision {
 
 /// Most path and key patterns one role may hold, so checking it stays cheap.
 pub const MAX_ROLE_PATTERNS: usize = 200;
-/// Most path and key patterns across every role one principal is bound to in a project.
+/// Most path and key patterns across every role that reaches one principal in a project,
+/// directly or through their groups.
 pub const MAX_PRINCIPAL_PATTERNS: usize = 400;
 
 /// The path and key patterns in `rules`, which are what make a check cost anything.

@@ -16,6 +16,10 @@ sekret secrets delete OLD_KEY
 
 In the web interface, values are masked until you reveal them, and every reveal is recorded in the audit log. Switching to another environment or folder masks everything again, and so do three minutes without touching the page, an ended session or a locked server. The three minutes are measured by the clock, so values left on screen when a laptop went to sleep are masked as soon as the page is seen again. The same applies to anything holding a typed or pasted value: the edit form, the new secret form and the import dialog close after three idle minutes and drop anything not yet saved. Hiding values forgets them in the browser too, so revealing them again asks the server and is recorded again.
 
+Pressing Escape in the edit or new secret form closes it, but asks first if you have typed anything. The search box looks at keys, comments and tags in the folder you are in and every folder inside it. Matches from those folders are listed under the table with their folder, and opening one goes to its folder with the search narrowed to that key.
+
+Each folder row says how many secrets it holds, counting the folders inside it. Only an empty folder can be deleted, so the delete button is turned off until its secrets are gone. sekret cannot move secrets between folders; set them again in the new place and delete the old ones.
+
 A folder with many secrets shows the first 100, with a button to show more. *Reveal all* is turned off in a folder with more than 100 secrets, so one click cannot pull every value at once; reveal them one at a time instead.
 
 On the project overview, which lists every key across every environment, a *Missing* cell opens that environment with the new secret form already holding the key. A copied value is cleared from the clipboard after 45 seconds if it is still there. Browsers only allow that while the tab has focus, so if you have moved to another window by then, sekret clears it when you come back, or tells you to clear it yourself when it cannot check what the clipboard holds. Signing out or being sent to sign in again clears it straight away. Closing or reloading the tab first asks you to confirm and tries to clear it, but the browser may refuse, for example when the tab is closed from another window, so clear the clipboard yourself if you are not sure. Pasting a `.env` file into the import dialog creates or updates every key in it in one write; closing the dialog throws the pasted text away.
@@ -44,7 +48,9 @@ The edit form opens only once the current value has loaded. If it cannot be load
 
 Every write to an environment, whether one secret or a hundred, records a snapshot of that environment's state afterwards. Restoring a snapshot puts the environment, or one folder of it, back the way it was: changed secrets go back to their old values, added ones are deleted and deleted ones come back. The restore is one new write, so it can be undone by restoring the snapshot before it. Removed secrets keep their history.
 
-In the web interface, opening a snapshot lists what restoring it would change, and the confirmation names the secrets it would remove. A restore that removes anything is shown in red.
+A restore undoes every change made since the snapshot, not only the one that created it. To undo a single bad edit, roll that secret back from its history instead.
+
+In the web interface, opening a snapshot shows what that change did, worked out against the snapshot before it, and then what restoring it would change. When restoring would also touch secrets the change did not, the drawer says how many. The confirmation names the secrets a restore would remove, and a restore that removes anything is shown in red.
 
 ```sh
 sekret snapshots list

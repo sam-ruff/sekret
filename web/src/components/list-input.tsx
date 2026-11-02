@@ -33,7 +33,10 @@ export function ListInput({
 }: ListInputProps) {
   const [draft, setDraft] = useState("");
   const [problem, setProblem] = useState<string>();
-  const problemId = `${useId()}-problem`;
+  const baseId = useId();
+  const problemId = `${baseId}-problem`;
+  const hintId = `${baseId}-hint`;
+  const hinting = !problem && !disabled && draft.trim() !== "";
 
   const commit = () => {
     const entry = normalise(draft);
@@ -93,7 +96,7 @@ export function ListInput({
           id={id}
           aria-label={ariaLabel}
           aria-invalid={problem ? true : undefined}
-          aria-describedby={problem ? problemId : undefined}
+          aria-describedby={problem ? problemId : hinting ? hintId : undefined}
           value={draft}
           disabled={disabled}
           onChange={(e) => {
@@ -110,6 +113,11 @@ export function ListInput({
       {problem && (
         <p id={problemId} role="alert" className="text-xs text-destructive" data-testid={testId ? `${testId}-problem` : undefined}>
           {problem}
+        </p>
+      )}
+      {hinting && (
+        <p id={hintId} className="text-xs text-muted-foreground" data-testid={testId ? `${testId}-hint` : undefined}>
+          Press Enter to add
         </p>
       )}
     </div>

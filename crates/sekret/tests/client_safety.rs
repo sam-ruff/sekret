@@ -336,6 +336,116 @@ fn project_files_others_can_edit_are_ignored() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Answers every connection with a 401 and records the request heads it saw, so a client that
+/// reaches it gets a quick failure instead of waiting for a timeout.
+struct Responder {
+    url: String,
+    seen: std::sync::mpsc::Receiver<String>,
+}
+
+impl Responder {
+    fn start() -> anyhow::Result<Self> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind")?;
+        let url = format!("http://{}", listener.local_addr().context("addr")?);
+        let (tx, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&stream);
+                let mut first = [0u8; 1];
+                let mut head = String::new();
+                // A TLS handshake starts with 0x16 and has no header lines to wait for.
+                if reader.read_exact(&mut first).is_ok() && first[0].is_ascii_alphabetic() {
+                    head.push(char::from(first[0]));
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                        head.push_str(&line);
+                        line.clear();
+                    }
+                }
+                if tx.send(head).is_err() {
+                    return;
+                }
+                let _ = (&stream).write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        Ok(Self { url, seen })
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.try_iter().collect()
+    }
+}
+
+fn proxy_env(proxy: &str) -> Vec<(&'static str, String)> {
+    [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ]
+    .into_iter()
+    .map(|name| (name, proxy.to_string()))
+    .collect()
+}
+
+/// A proxy would read plain http, tokens and passphrases included, and would reach its own
+/// loopback rather than ours, so the CLI never uses one for plain http or for this machine.
+#[test]
+fn proxies_are_not_used_for_plain_http_or_loopback() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let proxy = Responder::start()?;
+    let server = Responder::start()?;
+    let port = server.url.rsplit(':').next().context("port")?.to_string();
+    let mut env: Vec<(&str, String)> = proxy_env(&proxy.url);
+    env.push(("SEKRET_TOKEN", "skt_proxy_canary".to_string()));
+    env.push(("NO_PROXY", String::new()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    for host in ["localhost", "127.0.0.1", "LOCALHOST"] {
+        let url = format!("http://{host}:{port}");
+        let output = run(&["--server", &url, "whoami"], &env, dir.path())?;
+        assert!(!output.status.success(), "the stand-in server answers 401");
+        let direct = server.requests();
+        assert_eq!(direct.len(), 1, "{host}: {direct:?}");
+        assert!(direct[0].contains("skt_proxy_canary"), "{host}: {direct:?}");
+    }
+    // https to this machine also stays off the proxy. The stand-in does not speak TLS, so the
+    // handshake fails, but it fails against the right listener.
+    let output = run(
+        &["--server", &format!("https://localhost:{port}"), "whoami"],
+        &env,
+        dir.path(),
+    )?;
+    assert!(!output.status.success());
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the TLS attempt went straight to the server"
+    );
+    // Plain http to another host, once allowed, does not go through the proxy either.
+    let output = run(
+        &["--server", "http://0.0.0.0:1", "--allow-insecure-http", "whoami"],
+        &env,
+        dir.path(),
+    )?;
+    assert!(!output.status.success());
+    assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+
+    // The proxy settings above are live: https to another host does use them.
+    let output = run(&["--server", "https://sekret.invalid", "whoami"], &env, dir.path())?;
+    assert!(!output.status.success());
+    let tunnelled = proxy.requests();
+    assert_eq!(tunnelled.len(), 1, "{tunnelled:?}");
+    assert!(tunnelled[0].starts_with("CONNECT sekret.invalid:443"), "{tunnelled:?}");
+    assert!(!tunnelled[0].contains("skt_proxy_canary"), "the token stays inside TLS");
+    Ok(())
+}
+
 #[test]
 fn plain_http_to_another_host_is_refused_unless_allowed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("dir")?;

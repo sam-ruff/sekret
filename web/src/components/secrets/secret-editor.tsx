@@ -1,7 +1,9 @@
 import { Info, Sparkles } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { Charset } from "@/api/types";
+import { DiscardDialog } from "@/components/discard-dialog";
 import { FormBlocker } from "@/components/form-blocker";
+import { useDiscardGuard } from "@/hooks/use-discard-guard";
 import { ListInput } from "@/components/list-input";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
@@ -37,6 +39,7 @@ interface SecretEditorProps {
 
 export function SecretEditor({ initial, isNew, valueHidden, generated, canGenerate = true, busy, onSave, onCancel }: SecretEditorProps) {
   const [draft, setDraft] = useState<SecretDraft>(initial);
+  const discard = useDiscardGuard(JSON.stringify(draft) !== JSON.stringify(initial));
   const keyProblem = draft.key && !isValidSecretKey(draft.key)
     ? "Start with a letter or underscore, then letters, digits, '_', '-' or '.'"
     : undefined;
@@ -68,20 +71,21 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
         // Popovers such as the character set list are portalled, so their Escape is not ours.
         if (event.key !== "Escape" || busy || !event.currentTarget.contains(event.target as Node)) return;
         event.preventDefault();
-        onCancel();
+        discard.guard(onCancel);
       }}
       className="space-y-4 rounded-xl border border-primary/30 bg-card p-4 shadow-sm"
       data-testid={isNew ? "new-secret-form" : `edit-secret-${initial.key}`}
     >
       <FieldGroup className="gap-4">
-        <div className="grid gap-4 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+        {/* The base column is capped too, or a long unbroken value widens the form past the screen. */}
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-4 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
           <Field>
             <FieldLabel htmlFor={`key-${id}`}>Key</FieldLabel>
             <Input
               id={`key-${id}`}
               value={draft.key}
               disabled={!isNew}
-              autoFocus={isNew}
+              autoFocus={isNew && !initial.key}
               aria-invalid={!!keyProblem}
               className="font-mono"
               placeholder="e.g. API_KEY"
@@ -132,9 +136,9 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
               <SecretTextarea
                 id={`value-${id}`}
                 value={draft.value}
-                autoFocus={!isNew}
+                autoFocus={!isNew || !!initial.key}
                 rows={Math.min(8, Math.max(1, draft.value.split("\n").length))}
-                className="min-h-8 font-mono text-sm"
+                className="min-h-8 font-mono text-sm break-all"
                 placeholder={valueHidden ? "You cannot read the current value; enter a replacement" : "Value"}
                 data-testid="secret-value-input"
                 onChange={(e) => setDraft({ ...draft, value: e.target.value })}
@@ -149,7 +153,7 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
             )}
           </Field>
         </div>
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-4 md:grid-cols-2">
           <Field>
             <FieldLabel htmlFor={`comment-${id}`}>Comment</FieldLabel>
             <Input
@@ -172,7 +176,7 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
                 value={draft.tags}
                 onChange={(tags) => setDraft({ ...draft, tags })}
                 normalise={slugify}
-                placeholder="Type a tag and press Enter"
+                placeholder="e.g. database"
                 testId="secret-tags"
               />
             )}
@@ -198,6 +202,8 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
           {draft.generator ? (isNew ? "Generate secret" : "Generate new value") : isNew ? "Add secret" : "Save"}
         </Button>
       </div>
+      {/* Portalled out of the form element, so the Escape check above ignores it. */}
+      <DiscardDialog {...discard.prompt} />
     </form>
   );
 }

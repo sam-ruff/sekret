@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { onSealResponse, redirectToLogin } from "@/api/client";
 import type { Me } from "@/api/types";
@@ -33,17 +33,18 @@ export function StatusGate({ children }: { children: ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [rechecking, setRechecking] = useState(false);
+  // Bumped to remount the pages, since rendered values outlive the cache they came from.
+  const [generation, setGeneration] = useState(0);
   const leaving = useSyncExternalStore(subscribeLeaving, isLeaving);
 
-  useEffect(
-    () =>
-      onSealResponse(() => {
-        setRechecking(true);
-        forgetAllButStatus(queryClient);
-        void queryClient.invalidateQueries({ queryKey: keys.sysStatus }).finally(() => setRechecking(false));
-      }),
-    [queryClient],
-  );
+  const recheck = useCallback(() => {
+    setRechecking(true);
+    setGeneration((value) => value + 1);
+    forgetAllButStatus(queryClient);
+    void queryClient.invalidateQueries({ queryKey: keys.sysStatus }).finally(() => setRechecking(false));
+  }, [queryClient]);
+
+  useEffect(() => onSealResponse(recheck), [recheck]);
 
   useEffect(
     () =>
@@ -58,14 +59,14 @@ export function StatusGate({ children }: { children: ReactNode }) {
           browserNavigation.reload();
           return;
         }
-        forgetAllButStatus(queryClient);
         if (message === "signed-out") {
+          forgetAllButStatus(queryClient);
           redirectToLogin();
           return;
         }
-        void queryClient.invalidateQueries({ queryKey: keys.sysStatus });
+        recheck();
       }),
-    [queryClient],
+    [queryClient, recheck],
   );
 
   const locked = status.data !== undefined && status.data.state !== "unsealed";
@@ -88,5 +89,5 @@ export function StatusGate({ children }: { children: ReactNode }) {
     );
   }
   if (!status.data || target || rechecking) return <GateSpinner />;
-  return children;
+  return <Fragment key={generation}>{children}</Fragment>;
 }

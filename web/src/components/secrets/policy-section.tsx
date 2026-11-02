@@ -16,6 +16,7 @@ import {
   describeRotation,
   draftFromPolicy,
   draftProblem,
+  inheritNote,
   overrideFromDraft,
   type PolicyDraft,
 } from "@/lib/generation";
@@ -67,6 +68,8 @@ function PolicyForm({ at, secretKey, view, canEdit, onRotate }: PolicySectionPro
   const problem = custom ? draftProblem(draft) : undefined;
   const changed = custom !== initialCustom || (custom && JSON.stringify(draft) !== JSON.stringify(initialDraft));
   const { effective, generated, next_rotation_at: next } = view;
+  // A typed value with nothing set up to generate it is not something to rotate as routine.
+  const rotatesRoutinely = generated || !!effective.rotation_days || !!effective.generator;
 
   return (
     <div className="space-y-4 rounded-lg border bg-card p-3">
@@ -146,8 +149,8 @@ function PolicyForm({ at, secretKey, view, canEdit, onRotate }: PolicySectionPro
           />
         </div>
       ) : (
-        <p className="text-sm text-muted-foreground">
-          Follows the project&apos;s secret defaults, set in project settings.
+        <p className="text-sm text-muted-foreground" data-testid="policy-inherit-note">
+          {inheritNote(initialCustom ? undefined : effective)}
         </p>
       )}
 
@@ -155,7 +158,7 @@ function PolicyForm({ at, secretKey, view, canEdit, onRotate }: PolicySectionPro
         <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" size="sm" onClick={onRotate} data-testid="policy-rotate-now">
             <RefreshCw />
-            Rotate now
+            {rotatesRoutinely ? "Rotate now" : "Replace with a generated value"}
           </Button>
           <Button size="sm" disabled={!changed || !!problem || save.isPending} onClick={() => save.mutate()} data-testid="policy-save">
             {save.isPending && <Spinner />}

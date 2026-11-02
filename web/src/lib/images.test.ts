@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { checkLogoFile, MAX_LOGO_BYTES, sniffImage, validateImage } from "./images";
+import { checkLogoFile, MAX_LOGO_BYTES, sniffImage, svgProblem, validateImage } from "./images";
+import { fitWithin, svgAspect } from "./svg-to-png";
 
 const PNG = Uint8Array.from(
   atob(
@@ -56,10 +57,10 @@ describe("checkLogoFile", () => {
 });
 
 describe("validateImage", () => {
-  it("passes a complete PNG and a clean SVG", () => {
+  it("passes a complete PNG and refuses every SVG, as the server does", () => {
     expect(validateImage(PNG)).toEqual({ ok: true, type: "image/png" });
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><use href="#g"/></svg>';
-    expect(validateImage(text(svg))).toEqual({ ok: true, type: "image/svg+xml" });
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect/></svg>';
+    expect(validateImage(text(svg))).toEqual({ ok: false, message: "SVG files are not accepted; convert the logo to PNG first" });
   });
 
   it("refuses magic bytes without a readable image", () => {
@@ -69,25 +70,27 @@ describe("validateImage", () => {
     expect(validateImage(pngWithSize(4097, 1))).toMatchObject({ ok: false, message: expect.stringContaining("larger than 4096") });
   });
 
-  it.each([
-    "<script>alert(1)</script>",
-    '<rect onload="alert(1)"/>',
-    '<a href="javascript:alert(1)"><rect/></a>',
-    '<image href="https://tracker.example/p.png"/>',
-    "<foreignObject><div>hi</div></foreignObject>",
-    "<style>@import url(https://evil.example/x.css);</style>",
-    '<rect fill="url(https://evil.example/p.svg#a)"/>',
-  ])("refuses an SVG containing %s", (body) => {
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1">${body}</svg>`;
-    expect(validateImage(text(svg))).toMatchObject({ ok: false, message: expect.stringContaining("the SVG is not allowed") });
-  });
-
-  it("refuses an SVG without the SVG namespace or with a DTD", () => {
-    expect(validateImage(text('<svg viewBox="0 0 1 1"><rect/></svg>'))).toMatchObject({ ok: false });
-    expect(validateImage(text('<!DOCTYPE svg [<!ENTITY a "a">]><svg xmlns="http://www.w3.org/2000/svg"/>'))).toMatchObject({ ok: false });
-  });
-
   it("names unknown files the way the server does", () => {
-    expect(validateImage(text("hello"))).toEqual({ ok: false, message: "the file is not a PNG, JPEG, GIF, WebP or SVG image" });
+    expect(validateImage(text("hello"))).toEqual({ ok: false, message: "the file is not a PNG, JPEG, GIF or WebP image" });
+  });
+});
+
+describe("svgProblem", () => {
+  it("lets a plain SVG through to be drawn in the browser", () => {
+    expect(svgProblem(text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect/></svg>'))).toBeUndefined();
+  });
+
+  it("refuses a document type, whose entities could expand without limit, and a missing namespace", () => {
+    expect(svgProblem(text('<!DOCTYPE svg [<!ENTITY a "a">]><svg xmlns="http://www.w3.org/2000/svg"/>'))).toContain("document type");
+    expect(svgProblem(text('<svg viewBox="0 0 1 1"><rect/></svg>'))).toContain("no SVG namespace");
+  });
+});
+
+describe("svg logo size", () => {
+  it("keeps the SVG's shape within 512 pixels", () => {
+    expect(fitWithin(svgAspect('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">'))).toEqual({ width: 512, height: 256 });
+    expect(fitWithin(svgAspect('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="40">'))).toEqual({ width: 128, height: 512 });
+    expect(fitWithin(svgAspect('<svg xmlns="http://www.w3.org/2000/svg">'))).toEqual({ width: 512, height: 512 });
+    expect(fitWithin(svgAspect('<svg viewBox="0 0 0 0" width="0">'))).toEqual({ width: 512, height: 512 });
   });
 });

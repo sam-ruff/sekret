@@ -1,6 +1,7 @@
 import { authorise, type Resource } from "@/lib/permissions";
 import { isCompleteCode, normaliseUserCode } from "@/lib/cli-code";
 import { isValidSecretKey } from "@/lib/dotenv";
+import { keyPatternCanMatch, pathPatternCanMatch } from "@/lib/glob";
 import { DEFAULT_GENERATOR, MAX_LENGTH, MAX_ROTATION_DAYS, MIN_LENGTH } from "@/lib/generation";
 import { MAX_LOGO_BYTES, validateImage } from "@/lib/images";
 import type {
@@ -191,7 +192,10 @@ export class MockError extends Error {
   }
 }
 
-const badRequest = (message: string) => new MockError(400, "bad_request", message);
+const badRequest = (message: string, code = "bad_request") => new MockError(400, code, message);
+
+/** The server's `MAX_PRINCIPAL_PATTERNS`: path and key patterns one caller's secret rules may hold. */
+const MAX_PRINCIPAL_PATTERNS = 400;
 
 /** The server's `MAX_LIFETIME`: ten years. */
 const MAX_TOKEN_LIFETIME = 10 * 365 * 86_400;
@@ -366,6 +370,29 @@ export class MockBackend {
 
   private requireOrg(subject: Subject, action: Action): void {
     if (!authorise(this.orgRules(), subject, action)) throw forbidden();
+  }
+
+  /** As the server: an org admin's changes to roles, bindings and members are judged by the org-admin role alone. */
+  private managementRules(rules: Rule[]): Rule[] {
+    if (!this.isOrgAdmin()) return rules;
+    return this.roleRules("org-admin", [], true) ?? rules;
+  }
+
+  /** Whether a binding to (`kind`, `id`) reaches an org admin, or a project admin of `projectId`. */
+  private reachesAdmin(kind: PrincipalKind, id: string, projectId?: string): boolean {
+    const admins = [
+      ...this.state.orgBindings.filter((b) => b.role === "org-admin"),
+      ...this.state.memberships.filter((m) => m.projectId === projectId && m.role === "admin"),
+    ];
+    const user = kind === "user" ? this.state.users.find((u) => u.id === id) : undefined;
+    const reach = [`${kind}:${id}`, ...(user?.groups ?? []).map((g) => `group:${g}`)];
+    return admins.some((a) => reach.includes(`${a.principal_kind}:${a.principal_id}`));
+  }
+
+  /** Only an admin may bind deny rules to an admin, so nobody else can lock them out. */
+  private checkDenyForAdmin(granted: Rule[], kind: PrincipalKind, id: string, administers: boolean, projectId?: string): void {
+    if (!granted.some((r) => r.effect === "deny") || administers) return;
+    if (this.reachesAdmin(kind, id, projectId)) throw escalation("only an admin can bind deny rules to an admin");
   }
 
   me(): Me {
@@ -800,6 +827,15 @@ export class MockBackend {
     const { project, rules } = this.loadProject(projectId);
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(rawPath);
+    const patterns = rules
+      .filter((r) => r.subject === "secrets")
+      .reduce((sum, r) => sum + (r.conditions?.paths?.length ?? 0) + (r.conditions?.keys?.length ?? 0), 0);
+    if (patterns > MAX_PRINCIPAL_PATTERNS) {
+      throw badRequest(
+        `your roles here hold more than ${MAX_PRINCIPAL_PATTERNS} path and key patterns, counting those of your groups; ask a project admin to simplify them`,
+        "too_many_patterns",
+      );
+    }
     const secrets = this.state.secrets
       .filter((s) => s.envId === env.id && (recursive ? within(s.path, path) : s.path === path) && !isDeleted(s))
       .filter((s) => authorise(rules, "secrets", "read", this.resource(env, s, currentVersion(s).tags)))
@@ -1176,10 +1212,15 @@ export class MockBackend {
   }
 
   addMember(projectId: string, request: AddMembership): void {
-    const { project, rules } = this.loadProject(projectId);
+    const { project, rules: own } = this.loadProject(projectId);
+    const rules = this.managementRules(own);
     this.require(rules, "members", "create");
     const granted = this.projectRoleRules(project.id, request.role);
     if (!covers(rules, granted)) throw escalation("you cannot grant a role with more access than you have");
+    const administers =
+      this.isOrgAdmin() ||
+      this.state.memberships.some((m) => m.projectId === project.id && m.role === "admin" && this.principalIsMe(m.principal_kind, m.principal_id));
+    this.checkDenyForAdmin(granted, request.principal_kind, request.principal_id, administers, project.id);
     this.ensurePrincipal(request.principal_kind, request.principal_id);
     const duplicate = this.state.memberships.some(
       (m) =>
@@ -1196,7 +1237,8 @@ export class MockBackend {
   }
 
   removeMember(projectId: string, kind: PrincipalKind, id: string, role: string): void {
-    const { project, rules } = this.loadProject(projectId);
+    const { project, rules: own } = this.loadProject(projectId);
+    const rules = this.managementRules(own);
     this.require(rules, "members", "delete");
     const removed = this.roleRules(role, this.state.roles[project.id] ?? [], false) ?? [];
     if (!covers(rules, removed)) throw escalation("you cannot remove a role with more access than you have");
@@ -1223,6 +1265,20 @@ export class MockBackend {
       throw badRequest("rules must name subjects for this scope and at least one action");
     }
     if (request.rules.length > 100) throw badRequest("too many rules");
+    for (const rule of request.rules) {
+      const badPath = rule.conditions?.paths?.find((p) => !pathPatternCanMatch(p));
+      if (badPath !== undefined) {
+        throw badRequest(
+          `path condition ${JSON.stringify(badPath)} can never match: folders look like /payments or /payments/**, starting with / and without a trailing /, // or . and .. segments`,
+        );
+      }
+      const badKey = rule.conditions?.keys?.find((k) => !keyPatternCanMatch(k));
+      if (badKey !== undefined) {
+        throw badRequest(
+          `key condition ${JSON.stringify(badKey)} can never match: keys start with a letter or _ and hold only letters, digits, _, - and .`,
+        );
+      }
+    }
     if (!covers(author, request.rules)) throw escalation("a role cannot grant more access than you have");
   }
 
@@ -1242,7 +1298,8 @@ export class MockBackend {
   }
 
   putRole(projectId: string, slug: string, request: PutRole): Role {
-    const { project, rules } = this.loadProject(projectId);
+    const { project, rules: own } = this.loadProject(projectId);
+    const rules = this.managementRules(own);
     const exists = (this.state.roles[project.id] ?? []).some((r) => r.slug === slug);
     this.require(rules, "roles", exists ? "edit" : "create");
     this.validateRole(slug, request, rules, false);
@@ -1253,7 +1310,7 @@ export class MockBackend {
 
   deleteRole(projectId: string, slug: string): void {
     const { project, rules } = this.loadProject(projectId);
-    this.require(rules, "roles", "delete");
+    this.require(this.managementRules(rules), "roles", "delete");
     this.state.roles[project.id] = (this.state.roles[project.id] ?? []).filter((r) => r.slug !== slug);
     this.audit("role.delete", { project_id: project.id }, { role: slug });
   }
@@ -1591,18 +1648,20 @@ export class MockBackend {
   }
 
   addOrgBinding(request: AddOrgBinding): void {
-    const rules = this.orgRules();
+    const rules = this.managementRules(this.orgRules());
     if (!authorise(rules, "org-members", "create")) throw forbidden();
-    if (!covers(rules, this.orgRoleRules(request.role))) {
+    const granted = this.orgRoleRules(request.role);
+    if (!covers(rules, granted)) {
       throw escalation("you cannot grant a role with more access than you have");
     }
+    this.checkDenyForAdmin(granted, request.principal_kind, request.principal_id, this.isOrgAdmin());
     this.ensurePrincipal(request.principal_kind, request.principal_id);
     this.state.orgBindings.push({ principal_kind: request.principal_kind, principal_id: request.principal_id, role: request.role });
     this.audit("org.binding-add", {}, request);
   }
 
   removeOrgBinding(kind: PrincipalKind, id: string, role: string): void {
-    this.requireOrg("org-members", "delete");
+    this.require(this.managementRules(this.orgRules()), "org-members", "delete");
     this.state.orgBindings = this.state.orgBindings.filter(
       (b) => !(b.principal_kind === kind && b.principal_id === id && b.role === role),
     );
@@ -1615,7 +1674,7 @@ export class MockBackend {
   }
 
   putOrgRole(slug: string, request: PutRole): Role {
-    const rules = this.orgRules();
+    const rules = this.managementRules(this.orgRules());
     const exists = (this.state.roles[""] ?? []).some((r) => r.slug === slug);
     if (!authorise(rules, "org-roles", exists ? "edit" : "create")) throw forbidden();
     this.validateRole(slug, request, rules, true);
@@ -1625,7 +1684,7 @@ export class MockBackend {
   }
 
   deleteOrgRole(slug: string): void {
-    this.requireOrg("org-roles", "delete");
+    this.require(this.managementRules(this.orgRules()), "org-roles", "delete");
     this.state.roles[""] = (this.state.roles[""] ?? []).filter((r) => r.slug !== slug);
     this.audit("org.role-delete", {}, { role: slug });
   }

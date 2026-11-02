@@ -130,21 +130,19 @@ async fn upload(h: &Harness, body: Vec<u8>) -> anyhow::Result<(StatusCode, Value
     Ok((status, response.json().await.unwrap_or_default()))
 }
 
+/// SVGs are no longer drawn on the server at all, ordinary or not.
 async fn dashed_logo_bombs_are_refused(db: String) -> anyhow::Result<()> {
     let h = start(options(db)).await?;
     h.create_project("app").await?;
     let started = Instant::now();
-    let (status, body) = upload(&h, dash_bomb().into_bytes()).await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body["message"].as_str().is_some_and(|m| m.contains("too complex")),
-        "{body}"
-    );
+    let dashed = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="none" stroke="black" stroke-dasharray="4 2"/></svg>"#;
+    for svg in [dash_bomb(), dashed.to_string()] {
+        let (status, body) = upload(&h, svg.into_bytes()).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["message"].as_str().is_some_and(|m| m.contains("SVG")), "{body}");
+    }
     // Generous for slow runners; the render it replaces took well over a minute.
     assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
-    let dashed = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="none" stroke="black" stroke-dasharray="4 2"/></svg>"#;
-    let (status, body) = upload(&h, dashed.as_bytes().to_vec()).await?;
-    assert_eq!(status, StatusCode::OK, "an ordinary dashed logo: {body}");
     Ok(())
 }
 

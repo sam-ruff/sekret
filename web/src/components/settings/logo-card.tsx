@@ -9,13 +9,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Spinner } from "@/components/ui/spinner";
 import { keys, useApiMutation } from "@/hooks/queries";
 import { errorMessage } from "@/lib/errors";
-import { checkLogoFile } from "@/lib/images";
+import { checkLogoFile, svgProblem } from "@/lib/images";
+import { svgToPng } from "@/lib/svg-to-png";
 
 const ACCEPT = "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,.png,.jpg,.jpeg,.gif,.webp,.svg";
 
 export function LogoCard({ project, canEdit }: { project: Project; canEdit: boolean }) {
   const input = useRef<HTMLInputElement>(null);
   const [problem, setProblem] = useState<string>();
+  const [converting, setConverting] = useState(false);
   const invalidate = [keys.projects, keys.project(project.slug)];
   const onError = (error: unknown) => {
     setProblem(errorMessage(error));
@@ -40,15 +42,34 @@ export function LogoCard({ project, canEdit }: { project: Project; canEdit: bool
     event.target.value = "";
     if (!file) return;
     setProblem(undefined);
-    const check = checkLogoFile(new Uint8Array(await file.arrayBuffer()));
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const check = checkLogoFile(bytes);
     if (!check.ok) {
       setProblem(check.message);
       return;
     }
-    upload.mutate(file);
+    if (check.type !== "image/svg+xml") {
+      upload.mutate(file);
+      return;
+    }
+    // The server takes only raster logos, so an SVG is drawn into a PNG here first.
+    const problemWithSvg = svgProblem(bytes);
+    if (problemWithSvg) {
+      setProblem(problemWithSvg);
+      return;
+    }
+    setConverting(true);
+    try {
+      const png = await svgToPng(bytes);
+      upload.mutate(new File([png.slice().buffer], file.name.replace(/\.svgz?$/i, "") + ".png", { type: "image/png" }));
+    } catch (error) {
+      setProblem(errorMessage(error));
+    } finally {
+      setConverting(false);
+    }
   };
 
-  const busy = upload.isPending || remove.isPending;
+  const busy = upload.isPending || remove.isPending || converting;
   const hasLogo = !!project.logo_url;
 
   return (
@@ -69,12 +90,13 @@ export function LogoCard({ project, canEdit }: { project: Project; canEdit: bool
           </div>
           <div className="min-w-0 space-y-2">
             <p className="text-sm text-muted-foreground">
-              PNG, JPEG, GIF, WebP or SVG, up to 512 KiB and 4096 by 4096 pixels. A square image works best.
+              PNG, JPEG, GIF, WebP or SVG, up to 512 KiB and 4096 by 4096 pixels. An SVG is turned into a PNG in your
+              browser before it is uploaded. A square image works best.
             </p>
             {canEdit && (
               <div className="flex flex-wrap gap-2">
                 <Button variant="outline" size="sm" disabled={busy} onClick={() => input.current?.click()} data-testid="logo-upload">
-                  {upload.isPending ? <Spinner /> : <ImageUp />}
+                  {upload.isPending || converting ? <Spinner /> : <ImageUp />}
                   {hasLogo ? "Replace" : "Upload logo"}
                 </Button>
                 {hasLogo && (

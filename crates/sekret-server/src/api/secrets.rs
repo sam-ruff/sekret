@@ -1,18 +1,21 @@
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use sekret_api::{
     BatchResult, BatchWrite, GenerateSecret, Overview, OverviewRow, PolicyOverride, RawSecret, RawSecrets,
     RestoreRequest, RollbackRequest, Secret, SecretList, SecretPolicyView, SecretUpsert, SecretVersion, SetSecret,
     Snapshot, SnapshotDetail,
 };
-use sekret_core::permissions::{Action, Resource, Rule, Subject, pattern_count};
+use sekret_core::permissions::{Action, MAX_PRINCIPAL_PATTERNS, Resource, Rule, Subject, pattern_count};
 use sekret_core::rotation::next_rotation;
 use sekret_core::validate;
 use sekret_store::{Environment, Project, SecretWithVersion};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Semaphore;
 use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -109,6 +112,12 @@ async fn scope(state: &AppState, principal: &Principal, project: &str, env: &str
 /// Pattern checks a listing may run on an async worker before it moves to the blocking pool.
 const INLINE_CHECKS: usize = 20_000;
 
+/// Long permission checks running at once: half the cores, so listings cannot take them all.
+static CHECK_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+    Arc::new(Semaphore::new((cores / 2).max(1)))
+});
+
 /// The secrets in `env` the rules allow every one of `actions` on. A long list checked against
 /// many patterns runs on the blocking pool, so it cannot stall the workers other requests need.
 async fn permitted(
@@ -117,6 +126,32 @@ async fn permitted(
     secrets: Vec<SecretWithVersion>,
     actions: &'static [Action],
 ) -> ApiResult<Vec<SecretWithVersion>> {
+    permitted_with(&CHECK_SLOTS, rules, env, secrets, actions).await
+}
+
+async fn permitted_with(
+    slots: &Arc<Semaphore>,
+    rules: &[Rule],
+    env: &str,
+    secrets: Vec<SecretWithVersion>,
+    actions: &'static [Action],
+) -> ApiResult<Vec<SecretWithVersion>> {
+    // Bindings are capped when made, but groups come from the identity provider at sign-in.
+    let checked = rules
+        .iter()
+        .filter(|r| r.subject == Subject::Secrets)
+        .map(|r| r.conditions.paths.len() + r.conditions.keys.len())
+        .sum::<usize>();
+    if checked > MAX_PRINCIPAL_PATTERNS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "too_many_patterns",
+            format!(
+                "your roles here hold more than {MAX_PRINCIPAL_PATTERNS} path and key patterns, counting those of \
+                 your groups; ask a project admin to simplify them"
+            ),
+        ));
+    }
     let keep = |rules: &[Rule], env: &str, s: &SecretWithVersion| {
         let resource = secret_resource(env, &s.secret.path, &s.secret.key, &s.version.tags);
         actions
@@ -126,11 +161,19 @@ async fn permitted(
     if !runs_off_runtime(secrets.len(), rules) {
         return Ok(secrets.into_iter().filter(|s| keep(rules, env, s)).collect());
     }
+    let slot = slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::internal("permission check", e))?;
     let rules = rules.to_vec();
     let env = env.to_string();
-    tokio::task::spawn_blocking(move || secrets.into_iter().filter(|s| keep(&rules, &env, s)).collect())
-        .await
-        .map_err(|e| ApiError::internal("permission check", e))
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        secrets.into_iter().filter(|s| keep(&rules, &env, s)).collect()
+    })
+    .await
+    .map_err(|e| ApiError::internal("permission check", e))
 }
 
 fn runs_off_runtime(items: usize, rules: &[Rule]) -> bool {
@@ -951,6 +994,44 @@ mod tests {
             assert_eq!(kept.len(), 100);
             assert!(kept.iter().all(|s| s.secret.path == "/app"));
         }
+        Ok(())
+    }
+
+    /// Groups can bring more patterns than any binding was checked against, so a listing refuses
+    /// them instead of running N secrets times P patterns.
+    #[tokio::test]
+    async fn listings_refuse_rules_over_the_pattern_cap() -> anyhow::Result<()> {
+        let mut over = rules(MAX_ROLE_PATTERNS_FOR_TEST);
+        over.extend(rules(MAX_ROLE_PATTERNS_FOR_TEST));
+        over.extend(rules(1));
+        let refused = permitted(&over, "prod", vec![stored("/", "K")], &[Action::Read]).await;
+        assert_eq!(refused.err().map(|e| e.code), Some("too_many_patterns"));
+        let mut at_cap = rules(MAX_ROLE_PATTERNS_FOR_TEST);
+        at_cap.extend(rules(MAX_ROLE_PATTERNS_FOR_TEST));
+        assert!(
+            permitted(&at_cap, "prod", vec![stored("/", "K")], &[Action::Read])
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    const MAX_ROLE_PATTERNS_FOR_TEST: usize = MAX_PRINCIPAL_PATTERNS / 2;
+
+    #[tokio::test]
+    async fn long_checks_wait_for_a_slot() -> anyhow::Result<()> {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await?;
+        let secrets: Vec<_> = (0..200).map(|i| stored("/app", &format!("K{i}"))).collect();
+        let rules = rules(200);
+        let check = permitted_with(&slots, &rules, "prod", secrets, &[Action::Read]);
+        tokio::pin!(check);
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(100), &mut check).await;
+        assert!(waited.is_err(), "no slot, so the check has not run");
+        drop(held);
+        let kept = check.await.map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(kept.len(), 200);
+        assert_eq!(slots.available_permits(), 1, "the slot is given back");
         Ok(())
     }
 

@@ -89,9 +89,67 @@ describe("mock backend", () => {
       rules: [{ effect: "deny", subject: "secrets", actions: ["read-value"], conditions: { environments: ["prod"], paths: [], keys: [], tags: [] } }],
     });
     b.addMember("app", { principal_kind: "user", principal_id: "user-sam", role: "no-prod" });
-    expect(() =>
-      b.putRole("app", "reader", { name: "Reader", description: "", rules: [{ effect: "allow", subject: "secrets", actions: ["read-value"] }] }),
-    ).toThrow(MockError);
+    const reader = { name: "Reader", description: "", rules: [{ effect: "allow" as const, subject: "secrets" as const, actions: ["read-value" as const] }] };
+    // An org admin is judged by the org-admin role alone, so a deny bound to them does not stop them.
+    expect(() => b.putRole("app", "reader", reader)).not.toThrow();
+    b.setMyOrgRole("org-member");
+    expect(() => b.putRole("app", "reader-2", reader)).toThrow(MockError);
+  });
+
+  it("lets only an admin bind deny rules to an admin", () => {
+    const b = backend();
+    const deny = { effect: "deny" as const, subject: "secrets" as const, actions: ["read-value" as const] };
+    b.putOrgRole("org-no-values", {
+      name: "No identities",
+      description: "",
+      rules: [{ effect: "deny", subject: "identities", actions: ["delete"] }],
+    });
+    b.putRole("app", "no-values", { name: "No values", description: "", rules: [deny] });
+    // The org admin may.
+    expect(() => b.addOrgBinding({ principal_kind: "user", principal_id: "user-sam", role: "org-no-values" })).not.toThrow();
+    b.addMember("app", { principal_kind: "group", principal_id: "ops", role: "admin" });
+    // Sam may add members here, but is no longer an admin of any kind.
+    b.putRole("app", "manager", { name: "Manager", description: "", rules: [{ effect: "allow", subject: "members", actions: ["read", "create"] }] });
+    b.addMember("app", { principal_kind: "user", principal_id: "user-sam", role: "manager" });
+    b.removeMember("app", "user", "user-sam", "admin");
+    b.setMyOrgRole("org-member");
+    let refused: unknown;
+    try {
+      b.addMember("app", { principal_kind: "group", principal_id: "ops", role: "no-values" });
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toMatchObject({ status: 403, code: "escalation", message: "only an admin can bind deny rules to an admin" });
+  });
+
+  it("refuses role conditions that can never match, as the server does", () => {
+    const b = backend();
+    const rule = (conditions: { paths?: string[]; keys?: string[] }) => ({
+      name: "Odd",
+      description: "",
+      rules: [{ effect: "allow" as const, subject: "secrets" as const, actions: ["read" as const], conditions: { environments: [], tags: [], paths: [], keys: [], ...conditions } }],
+    });
+    expect(() => b.putRole("app", "odd", rule({ paths: ["payments/**"] }))).toThrow(/path condition "payments\/\*\*" can never match/);
+    expect(() => b.putRole("app", "odd", rule({ keys: ["1DB"] }))).toThrow(/key condition "1DB" can never match/);
+    expect(() => b.putRole("app", "odd", rule({ paths: ["/payments/**"], keys: ["DB_*"] }))).not.toThrow();
+  });
+
+  it("refuses to list secrets for a caller whose roles hold too many patterns", () => {
+    const b = backend();
+    const paths = Array.from({ length: 401 }, (_, i) => `/f${i}`);
+    b.putRole("app", "many", {
+      name: "Many",
+      description: "",
+      rules: [{ effect: "allow", subject: "secrets", actions: ["read"], conditions: { environments: [], tags: [], keys: [], paths } }],
+    });
+    b.addMember("app", { principal_kind: "user", principal_id: "user-sam", role: "many" });
+    let refused: unknown;
+    try {
+      b.listSecrets("app", "dev", "/", false);
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toMatchObject({ status: 400, code: "too_many_patterns" });
   });
 
   describe("OIDC auth method", () => {

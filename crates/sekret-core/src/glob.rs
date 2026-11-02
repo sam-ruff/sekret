@@ -321,10 +321,91 @@ fn from(start: usize, w: usize) -> u64 {
     u64::MAX << (start - base)
 }
 
+fn wildcard_or(c: char, plain: impl Fn(char) -> bool) -> bool {
+    matches!(c, '*' | '?') || plain(c)
+}
+
+/// Whether a folder pattern is shaped so it can match a stored folder path, which is always
+/// `/` or `/a/b` with segments of letters, digits, `_`, `-` and `.`.
+pub fn path_pattern_can_match(pattern: &str) -> bool {
+    let Some(rest) = pattern.strip_prefix('/') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    rest.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .chars()
+                .all(|c| wildcard_or(c, |c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    })
+}
+
+/// Whether a key pattern is shaped so it can match a secret key, which starts with a letter or
+/// `_` and holds only letters, digits, `_`, `-` and `.`.
+pub fn key_pattern_can_match(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    wildcard_or(first, |c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| wildcard_or(c, |c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn patterns_that_can_never_match_are_recognised() {
+        for good in [
+            "/",
+            "/**",
+            "/payments",
+            "/payments/**",
+            "/a/*/b",
+            "/app.v2/?x",
+            "/**/db",
+        ] {
+            assert!(path_pattern_can_match(good), "{good}");
+        }
+        for bad in [
+            "",
+            "payments/**",
+            "/payments/",
+            "/payments//**",
+            "//",
+            "/a/./b",
+            "/a/../b",
+            "/a/..",
+            "/a b",
+            "/pay$ments",
+        ] {
+            assert!(!path_pattern_can_match(bad), "{bad}");
+        }
+        for good in ["DB_*", "*", "_X", "?ATH", "stripe.key-1"] {
+            assert!(key_pattern_can_match(good), "{good}");
+        }
+        for bad in ["", "1DB", "-X", "DB KEY", "DB/*", "DB$"] {
+            assert!(!key_pattern_can_match(bad), "{bad}");
+        }
+    }
+
+    proptest! {
+        /// Every folder path the store can hold is matched by a pattern spelling it out, and that
+        /// pattern passes the shape check.
+        #[test]
+        fn stored_paths_pass_as_patterns(segments in prop::collection::vec("[a-zA-Z0-9_.-]{1,8}", 0..5)) {
+            prop_assume!(segments.iter().all(|s| s != "." && s != ".."));
+            let path = format!("/{}", segments.join("/"));
+            prop_assert!(path_pattern_can_match(&path));
+            prop_assert!(glob_match(&path, &path, Some('/')));
+        }
+    }
 
     fn path(p: &str, t: &str) -> bool {
         glob_match(p, t, Some('/'))

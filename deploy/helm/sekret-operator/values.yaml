@@ -30,7 +30,9 @@ watchNamespaces: []
 clusterWide: false
 
 # When set, the operator may only read and mint tokens for these service accounts, in every
-# watched namespace. Empty allows any service account there that has opted in.
+# watched namespace, and Kubernetes enforces it. Empty lets RBAC allow any service account
+# there; the opt-in annotation is then only checked by the operator itself, so a stolen
+# operator token could skip it. Recommended.
 tokenServiceAccounts: []
 
 # ValidatingAdmissionPolicies that only let the operator request tokens with the `sekret`
@@ -42,6 +44,9 @@ tokenServiceAccounts: []
 # Needs Kubernetes 1.30 or later.
 tokenPolicy:
   enabled: true
+  # Turning the policies off with clusterWide lets the operator mint any token for any service
+  # account in the cluster, which is cluster-admin. The chart refuses that unless this is true.
+  acknowledgeClusterWideWithoutPolicy: false
 
 concurrency: 4
 

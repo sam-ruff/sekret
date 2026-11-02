@@ -276,6 +276,11 @@ pub struct ServerArgs {
     #[arg(long, env = "SEKRET_ALLOW_INSECURE_HTTP", num_args = 0..=1, default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new())]
     pub allow_insecure_http: Option<bool>,
+    /// Start even when another user can change or replace the configuration file, or a key,
+    /// passphrase or trust file it names, and only warn.
+    #[arg(long, env = "SEKRET_ALLOW_SHARED_CONFIG", num_args = 0..=1, default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new())]
+    pub allow_shared_config: Option<bool>,
     /// [default: 200]
     #[arg(long, env = "SEKRET_SNAPSHOTS_TO_KEEP")]
     pub snapshots_to_keep: Option<i64>,
@@ -362,6 +367,7 @@ pub struct ServerSection {
     pub public_url: Option<String>,
     pub trusted_proxies: Option<Vec<String>>,
     pub allow_insecure_http: Option<bool>,
+    pub allow_shared_config: Option<bool>,
     pub unix_socket: Option<PathBuf>,
     pub unix_socket_mode: Option<String>,
     pub max_connections: Option<usize>,
@@ -1163,6 +1169,8 @@ pub fn resolve_with(
     let proxies_in_file = server.trusted_proxies.is_some();
     let insecure_in_file = server.allow_insecure_http.is_some();
     let allow_insecure_http = args.allow_insecure_http.or(server.allow_insecure_http).unwrap_or(false);
+    let shared_in_file = server.allow_shared_config.is_some();
+    let allow_shared_config = args.allow_shared_config.or(server.allow_shared_config).unwrap_or(false);
     let role_in_file = auth.default_org_role.is_some();
     let default_org_role = args
         .default_org_role
@@ -1480,6 +1488,13 @@ pub fn resolve_with(
         Some(allow_insecure_http.to_string()),
         insecure_in_file,
     );
+    notes.note(
+        "server.allow_shared_config",
+        "allow-shared-config",
+        "SEKRET_ALLOW_SHARED_CONFIG",
+        Some(allow_shared_config.to_string()),
+        shared_in_file,
+    );
     let oidc_lists: [(_, _, _, _, _, &[&str]); 4] = [
         (
             "oidc.group_claims",
@@ -1627,9 +1642,21 @@ pub fn resolve_with(
     if let Some(warning) = database_flag_warning(&database_choice) {
         warnings.push(warning);
     }
-    if let Some(warning) = args.store.config.as_deref().and_then(config_writers) {
-        warnings.push(warning);
-    }
+    let client_ca_file = args.tls_client_ca_file.clone().or(tls_file.client_ca_file.clone());
+    let shared = SharedFiles {
+        config: args.store.config.as_deref().and_then(config_writers),
+        others: replace_exposures(&[
+            ("root key file", root_key_file.as_deref()),
+            ("remember secret file", remember_secret_file.as_deref()),
+            ("unlock passphrase file", unlock_passphrase_file.as_deref()),
+            ("setup passphrase file", setup_passphrase_file.as_deref()),
+            ("OIDC client secret file", oidc_secret_file.as_deref()),
+            ("TLS key file", tls_key_file.as_deref()),
+            ("TLS client CA file", client_ca_file.as_deref()),
+            ("database URL file", database_choice.file.as_deref()),
+        ]),
+    };
+    warnings.extend(shared.check(args.allow_shared_config, server.allow_shared_config)?);
     if let Some(warning) = default_role_warning(&default_org_role) {
         warnings.push(warning);
     }
@@ -1902,12 +1929,15 @@ pub fn writable_by_others(file: DirFacts, uid: u32, gid: u32) -> Option<&'static
     None
 }
 
-/// The configuration file decides who signs in and who is an admin, so anyone else who can
-/// change or replace it can make themselves one at the next restart.
+/// Why another user, other than root, could change or replace `path`.
 #[cfg(unix)]
-fn config_writers(path: &Path) -> Option<String> {
+fn replace_exposure(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
+    // Devices and FIFOs are refused when read, with a clearer reason.
+    if !meta.is_file() {
+        return None;
+    }
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let facts = DirFacts {
@@ -1915,17 +1945,82 @@ fn config_writers(path: &Path) -> Option<String> {
         gid: meta.gid(),
         mode: meta.mode(),
     };
-    let why = writable_by_others(facts, uid, gid)
+    writable_by_others(facts, uid, gid)
         .map(|why| format!("{} {why}", path.display()))
-        .or_else(|| directory_exposure(path))?;
+        .or_else(|| directory_exposure(path))
+}
+
+#[cfg(not(unix))]
+fn replace_exposure(_path: &Path) -> Option<String> {
+    None
+}
+
+/// The configuration file decides who signs in and who is an admin, so anyone else who can
+/// change or replace it can make themselves one at the next restart.
+fn config_writers(path: &Path) -> Option<String> {
+    let why = replace_exposure(path)?;
     Some(format!(
         "the configuration file: {why}; whoever can change it decides who signs in and who is an admin"
     ))
 }
 
-#[cfg(not(unix))]
-fn config_writers(_path: &Path) -> Option<String> {
-    None
+fn replace_exposures(files: &[(&str, Option<&Path>)]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|(name, path)| {
+            let why = path.and_then(replace_exposure)?;
+            Some(format!(
+                "the {name}: {why}; whoever can change it can swap what the server trusts"
+            ))
+        })
+        .collect()
+}
+
+/// Files the server trusts that other users could change or replace.
+#[derive(Debug, Default)]
+struct SharedFiles {
+    config: Option<String>,
+    others: Vec<String>,
+}
+
+impl SharedFiles {
+    /// Refuses to start while any of them is shared, unless allowed, and returns the warnings
+    /// for those that were allowed. A `true` in the configuration file covers the other files but
+    /// not the file itself, since whoever can change the file could have written it.
+    fn check(self, from_args: Option<bool>, from_file: Option<bool>) -> anyhow::Result<Vec<String>> {
+        let files_allowed = from_args.or(from_file).unwrap_or(false);
+        let config_allowed = from_args.unwrap_or(false);
+        let mut refused = Vec::new();
+        let mut allowed = Vec::new();
+        if let Some(why) = self.config {
+            if config_allowed {
+                allowed.push(why)
+            } else {
+                refused.push(why)
+            }
+        }
+        for why in self.others {
+            if files_allowed {
+                allowed.push(why)
+            } else {
+                refused.push(why)
+            }
+        }
+        if refused.is_empty() {
+            return Ok(allowed);
+        }
+        let only_file_says_so = from_args.is_none() && from_file == Some(true);
+        let hint = if only_file_says_so {
+            "; server.allow_shared_config in the configuration file does not cover the file itself"
+        } else {
+            ""
+        };
+        bail!(
+            "refusing to start: {}. Make these files and their directories writable only by sekret's user or \
+             root, or pass --allow-shared-config (SEKRET_ALLOW_SHARED_CONFIG) to start anyway{hint}",
+            refused.join("; ")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2526,7 +2621,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Result<()> {
+    fn a_configuration_file_others_can_change_is_refused_unless_allowed() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().context("dir")?;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
@@ -2545,6 +2640,19 @@ mod tests {
         let mut flags = args(&["--public-url", "https://x"])?;
         flags.store.config = Some(path.clone());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+        let refused = resolve(&flags, FileConfig::default());
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("--allow-shared-config")),
+            "a shared configuration file stops the server"
+        );
+        let in_file = parse("server:\n  allow_shared_config: true\n")?;
+        let refused = resolve(&flags, in_file);
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("does not cover the file itself")),
+            "the shared file cannot excuse itself"
+        );
+        let mut flags = args(&["--public-url", "https://x", "--allow-shared-config"])?;
+        flags.store.config = Some(path.clone());
         let resolved = resolve(&flags, FileConfig::default())?;
         assert!(
             resolved
@@ -3124,6 +3232,61 @@ mod tests {
         assert!(ancestor_replaceable(&above(0, 0, 0o40777, 1000), 1000, 1000).is_some());
         assert!(ancestor_replaceable(&above(0, 50, 0o40775, 0), 1000, 1000).is_some());
         assert!(ancestor_replaceable(&above(2000, 2000, 0o40755, 1000), 1000, 1000).is_some());
+    }
+
+    #[test]
+    fn shared_files_stop_the_server_unless_allowed() -> anyhow::Result<()> {
+        let both = || SharedFiles {
+            config: Some("the configuration file: open".into()),
+            others: vec!["the TLS key file: open".into()],
+        };
+        let others_only = || SharedFiles {
+            config: None,
+            others: vec!["the TLS key file: open".into()],
+        };
+        assert!(SharedFiles::default().check(None, None)?.is_empty());
+        assert!(both().check(None, None).is_err());
+        assert!(both().check(Some(false), Some(true)).is_err(), "a flag beats the file");
+        assert!(both().check(None, Some(true)).is_err(), "the file cannot excuse itself");
+        assert!(others_only().check(Some(false), Some(true)).is_err());
+        assert_eq!(
+            others_only().check(None, Some(true))?.len(),
+            1,
+            "the file covers the others"
+        );
+        assert_eq!(both().check(Some(true), None)?.len(), 2, "allowed ones are warnings");
+        assert_eq!(both().check(Some(true), Some(false))?.len(), 2);
+        let refused = both().check(None, None).err().context("refused")?.to_string();
+        assert!(
+            refused.contains("configuration file") && refused.contains("TLS key file"),
+            "every reason is named: {refused}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_files_others_can_replace_are_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+        let key = dir.path().join("root.key");
+        std::fs::write(&key, "x").context("write")?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        assert!(replace_exposures(&[("root key file", Some(&key))]).is_empty());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).context("chmod")?;
+        assert!(
+            replace_exposures(&[("root key file", Some(&key))]).is_empty(),
+            "reading is only warned about"
+        );
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o602)).context("chmod")?;
+        let why = replace_exposures(&[("root key file", Some(&key))]);
+        assert!(why.len() == 1 && why[0].contains("root key file"), "{why:?}");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).context("chmod dir")?;
+        assert_eq!(replace_exposures(&[("root key file", Some(&key))]).len(), 1);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
+        Ok(())
     }
 
     #[cfg(unix)]

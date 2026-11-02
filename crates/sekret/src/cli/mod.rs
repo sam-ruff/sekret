@@ -929,17 +929,48 @@ pub fn ask_project_allow(
     Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// Like [`load_policy`], first asking about an unconfirmed project file `allow` list and saving
-/// a yes beside the stored logins.
+/// Refuses to load secrets from a project and environment only the project file chose, unless
+/// the person agrees at a terminal.
+pub fn confirm_file_choice(
+    scope: &config::ChoiceScope,
+    prompter: &dyn Prompter,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let shown = format::one_line(&scope.file.display().to_string());
+    let target = scope.describe();
+    if !interactive {
+        bail!(
+            "{shown} chooses {target}; pass --project and --env (or set SEKRET_PROJECT and SEKRET_ENVIRONMENT), \
+             or run this once at a terminal to confirm the file's choice"
+        );
+    }
+    let answer = prompter.line(&format!(
+        "{shown} asks to load secrets from:\n\n    {target}\n\nThe command you run, and anything it starts, will \
+         see them. Load from there now and whenever this file asks for it again? [y/N] "
+    ))?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+    bail!("not loading secrets from {target}; pass --project and --env to choose")
+}
+
+/// Like [`load_policy`], first confirming a project and environment the project file chose and
+/// any unconfirmed `allow` list it has, and saving each yes beside the stored logins.
 pub fn load_policy_confirming(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shell::LoadPolicy> {
     let mut stderr = std::io::stderr();
-    if let Some(note) = file_choice_note(resolved) {
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
+    if let Some(scope) = &resolved.unconfirmed_choice {
+        confirm_file_choice(scope, &crate::prompt::Terminal, interactive)?;
+        let path = config::credentials_path()?;
+        let mut credentials = read_credentials(&path)?;
+        credentials.confirm_choice(scope);
+        config::save_credentials(&path, &credentials)?;
+    } else if let Some(note) = file_choice_note(resolved) {
         writeln!(stderr, "{note}")?;
     }
     let Some((scope, names)) = &resolved.unconfirmed_allow else {
         return load_policy(resolved, flags);
     };
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
     if !ask_project_allow(scope, names, &crate::prompt::Terminal, interactive, &mut stderr)? {
         return load_policy(resolved, flags);
     }
@@ -1632,6 +1663,7 @@ mod tests {
             allow: vec![],
             unconfirmed_allow: None,
             chosen_by_file: None,
+            unconfirmed_choice: None,
             project_file: None,
             stale_shell: None,
         }
@@ -1714,6 +1746,37 @@ mod tests {
         assert_eq!(policy.check("LD_PRELOAD"), Err(shell::SkipReason::Blocked));
         let flagged = load_policy(&resolved, &["LD_PRELOAD".into()])?;
         assert_eq!(flagged.check("LD_PRELOAD"), Ok(()), "a flag is the person's own choice");
+        Ok(())
+    }
+
+    #[test]
+    fn a_project_file_choice_needs_a_yes_at_a_terminal() -> anyhow::Result<()> {
+        let scope = config::ChoiceScope {
+            file: "/repo/.sekret.toml".into(),
+            server: "https://s.test".into(),
+            project: "payments".into(),
+            environment: "prod\u{1b}[2J".into(),
+        };
+        let refused = confirm_file_choice(&scope, &Answer("y"), false);
+        assert!(
+            refused.is_err_and(|e| {
+                let text = e.to_string();
+                text.contains("--project") && text.contains("payments/prod") && !text.contains('\u{1b}')
+            }),
+            "without a terminal the file's choice is refused, not asked"
+        );
+        assert!(confirm_file_choice(&scope, &Answer(""), true).is_err());
+        assert!(confirm_file_choice(&scope, &Answer("n"), true).is_err());
+        confirm_file_choice(&scope, &Answer("Yes"), true)?;
+
+        let recorded = Recorded(std::cell::RefCell::new(String::new()));
+        confirm_file_choice(&scope, &recorded, true)?;
+        let asked = recorded.0.into_inner();
+        assert!(
+            asked.contains("payments/prod") && asked.contains("https://s.test") && asked.contains("/repo/.sekret.toml"),
+            "{asked}"
+        );
+        assert!(!asked.contains('\u{1b}'), "{asked}");
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Boxes, CheckCircle2, Circle, KeyRound, ShieldCheck, Trash2 } from "lucide-react";
+import { Boxes, CheckCircle2, Circle, KeyRound, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { api } from "@/api/endpoints";
 import type { AuthMethodConfig, AuthMethodKind } from "@/api/types";
@@ -70,8 +70,28 @@ function MethodCard({
   );
 }
 
+/** Stands in for the form of a method that is not configured, until someone chooses to set it up. */
+function SetUpPrompt({ kind, canEdit, onSetUp }: { kind: AuthMethodKind; canEdit: boolean; onSetUp: () => void }) {
+  if (!canEdit) return <p className="text-sm text-muted-foreground">Not set up.</p>;
+  return (
+    <Button variant="outline" onClick={onSetUp} data-testid={`auth-method-${kind}-setup`}>
+      <Plus />
+      Set up {LABELS[kind]}
+    </Button>
+  );
+}
+
 export function AuthMethods({ identityId, canEdit }: { identityId: string; canEdit: boolean }) {
   const [removing, setRemoving] = useState<AuthMethodKind | null>(null);
+  // Unconfigured methods stay collapsed, so the page leads with what is set up.
+  const [settingUp, setSettingUp] = useState<ReadonlySet<AuthMethodKind>>(new Set());
+  const setUp = (kind: AuthMethodKind, open: boolean) =>
+    setSettingUp((current) => {
+      const next = new Set(current);
+      if (open) next.add(kind);
+      else next.delete(kind);
+      return next;
+    });
   // The reviewer token reads back redacted, so a replaced token leaves the config unchanged; remount on each save.
   const [kubernetesSaves, setKubernetesSaves] = useState(0);
   const methods = useQuery({ queryKey: keys.authMethods(identityId), queryFn: () => api.authMethods(identityId) });
@@ -96,6 +116,7 @@ export function AuthMethods({ identityId, canEdit }: { identityId: string; canEd
     mutationFn: (kind: AuthMethodKind) => api.deleteAuthMethod(identityId, kind),
     invalidate,
     success: (_, kind) => `${LABELS[kind]} removed`,
+    onSuccess: (_, kind) => setUp(kind, false),
   });
 
   if (methods.error) return <ErrorState error={methods.error} onRetry={() => void methods.refetch()} />;
@@ -118,13 +139,18 @@ export function AuthMethods({ identityId, canEdit }: { identityId: string; canEd
         canEdit={canEdit}
         onRemove={() => setRemoving("oidc")}
       >
-        <OidcForm
-          key={JSON.stringify(oidc ?? null)}
-          initial={oidc}
-          disabled={!canEdit}
-          busy={pendingKind === "oidc"}
-          onSave={(config) => put.mutate({ kind: "oidc", ...config })}
-        />
+        {oidc || settingUp.has("oidc") ? (
+          <OidcForm
+            key={JSON.stringify(oidc ?? null)}
+            initial={oidc}
+            disabled={!canEdit}
+            busy={pendingKind === "oidc"}
+            onSave={(config) => put.mutate({ kind: "oidc", ...config })}
+            onCancel={oidc ? undefined : () => setUp("oidc", false)}
+          />
+        ) : (
+          <SetUpPrompt kind="oidc" canEdit={canEdit} onSetUp={() => setUp("oidc", true)} />
+        )}
       </MethodCard>
       <MethodCard
         kind="kubernetes"
@@ -134,13 +160,18 @@ export function AuthMethods({ identityId, canEdit }: { identityId: string; canEd
         canEdit={canEdit}
         onRemove={() => setRemoving("kubernetes")}
       >
-        <KubernetesForm
-          key={`${kubernetesSaves}:${JSON.stringify(kubernetes ?? null)}`}
-          initial={kubernetes}
-          disabled={!canEdit}
-          busy={pendingKind === "kubernetes"}
-          onSave={(config) => put.mutate({ kind: "kubernetes", ...config })}
-        />
+        {kubernetes || settingUp.has("kubernetes") ? (
+          <KubernetesForm
+            key={`${kubernetesSaves}:${JSON.stringify(kubernetes ?? null)}`}
+            initial={kubernetes}
+            disabled={!canEdit}
+            busy={pendingKind === "kubernetes"}
+            onSave={(config) => put.mutate({ kind: "kubernetes", ...config })}
+            onCancel={kubernetes ? undefined : () => setUp("kubernetes", false)}
+          />
+        ) : (
+          <SetUpPrompt kind="kubernetes" canEdit={canEdit} onSetUp={() => setUp("kubernetes", true)} />
+        )}
       </MethodCard>
       <MethodCard
         kind="universal"

@@ -44,6 +44,7 @@ import { useProjectPermissions } from "@/hooks/use-permissions";
 import { isValidSecretKey } from "@/lib/dotenv";
 import { generatorFromDraft } from "@/lib/generation";
 import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
+import { countByChildFolder, matchesBelow, matchesSecret, relativeFolder } from "@/lib/secret-search";
 import { focusInstead } from "@/lib/return-focus";
 import { REVEAL_ALL_LIMIT, ROW_PAGE } from "@/lib/secret-limits";
 import { cn } from "@/lib/utils";
@@ -111,6 +112,90 @@ function NewFolderDialog({
   );
 }
 
+/** Column headings; on phones the rows are cards, so the headings are only read out. */
+function SecretTableHeader() {
+  return (
+    <div
+      role="row"
+      className={cn(
+        "grid gap-x-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground max-md:sr-only",
+        SECRET_ROW_COLUMNS,
+      )}
+    >
+      <span role="columnheader">Key</span>
+      <span role="columnheader">Value</span>
+      <span role="columnheader" className="text-right">
+        <span className="sr-only lg:not-sr-only">Updated</span>
+        <span className="sr-only"> and actions</span>
+      </span>
+    </div>
+  );
+}
+
+/** Matches from subfolders listed at once; more ask for a narrower search. */
+const BELOW_LIMIT = 50;
+
+const secretCount = (count: number) => (count === 1 ? "1 secret" : `${count} secrets`);
+
+/** A subfolder, with how many secrets it holds; only an empty one offers to be deleted. */
+function FolderRow({
+  name,
+  href,
+  count,
+  canDelete,
+  onDelete,
+}: {
+  name: string;
+  href: string;
+  count: number;
+  canDelete: boolean;
+  onDelete: () => void;
+}) {
+  const deleteButton = (blocked: boolean) => (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      className="text-muted-foreground"
+      disabled={blocked}
+      onClick={onDelete}
+      aria-label={`Delete folder ${name}`}
+      data-testid={`delete-folder-${name}`}
+    >
+      <Trash2 />
+    </Button>
+  );
+
+  return (
+    <div role="row" className="flex items-center gap-2 border-b px-4 py-2.5 last:border-b-0 hover:bg-muted/40" data-testid={`folder-row-${name}`}>
+      <div role="cell" aria-colspan={2} className="flex min-w-0 flex-1 items-center gap-2">
+        <Link to={href} className="-my-2.5 flex min-w-0 flex-1 items-center gap-2 py-2.5 font-mono text-sm" data-testid={`open-folder-${name}`}>
+          <Folder className="size-4 shrink-0 fill-primary/20 text-primary" />
+          <span className="truncate">{name}</span>
+        </Link>
+        {count > 0 && (
+          <span className="shrink-0 text-xs text-muted-foreground" data-testid={`folder-count-${name}`}>
+            {secretCount(count)}
+          </span>
+        )}
+      </div>
+      <div role="cell" className="flex shrink-0 justify-end">
+        {canDelete && count === 0 && deleteButton(false)}
+        {canDelete && count > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* A disabled button gets no pointer events, so the wrapper carries the tooltip. */}
+              <span tabIndex={0} className="rounded-lg" data-testid={`delete-folder-blocked-${name}`}>
+                {deleteButton(true)}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>Holds {secretCount(count)}. Delete them first to delete the folder.</TooltipContent>
+          </Tooltip>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** Stands in for the editor until the current value has loaded, or says why it could not. */
 function ValueLoadState({
   secretKey,
@@ -156,12 +241,13 @@ function SecretsView() {
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
 
-  const [filter, setFilter] = useState("");
+  const [search, setSearch] = useSearchParams();
+  // A search result from a parent folder links here with `?q=` set to its key.
+  const [filter, setFilter] = useState(() => search.get("q") ?? "");
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const [revealAll, setRevealAll] = useState(false);
   /** Keys hidden again by hand while everything else is revealed. */
   const [hiddenFromAll, setHiddenFromAll] = useState<Set<string>>(new Set());
-  const [search, setSearch] = useSearchParams();
   /** The key the new secret form starts with, or null while the form is closed. An empty `?add=` opens it blank. */
   const [adding, setAdding] = useState<string | null>(() => {
     const key = search.get("add");
@@ -179,14 +265,15 @@ function SecretsView() {
   const returnFocus = useRef<HTMLElement | null>(null);
   const rotateReturnFocus = useRef<HTMLElement | null>(null);
 
-  // The prefilled key or import request has been read; a reload should not open the form again.
+  // The prefilled key, search or import request has been read; a reload should not apply it again.
   useEffect(() => {
-    if (!search.has("add") && !search.has("import")) return;
+    if (!search.has("add") && !search.has("import") && !search.has("q")) return;
     setSearch(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("add");
         next.delete("import");
+        next.delete("q");
         return next;
       },
       { replace: true },
@@ -201,6 +288,12 @@ function SecretsView() {
     queryKey: keys.secrets(project, envSlug, path),
     queryFn: () => api.secrets(at, false),
     enabled: !!env,
+  });
+  // Everything below this folder, without values: it counts what each subfolder holds and lets search reach into them.
+  const under = useQuery({
+    queryKey: [...keys.secrets(project, envSlug, path), "recursive"],
+    queryFn: () => api.secretsUnder(at),
+    enabled: !!env && (list.data?.folders.length ?? 0) > 0,
   });
   const tooManyToRevealAll = (list.data?.secrets.length ?? 0) > REVEAL_ALL_LIMIT;
   // Reveal all fetches the folder's values in one go; anything else fetches only the secret it is for.
@@ -319,14 +412,23 @@ function SecretsView() {
   const secrets = list.data?.secrets ?? [];
   const folders = list.data?.folders ?? [];
   const needle = filter.trim().toLowerCase();
-  const visibleSecrets = secrets.filter(
-    (s) =>
-      !needle ||
-      s.key.toLowerCase().includes(needle) ||
-      s.comment.toLowerCase().includes(needle) ||
-      s.tags.some((t) => t.includes(needle)),
-  );
+  const visibleSecrets = secrets.filter((s) => matchesSecret(s, needle));
   const visibleFolders = folders.filter((f) => !needle || f.toLowerCase().includes(needle));
+  const folderCounts = under.data ? countByChildFolder(path, under.data.secrets) : undefined;
+  const below = under.data ? matchesBelow(path, under.data.secrets, needle) : [];
+  const searchingBelow = folders.length > 0 && under.isPending;
+  const nothingFound =
+    needle !== "" &&
+    visibleSecrets.length + visibleFolders.length + below.length === 0 &&
+    !searchingBelow &&
+    secrets.length + folders.length > 0;
+  /** Opens a match from a subfolder with the search narrowed to its key. */
+  const matchHref = (secret: Secret) => {
+    const params = new URLSearchParams();
+    if (secret.path !== "/") params.set("path", secret.path);
+    params.set("q", secret.key);
+    return `${base}?${params.toString()}`;
+  };
   // Rows are drawn a page at a time, so a folder with thousands of keys stays usable.
   const shownFolders = visibleFolders.slice(0, shownRows);
   const shownSecrets = visibleSecrets.slice(0, Math.max(0, shownRows - shownFolders.length));
@@ -507,114 +609,94 @@ function SecretsView() {
           )}
 
           {list.isSuccess && (visibleFolders.length > 0 || visibleSecrets.length > 0) && (
-            <div className="overflow-hidden rounded-xl border bg-card" data-testid="secrets-table">
-              <div
-                className={cn(
-                  "hidden gap-x-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:grid",
-                  SECRET_ROW_COLUMNS,
+            <div className="overflow-hidden rounded-xl border bg-card">
+              <div role="table" aria-label={`Secrets in ${folderLabel(path)}`} data-testid="secrets-table">
+                <SecretTableHeader />
+                {shownFolders.map((name) => {
+                  const folderPath = joinPath(path, name);
+                  return (
+                    <FolderRow
+                      key={name}
+                      name={name}
+                      href={`${base}${folderQuery(folderPath)}`}
+                      count={folderCounts?.get(name) ?? 0}
+                      canDelete={perms.can("folders", "delete", { environment: envSlug, path: folderPath })}
+                      onDelete={() => setDeletingFolder(folderPath)}
+                    />
+                  );
+                })}
+                {shownSecrets.map((secret) =>
+                  editing === secret.key ? (
+                    <div key={secret.key} role="row" className="border-b p-3 last:border-b-0">
+                      <div role="cell" aria-colspan={3}>
+                        {/* The update replaces the value, so the editor waits for it rather than starting empty. */}
+                        {!secret.value_hidden && valueOf(secret.key) === undefined ? (
+                          <ValueLoadState
+                            secretKey={secret.key}
+                            error={singleQuery(secret.key)?.error ?? null}
+                            onRetry={() => void singleQuery(secret.key)?.refetch()}
+                            onCancel={() => setEditing(null)}
+                          />
+                        ) : (
+                          <SecretEditor
+                            isNew={false}
+                            valueHidden={secret.value_hidden}
+                            generated={secret.generated}
+                            initial={{
+                              key: secret.key,
+                              value: valueOf(secret.key) ?? "",
+                              comment: secret.comment,
+                              tags: secret.tags,
+                            }}
+                            busy={save.isPending}
+                            onCancel={() => {
+                              setEditing(null);
+                              forgetFailedSave();
+                            }}
+                            onSave={(draft) => {
+                              const unchanged =
+                                !draft.generator &&
+                                draft.value === (valueOf(secret.key) ?? "") &&
+                                draft.comment === secret.comment &&
+                                draft.tags.join() === secret.tags.join() &&
+                                !secret.value_hidden;
+                              if (unchanged) {
+                                setEditing(null);
+                                return;
+                              }
+                              save.mutate({ draft, isNew: false });
+                            }}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <SecretRow
+                      key={secret.key}
+                      secret={secret}
+                      revealed={isRevealed(secret.key)}
+                      value={isRevealed(secret.key) ? valueOf(secret.key) : undefined}
+                      abilities={{
+                        edit: perms.can("secrets", "edit", resourceFor(secret)),
+                        remove: perms.can("secrets", "delete", resourceFor(secret)),
+                        history: perms.can("secret-versions", "read", resourceFor(secret)),
+                      }}
+                      onToggleReveal={() => toggleReveal(secret.key)}
+                      onCopyValue={() => fetchValue(secret.key)}
+                      onEdit={() => setEditing(secret.key)}
+                      onDelete={() => setDeleting(secret)}
+                      onHistory={(returnTo) => {
+                        returnFocus.current = returnTo;
+                        setDrawerKey(secret.key);
+                      }}
+                      onRotate={(returnTo) => {
+                        rotateReturnFocus.current = returnTo;
+                        setRotating(secret.key);
+                      }}
+                    />
+                  ),
                 )}
-              >
-                <span>Key</span>
-                <span>Value</span>
-                <span />
               </div>
-              {shownFolders.map((name) => {
-                const folderPath = joinPath(path, name);
-                const canDelete = perms.can("folders", "delete", { environment: envSlug, path: folderPath });
-                return (
-                  <div key={name} className="flex items-center gap-2 border-b px-4 py-2.5 last:border-b-0 hover:bg-muted/40" data-testid={`folder-row-${name}`}>
-                    <Link
-                      to={`${base}${folderQuery(folderPath)}`}
-                      className="-my-2.5 flex min-w-0 flex-1 items-center gap-2 py-2.5 font-mono text-sm"
-                      data-testid={`open-folder-${name}`}
-                    >
-                      <Folder className="size-4 shrink-0 fill-primary/20 text-primary" />
-                      <span className="truncate">{name}</span>
-                    </Link>
-                    {canDelete && (
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        className="text-muted-foreground"
-                        onClick={() => setDeletingFolder(folderPath)}
-                        aria-label={`Delete folder ${name}`}
-                        data-testid={`delete-folder-${name}`}
-                      >
-                        <Trash2 />
-                      </Button>
-                    )}
-                  </div>
-                );
-              })}
-              {shownSecrets.map((secret) =>
-                editing === secret.key ? (
-                  <div key={secret.key} className="border-b p-3 last:border-b-0">
-                    {/* The update replaces the value, so the editor waits for it rather than starting empty. */}
-                    {!secret.value_hidden && valueOf(secret.key) === undefined ? (
-                      <ValueLoadState
-                        secretKey={secret.key}
-                        error={singleQuery(secret.key)?.error ?? null}
-                        onRetry={() => void singleQuery(secret.key)?.refetch()}
-                        onCancel={() => setEditing(null)}
-                      />
-                    ) : (
-                      <SecretEditor
-                        isNew={false}
-                        valueHidden={secret.value_hidden}
-                        generated={secret.generated}
-                        initial={{
-                          key: secret.key,
-                          value: valueOf(secret.key) ?? "",
-                          comment: secret.comment,
-                          tags: secret.tags,
-                        }}
-                        busy={save.isPending}
-                        onCancel={() => {
-                          setEditing(null);
-                          forgetFailedSave();
-                        }}
-                        onSave={(draft) => {
-                          const unchanged =
-                            !draft.generator &&
-                            draft.value === (valueOf(secret.key) ?? "") &&
-                            draft.comment === secret.comment &&
-                            draft.tags.join() === secret.tags.join() &&
-                            !secret.value_hidden;
-                          if (unchanged) {
-                            setEditing(null);
-                            return;
-                          }
-                          save.mutate({ draft, isNew: false });
-                        }}
-                      />
-                    )}
-                  </div>
-                ) : (
-                  <SecretRow
-                    key={secret.key}
-                    secret={secret}
-                    revealed={isRevealed(secret.key)}
-                    value={isRevealed(secret.key) ? valueOf(secret.key) : undefined}
-                    abilities={{
-                      edit: perms.can("secrets", "edit", resourceFor(secret)),
-                      remove: perms.can("secrets", "delete", resourceFor(secret)),
-                      history: perms.can("secret-versions", "read", resourceFor(secret)),
-                    }}
-                    onToggleReveal={() => toggleReveal(secret.key)}
-                    onCopyValue={() => fetchValue(secret.key)}
-                    onEdit={() => setEditing(secret.key)}
-                    onDelete={() => setDeleting(secret)}
-                    onHistory={(returnTo) => {
-                      returnFocus.current = returnTo;
-                      setDrawerKey(secret.key);
-                    }}
-                    onRotate={(returnTo) => {
-                      rotateReturnFocus.current = returnTo;
-                      setRotating(secret.key);
-                    }}
-                  />
-                ),
-              )}
               {hiddenCount > 0 && (
                 <p className="flex items-start gap-1.5 px-4 py-2.5 text-xs text-muted-foreground" data-testid="hidden-values-note">
                   <Lock className="mt-0.5 size-3.5 shrink-0" />
@@ -635,11 +717,46 @@ function SecretsView() {
             </div>
           )}
 
-          {list.isSuccess && needle && visibleSecrets.length === 0 && visibleFolders.length === 0 && secrets.length + folders.length > 0 && (
+          {list.isSuccess && needle && below.length > 0 && (
+            <section className="space-y-2" aria-labelledby="search-below-heading" data-testid="search-below">
+              <h2 id="search-below-heading" className="text-sm font-medium text-muted-foreground">
+                {below.length === 1 ? "1 match" : `${below.length} matches`} in folders inside {folderLabel(path)}
+              </h2>
+              <ul className="overflow-hidden rounded-xl border bg-card">
+                {below.slice(0, BELOW_LIMIT).map((secret) => (
+                  <li key={secret.id} className="border-b last:border-b-0">
+                    <Link
+                      to={matchHref(secret)}
+                      className="flex min-w-0 items-center gap-2 px-4 py-2.5 font-mono text-sm hover:bg-muted/40"
+                      data-testid={`search-below-${secret.key}`}
+                    >
+                      <Folder className="size-4 shrink-0 fill-primary/20 text-primary" />
+                      <span className="min-w-0 truncate">
+                        <span className="text-muted-foreground">{relativeFolder(path, secret.path)}/</span>
+                        {secret.key}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              {below.length > BELOW_LIMIT && (
+                <p className="text-xs text-muted-foreground" data-testid="search-below-more">
+                  Showing the first {BELOW_LIMIT}. Type more of the name to narrow the search.
+                </p>
+              )}
+            </section>
+          )}
+          {list.isSuccess && needle && under.isError && (
+            <p className="text-xs text-muted-foreground" data-testid="search-below-failed">
+              The folders inside this one could not be searched.
+            </p>
+          )}
+
+          {list.isSuccess && nothingFound && (
             <EmptyState
               icon={<Search />}
               title={`Nothing matches "${filter.trim()}"`}
-              description="Search looks at keys, comments and tags in this folder."
+              description="Search looks at keys, comments and tags in this folder and the folders inside it."
               action={
                 <Button variant="outline" size="sm" onClick={() => setFilter("")}>
                   Clear search

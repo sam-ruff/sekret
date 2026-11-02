@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { LOGO_PNG, TRUNCATED_PNG } from "./fixtures/images";
-import { expectToast, isMobile } from "./helpers";
+import { expectToast, failNext, isMobile } from "./helpers";
 
 const settings = "/projects/storefront/settings/general";
 
@@ -43,6 +43,31 @@ test("refuses files that are not images before uploading", async ({ page }) => {
   await card.getByTestId("logo-input").setInputFiles({ name: "huge.png", mimeType: "image/png", buffer: huge });
   await expect(card.getByTestId("logo-error")).toContainText("at most 512 KiB");
   await expect(card.getByTestId("logo-preview-empty")).toBeVisible();
+});
+
+test("turns an SVG into a PNG in the browser, since the server takes only raster logos", async ({ page }) => {
+  await page.goto(settings);
+  const card = page.getByTestId("logo-card");
+  await expect(card).toContainText("An SVG is turned into a PNG in your browser");
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100" fill="#3b82f6"/></svg>';
+  await card.getByTestId("logo-input").setInputFiles({ name: "logo.svg", mimeType: "image/svg+xml", buffer: Buffer.from(svg) });
+  // The mock, like the server, refuses SVG, so this only succeeds once the browser has drawn a PNG.
+  await expectToast(page, "Logo updated");
+  const preview = card.getByTestId("logo-preview-image");
+  await expect.poll(() => preview.evaluate((img: HTMLImageElement) => `${img.naturalWidth}x${img.naturalHeight}`)).toBe("512x256");
+  await expect(card.getByTestId("logo-error")).toHaveCount(0);
+
+  const withDoctype = `<!DOCTYPE svg [<!ENTITY a "a">]>${svg}`;
+  await card.getByTestId("logo-input").setInputFiles({ name: "bad.svg", mimeType: "image/svg+xml", buffer: Buffer.from(withDoctype) });
+  await expect(card.getByTestId("logo-error")).toContainText("document type");
+});
+
+test("says plainly when the previous logo is still being processed", async ({ page }) => {
+  await page.goto(settings);
+  const card = page.getByTestId("logo-card");
+  await failNext(page, "PUT", "/logo$", 429, "logo_busy", "your previous logo is still being processed");
+  await card.getByTestId("logo-input").setInputFiles({ name: "logo.png", mimeType: "image/png", buffer: LOGO_PNG });
+  await expect(card.getByTestId("logo-error")).toContainText("Upload one at a time");
 });
 
 test("shows the server's message for an image it cannot read", async ({ page }) => {

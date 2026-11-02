@@ -39,6 +39,39 @@ test("toasts sit at the bottom on pages and move to the top only while a drawer 
   expect(await toastTop("Rolled LOG_LEVEL back to version 1")).toBeLessThan(height / 2);
 });
 
+test("a toast from before a drawer opened does not cover it, and drawer toasts keep clear of it", async ({ page }) => {
+  await page.goto("/projects/storefront/secrets/dev");
+  const toasts = page.locator("[data-sonner-toast]");
+  await page.getByTestId("secret-row-LOG_LEVEL").getByTestId("secret-actions").click();
+  await page.getByTestId("secret-edit").click();
+  await page.getByTestId("edit-secret-LOG_LEVEL").getByTestId("secret-comment-input").fill("Quieter");
+  await page.getByTestId("edit-secret-LOG_LEVEL").getByTestId("secret-save").click();
+  await expect(toasts.filter({ hasText: "Saved LOG_LEVEL" })).toBeVisible();
+
+  await page.getByTestId("secret-row-LOG_LEVEL").getByTestId("secret-key").click();
+  await expect(page.getByTestId("secret-drawer")).toBeVisible();
+  await expect(toasts.filter({ hasText: "Saved LOG_LEVEL" })).toHaveCount(0);
+
+  await page.getByTestId("history-values-toggle").click();
+  await page.getByTestId("rollback-1").click();
+  await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
+  const rolled = toasts.filter({ hasText: "Rolled LOG_LEVEL back to version 1" }).first();
+  await expect(rolled).toBeVisible();
+  if (isMobile(page)) return;
+  // The drawer fills the right of the screen, so the toast sits on the left.
+  const box = await rolled.boundingBox();
+  const drawer = await page.getByTestId("secret-drawer").boundingBox();
+  expect(box && drawer).toBeTruthy();
+  if (!box || !drawer) return;
+  expect(box.x + box.width).toBeLessThanOrEqual(drawer.x);
+});
+
+test("the project switcher reads as one name with the current project", async ({ page }) => {
+  await page.goto("/projects/storefront/secrets/dev");
+  if (isMobile(page)) await page.getByTestId("sidebar-trigger").click();
+  await expect(page.getByTestId("project-switcher")).toHaveAccessibleName("Switch project, current: Storefront");
+});
+
 test("the sidebar becomes a sheet on narrow screens", async ({ page }) => {
   test.skip(!isMobile(page), "Mobile layout only");
   await page.goto("/projects/storefront/secrets/dev");

@@ -1,6 +1,31 @@
 import { expect, test } from "@playwright/test";
 import { expectToast, navigate, openProject, secretRow } from "./helpers";
 
+test("a snapshot says what its own change did, apart from what restoring it would undo", async ({ page }) => {
+  await page.goto("/projects/storefront/snapshots/dev");
+  // Restoring is not framed as undoing one bad change.
+  await expect(page.getByText("including undoing later changes")).toBeVisible();
+  await expect(page.getByText("Restore one to undo a bad change")).toHaveCount(0);
+
+  const list = page.getByTestId("snapshot-list");
+  const changed = list.getByRole("button").filter({ hasText: "1 secret changed in /" }).first();
+  await changed.click();
+  const sheet = page.getByTestId("snapshot-sheet");
+  const effect = sheet.getByTestId("snapshot-effect");
+  await expect(effect.locator("li")).toHaveCount(1);
+  await expect(effect.getByTestId("effect-LOG_LEVEL")).toContainText("Changed");
+  // Restoring it would also remove secrets added later, which the sheet points out.
+  await expect(sheet.getByTestId("change-FEATURE_FLAGS")).toContainText("Removed");
+  await expect(sheet.getByTestId("restore-unrelated")).toContainText("this change did not touch");
+  await expect(sheet.getByTestId("restore-unrelated")).toContainText("Roll back in its history");
+  await page.keyboard.press("Escape");
+
+  // The oldest snapshot has nothing before it to compare with.
+  await list.locator("li").last().getByRole("button").click();
+  await expect(sheet.getByTestId("effect-none")).toContainText("earliest snapshot");
+  await expect(sheet.getByTestId("snapshot-effect")).toHaveCount(0);
+});
+
 test("previews and restores a snapshot", async ({ page }) => {
   await openProject(page);
   await navigate(page, "nav-snapshots");

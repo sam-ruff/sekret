@@ -29,7 +29,10 @@ test("shows where the request came from and approves only after the code is type
   await expect(request.getByTestId("cli-request-agent")).toHaveText(MOCK_AGENT);
   await expect(request.getByTestId("cli-request-agent-note")).toHaveText("Reported by the requester, so it can be faked.");
   await expect(request.getByTestId("cli-request-age")).toHaveText("1 minute ago");
-  await expect(request.getByTestId("cli-request-expires")).toHaveText(/^in 9 minutes \(\d{2}:\d{2}\)$/);
+  // Near midnight the expiry falls tomorrow, so the date is shown as well.
+  await expect(request.getByTestId("cli-request-expires")).toHaveText(
+    /^in 9 minutes \((\d{1,2} \w{3} \d{4}, )?\d{2}:\d{2}\)$/,
+  );
   // Same network, so no extra check is asked for.
   await expect(page.getByTestId("cli-other-address")).toHaveCount(0);
 
@@ -114,7 +117,7 @@ test("sends the browser to sign in again when the server asks, then asks for the
   await expect(page).toHaveURL(/\/cli-login\?code=AUTH-2345$/);
   await expect(page.locator("[data-sonner-toast]")).toHaveCount(0);
   await expect(page.getByTestId("cli-signed-in-again")).toHaveText(
-    "You are signed in again. Type the code from your terminal once more to approve.",
+    "You are signed in again. For safety, confirm the code from your terminal once more, as the page does not keep it across signing in.",
   );
   // The typed code is asked for again after the round trip.
   await expect(page.getByTestId("cli-code-input")).toHaveValue("");

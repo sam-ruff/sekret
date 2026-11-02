@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SnapshotChange } from "@/api/types";
-import { restoreSummary, snapshotTitle } from "./snapshots";
+import { restoreSummary, snapshotEffect, snapshotTitle, unrelatedChanges } from "./snapshots";
 
 describe("snapshotTitle", () => {
   it.each([
@@ -52,5 +52,37 @@ describe("restoreSummary", () => {
 
   it("says when there is nothing to restore", () => {
     expect(restoreSummary([], "/", "Development")).toBe("/ in Development already matches this snapshot.");
+  });
+});
+
+const listed = (
+  kind: SnapshotChange["kind"],
+  key: string,
+  snapshot: number | null,
+  current: number | null,
+  path = "/",
+): SnapshotChange => ({ kind, key, path, snapshot_version: snapshot, current_version: current });
+
+describe("snapshotEffect", () => {
+  // History: LOG_LEVEL v1 -> v2 (this change), then later FEATURE_FLAGS added and LOG_LEVEL v3.
+  const before = [listed("changed", "LOG_LEVEL", 1, 3), listed("removed", "FEATURE_FLAGS", null, 1)];
+  const after = [listed("changed", "LOG_LEVEL", 2, 3), listed("removed", "FEATURE_FLAGS", null, 1)];
+
+  it("finds the one secret a mid-history change touched", () => {
+    expect(snapshotEffect(before, after)).toEqual([{ path: "/", key: "LOG_LEVEL", kind: "changed" }]);
+    expect(unrelatedChanges(after, snapshotEffect(before, after))).toBe(1);
+  });
+
+  it("tells additions and deletions apart, including keys one list leaves out", () => {
+    // This change added NEW and deleted OLD, and both are as it left them now, so only the earlier list names them.
+    const was = [listed("removed", "NEW", null, 1), listed("added", "OLD", 4, null)];
+    expect(snapshotEffect(was, [])).toEqual([
+      { path: "/", key: "NEW", kind: "added" },
+      { path: "/", key: "OLD", kind: "deleted" },
+    ]);
+  });
+
+  it("finds nothing when both snapshots hold the same versions", () => {
+    expect(snapshotEffect(after, after)).toEqual([]);
   });
 });

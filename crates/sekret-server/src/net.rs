@@ -108,8 +108,40 @@ impl reqwest::dns::Resolve for NoMetadata {
     }
 }
 
+/// The proxy for `url`, if one should be used: only https to another host goes through `proxy`,
+/// so plain http never crosses a proxy in the clear and loopback stays on this machine.
+fn proxy_for(url: &reqwest::Url, proxy: &reqwest::Url) -> Option<reqwest::Url> {
+    if url.scheme() != "https" {
+        return None;
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        None => true,
+    };
+    (!loopback).then(|| proxy.clone())
+}
+
+/// The environment's https proxy, applied through `proxy_for` and still honouring `NO_PROXY`.
+fn environment_proxy() -> Option<reqwest::Proxy> {
+    let target = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))?;
+    let target = reqwest::Url::parse(&target).ok()?;
+    Some(reqwest::Proxy::custom(move |url| proxy_for(url, &target)).no_proxy(reqwest::NoProxy::from_env()))
+}
+
 fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder().no_proxy();
+    let builder = match environment_proxy() {
+        Some(proxy) => builder.proxy(proxy),
+        None => builder,
+    };
+    builder
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -227,6 +259,27 @@ impl TokenReviewer for ReqwestTokenReviewer {
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn only_https_to_another_host_goes_through_a_proxy() -> anyhow::Result<()> {
+        let proxy = reqwest::Url::parse("http://proxy.example:3128").context("proxy")?;
+        let through = |url: &str| -> anyhow::Result<bool> {
+            Ok(proxy_for(&reqwest::Url::parse(url).context("url")?, &proxy).is_some())
+        };
+        assert!(through("https://auth.example.com/realms/main")?);
+        for url in [
+            "http://auth.example.com",
+            "https://localhost:8443",
+            "https://LOCALHOST.",
+            "https://k8s.localhost",
+            "https://127.0.0.1:6443",
+            "https://[::1]:6443",
+            "https://[::ffff:127.0.0.1]:6443",
+        ] {
+            assert!(!through(url)?, "{url} must not use the proxy");
+        }
+        Ok(())
+    }
 
     #[test]
     fn outbound_urls_are_restricted() {

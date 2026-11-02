@@ -95,6 +95,7 @@ export function RolesPanel({
             },
             {
               header: "Description",
+              long: true,
               cell: (r) => <span className="text-muted-foreground">{r.description || "No description"}</span>,
             },
             {

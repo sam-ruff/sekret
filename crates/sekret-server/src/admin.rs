@@ -97,6 +97,9 @@ pub struct Rotation<'a> {
     pub skip_unreadable: bool,
     /// Where the marks are, so they move to the new root key with the database.
     pub epoch_files: &'a [PathBuf],
+    /// Replace the integrity key too, revoking every token, client secret and pending CLI login,
+    /// for when the old root key may have leaked.
+    pub new_integrity_key: bool,
 }
 
 /// What a root key replacement did.
@@ -107,6 +110,8 @@ pub struct RotationReport {
     pub skipped: Vec<String>,
     /// Why the epoch marks could not be moved to the new key after the change was committed.
     pub stale_marks: Option<String>,
+    /// The integrity key was replaced, so every token and client secret was revoked.
+    pub credentials_revoked: bool,
 }
 
 /// Re-encrypts each value under a fresh data key for its project, so nothing written under the
@@ -155,8 +160,9 @@ fn unreadable_rows(rows: &[String]) -> ApiError {
 
 /// Replaces the root key: every project gets a fresh data key wrapped under `new_root`, every
 /// secret value (history included) is re-encrypted under it, machine credentials are resealed,
-/// the integrity key is wrapped again, so tokens and client secrets keep working, and the
-/// fingerprint is recorded, all in one transaction. In passphrase mode `seal` carries the new
+/// the integrity key is wrapped again, so tokens and client secrets keep working, or with
+/// `new_integrity_key` replaced and every token and client secret revoked, and the fingerprint is
+/// recorded, all in one transaction. In passphrase mode `seal` carries the new
 /// wrap. Either way the stored seal configuration moves past its epoch and the recorded marks and
 /// is signed with the new root key, so the next start does not take it for tampering.
 pub async fn rotate_root_key(
@@ -196,17 +202,24 @@ pub async fn rotate_root_key(
         )?);
         rewrapped.push((project.id.clone(), wrap_data_key(new_root, &new_key, &project.id)?));
     }
-    let integrity = match store.get_meta(INTEGRITY_KEY_META).await? {
-        None => crate::seal::load_integrity_key(store, old_root).await?,
+    let old_integrity = match store.get_meta(INTEGRITY_KEY_META).await? {
+        None => Some(crate::seal::load_integrity_key(store, old_root).await?),
         Some(wrapped) => match IntegrityKey::unwrap(old_root, &wrapped) {
-            Ok(key) => key,
+            Ok(key) => Some(key),
             Err(_) => {
-                // A fresh one means signing in again and new client secrets, rather than
-                // vouching for whatever the database holds now.
                 unreadable.push("the integrity key, so every token, client secret and auth method".into());
-                IntegrityKey::generate()?
+                None
             }
         },
+    };
+    // A fresh one means signing in again and new client secrets, rather than vouching for
+    // whatever the database holds now or whatever the holder of the old root key adds later.
+    let fresh = match (&old_integrity, rotation.new_integrity_key) {
+        (Some(_), false) => None,
+        _ => Some(IntegrityKey::generate()?),
+    };
+    let Some(integrity) = fresh.as_ref().or(old_integrity.as_ref()) else {
+        return Err(ApiError::internal("integrity key", "no integrity key to wrap"));
     };
     let mut resealed = Vec::new();
     for identity in store.list_identities().await? {
@@ -214,18 +227,25 @@ pub async fn rotate_root_key(
             let config: AuthMethodConfig = serde_json::from_value(method.config.clone())
                 .map_err(|e| ApiError::internal("auth method config", e))?;
             let config = match reseal(old_root, new_root, &identity.id, &config) {
-                Ok(Some(config)) => config,
-                Ok(None) => continue,
+                Ok(config) => config,
                 Err(_) => {
                     unreadable.push(format!("{} credential of identity {}", method.kind, identity.id));
                     continue;
                 }
             };
+            if config.is_none() && fresh.is_none() {
+                continue;
+            }
             // Only a method that was this server's keeps a signature over its new form.
-            let vouched = crate::auth::auth_method_verified(&integrity, &method);
-            method.config = serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
+            let vouched = old_integrity
+                .as_ref()
+                .is_some_and(|key| crate::auth::auth_method_verified(key, &method));
+            if let Some(config) = config {
+                method.config =
+                    serde_json::to_value(&config).map_err(|e| ApiError::internal("auth method config", e))?;
+            }
             method = match vouched {
-                true => crate::auth::sign_auth_method(&integrity, method)?,
+                true => crate::auth::sign_auth_method(integrity, method)?,
                 false => AuthMethod { mac: None, ..method },
             };
             resealed.push(method);
@@ -257,6 +277,7 @@ pub async fn rotate_root_key(
             fingerprint,
             seal,
             integrity_key: Some(integrity.wrap(new_root)?),
+            revoke_credentials: fresh.is_some(),
         })
         .await;
     if let Err(error) = replaced {
@@ -281,5 +302,6 @@ pub async fn rotate_root_key(
         projects,
         skipped: unreadable,
         stale_marks,
+        credentials_revoked: fresh.is_some(),
     })
 }

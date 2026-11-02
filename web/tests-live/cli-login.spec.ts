@@ -87,7 +87,10 @@ test("shows where a CLI login came from and approves it only with the typed code
   await expect(details.getByTestId("cli-request-ip")).toHaveText(/[0-9a-f.:]+/);
   await expect(details.getByTestId("cli-request-agent")).toHaveText("sekret-live-test/1.0");
   await expect(details.getByTestId("cli-request-age")).toHaveText("just now");
-  await expect(details.getByTestId("cli-request-expires")).toHaveText(/^in \d+ minutes? \(\d{2}:\d{2}\)$/);
+  // Near midnight the expiry falls tomorrow, so the date is shown as well.
+  await expect(details.getByTestId("cli-request-expires")).toHaveText(
+    /^in \d+ minutes? \((\d{1,2} \w{3} \d{4}, )?\d{2}:\d{2}\)$/,
+  );
   await expect(details.getByTestId("cli-request-agent-note")).toHaveText("Reported by the requester, so it can be faked.");
   // The CLI and this browser are on the same machine, so there is no different-network warning.
   await expect(page.getByTestId("cli-other-address")).toHaveCount(0);

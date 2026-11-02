@@ -13,6 +13,9 @@ server:
   trusted_proxies: []
   # Allow http:// OIDC issuers and Kubernetes hosts. Development only.
   allow_insecure_http: false
+  # Start, with a warning, when another user can change the key, passphrase or trust files
+  # named here. Covers this file itself only when set by flag or environment variable.
+  allow_shared_config: false
   # Connections served at once; more wait until one closes.
   max_connections: 512
   # Unix socket on the host for `sekret sys unseal --socket`, which skips the network's

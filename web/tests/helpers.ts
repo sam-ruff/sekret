@@ -31,6 +31,20 @@ export async function secretAction(
   await page.getByTestId(action).click();
 }
 
+/** Makes the mock answer the next matching request with this error, as the real server would. */
+export async function failNext(page: Page, method: string, path: string, status: number, code: string, message: string) {
+  await page.evaluate(
+    async ([method, path, status, code, message]) => {
+      const file = "/src/api/mock/server.ts";
+      const mock = (await import(/* @vite-ignore */ file)) as {
+        mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
+      };
+      mock.mockFailNext(method, path, status, code, message);
+    },
+    [method, path, status, code, message] as const,
+  );
+}
+
 export async function expectToast(page: Page, text: string | RegExp): Promise<void> {
   await expect(page.locator("[data-sonner-toast]").filter({ hasText: text }).first()).toBeVisible();
 }

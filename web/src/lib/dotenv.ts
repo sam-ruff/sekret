@@ -91,24 +91,28 @@ export function parseDotenv(text: string): EnvParseResult {
       continue;
     }
 
-    let rest = body.slice(eq + 1).trimStart();
+    const rest = body.slice(eq + 1).trimStart();
     const quote = rest[0];
     if (quote !== '"' && quote !== "'" && quote !== "`") {
       set(key, rest.replace(/\s+#.*$/, "").trim(), lineNumber);
       continue;
     }
 
-    let end = closingQuote(rest, quote, 1);
-    while (end === -1 && quote === '"' && index + 1 < lines.length) {
+    // Each continuation line is scanned on its own so an unterminated quote stays linear. A
+    // backslash at the end of a line only escapes the newline, so no escape carries over.
+    const parts = [rest.slice(1)];
+    let end = closingQuote(rest, quote, 1) - 1;
+    while (end < 0 && quote === '"' && index + 1 < lines.length) {
       index += 1;
-      rest += `\n${lines[index]}`;
-      end = closingQuote(rest, quote, 1);
+      parts.push(lines[index]);
+      end = closingQuote(lines[index], quote, 0);
     }
-    if (end === -1) {
+    if (end < 0) {
       issues.push({ line: lineNumber, message: `unterminated quote for ${key}` });
       continue;
     }
-    const inner = rest.slice(1, end);
+    parts[parts.length - 1] = parts[parts.length - 1].slice(0, end);
+    const inner = parts.join("\n");
     set(key, quote === '"' ? unescapeDouble(inner) : inner, lineNumber);
   }
 

@@ -37,6 +37,8 @@ jobs:
       e2e-script: e2e
       # The runner image does not ship Chromium's shared libraries.
       playwright-with-deps: true
+      # Two browsers at a time on a shared runner take longer than the default half hour.
+      timeout-minutes: 60
 
   ansible:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -79,6 +81,16 @@ jobs:
           for name in tokens secrets; do
             echo "$rendered" | grep -q "policyName: sekret-sekret-operator-$name"
           done
+      - name: The chart refuses cluster-wide rights without the admission policies unless acknowledged
+        run: |
+          chart="deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com"
+          if helm template sekret $chart --set clusterWide=true --set tokenPolicy.enabled=false > /dev/null; then exit 1; fi
+          helm template sekret $chart --set clusterWide=true --set tokenPolicy.enabled=false \
+            --set tokenPolicy.acknowledgeClusterWideWithoutPolicy=true > /dev/null
+          helm template sekret $chart --set tokenPolicy.enabled=false > /dev/null
+          helm install --dry-run=client sekret $chart | grep -q 'tokenServiceAccounts is empty'
+          if helm install --dry-run=client sekret $chart --set 'tokenServiceAccounts={app}' \
+            | grep -q 'tokenServiceAccounts is empty'; then exit 1; fi
 
   docs-check:
     uses: sam-ruff/actions/.github/workflows/docs-pages.yml@v1

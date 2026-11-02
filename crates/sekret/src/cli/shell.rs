@@ -186,6 +186,10 @@ const BLOCKED_EXACT: &[&str] = &[
     "CI_API_GRAPHQL_URL",
     "AZURE_AUTHORITY_HOST",
     "CYPRESS_INSTALL_BINARY",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+    "CONTAINER_SSHKEY",
+    "BUILDKIT_HOST",
 ];
 
 const BLOCKED_PREFIXES: &[&str] = &[
@@ -288,6 +292,12 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "COMPOSER_",
     "PUPPETEER_",
     "PLAYWRIGHT_",
+    "CONTAINERS_",
+    "PODMAN_",
+    "BUILDAH_",
+    "RESTIC_",
+    "BORG_",
+    "RCLONE_",
 ];
 
 /// `INIT` covers `VIMINIT` and `EXINIT`, and `RC` the rc files tools run, such as `PSQLRC`,
@@ -890,6 +900,43 @@ mod tests {
         for fine in ["DATABASE_URL", "PSQL_HOST", "AWS_REGION", "SENTRY_DSN", "OPTS_URL"] {
             assert_eq!(policy.check(fine), Ok(()), "{fine}");
         }
+    }
+
+    /// Remote container engines and backup or sync tools, which would send a working tree or a
+    /// backup to whoever wrote the secret.
+    const REMOTE_DESTINATIONS: &[&str] = &[
+        "CONTAINER_HOST",
+        "CONTAINER_CONNECTION",
+        "CONTAINER_SSHKEY",
+        "CONTAINERS_CONF",
+        "CONTAINERS_REGISTRIES_CONF",
+        "PODMAN_CONNECTIONS_CONF",
+        "BUILDAH_ISOLATION",
+        "BUILDKIT_HOST",
+        "RESTIC_REPOSITORY",
+        "RESTIC_PASSWORD",
+        "RESTIC_REPOSITORY_FILE",
+        "BORG_REPO",
+        "BORG_PASSPHRASE",
+        "RCLONE_CONFIG_MYREMOTE_TYPE",
+        "RCLONE_CONFIG_MYREMOTE_HOST",
+        "rclone_config",
+        "container_host",
+    ];
+
+    #[test]
+    fn remote_engines_and_backup_destinations_are_refused() -> anyhow::Result<()> {
+        let policy = strict();
+        for name in REMOTE_DESTINATIONS {
+            assert!(is_blocked(name), "{name}");
+            assert_eq!(policy.check(name), Err(SkipReason::Blocked), "{name}");
+        }
+        for fine in ["CONTAINER_NAME", "BACKUP_BUCKET", "PODS_URL", "BORGES_KEY"] {
+            assert_eq!(policy.check(fine), Ok(()), "{fine}");
+        }
+        let allowed = LoadPolicy::new(["RESTIC_REPOSITORY".to_string()])?;
+        assert_eq!(allowed.check("RESTIC_REPOSITORY"), Ok(()));
+        Ok(())
     }
 
     /// Build tool settings that run a command or swap the toolchain, from the round 5 audit.

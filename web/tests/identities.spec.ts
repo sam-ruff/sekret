@@ -1,5 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-import { expectToast, navigate } from "./helpers";
+import { expect, test } from "@playwright/test";
+import { expectToast, failNext, navigate } from "./helpers";
 
 const CONFIGURED = /^\s*Configured/;
 
@@ -18,6 +18,10 @@ test("creates an identity and configures every auth method", async ({ page }) =>
   // OIDC with the GitHub Actions preset.
   const oidc = page.getByTestId("auth-method-oidc");
   await expect(oidc.getByTestId("auth-method-oidc-status")).toHaveText(/Not configured/);
+  // Unconfigured methods start collapsed.
+  await expect(oidc.getByTestId("oidc-form")).toHaveCount(0);
+  await expect(page.getByTestId("k8s-host")).toHaveCount(0);
+  await oidc.getByTestId("auth-method-oidc-setup").click();
   await oidc.getByTestId("oidc-preset-github").click();
   await expect(oidc.getByTestId("oidc-issuer")).toHaveValue("https://token.actions.githubusercontent.com");
   await expect(oidc.getByTestId("oidc-subjects")).toContainText("repo:");
@@ -27,6 +31,7 @@ test("creates an identity and configures every auth method", async ({ page }) =>
 
   // Kubernetes in JWKS mode.
   const k8s = page.getByTestId("auth-method-kubernetes");
+  await k8s.getByTestId("auth-method-kubernetes-setup").click();
   await k8s.getByTestId("k8s-mode").click();
   await page.getByTestId("k8s-mode-jwks").click();
   await k8s.getByTestId("k8s-issuer").fill("https://kubernetes.default.svc.cluster.local");
@@ -158,19 +163,6 @@ test("long OIDC subjects wrap inside the form instead of widening it", async ({ 
   }
 });
 
-async function failNext(page: Page, method: string, path: string, status: number, code: string, message: string) {
-  await page.evaluate(
-    async ([method, path, status, code, message]) => {
-      const file = "/src/api/mock/server.ts";
-      const mock = (await import(/* @vite-ignore */ file)) as {
-        mockFailNext: (method: string, path: string, status: number, code: string, message: string) => void;
-      };
-      mock.mockFailNext(method, path, status, code, message);
-    },
-    [method, path, status, code, message] as const,
-  );
-}
-
 test("sets the longest OIDC token lifetime, which survives a reload", async ({ page }) => {
   await page.goto("/org/identities");
   await page.getByTestId("identity-link-github-deploy").click();
@@ -215,8 +207,16 @@ test("rejects an OIDC binding without a subject or claim", async ({ page }) => {
   await page.getByTestId("identity-link-billing-worker").click();
   await page.getByTestId("identity-tab-auth").click();
   const oidc = page.getByTestId("auth-method-oidc");
+  await oidc.getByTestId("auth-method-oidc-setup").click();
+  // Nothing to warn about until there is an issuer.
+  await expect(oidc.getByTestId("oidc-unbounded")).toHaveCount(0);
   await oidc.getByTestId("oidc-issuer").fill("https://issuer.example.com");
+  await expect(oidc.getByTestId("oidc-unbounded")).toBeVisible();
   await expect(oidc.getByTestId("oidc-save")).toBeDisabled();
+  // Cancel folds the form away again.
+  await oidc.getByTestId("oidc-cancel").click();
+  await expect(oidc.getByTestId("oidc-form")).toHaveCount(0);
+  await expect(oidc.getByTestId("auth-method-oidc-setup")).toBeVisible();
 });
 
 test("keeps, replaces and clears a stored Kubernetes reviewer token", async ({ page }) => {

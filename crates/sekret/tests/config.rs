@@ -69,7 +69,12 @@ const fn list(key: &'static str, flag: &'static str, env: &'static str, separato
     }
 }
 
-const OPTIONS: [Opt; 40] = [
+const OPTIONS: [Opt; 41] = [
+    scalar(
+        "server.allow_shared_config",
+        "allow-shared-config",
+        "SEKRET_ALLOW_SHARED_CONFIG",
+    ),
     scalar("server.max_connections", "max-connections", "SEKRET_MAX_CONNECTIONS"),
     scalar("server.unix_socket", "unix-socket", "SEKRET_UNIX_SOCKET"),
     scalar("server.unix_socket_mode", "unix-socket-mode", "SEKRET_UNIX_SOCKET_MODE"),
@@ -1219,6 +1224,87 @@ async fn http_issuer_accepted(server: &Running, admin: &str) -> anyhow::Result<b
         StatusCode::BAD_REQUEST if body.to_string().contains("url not allowed") => Ok(false),
         other => bail!("unexpected {other}: {body}"),
     }
+}
+
+#[cfg(unix)]
+fn chmod(path: &str, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).with_context(|| format!("chmod {path}"))
+}
+
+/// A key file another user can change stops the server, unless `allow_shared_config` is set
+/// in any of the three ways, which turns the refusal into a warning.
+#[cfg(unix)]
+#[tokio::test]
+async fn allow_shared_config_starts_with_shared_key_files() -> anyhow::Result<()> {
+    const KEY: &str = "server.allow_shared_config";
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let key = sb.root_key("root.key")?;
+        chmod(&key, 0o606)?;
+        let log = sb.keyed(&key).refused().await?;
+        assert!(
+            log.contains("refusing to start") && log.contains("root key file") && log.contains("--allow-shared-config"),
+            "{way:?}: {log}"
+        );
+        let log = sb.keyed(&key).set(way, KEY, "false").refused().await?;
+        assert!(log.contains("refusing to start"), "{way:?}: {log}");
+
+        let server = sb.keyed(&key).set(way, KEY, "true").start().await?;
+        assert_eq!(server.state().await?, "unsealed", "{way:?}");
+        let log = server.log();
+        assert!(
+            log.contains("root key file") && log.contains("swap what the server trusts"),
+            "{way:?}: the refusal becomes a warning: {log}"
+        );
+        drop(server);
+
+        chmod(&key, 0o600)?;
+        let server = sb.keyed(&key).set(way, KEY, "false").start().await?;
+        assert!(!server.log().contains("swap what the server trusts"), "{way:?}");
+    }
+    Ok(())
+}
+
+/// The configuration file cannot excuse itself; only a flag or environment variable can.
+#[cfg(unix)]
+#[tokio::test]
+async fn allow_shared_config_in_a_shared_file_does_not_cover_that_file() -> anyhow::Result<()> {
+    const KEY: &str = "server.allow_shared_config";
+    let sb = Sandbox::new()?;
+    let key = sb.root_key("root.key")?;
+    let config = sb.write("shared.yaml", "server:\n  allow_shared_config: true\n")?;
+    chmod(&config, 0o666)?;
+    let config_arg = format!("--config={config}");
+    let log = sb.keyed(&key).arg(&config_arg).refused().await?;
+    assert!(
+        log.contains("configuration file") && log.contains("does not cover the file itself"),
+        "{log}"
+    );
+    for way in [Way::Flag, Way::Env] {
+        let server = sb.keyed(&key).arg(&config_arg).set(way, KEY, "true").start().await?;
+        assert!(
+            server.log().contains("decides who signs in"),
+            "{way:?}: {}",
+            server.log()
+        );
+        drop(server);
+        let log = sb.keyed(&key).arg(&config_arg).set(way, KEY, "false").refused().await?;
+        assert!(log.contains("refusing to start"), "{way:?}: {log}");
+    }
+
+    // A flag or variable saying false beats the file's true for the other files too.
+    chmod(&key, 0o606)?;
+    for way in [Way::Flag, Way::Env] {
+        let log = sb
+            .keyed(&key)
+            .set(Way::File, KEY, "true")
+            .set(way, KEY, "false")
+            .refused()
+            .await?;
+        assert!(log.contains("root key file"), "{way:?}: {log}");
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -4281,12 +4367,22 @@ async fn files_holding_a_database_password_or_in_open_directories_are_warned_abo
     std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
     let moved = moved.display().to_string();
     for way in WAYS {
-        let server = sb.launch().set(way, "seal.root_key_file", &moved).start().await?;
+        let log = sb.launch().set(way, "seal.root_key_file", &moved).refused().await?;
+        assert!(
+            log.contains("writable by every user, so anyone can replace it") && log.contains("refusing to start"),
+            "{way:?}: {log}"
+        );
+        let server = sb
+            .launch()
+            .set(way, "seal.root_key_file", &moved)
+            .arg("--allow-shared-config")
+            .start()
+            .await?;
         assert!(
             server
                 .log()
                 .contains("writable by every user, so anyone can replace it"),
-            "{way:?}: {}",
+            "{way:?}: allowed, it is a warning: {}",
             server.log()
         );
     }
@@ -4410,17 +4506,32 @@ async fn a_database_password_in_a_flag_is_warned_about() -> anyhow::Result<()> {
 /// Whoever can change the configuration file decides who signs in as an admin.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Result<()> {
+async fn a_configuration_file_others_can_change_is_refused() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new()?;
     let key = sb.root_key("root.key")?;
     let config = sb.write("own.yaml", "auth:\n  default_org_role: org-member\n")?;
     const WARNING: &str = "whoever can change it decides who signs in";
-    for (mode, warned) in [(0o600, false), (0o644, false), (0o666, true)] {
+    for mode in [0o600, 0o644] {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).context("chmod")?;
         let server = sb.keyed(&key).arg(&format!("--config={config}")).start().await?;
-        assert_eq!(server.log().contains(WARNING), warned, "{mode:o}: {}", server.log());
+        assert!(!server.log().contains(WARNING), "{mode:o}: {}", server.log());
     }
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+    let log = sb.keyed(&key).arg(&format!("--config={config}")).refused().await?;
+    assert!(log.contains(WARNING) && log.contains("refusing to start"), "{log}");
+    let server = sb
+        .keyed(&key)
+        .arg(&format!("--config={config}"))
+        .arg("--allow-shared-config")
+        .start()
+        .await?;
+    assert!(
+        server.log().contains(WARNING),
+        "allowed, it is a warning: {}",
+        server.log()
+    );
+    drop(server);
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
     let server = sb.keyed(&key).env("SEKRET_CONFIG", &config).start().await?;
     assert!(!server.log().contains(WARNING), "{}", server.log());
@@ -4432,13 +4543,12 @@ async fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Res
     let replaceable = open.join("sekret.yaml");
     std::fs::write(&replaceable, "auth:\n  default_org_role: org-member\n").context("write")?;
     std::fs::set_permissions(&replaceable, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
-    let server = sb
+    let log = sb
         .keyed(&key)
         .env("SEKRET_CONFIG", &replaceable.display().to_string())
-        .start()
+        .refused()
         .await?;
-    assert!(server.log().contains(WARNING), "{}", server.log());
-    drop(server);
+    assert!(log.contains(WARNING), "{log}");
     // So does one further up, by swapping the private directory below it.
     let nested = open.join("conf");
     std::fs::create_dir(&nested).context("dir")?;
@@ -4447,10 +4557,8 @@ async fn a_configuration_file_others_can_change_is_warned_about() -> anyhow::Res
     std::fs::write(&deep, "auth:\n  default_org_role: org-member\n").context("write")?;
     std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
     let deep = deep.display().to_string();
-    let server = sb.keyed(&key).arg(&format!("--config={deep}")).start().await?;
-    let log = server.log();
+    let log = sb.keyed(&key).arg(&format!("--config={deep}")).refused().await?;
     assert!(log.contains(WARNING) && log.contains("is below"), "{log}");
-    drop(server);
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).context("chmod")?;
     let server = sb.keyed(&key).arg(&format!("--config={deep}")).start().await?;
     assert!(!server.log().contains(WARNING), "{}", server.log());

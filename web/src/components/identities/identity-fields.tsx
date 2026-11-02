@@ -88,7 +88,7 @@ export function IdentityFields({
           id={`${idPrefix}-cidrs`}
           value={draft.trustedCidrs}
           onChange={(trustedCidrs) => onChange({ ...draft, trustedCidrs })}
-          placeholder="Such as 10.0.0.0/8, then Enter"
+          placeholder="e.g. 10.0.0.0/8"
           mono
           validate={(c) => (CIDR.test(c) ? undefined : "Use a range such as 10.0.0.0/8 or 192.168.1.5/32")}
           testId="identity-cidrs"

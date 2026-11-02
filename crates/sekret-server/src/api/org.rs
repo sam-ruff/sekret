@@ -18,7 +18,10 @@ use super::listing::{AuditParams, IdentityParams, UserParams, audit_page, page_i
 use super::projects::{api_role, builtin_roles, ensure_principal_exists, removal_escalation, validate_role};
 use super::{AuditTarget, audit, from_api_kind, to_api_kind};
 use crate::auth::{ClientIp, Principal};
-use crate::authz::{org_rules, project_rules, require_any, role_rules};
+use crate::authz::{
+    added_denies, admin_bindings, deny_needs_admin, has_denies, is_org_admin, org_management_rules, org_rules,
+    project_rules, reaches_admin, require_any, role_rules,
+};
 use crate::error::{ApiError, ApiResult};
 use crate::machine::{
     CLIENT_SECRET_PREFIX, auth_method_source, client_secret_source, redact, seal_for_storage, validate_config,
@@ -661,7 +664,11 @@ async fn revoke_identity_tokens(
 
 #[utoipa::path(get, path = "/api/v1/org/bindings", tag = "organisation", responses((status = 200, body = Vec<OrgBinding>)), security(("bearer" = [])))]
 async fn list_bindings(State(state): State<AppState>, principal: Principal) -> ApiResult<Json<Vec<OrgBinding>>> {
-    require_any(&org_rules(&state, &principal).await?, Subject::OrgMembers, Action::Read)?;
+    require_any(
+        &org_management_rules(&state, &principal).await?,
+        Subject::OrgMembers,
+        Action::Read,
+    )?;
     let users = state.store.list_users().await?;
     let identities = state.store.list_identities().await?;
     let name = |kind: PrincipalKind, id: &str| match kind {
@@ -702,9 +709,10 @@ async fn add_binding(
     principal: Principal,
     Json(request): Json<AddOrgBinding>,
 ) -> ApiResult<StatusCode> {
-    let rules = org_rules(&state, &principal).await?;
+    let rules = org_management_rules(&state, &principal).await?;
     require_any(&rules, Subject::OrgMembers, Action::Create)?;
-    if !covers(&rules, &org_role_rules(&state, &request.role).await?) {
+    let granted = org_role_rules(&state, &request.role).await?;
+    if !covers(&rules, &granted) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "escalation",
@@ -713,6 +721,17 @@ async fn add_binding(
     }
     let kind = from_api_kind(request.principal_kind);
     ensure_principal_exists(&state, kind, &request.principal_id).await?;
+    if has_denies(&granted)
+        && reaches_admin(
+            &state.store.list_users().await?,
+            &admin_bindings(&state, &[]).await?,
+            kind,
+            &request.principal_id,
+        )
+        && !is_org_admin(&state, &principal).await?
+    {
+        return Err(deny_needs_admin());
+    }
     state
         .store
         .add_org_binding(Binding {
@@ -744,7 +763,7 @@ async fn remove_binding(
     principal: Principal,
     Path((kind, id, role)): Path<(String, String, String)>,
 ) -> ApiResult<StatusCode> {
-    let rules = org_rules(&state, &principal).await?;
+    let rules = org_management_rules(&state, &principal).await?;
     require_any(&rules, Subject::OrgMembers, Action::Delete)?;
     let kind = PrincipalKind::parse(&kind).ok_or_else(|| ApiError::bad_request("unknown principal kind"))?;
     if !may_remove(&rules, &org_role_rules(&state, &role).await.unwrap_or_default()) {
@@ -797,7 +816,11 @@ async fn leaves_no_admin(state: &AppState, kind: PrincipalKind, id: &str, role: 
 
 #[utoipa::path(get, path = "/api/v1/org/roles", tag = "organisation", responses((status = 200, body = Vec<Role>)), security(("bearer" = [])))]
 async fn list_org_roles(State(state): State<AppState>, principal: Principal) -> ApiResult<Json<Vec<Role>>> {
-    require_any(&org_rules(&state, &principal).await?, Subject::OrgRoles, Action::Read)?;
+    require_any(
+        &org_management_rules(&state, &principal).await?,
+        Subject::OrgRoles,
+        Action::Read,
+    )?;
     let mut roles = builtin_roles(true);
     roles.extend(state.store.list_roles("").await?.into_iter().map(api_role));
     Ok(Json(roles))
@@ -812,7 +835,7 @@ async fn put_org_role(
     Path(slug): Path<String>,
     Json(request): Json<PutRole>,
 ) -> ApiResult<Json<Role>> {
-    let rules = org_rules(&state, &principal).await?;
+    let rules = org_management_rules(&state, &principal).await?;
     let existing = state.store.list_roles("").await?.into_iter().find(|r| r.slug == slug);
     require_any(
         &rules,
@@ -828,6 +851,23 @@ async fn put_org_role(
         && !may_remove(&rules, &dropped_rules(&existing.rules, &request.rules))
     {
         return Err(removal_escalation());
+    }
+    if let Some(existing) = &existing
+        && added_denies(&existing.rules, &request.rules)
+        && !is_org_admin(&state, &principal).await?
+    {
+        let users = state.store.list_users().await?;
+        let admins = admin_bindings(&state, &[]).await?;
+        let binds_admin = state
+            .store
+            .list_org_bindings()
+            .await?
+            .iter()
+            .filter(|b| b.role_slug == slug)
+            .any(|b| reaches_admin(&users, &admins, b.principal_kind, &b.principal_id));
+        if binds_admin {
+            return Err(deny_needs_admin());
+        }
     }
     let role = sekret_store::Role {
         id: uuid::Uuid::new_v4().to_string(),
@@ -859,7 +899,7 @@ async fn delete_org_role(
     principal: Principal,
     Path(slug): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let rules = org_rules(&state, &principal).await?;
+    let rules = org_management_rules(&state, &principal).await?;
     require_any(&rules, Subject::OrgRoles, Action::Delete)?;
     if !may_remove(&rules, &org_role_rules(&state, &slug).await.unwrap_or_default()) {
         return Err(removal_escalation());

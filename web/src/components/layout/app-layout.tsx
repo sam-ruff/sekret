@@ -65,7 +65,17 @@ function TopbarTitle() {
   // Once the list has loaded, a slug that is not in it is not shown as if it were a project.
   const name = current?.name ?? (projects ? undefined : project);
   const orgSection = pathname.startsWith("/org/") ? pathname.split("/")[2] : undefined;
-  const scope = pathname.startsWith("/org") ? "Organisation" : "Projects";
+  const scope = /^\/org(\/|$)/.test(pathname) ? "Organisation" : /^\/projects(\/|$)/.test(pathname) ? "Projects" : null;
+
+  if (!scope) {
+    return (
+      <nav className="flex min-w-0 flex-1 items-center gap-1 text-sm" aria-label="Location">
+        <span className="truncate font-medium text-foreground" data-testid="topbar-scope">
+          Not found
+        </span>
+      </nav>
+    );
+  }
 
   return (
     <nav className="flex min-w-0 flex-1 items-center gap-1 text-sm text-muted-foreground" aria-label="Location">

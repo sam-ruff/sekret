@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Camera, ChevronRight, History, Minus, Plus, RefreshCw, Undo2 } from "lucide-react";
+import { Camera, ChevronRight, History, Info, Minus, Plus, RefreshCw, Undo2 } from "lucide-react";
 import { useRef, useState } from "react";
 import { Navigate } from "react-router";
 import { api } from "@/api/endpoints";
@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/page-header";
 import { EnvTabs } from "@/components/project/env-tabs";
 import { MissingEnvironment } from "@/components/project/missing-environment";
 import { EmptyState, ErrorState, ListSkeleton } from "@/components/states";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
@@ -20,9 +21,9 @@ import { keys, useApiMutation } from "@/hooks/queries";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
-import { normalisePath } from "@/lib/paths";
 import { ROW_PAGE } from "@/lib/secret-limits";
-import { restoreSummary, snapshotTitle } from "@/lib/snapshots";
+import { folderLabel, normalisePath } from "@/lib/paths";
+import { restoreSummary, snapshotEffect, snapshotTitle, unrelatedChanges, type SnapshotEffect } from "@/lib/snapshots";
 import { cn } from "@/lib/utils";
 
 const KIND_STYLE: Record<SnapshotChange["kind"], { label: string; className: string; icon: typeof Plus }> = {
@@ -55,11 +56,77 @@ function ChangeRow({ change }: { change: SnapshotChange }) {
   );
 }
 
+const EFFECT_STYLE: Record<SnapshotEffect["kind"], { label: string; className: string; icon: typeof Plus }> = {
+  added: { label: "Added", className: "border-success/40 text-success", icon: Plus },
+  deleted: { label: "Deleted", className: "border-destructive/40 text-destructive", icon: Minus },
+  changed: { label: "Changed", className: "border-warning/50 text-warning", icon: RefreshCw },
+};
+
+function EffectRow({ effect }: { effect: SnapshotEffect }) {
+  const style = EFFECT_STYLE[effect.kind];
+  const where = effect.path === "/" ? "/" : `${effect.path}/`;
+  return (
+    <li className="flex items-center gap-3 rounded-lg border bg-card px-3 py-2" data-testid={`effect-${effect.key}`}>
+      <Badge variant="outline" className={cn("w-24 justify-start", style.className)}>
+        <style.icon /> {style.label}
+      </Badge>
+      <div className="min-w-0 flex-1 truncate font-mono text-sm">
+        <span className="text-muted-foreground">{where}</span>
+        {effect.key}
+      </div>
+    </li>
+  );
+}
+
+/** What the snapshot's own change did, worked out against the snapshot before it. */
+function ChangeEffect({
+  previous,
+  effect,
+  pending,
+  failed,
+}: {
+  previous: Snapshot | null;
+  effect: SnapshotEffect[];
+  pending: boolean;
+  failed: boolean;
+}) {
+  if (!previous) {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="effect-none">
+        This is the earliest snapshot listed, so there is nothing before it to compare with.
+      </p>
+    );
+  }
+  if (pending) return <ListSkeleton rows={1} />;
+  if (failed) {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="effect-failed">
+        sekret could not work out what this change did.
+      </p>
+    );
+  }
+  if (effect.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="effect-none">
+        It changed nothing you can see in this folder.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-2" data-testid="snapshot-effect">
+      {effect.slice(0, ROW_PAGE).map((e) => (
+        <EffectRow key={`${e.path}:${e.key}`} effect={e} />
+      ))}
+    </ul>
+  );
+}
+
 function SnapshotSheet({
   project,
   env,
   envName,
   snapshot,
+  previous,
   canRestore,
   onClose,
 }: {
@@ -67,6 +134,8 @@ function SnapshotSheet({
   env: string;
   envName: string;
   snapshot: Snapshot | null;
+  /** The snapshot just before this one, to tell what this one's change did. */
+  previous: Snapshot | null;
   canRestore: boolean;
   onClose: () => void;
 }) {
@@ -91,6 +160,12 @@ function SnapshotSheet({
     queryFn: () => api.snapshot(project, env, id, path),
     enabled: snapshot !== null,
   });
+  const previousId = previous?.id ?? "";
+  const before = useQuery({
+    queryKey: keys.snapshot(project, env, previousId, path),
+    queryFn: () => api.snapshot(project, env, previousId, path),
+    enabled: snapshot !== null && previous !== null,
+  });
 
   const restore = useApiMutation({
     mutationFn: () => api.restoreSnapshot(project, env, id, path),
@@ -106,6 +181,8 @@ function SnapshotSheet({
   const settling = normalisePath(folder) !== path;
   const removes = changes.some((c) => c.kind === "removed");
   const hiddenRows = Math.max(0, changes.length - shownRows);
+  const effect = before.data && detail.data ? snapshotEffect(before.data.changes, detail.data.changes) : [];
+  const unrelated = before.data && detail.data ? unrelatedChanges(changes, effect) : 0;
 
   return (
     <Sheet
@@ -157,9 +234,34 @@ function SnapshotSheet({
               <FieldDescription>
                 Only secrets in this folder and below are compared and restored. <span className="font-mono">/</span> is
                 the top folder, so it covers everything.
-              </FieldDescription>            </Field>
+              </FieldDescription>
+            </Field>
+            <section className="space-y-2" data-testid="effect-section">
+              <h3 className="text-sm font-semibold">What this change did</h3>
+              <ChangeEffect
+                previous={previous}
+                effect={effect}
+                pending={before.isPending || detail.isPending}
+                failed={before.isError || detail.isError}
+              />
+            </section>
             <section className="space-y-2">
               <h3 className="text-sm font-semibold">What restoring would change</h3>
+              <p className="text-sm text-muted-foreground">
+                Restoring puts {folderLabel(path)} back as it was right after this change, which undoes every change made
+                since.
+              </p>
+              {unrelated > 0 && (
+                <Alert data-testid="restore-unrelated">
+                  <Info />
+                  <AlertDescription>
+                    {unrelated === 1
+                      ? "1 of these changes is to a secret this change did not touch."
+                      : `${unrelated} of these changes are to secrets this change did not touch.`}{" "}
+                    To undo one secret, use Roll back in its history instead.
+                  </AlertDescription>
+                </Alert>
+              )}
               {detail.isPending && <ListSkeleton rows={3} />}
               {detail.error && <ErrorState error={detail.error} onRetry={() => void detail.refetch()} />}
               {detail.isSuccess && changes.length === 0 && (
@@ -232,10 +334,19 @@ export function SnapshotsPage() {
   }
 
   const canRestore = perms.can("snapshots", "edit", { environment: envSlug });
+  // The list is newest first, so the one before a snapshot comes after it.
+  const previousOf = (snapshot: Snapshot | null): Snapshot | null => {
+    const index = list.data?.findIndex((s) => s.id === snapshot?.id) ?? -1;
+    if (index < 0) return null;
+    return list.data?.[index + 1] ?? null;
+  };
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Snapshots" description="Every change saves the state of an environment. Restore one to undo a bad change." />
+      <PageHeader
+        title="Snapshots"
+        description="Each change saves the whole environment. Restoring one puts every secret back as it was then, including undoing later changes. To undo one secret, use Roll back in its history."
+      />
       {environments.error && <ErrorState error={environments.error} onRetry={() => void environments.refetch()} />}
       {environments.isPending && <ListSkeleton rows={5} />}
       {environments.isSuccess && envs.length === 0 && (
@@ -292,6 +403,7 @@ export function SnapshotsPage() {
             env={envSlug}
             envName={env.name}
             snapshot={open}
+            previous={previousOf(open)}
             canRestore={canRestore}
             onClose={() => setOpen(null)}
           />

@@ -178,8 +178,9 @@ test("hides history values until asked, then diffs versions and rolls back", asy
 
   await drawer.getByTestId("rollback-2").click();
   await expect(page.getByTestId("rollback-confirm")).toContainText(
-    'Its comment becomes "Rolled back to version 2" followed by that version\'s comment.',
+    "LOG_LEVEL gets a new version with the value and tags from version 2. The current value stays in history.",
   );
+  await expect(page.getByTestId("rollback-confirm")).not.toContainText("Its comment becomes");
   await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
   await expectToast(page, "Rolled LOG_LEVEL back to version 2");
   // The restored version's comment comes back with the rollback noted in front of it.

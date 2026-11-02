@@ -30,9 +30,9 @@ export function SecretDefaultsCard({ project, canEdit }: { project: string; canE
       <CardHeader>
         <CardTitle>Secret defaults</CardTitle>
         <CardDescription>
-          How sekret generates and rotates values for secrets that do not set their own policy. When off, sekret only stores
-          values you type. Automatic rotation only ever replaces values sekret generated, never ones that were typed or
-          imported.
+          How sekret generates and rotates values for secrets that do not set their own policy. Without project defaults,
+          Generate makes 32 letters and digits and nothing rotates unless a secret sets its own policy. Automatic rotation
+          only ever replaces values sekret generated, never ones that were typed or imported.
         </CardDescription>
       </CardHeader>
       {policy.isPending && (
@@ -71,7 +71,7 @@ function DefaultsForm({ project, policy, canEdit }: { project: string; policy: S
         <Field orientation="horizontal">
           <Switch id="defaults-on" checked={on} disabled={!canEdit} onCheckedChange={setOn} data-testid="defaults-enabled" />
           <FieldLabel htmlFor="defaults-on" className="font-normal">
-            Use project defaults for generated secrets
+            Set project-wide generation and rotation
           </FieldLabel>
         </Field>
         {on ? (
@@ -102,7 +102,7 @@ function DefaultsForm({ project, policy, canEdit }: { project: string; policy: S
           <p className="text-sm text-muted-foreground" data-testid="defaults-summary">
             {initiallyOn && !on
               ? "Saving turns the defaults off. Secrets with their own policy keep it."
-              : "Off. Generating uses 32 letters and digits, and nothing rotates unless a secret sets its own policy."}
+              : "Off. Generate makes 32 letters and digits, and nothing rotates unless a secret sets its own policy."}
           </p>
         )}
         {on && !problem && (

@@ -2699,7 +2699,7 @@
           }
         ],
         "requestBody": {
-          "description": "PNG, JPEG, GIF, WebP or SVG, at most 512 KiB",
+          "description": "PNG, JPEG, GIF or WebP, at most 512 KiB and 4096 pixels on a side. SVG is refused; convert it to PNG first.",
           "content": {
             "application/octet-stream": {
               "schema": {
@@ -2729,6 +2729,16 @@
             }
           },
           "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`, or `logo_busy` while the caller's previous upload is still being processed",
             "content": {
               "application/json": {
                 "schema": {

@@ -30,6 +30,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.clusterWide .Values.watchNamespaces }}
 {{- fail "set either clusterWide or watchNamespaces, not both" }}
 {{- end }}
+{{- if and .Values.clusterWide (not .Values.tokenPolicy.enabled) (not .Values.tokenPolicy.acknowledgeClusterWideWithoutPolicy) }}
+{{- fail "clusterWide with tokenPolicy.enabled false lets the operator mint any token for any service account in the cluster; keep tokenPolicy on, watch named namespaces, or set tokenPolicy.acknowledgeClusterWideWithoutPolicy to accept that" }}
+{{- end }}
 {{- if .Values.clusterWide }}
 {{- list | toJson }}
 {{- else }}

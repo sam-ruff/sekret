@@ -65,6 +65,30 @@ describe("parseDotenv", () => {
     expect(result.issues.map((i) => i.line)).toEqual([2, 3, 4]);
   });
 
+  it("lets a backslash at the end of a line escape only the newline", () => {
+    const result = parseDotenv('A="one\\\ntwo"\nB=2');
+    expect(result.entries).toEqual([
+      { key: "A", value: "one\\\ntwo" },
+      { key: "B", value: "2" },
+    ]);
+  });
+
+  it("closes a multi-line value on a later line and keeps the lines after it", () => {
+    const result = parseDotenv('A="x\n\n\ny" trailing\nB=2');
+    expect(result.entries).toEqual([
+      { key: "A", value: "x\n\n\ny" },
+      { key: "B", value: "2" },
+    ]);
+  });
+
+  it("parses a huge unterminated double quote in linear time", () => {
+    const started = performance.now();
+    const result = parseDotenv(`A="${"x\n".repeat(200_000)}`);
+    // The old parser took minutes on this; a linear one takes milliseconds.
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(result.issues).toEqual([{ line: 1, message: "unterminated quote for A" }]);
+  });
+
   it("normalises Windows line endings", () => {
     expect(parseDotenv("A=1\r\nB=2\r\n").entries).toEqual([
       { key: "A", value: "1" },

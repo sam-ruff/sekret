@@ -265,6 +265,7 @@ async fn a_rotation_past_an_unreadable_project_key_still_unlocks(db: String) -> 
             fingerprint: root(&h)?.fingerprint(),
             seal: None,
             integrity_key: None,
+            revoke_credentials: false,
         })
         .await?;
 
@@ -351,6 +352,7 @@ async fn a_mark_left_behind_by_a_key_change_is_reported(db: String) -> anyhow::R
         marks: high_water(&[]),
         skip_unreadable: false,
         epoch_files: &paths,
+        new_integrity_key: false,
     };
     let report = rotate_root_key(h.state.store.as_ref(), &old, &new, None, rotation).await;
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).context("chmod")?;

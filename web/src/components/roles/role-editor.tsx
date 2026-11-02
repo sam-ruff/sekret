@@ -21,7 +21,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { DiscardInline } from "@/components/discard-dialog";
 import { FormBlocker } from "@/components/form-blocker";
+import { useDiscardGuard } from "@/hooks/use-discard-guard";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -29,6 +31,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { isEscalation, errorMessage } from "@/lib/errors";
 import { slugify } from "@/lib/format";
+import { keyPatternCanMatch, pathPatternCanMatch } from "@/lib/glob";
 import { cn } from "@/lib/utils";
 import {
   ACTION_LABELS,
@@ -81,6 +84,7 @@ function ConditionsBuilder({
               <Checkbox
                 checked={rule.environments.includes(slug)}
                 disabled={readOnly}
+                aria-label={`${SUBJECT_LABELS[rule.subject]} only in ${slug}`}
                 onCheckedChange={(on) => toggleEnv(slug, on === true)}
                 data-testid={`condition-env-${rule.subject}-${slug}`}
               />
@@ -95,10 +99,14 @@ function ConditionsBuilder({
         <ListInput
           value={rule.paths}
           onChange={(paths) => onChange({ paths })}
-          placeholder="/app/** then Enter"
+          placeholder="e.g. /app/**"
           mono
           disabled={readOnly}
-          validate={(p) => (p.startsWith("/") ? undefined : "Paths start with /")}
+          validate={(p) =>
+            pathPatternCanMatch(p)
+              ? undefined
+              : "This can never match: folders look like /payments or /payments/**, starting with / and without a trailing /"
+          }
           testId={`condition-paths-${rule.subject}`}
         />
       </div>
@@ -107,9 +115,14 @@ function ConditionsBuilder({
         <ListInput
           value={rule.keys}
           onChange={(keys) => onChange({ keys })}
-          placeholder="DB_* then Enter"
+          placeholder="e.g. DB_*"
           mono
           disabled={readOnly}
+          validate={(k) =>
+            keyPatternCanMatch(k)
+              ? undefined
+              : "This can never match: keys start with a letter or _ and hold only letters, digits, _, - and ."
+          }
           testId={`condition-keys-${rule.subject}`}
         />
       </div>
@@ -119,7 +132,7 @@ function ConditionsBuilder({
           value={rule.tags}
           onChange={(tags) => onChange({ tags })}
           normalise={slugify}
-          placeholder="database then Enter"
+          placeholder="e.g. database"
           disabled={readOnly}
           testId={`condition-tags-${rule.subject}`}
         />
@@ -191,6 +204,7 @@ function RuleRow({
               <Checkbox
                 checked={rule.actions.includes(action)}
                 disabled={readOnly}
+                aria-label={`${SUBJECT_LABELS[rule.subject]}${extra ? " (additional rule)" : ""}: ${ACTION_LABELS[action]}`}
                 onCheckedChange={(on) =>
                   onChange({
                     actions: on === true ? ACTIONS.filter((a) => a === action || rule.actions.includes(a)) : rule.actions.filter((a) => a !== action),
@@ -238,6 +252,11 @@ function RuleRow({
   );
 }
 
+/** The editable parts of the form, compared to tell whether anything is unsaved. */
+function formSnapshot(name: string, slug: string, description: string, rows: EditableRule[]): string {
+  return JSON.stringify({ name, slug, description, rules: toRules(rows) });
+}
+
 export function RoleEditor({
   open,
   onOpenChange,
@@ -256,6 +275,8 @@ export function RoleEditor({
   const [rows, setRows] = useState<EditableRule[]>(() => toEditable(role?.rules ?? [], subjects));
   const [problem, setProblem] = useState<{ escalation: boolean; message: string }>();
   const [busy, setBusy] = useState(false);
+  const [initialForm] = useState(() => formSnapshot(name, slug, description, rows));
+  const discard = useDiscardGuard(!readOnly && formSnapshot(name, slug, description, rows) !== initialForm);
 
   const update = (id: string, patch: Partial<EditableRule>) => {
     setProblem(undefined);
@@ -290,7 +311,14 @@ export function RoleEditor({
   const blocker = !name.trim() ? "Give the role a name to save it." : !slug ? "Give the role an ID to save it." : null;
 
   return (
-    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (busy) return;
+        if (next) onOpenChange(true);
+        else discard.guard(() => onOpenChange(false));
+      }}
+    >
       <DialogContent
         className="max-h-[92svh] gap-0 overflow-hidden p-0 sm:max-w-5xl"
         onCloseAutoFocus={onCloseAutoFocus}
@@ -305,6 +333,11 @@ export function RoleEditor({
                 : "Tick what the role may do. Deny rules always win over allow rules."}
             </DialogDescription>
           </DialogHeader>
+          {discard.prompt.open && (
+            <div className="border-b p-4 sm:px-6">
+              <DiscardInline {...discard.prompt} />
+            </div>
+          )}
           {/* Relative, so the checkboxes' hidden inputs stay inside the scrolling area rather than stretching the dialog. */}
           <div className="relative min-h-0 flex-1 space-y-6 overflow-y-auto p-4 sm:p-6">
             {!readOnly && (

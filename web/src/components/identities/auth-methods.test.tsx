@@ -31,6 +31,7 @@ describe("AuthMethods", () => {
     renderWithProviders(<AuthMethods identityId="id-1" canEdit />, { client });
 
     const k8s = await screen.findByTestId("auth-method-kubernetes");
+    await userEvent.click(screen.getByTestId("auth-method-kubernetes-setup"));
     await userEvent.type(screen.getByTestId("k8s-host"), "https://k8s.example:6443");
     await userEvent.type(screen.getByTestId("k8s-reviewer-jwt"), TOKEN);
     await userEvent.type(screen.getByTestId("k8s-namespaces-input"), "billing{Enter}");
@@ -50,6 +51,7 @@ describe("AuthMethods", () => {
     renderWithProviders(<AuthMethods identityId="id-1" canEdit />, { client });
 
     await screen.findByTestId("auth-method-kubernetes");
+    await userEvent.click(screen.getByTestId("auth-method-kubernetes-setup"));
     await userEvent.type(screen.getByTestId("k8s-host"), "https://k8s.example:6443");
     await userEvent.type(screen.getByTestId("k8s-reviewer-jwt"), TOKEN);
     await userEvent.type(screen.getByTestId("k8s-namespaces-input"), "billing{Enter}");
@@ -59,5 +61,36 @@ describe("AuthMethods", () => {
     await waitFor(() => expect(mocked.putAuthMethod).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(client.getMutationCache().getAll()).toHaveLength(0));
     expect(screen.getByTestId("k8s-reviewer-jwt")).toHaveValue(TOKEN);
+  });
+
+  it("keeps unconfigured methods collapsed until someone sets one up, and Cancel collapses it again", async () => {
+    renderWithProviders(<AuthMethods identityId="id-1" canEdit />);
+    await userEvent.click(await screen.findByTestId("auth-method-oidc-setup"));
+    expect(screen.getByTestId("oidc-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("k8s-host")).toBeNull();
+    // No warning about unbound tokens before there is an issuer.
+    expect(screen.queryByTestId("oidc-unbounded")).toBeNull();
+    await userEvent.type(screen.getByTestId("oidc-issuer"), "https://issuer.example.com");
+    expect(screen.getByTestId("oidc-unbounded")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("oidc-cancel"));
+    expect(screen.queryByTestId("oidc-form")).toBeNull();
+    expect(screen.getByTestId("auth-method-oidc-setup")).toBeInTheDocument();
+  });
+
+  it("shows configured methods in full, without a Cancel, and only a note to readers", async () => {
+    mocked.authMethods.mockResolvedValue([
+      {
+        kind: "oidc",
+        issuer: "https://issuer.example.com",
+        jwks_url: null,
+        max_token_lifetime: 3600,
+        bindings: { audiences: ["sekret"], subjects: ["repo:a/b:*"], claims: {} },
+      },
+    ]);
+    renderWithProviders(<AuthMethods identityId="id-1" canEdit={false} />);
+    expect(await screen.findByTestId("oidc-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("oidc-cancel")).toBeNull();
+    expect(screen.queryByTestId("auth-method-kubernetes-setup")).toBeNull();
+    expect(screen.getByTestId("auth-method-kubernetes")).toHaveTextContent("Not set up.");
   });
 });

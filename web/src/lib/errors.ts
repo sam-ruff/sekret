@@ -6,7 +6,15 @@ const FRIENDLY: Record<string, string> = {
   backup_in_progress: "Another backup is being made. Try again when it finishes.",
   passphrase_required: "Confirm this change with the current passphrase.",
   reauthentication_required: "Sign in again to approve this.",
+  logo_busy: "Your previous logo is still being processed. Upload one at a time, and try again in a moment.",
 };
+
+const DENY_FOR_ADMIN = "only an admin can bind deny rules to an admin";
+
+/** Binding a deny to an admin, which only an admin may do; not a case of granting too much. */
+export function isDenyForAdmin(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && error.message === DENY_FOR_ADMIN;
+}
 
 /** Browsers' wording when a request or a lazily loaded part of the page could not be fetched. */
 const UNREACHABLE = [/failed to fetch/i, /networkerror/i, /load failed/i, /dynamically imported module/i, /importing a module script failed/i];
@@ -23,6 +31,9 @@ export function errorMessage(error: unknown): string {
 function apiErrorMessage(error: ApiError): string {
   const friendly = FRIENDLY[error.code];
   if (friendly) return friendly;
+  if (isDenyForAdmin(error)) {
+    return "Only an admin can give deny rules to an admin, so that nobody else can lock the admins out";
+  }
   if (error.status === 413) {
     return "That is too large for the server to accept. Make it smaller, or split it into several changes.";
   }
@@ -46,7 +57,7 @@ export function backoffSeconds(error: unknown): number | null {
 }
 
 export function isEscalation(error: unknown): error is ApiError {
-  return error instanceof ApiError && error.status === 403 && error.code === "escalation";
+  return error instanceof ApiError && error.status === 403 && error.code === "escalation" && !isDenyForAdmin(error);
 }
 
 /** The change was saved, but the seal mark file outside the database is behind and needs repair on the host. */

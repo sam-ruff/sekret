@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { globMatch } from "./glob";
+import { globMatch, keyPatternCanMatch, pathPatternCanMatch } from "./glob";
+
+describe("pattern shapes", () => {
+  it("agrees with the server on folder patterns that can never match", () => {
+    for (const good of ["/", "/**", "/payments", "/payments/**", "/a/*/b", "/app.v2/?x", "/**/db"]) {
+      expect(pathPatternCanMatch(good), good).toBe(true);
+    }
+    for (const bad of ["", "payments/**", "/payments/", "/payments//**", "//", "/a/./b", "/a/../b", "/a/..", "/a b", "/pay$ments"]) {
+      expect(pathPatternCanMatch(bad), bad).toBe(false);
+    }
+  });
+
+  it("agrees with the server on key patterns that can never match", () => {
+    for (const good of ["DB_*", "*", "_X", "?ATH", "stripe.key-1"]) expect(keyPatternCanMatch(good), good).toBe(true);
+    for (const bad of ["", "1DB", "-X", "DB KEY", "DB/*", "DB$"]) expect(keyPatternCanMatch(bad), bad).toBe(false);
+  });
+});
 
 const path = (pattern: string, text: string) => globMatch(pattern, text, "/");
 

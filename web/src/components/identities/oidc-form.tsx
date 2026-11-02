@@ -32,9 +32,11 @@ interface OidcFormProps {
   busy: boolean;
   disabled?: boolean;
   onSave: (config: OidcAuthConfig) => void;
+  /** Shown as a Cancel button, for a method still being set up. */
+  onCancel?: () => void;
 }
 
-export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
+export function OidcForm({ initial, busy, disabled, onSave, onCancel }: OidcFormProps) {
   const [issuer, setIssuer] = useState(initial?.issuer ?? "");
   const [jwksUrl, setJwksUrl] = useState(initial?.jwks_url ?? "");
   const [audiences, setAudiences] = useState<string[]>(initial?.bindings.audiences ?? ["sekret"]);
@@ -125,7 +127,7 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
             onChange={setSubjects}
             mono
             disabled={disabled}
-            placeholder="repo:org/repo:* then Enter"
+            placeholder="e.g. repo:org/repo:*"
             testId="oidc-subjects"
           />
           <FieldDescription>Globs over the sub claim; * matches anything.</FieldDescription>
@@ -154,7 +156,7 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
                 onChange={(globs) => updateClaim(claim.id, { globs })}
                 mono
                 disabled={disabled}
-                placeholder="Glob then Enter"
+                placeholder="e.g. my-org"
                 testId="oidc-claim-globs"
               />
             </div>
@@ -195,14 +197,20 @@ export function OidcForm({ initial, busy, disabled, onSave }: OidcFormProps) {
           </>
         )}
       />
-      {unbounded && (
+      {/* Only once there is an issuer to accept every token from. */}
+      {unbounded && issuer.trim() !== "" && (
         <p className="flex items-start gap-2 text-sm text-muted-foreground" data-testid="oidc-unbounded">
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
           Bind at least one subject or claim so not every token from this issuer is accepted.
         </p>
       )}
       {!disabled && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
+          {onCancel && (
+            <Button type="button" variant="outline" onClick={onCancel} disabled={busy} data-testid="oidc-cancel">
+              Cancel
+            </Button>
+          )}
           <Button type="submit" disabled={!valid || busy} data-testid="oidc-save">
             {busy && <Spinner />}
             Save OIDC

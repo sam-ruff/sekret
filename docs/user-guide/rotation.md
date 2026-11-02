@@ -45,6 +45,8 @@ sekret secrets policy SESSION_KEY
 
 The last command shows the policy in force, where it comes from and the next rotation time.
 
+In the web interface the project default is under *Settings > General > Secret defaults*. With it off, *Generate* makes 32 letters and digits and nothing rotates unless a secret sets its own policy. A secret's drawer says what *Project default* currently means for it. For a typed value with nothing set up to generate it, the drawer's button reads *Replace with a generated value* rather than *Rotate now*, and asks before replacing it.
+
 Changing the project default needs the right to edit settings and unrestricted rights to create and edit secrets, because it changes every inheriting secret. Changing one secret's policy needs the right to edit that secret.
 
 ## How rotation runs

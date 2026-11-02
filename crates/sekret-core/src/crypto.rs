@@ -37,17 +37,45 @@ pub struct RootKey([u8; KEY_LEN]);
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DataKey([u8; KEY_LEN]);
 
-/// Whether 32 bytes of key material are printable text, such as a password, rather than raw
-/// random bytes. Random bytes are all printable about once in 10^14.
+/// Whether 32 bytes of key material are text, such as a password in any language, rather than
+/// raw random bytes. Random bytes are valid text far less than once in 10^12.
 fn printable_text(material: &[u8]) -> bool {
-    material.iter().all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+    std::str::from_utf8(material).is_ok_and(|text| text.chars().all(|c| !c.is_control() || c.is_whitespace()))
+}
+
+/// Fewer distinct byte values than this in 32 bytes means they were not drawn at random.
+const MIN_DISTINCT_KEY_BYTES: usize = 16;
+/// Consecutive bytes stepping by the same amount this many times, such as all zeros or
+/// `00 01 02 ...`. Random bytes do so about once in 10^15.
+const MAX_KEY_STEP_RUN: usize = 8;
+
+/// Whether 32 key bytes could have come from a random source.
+fn looks_random(key: &[u8]) -> bool {
+    let mut seen = [false; 256];
+    for byte in key {
+        seen[usize::from(*byte)] = true;
+    }
+    if seen.iter().filter(|s| **s).count() < MIN_DISTINCT_KEY_BYTES {
+        return false;
+    }
+    let mut run = 0;
+    let mut previous = None;
+    for pair in key.windows(2) {
+        let step = pair[1].wrapping_sub(pair[0]);
+        run = if previous == Some(step) { run + 1 } else { 0 };
+        if run + 1 >= MAX_KEY_STEP_RUN {
+            return false;
+        }
+        previous = Some(step);
+    }
+    true
 }
 
 /// Decodes key material straight into `out`, so no stray copy of the key is left on the stack.
-/// Raw material must be exactly 32 bytes that are not printable text.
+/// Raw material must be exactly 32 bytes that are not text. Either way the key must look random.
 pub(crate) fn fill_from_material(material: &[u8], out: &mut [u8; KEY_LEN]) -> Result<(), CryptoError> {
     if material.len() == KEY_LEN {
-        if printable_text(material) {
+        if printable_text(material) || !looks_random(material) {
             return Err(CryptoError::InvalidKey);
         }
         out.copy_from_slice(material);
@@ -55,11 +83,21 @@ pub(crate) fn fill_from_material(material: &[u8], out: &mut [u8; KEY_LEN]) -> Re
     }
     let text = std::str::from_utf8(material).map_err(|_| CryptoError::InvalidKey)?;
     let decoded = decode_key_text(text.trim(), &[&STANDARD]).ok_or(CryptoError::InvalidKey)?;
-    if decoded.len() != KEY_LEN {
+    if decoded.len() != KEY_LEN || !looks_random(&decoded) {
         return Err(CryptoError::InvalidKey);
     }
     out.copy_from_slice(&decoded);
     Ok(())
+}
+
+/// Fills `out` with random key bytes that [`fill_from_material`] accepts back from a file.
+pub(crate) fn fill_random_key(out: &mut [u8; KEY_LEN]) -> Result<(), CryptoError> {
+    loop {
+        fill_random(out)?;
+        if looks_random(out) && !printable_text(out) {
+            return Ok(());
+        }
+    }
 }
 
 /// Hex, or else base64 under the first of `engines` that accepts it, decoded into a buffer
@@ -105,7 +143,7 @@ impl RootKey {
 
     pub fn generate() -> Result<Self, CryptoError> {
         let mut key = Self([0u8; KEY_LEN]);
-        fill_random(&mut key.0)?;
+        fill_random_key(&mut key.0)?;
         Ok(key)
     }
 
@@ -468,7 +506,7 @@ mod tests {
 
     #[test]
     fn root_key_parses_raw_base64_and_hex() -> anyhow::Result<()> {
-        let raw = [7u8; 32];
+        let raw: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(149).wrapping_add(0x9b) ^ (i as u8 >> 2));
         let a = RootKey::parse(&raw).context("raw")?;
         let b = RootKey::parse(format!("{}\n", STANDARD.encode(raw)).as_bytes()).context("b64")?;
         let c = RootKey::parse(hex::encode(raw).as_bytes()).context("hex")?;
@@ -484,11 +522,64 @@ mod tests {
         assert_eq!(password.len(), KEY_LEN);
         assert_eq!(RootKey::parse(password).err(), Some(CryptoError::InvalidKey));
         assert_eq!(RootKey::parse(&[b'a'; 32]).err(), Some(CryptoError::InvalidKey));
-        let mut raw = [b'a'; 32];
+        let mut raw = *password;
         raw[5] = 0xfe;
-        RootKey::parse(&raw).context("one byte outside text makes it raw")?;
+        RootKey::parse(&raw).context("one byte that is not text makes it raw")?;
         // The same text as base64 is a real key, so encoded keys are unaffected.
         RootKey::parse(STANDARD.encode(password).as_bytes()).context("base64")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_ascii_password_is_not_a_raw_key() -> anyhow::Result<()> {
+        let mut password = "pässwörd-für-den-sekret-server".as_bytes().to_vec();
+        password.resize(KEY_LEN, b'!');
+        assert_eq!(password.len(), KEY_LEN);
+        assert_eq!(RootKey::parse(&password).err(), Some(CryptoError::InvalidKey));
+        assert_eq!(
+            crate::seal::DeviceKey::parse(&password).err(),
+            Some(CryptoError::InvalidKey),
+            "device keys share the check"
+        );
+        password.pop();
+        password.push(b'\n');
+        assert_eq!(RootKey::parse(&password).err(), Some(CryptoError::InvalidKey));
+        Ok(())
+    }
+
+    #[test]
+    fn patterned_key_material_is_refused_however_it_is_encoded() -> anyhow::Result<()> {
+        let zeros = [0u8; KEY_LEN];
+        let counting: [u8; KEY_LEN] = std::array::from_fn(|i| i as u8 + 0x80);
+        for bytes in [zeros, counting, [0xffu8; KEY_LEN]] {
+            assert_eq!(RootKey::parse(&bytes).err(), Some(CryptoError::InvalidKey));
+            assert_eq!(
+                RootKey::parse(hex::encode(bytes).as_bytes()).err(),
+                Some(CryptoError::InvalidKey)
+            );
+            assert_eq!(
+                RootKey::parse(STANDARD.encode(bytes).as_bytes()).err(),
+                Some(CryptoError::InvalidKey)
+            );
+        }
+        assert_eq!(
+            RootKey::parse("0".repeat(64).as_bytes()).err(),
+            Some(CryptoError::InvalidKey)
+        );
+        assert_eq!(
+            RootKey::parse(format!("{}=", "A".repeat(43)).as_bytes()).err(),
+            Some(CryptoError::InvalidKey)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_keys_always_parse_back() -> anyhow::Result<()> {
+        for _ in 0..256 {
+            let key = RootKey::generate().context("root")?;
+            let parsed = RootKey::parse(key.to_key_file_text().as_bytes()).context("parse")?;
+            assert_eq!(parsed.fingerprint(), key.fingerprint());
+        }
         Ok(())
     }
 

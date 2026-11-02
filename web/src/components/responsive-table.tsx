@@ -12,6 +12,8 @@ export interface Column<T> {
   actions?: boolean;
   /** Mark the column that titles each card on narrow screens. */
   primary?: boolean;
+  /** Prose that may run over several lines: on narrow screens it sits under its label, left-aligned. */
+  long?: boolean;
 }
 
 interface ResponsiveTableProps<T> {
@@ -58,6 +60,7 @@ export function ResponsiveTable<T>({ rows, columns, rowKey, rowTestId, onRowClic
                     "col-span-2 flex min-w-0 items-center justify-between gap-4 md:table-cell md:px-4 md:py-3 md:align-middle",
                     c.primary && "col-span-1 col-start-1 row-start-1 font-medium",
                     c.actions && "col-span-1 col-start-2 row-start-1 justify-end self-start",
+                    c.long && "max-md:flex-col max-md:items-start max-md:gap-0.5",
                     c.className,
                   )}
                 >
@@ -69,7 +72,7 @@ export function ResponsiveTable<T>({ rows, columns, rowKey, rowTestId, onRowClic
                       "min-w-0",
                       c.actions ? "flex items-center justify-end gap-2" : "md:contents",
                       // Values sit against the right edge of a card, wrapped onto several lines or not.
-                      !c.primary && !c.actions && "max-md:text-right",
+                      !c.primary && !c.actions && !c.long && "max-md:text-right",
                     )}
                   >
                     {c.cell(row)}

@@ -13,6 +13,6 @@ export function environmentDeleteText(count: number | undefined, failed: boolean
   const secrets = count === 1 ? "1 secret" : `${count} secrets`;
   return {
     blocked: true,
-    text: `It still holds ${secrets}, counting its folders. Only an empty environment can be deleted, so delete or move them first.`,
+    text: `It still holds ${secrets}, counting its folders. Only an empty environment can be deleted, so delete those secrets first.`,
   };
 }

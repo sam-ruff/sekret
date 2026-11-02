@@ -33,17 +33,18 @@ helm install sekret-operator deploy/helm/sekret-operator \
 | `sekret.clientCertificate.secretName` | none | A `kubernetes.io/tls` Secret to present to a server that requires mutual TLS. |
 | `watchNamespaces` | the release namespace | The namespaces to watch, each with its own `Role`. |
 | `clusterWide` | `false` | Watches every namespace with a `ClusterRole`. Cannot be combined with `watchNamespaces`. |
-| `tokenServiceAccounts` | all | Names of the only service accounts the operator may read and mint tokens for, in every watched namespace. |
+| `tokenServiceAccounts` | all | Names of the only service accounts the operator may read and mint tokens for, in every watched namespace. Kubernetes enforces this through RBAC, so set it: the opt-in annotation below is only checked by the operator. The install notes warn while it is empty. |
 | `serviceAccount.create` | `true` | Creates the operator's own service account. With `false`, name an existing account in `serviceAccount.name`. |
 | `serviceAccount.name` | the release name | The operator's service account. Required when `serviceAccount.create` is `false`. The chart refuses `default`, since every pod in the namespace that names no account runs as it and would get the operator's rights. |
 | `tokenPolicy.enabled` | `true` | Installs two `ValidatingAdmissionPolicy` objects. One lets the operator request only tokens with the `sekret` audience that expire within ten minutes, and none in `kube-system`. The other lets it write only the `Secret` types listed below and no `kubernetes.io/service-account.*` annotations, so it cannot have the cluster fill in a long-lived service account token instead. It also limits the operator to `Secret`s it manages: each must carry the label `app.kubernetes.io/managed-by: sekret-operator` and be controlled by a `SekretSecret`, an update may not move a `Secret` to another owner or take over one that has none, and nothing may be written in `kube-system`. So a bug in the operator, or someone holding its token, cannot overwrite your other `Secret`s. This guards what the operator writes, not what it reads: it can still read every `Secret` its role reaches. Needs Kubernetes 1.30 or later; set it to `false` on older clusters. |
+| `tokenPolicy.acknowledgeClusterWideWithoutPolicy` | `false` | The chart refuses `clusterWide: true` with `tokenPolicy.enabled: false`, since the operator could then mint any token for any service account in the cluster. Set this to `true` to accept that. |
 
 !!! warning "Cluster-wide mode is close to cluster-admin"
     With `clusterWide: true` the operator can read and write every `Secret` in the cluster and mint a token for any service account, including powerful ones in `kube-system`. Anyone who takes over the operator's pod or token gets the same reach. The token policy narrows what those tokens can be used for, but prefer listing namespaces in `watchNamespaces` unless you really need every one.
 
 The chart's old `watchNamespace` value has gone. A release that still sets it fails to render, with a message saying to use `watchNamespaces` or `clusterWide` instead.
 
-When running the binary directly, `sekret operator` needs either `--namespace web,api` (or `SEKRET_OPERATOR_NAMESPACE`) or `--all-namespaces` (or `SEKRET_OPERATOR_ALL_NAMESPACES=true`). It does not fall back to watching the whole cluster. `--allow-insecure-http` (or `SEKRET_OPERATOR_ALLOW_INSECURE_HTTP`) matches `sekret.allowInsecureHttp`.
+When running the binary directly, `sekret operator` needs either `--namespace web,api` (or `SEKRET_OPERATOR_NAMESPACE`) or `--all-namespaces` (or `SEKRET_OPERATOR_ALL_NAMESPACES=true`). It does not fall back to watching the whole cluster. `--allow-insecure-http` (or `SEKRET_OPERATOR_ALLOW_INSECURE_HTTP`) matches `sekret.allowInsecureHttp`. The operator uses `HTTPS_PROXY` and `NO_PROXY` only for an `https://` server; a plain `http://` or loopback server is always reached directly, so a proxy never sees its tokens in the clear.
 
 ## Configure sekret
 
@@ -52,6 +53,8 @@ Create a machine identity with a [Kubernetes auth method](../user-guide/machine-
 ## Let a service account be used
 
 The operator only mints a token for a service account that carries the annotation `sekret.sam-ruff.github.io/allow-sekretsecret: "true"`. Without it, the `SekretSecret` stays not ready with the reason `ServiceAccountNotAllowed`, and no token is requested.
+
+The annotation is a check inside the operator, not a cluster control. Its RBAC still lets it mint tokens for every service account in the watched namespaces, so a bug, or someone holding the operator's token, could skip the check. `tokenServiceAccounts` is the version Kubernetes enforces: list the accounts there as well.
 
 !!! warning "Creating a SekretSecret is a powerful right"
     The operator acts with its own rights, not those of whoever created the `SekretSecret`. Anyone who can create a `SekretSecret` in a namespace, and read the `Secret` it writes, can use the sekret access of every opted-in service account there, without being allowed to create pods or tokens for those accounts. Grant `create` on `sekretsecrets` only to people who may already act as those service accounts. The right to annotate service accounts (`update` or `patch` on `serviceaccounts`) is just as powerful, because it can opt an account in. Give each workload its own service account and opt in only the ones meant for the operator.

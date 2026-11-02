@@ -868,24 +868,15 @@ async fn project_logos(db: String) -> anyhow::Result<()> {
     };
     let (status, _) = upload(h.admin.clone(), b"\x89PNG\r\n\x1a\nnot really a png".to_vec()).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "image headers alone are not enough");
-    // A scripted SVG is rendered to pixels; the script cannot reach what is stored and served.
+    // SVGs are refused outright; the web interface converts them to PNG before uploading.
     let svg_attack =
         br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><script>alert(1)</script><rect width="4" height="4"/></svg>"#
             .to_vec();
-    let (status, project) = upload(h.admin.clone(), svg_attack).await?;
-    assert_eq!(status, StatusCode::OK, "{project}");
-    let rendered = h
-        .client
-        .get(format!("{}{}", h.base, project["logo_url"].as_str().context("url")?))
-        .bearer_auth(&h.admin)
-        .send()
-        .await
-        .context("logo")?
-        .bytes()
-        .await
-        .context("bytes")?;
-    assert!(rendered.starts_with(b"\x89PNG"), "stored as a PNG");
-    assert!(!rendered.windows(6).any(|w| w == b"script"));
+    let (status, body) = upload(h.admin.clone(), svg_attack).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().is_some_and(|m| m.contains("SVG")), "{body}");
+    let (status, _) = h.get("/api/v1/projects/app/logo", &h.admin).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored");
 
     let (status, project) = upload(h.admin.clone(), png.clone()).await?;
     assert_eq!(status, StatusCode::OK, "{project}");

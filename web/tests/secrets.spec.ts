@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { expectToast, isMobile, openProject, secretAction, secretRow } from "./helpers";
+import { expectToast, failNext, isMobile, openProject, secretAction, secretRow } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await openProject(page);
@@ -58,6 +58,89 @@ test("filters by key, comment or tag", async ({ page }) => {
   await expect(page.getByTestId("no-search-results")).toBeVisible();
 });
 
+test("search reaches into subfolders and opens a match in its own folder", async ({ page }) => {
+  await page.getByTestId("secret-search").fill("webhook");
+  // Nothing at the top matches, so the subfolder matches stand alone.
+  await expect(page.getByTestId("secrets-table")).toHaveCount(0);
+  await expect(page.getByTestId("no-search-results")).toHaveCount(0);
+  const below = page.getByTestId("search-below");
+  await expect(below).toContainText("in folders inside /");
+  const match = below.getByTestId("search-below-WEBHOOK_SECRET");
+  await expect(match).toHaveText("payments/WEBHOOK_SECRET");
+  await match.click();
+
+  await expect(page).toHaveURL(/path=%2Fpayments$/);
+  await expect(page.getByTestId("current-folder")).toHaveText("payments");
+  await expect(page.getByTestId("secret-search")).toHaveValue("WEBHOOK_SECRET");
+  await expect(secretRow(page, "WEBHOOK_SECRET")).toBeVisible();
+  await expect(secretRow(page, "PAYPAL_CLIENT_ID")).toHaveCount(0);
+
+  // A search that finds nothing anywhere says it looked below too.
+  await page.getByTestId("crumb-root").click();
+  await page.getByTestId("secret-search").fill("zzz-nothing");
+  await expect(page.getByTestId("no-search-results")).toContainText("this folder and the folders inside it");
+});
+
+test("asks before Escape throws away a changed secret, and closes an unchanged one at once", async ({ page }) => {
+  await page.getByTestId("add-secret").click();
+  const form = page.getByTestId("new-secret-form");
+  await page.keyboard.press("Escape");
+  await expect(form).toHaveCount(0);
+  await expect(page.getByTestId("discard-dialog")).toHaveCount(0);
+
+  await page.getByTestId("add-secret").click();
+  await form.getByTestId("secret-key-input").fill("HALF_TYPED");
+  await form.getByTestId("secret-value-input").fill("not saved yet");
+  await page.keyboard.press("Escape");
+  const discard = page.getByTestId("discard-dialog");
+  await expect(discard).toContainText("Discard changes?");
+  await discard.getByTestId("discard-keep").click();
+  await expect(discard).toHaveCount(0);
+  await expect(form.getByTestId("secret-value-input")).toHaveValue("not saved yet");
+
+  await form.getByTestId("secret-value-input").press("Escape");
+  await discard.getByTestId("discard-confirm").click();
+  await expect(form).toHaveCount(0);
+  await expect(secretRow(page, "HALF_TYPED")).toHaveCount(0);
+
+  // Cancel is a deliberate choice, so it does not ask.
+  await secretAction(page, "LOG_LEVEL", "secret-edit");
+  const editor = page.getByTestId("edit-secret-LOG_LEVEL");
+  await editor.getByTestId("secret-comment-input").fill("changed my mind");
+  await editor.getByRole("button", { name: "Cancel" }).click();
+  await expect(editor).toHaveCount(0);
+  await expect(page.getByTestId("discard-dialog")).toHaveCount(0);
+});
+
+test("a long value stays inside the editor and wraps", async ({ page }) => {
+  await secretAction(page, "DATABASE_URL", "secret-edit");
+  const editor = page.getByTestId("edit-secret-DATABASE_URL");
+  const value = editor.getByTestId("secret-value-input");
+  await value.fill(`postgres://shop:${"x".repeat(60)}@db.internal.example.com:5432/shop`);
+  const card = await editor.boundingBox();
+  const field = await value.boundingBox();
+  const generate = await editor.getByTestId("secret-generate").boundingBox();
+  expect(card && field && generate).toBeTruthy();
+  if (!card || !field || !generate) return;
+  expect(field.x + field.width).toBeLessThanOrEqual(card.x + card.width);
+  expect(generate.x + generate.width).toBeLessThanOrEqual(card.x + card.width);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+});
+
+test("says why the list is refused when the caller's roles hold too many patterns", async ({ page }) => {
+  await failNext(
+    page,
+    "GET",
+    "/environments/staging/secrets",
+    400,
+    "too_many_patterns",
+    "your roles here hold more than 400 path and key patterns, counting those of your groups; ask a project admin to simplify them",
+  );
+  await page.getByTestId("env-tab-staging").click();
+  await expect(page.getByTestId("error-state")).toContainText("Your roles here hold more than 400 path and key patterns");
+});
+
 test("navigates folders with breadcrumbs", async ({ page }) => {
   await page.getByTestId("open-folder-payments").click();
   await expect(page).toHaveURL(/path=%2Fpayments/);
@@ -88,14 +171,25 @@ test("creates and deletes a folder", async ({ page }) => {
 });
 
 test("does not offer to delete a folder that still has secrets, and says how many", async ({ page }) => {
-  await page.getByTestId("delete-folder-payments").click();
-  const dialog = page.getByTestId("delete-folder-dialog");
-  await expect(dialog).toContainText("/payments is not empty");
-  await expect(dialog.getByTestId("delete-folder-contents")).toContainText(/It still holds \d+ secrets?/);
-  await expect(dialog.getByTestId("confirm-action")).toHaveCount(0);
-  await dialog.getByTestId("confirm-cancel").click();
-  await expect(dialog).toHaveCount(0);
-  await expect(page.getByTestId("folder-row-payments")).toBeVisible();
+  const row = page.getByTestId("folder-row-payments");
+  await expect(row.getByTestId("folder-count-payments")).toHaveText(/^\d+ secrets?$/);
+  await expect(row.getByTestId("delete-folder-payments")).toBeDisabled();
+  await row.getByTestId("delete-folder-blocked-payments").focus();
+  await expect(page.getByRole("tooltip")).toContainText("Delete them first to delete the folder.");
+  await expect(page.getByRole("tooltip")).not.toContainText("move");
+  // An empty folder shows no count and can be deleted.
+  await page.getByTestId("open-folder-payments").click();
+  await expect(page.getByTestId("folder-row-legacy")).toBeVisible();
+  await expect(page.getByTestId("folder-count-legacy")).toHaveCount(0);
+  await expect(page.getByTestId("delete-folder-legacy")).toBeEnabled();
+});
+
+test("the secrets list is a table with a heading for every column", async ({ page }) => {
+  const table = page.getByRole("table", { name: "Secrets in /" });
+  await expect(table).toBeVisible();
+  await expect(table.getByRole("columnheader")).toHaveText(["Key", "Value", /Updated and actions/]);
+  const row = table.getByRole("row").filter({ has: page.getByTestId("secret-key").getByText("LOG_LEVEL", { exact: true }) });
+  await expect(row.getByRole("cell")).toHaveCount(3);
 });
 
 test("imports a pasted .env file in one batch", async ({ page }) => {
@@ -151,6 +245,8 @@ test("Escape closes the new secret editor, and the value field keeps password ma
   await expect(value).toHaveAttribute("data-form-type", "other");
   await form.getByTestId("secret-key-input").fill("HALF_DONE");
   await form.getByTestId("secret-key-input").press("Escape");
+  // Something was typed, so Escape asks before throwing it away.
+  await page.getByTestId("discard-dialog").getByTestId("discard-confirm").click();
   await expect(form).toHaveCount(0);
   await expect(page.getByTestId("add-secret")).toBeEnabled();
 });

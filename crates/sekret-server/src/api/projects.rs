@@ -6,6 +6,7 @@ use sekret_api::{
     Membership, Project, ProjectPermissions, PutRole, Role, SecretPolicy, UpdateEnvironment, UpdateProject,
 };
 use sekret_core::crypto::{DataKey, wrap_data_key};
+use sekret_core::glob::{key_pattern_can_match, path_pattern_can_match};
 use sekret_core::permissions::{
     Action, BuiltinRole, MAX_PRINCIPAL_PATTERNS, MAX_ROLE_PATTERNS, Resource, Rule, Subject, covers, denied,
     dropped_rules, may_remove, pattern_count,
@@ -21,7 +22,10 @@ use utoipa_axum::routes;
 use super::listing::{AuditParams, audit_page};
 use super::{AuditTarget, api_env, api_project, audit, find_env, from_api_kind, load_project, to_api_kind};
 use crate::auth::{ClientIp, Principal};
-use crate::authz::{allowed, can_see_project, org_rules, project_rules, require, require_any};
+use crate::authz::{
+    Key, added_denies, admin_bindings, allowed, can_see_project, deny_needs_admin, has_denies, holders, is_org_admin,
+    is_project_admin, org_rules, project_management_rules, project_rules, reaches_admin, require, require_any,
+};
 use crate::error::{ApiError, ApiResult};
 use crate::rotation::project_policy;
 use crate::state::AppState;
@@ -643,7 +647,7 @@ async fn list_members(
     principal: Principal,
     Path(project): Path<String>,
 ) -> ApiResult<Json<Vec<Membership>>> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     require_any(&rules, Subject::Members, Action::Read)?;
     let names = principal_names(&state).await?;
     let members = state.store.list_memberships(&project.id).await?;
@@ -664,6 +668,27 @@ async fn list_members(
     ))
 }
 
+/// Loads a project for reading or changing its roles and members, judged by
+/// [`project_management_rules`] so org admins can never be locked out of repairing access.
+async fn load_for_management(
+    state: &AppState,
+    principal: &Principal,
+    project: &str,
+) -> ApiResult<(sekret_store::Project, Vec<Rule>)> {
+    let (project, rules) = load_project(state, principal, project).await?;
+    let rules = project_management_rules(state, principal, rules).await?;
+    Ok((project, rules))
+}
+
+/// Whether the caller administers the project: an org admin or one of its admins.
+async fn administers(
+    state: &AppState,
+    principal: &Principal,
+    memberships: &[sekret_store::Membership],
+) -> ApiResult<bool> {
+    Ok(is_project_admin(memberships, principal) || is_org_admin(state, principal).await?)
+}
+
 async fn project_role_rules(state: &AppState, project_id: &str, slug: &str) -> ApiResult<Vec<Rule>> {
     let custom = state.store.list_roles(project_id).await?;
     crate::authz::role_rules(slug, &custom, false).ok_or_else(|| ApiError::bad_request(format!("unknown role {slug}")))
@@ -678,7 +703,7 @@ async fn add_member(
     Path(project): Path<String>,
     Json(request): Json<AddMembership>,
 ) -> ApiResult<StatusCode> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     require_any(&rules, Subject::Members, Action::Create)?;
     let granted = project_role_rules(&state, &project.id, &request.role).await?;
     if !covers(&rules, &granted) {
@@ -691,12 +716,25 @@ async fn add_member(
     let kind = from_api_kind(request.principal_kind);
     let memberships = state.store.list_memberships(&project.id).await?;
     let custom = state.store.list_roles(&project.id).await?;
+    let users = state.store.list_users().await?;
     let bound = Bound {
         memberships: &memberships,
         custom: &custom,
+        users: &users,
     };
-    if bound.patterns(kind, &request.principal_id, Some(&request.role), None) > MAX_PRINCIPAL_PATTERNS {
+    if !bound.fits_binding(kind, &request.principal_id, &request.role) {
         return Err(too_many_principal_patterns());
+    }
+    if has_denies(&granted)
+        && reaches_admin(
+            &users,
+            &admin_bindings(&state, &memberships).await?,
+            kind,
+            &request.principal_id,
+        )
+        && !administers(&state, &principal, &memberships).await?
+    {
+        return Err(deny_needs_admin());
     }
     ensure_principal_exists(&state, kind, &request.principal_id).await?;
     state
@@ -733,7 +771,7 @@ async fn remove_member(
     principal: Principal,
     Path((project, kind, id, role)): Path<(String, String, String, String)>,
 ) -> ApiResult<StatusCode> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     require_any(&rules, Subject::Members, Action::Delete)?;
     let kind = PrincipalKind::parse(&kind).ok_or_else(|| ApiError::bad_request("unknown principal kind"))?;
     let removed = project_role_rules(&state, &project.id, &role).await.unwrap_or_default();
@@ -768,18 +806,36 @@ pub fn removal_escalation() -> ApiError {
 struct Bound<'a> {
     memberships: &'a [sekret_store::Membership],
     custom: &'a [sekret_store::Role],
+    /// Users with the groups they last signed in with, which bring the roles bound to those groups.
+    users: &'a [sekret_store::User],
 }
 
 impl Bound<'_> {
-    /// Path and key patterns across every role (`kind`, `id`) is bound to, counting `extra` as
-    /// bound too and `replaced` in place of the stored role with its slug.
-    fn patterns(&self, kind: PrincipalKind, id: &str, extra: Option<&str>, replaced: Option<(&str, &[Rule])>) -> usize {
+    fn holders<'k>(&'k self, kind: PrincipalKind, id: &'k str) -> Vec<Vec<Key<'k>>> {
+        holders(self.users, kind, id)
+    }
+
+    /// Whether binding `role` to (`kind`, `id`) keeps everyone it reaches within the cap.
+    fn fits_binding(&self, kind: PrincipalKind, id: &str, role: &str) -> bool {
+        self.holders(kind, id)
+            .iter()
+            .all(|keys| self.patterns(keys, Some(((kind, id), role)), None) <= MAX_PRINCIPAL_PATTERNS)
+    }
+
+    /// Path and key patterns across every role bound to any of `keys`, counting `extra` as bound
+    /// too and `replaced` in place of the stored role with its slug.
+    fn patterns<'k>(
+        &'k self,
+        keys: &[Key<'k>],
+        extra: Option<(Key<'k>, &'k str)>,
+        replaced: Option<(&str, &[Rule])>,
+    ) -> usize {
         let mut slugs: Vec<&str> = self
             .memberships
             .iter()
-            .filter(|m| m.principal_kind == kind && m.principal_id == id)
+            .filter(|m| keys.contains(&(m.principal_kind, m.principal_id.as_str())))
             .map(|m| m.role_slug.as_str())
-            .chain(extra)
+            .chain(extra.filter(|(key, _)| keys.contains(key)).map(|(_, slug)| slug))
             .collect();
         slugs.sort_unstable();
         slugs.dedup();
@@ -792,17 +848,20 @@ impl Bound<'_> {
             .sum()
     }
 
-    /// Whether every principal bound to `slug` stays within the cap once it holds `rules`.
+    /// Whether everyone `slug` reaches stays within the cap once it holds `rules`.
     fn fits(&self, slug: &str, rules: &[Rule]) -> bool {
         self.memberships.iter().filter(|m| m.role_slug == slug).all(|m| {
-            self.patterns(m.principal_kind, &m.principal_id, None, Some((slug, rules))) <= MAX_PRINCIPAL_PATTERNS
+            self.holders(m.principal_kind, &m.principal_id)
+                .iter()
+                .all(|keys| self.patterns(keys, None, Some((slug, rules))) <= MAX_PRINCIPAL_PATTERNS)
         })
     }
 }
 
 fn too_many_principal_patterns() -> ApiError {
     ApiError::bad_request(format!(
-        "a member can hold at most {MAX_PRINCIPAL_PATTERNS} path and key patterns across their roles in a project"
+        "a member can hold at most {MAX_PRINCIPAL_PATTERNS} path and key patterns across their roles in a project, \
+         counting the roles of their groups"
     ))
 }
 
@@ -849,7 +908,7 @@ async fn list_roles(
     principal: Principal,
     Path(project): Path<String>,
 ) -> ApiResult<Json<Vec<Role>>> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     require_any(&rules, Subject::Roles, Action::Read)?;
     let mut roles = builtin_roles(false);
     roles.extend(state.store.list_roles(&project.id).await?.into_iter().map(api_role));
@@ -888,6 +947,18 @@ pub fn validate_role(slug: &str, request: &PutRole, author_rules: &[Rule], org_s
                 "environment and tag conditions must be exact lowercase slugs, without wildcards",
             ));
         }
+        if let Some(bad) = c.paths.iter().find(|p| !path_pattern_can_match(p)) {
+            return Err(ApiError::bad_request(format!(
+                "path condition {bad:?} can never match: folders look like /payments or /payments/**, \
+                 starting with / and without a trailing /, // or . and .. segments"
+            )));
+        }
+        if let Some(bad) = c.keys.iter().find(|k| !key_pattern_can_match(k)) {
+            return Err(ApiError::bad_request(format!(
+                "key condition {bad:?} can never match: keys start with a letter or _ and hold only \
+                 letters, digits, _, - and ."
+            )));
+        }
     }
     // Deny rules escape the escalation check below, so this bounds them too.
     if pattern_count(&request.rules) > MAX_ROLE_PATTERNS {
@@ -915,7 +986,7 @@ async fn put_role(
     Path((project, slug)): Path<(String, String)>,
     Json(request): Json<PutRole>,
 ) -> ApiResult<Json<Role>> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     let custom = state.store.list_roles(&project.id).await?;
     let existing = custom.iter().find(|r| r.slug == slug);
     require_any(
@@ -934,12 +1005,26 @@ async fn put_role(
         return Err(removal_escalation());
     }
     let memberships = state.store.list_memberships(&project.id).await?;
+    let users = state.store.list_users().await?;
     let bound = Bound {
         memberships: &memberships,
         custom: &custom,
+        users: &users,
     };
     if !bound.fits(&slug, &request.rules) {
         return Err(too_many_principal_patterns());
+    }
+    if let Some(existing) = &existing
+        && added_denies(&existing.rules, &request.rules)
+    {
+        let admins = admin_bindings(&state, &memberships).await?;
+        let binds_admin = memberships
+            .iter()
+            .filter(|m| m.role_slug == slug)
+            .any(|m| reaches_admin(&users, &admins, m.principal_kind, &m.principal_id));
+        if binds_admin && !administers(&state, &principal, &memberships).await? {
+            return Err(deny_needs_admin());
+        }
     }
     let role = sekret_store::Role {
         id: uuid::Uuid::new_v4().to_string(),
@@ -974,7 +1059,7 @@ async fn delete_role(
     principal: Principal,
     Path((project, slug)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let (project, rules) = load_project(&state, &principal, &project).await?;
+    let (project, rules) = load_for_management(&state, &principal, &project).await?;
     require_any(&rules, Subject::Roles, Action::Delete)?;
     let removed = project_role_rules(&state, &project.id, &slug).await.unwrap_or_default();
     if !may_remove(&rules, &removed) {

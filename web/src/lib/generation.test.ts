@@ -6,6 +6,7 @@ import {
   describeRotation,
   draftFromPolicy,
   draftProblem,
+  inheritNote,
   isPolicyOff,
   lengthProblem,
   overrideFromDraft,
@@ -31,6 +32,12 @@ describe("generation model", () => {
     expect(isPolicyOff({})).toBe(true);
     expect(isPolicyOff({ generator: null, rotation_days: null })).toBe(true);
     expect(isPolicyOff({ rotation_days: 7 })).toBe(false);
+  });
+
+  it("says what following the project default resolves to", () => {
+    expect(inheritNote({ generator: null, rotation_days: null })).toContain("The project sets no defaults");
+    expect(inheritNote({ rotation_days: 30 })).toContain("shown above");
+    expect(inheritNote(undefined)).toBe("Follows the project's secret defaults, set in project settings.");
   });
 
   it("round-trips a policy through the editable draft", () => {

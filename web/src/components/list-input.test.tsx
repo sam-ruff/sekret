@@ -26,6 +26,19 @@ describe("ListInput", () => {
     expect(screen.getByLabelText("Globs for claim repository_owner")).toBe(input);
   });
 
+  it("says how to add an entry only while one is being typed", async () => {
+    render(<Harness ariaLabel="Tags" />);
+    const input = screen.getByLabelText("Tags");
+    expect(screen.queryByTestId("list-hint")).toBeNull();
+    await userEvent.type(input, "acme");
+    const hint = screen.getByTestId("list-hint");
+    expect(hint).toHaveTextContent("Press Enter to add");
+    expect(input).toHaveAttribute("aria-describedby", hint.id);
+    await userEvent.type(input, "{Enter}");
+    expect(screen.queryByTestId("list-hint")).toBeNull();
+    expect(input).not.toHaveAttribute("aria-describedby");
+  });
+
   it("ties a refused entry's message to the input so it is announced", async () => {
     render(<Harness ariaLabel="Tags" />);
     const input = screen.getByLabelText("Tags");
@@ -39,6 +52,7 @@ describe("ListInput", () => {
 
     await userEvent.type(input, "x");
     expect(screen.queryByTestId("list-problem")).toBeNull();
-    expect(input).not.toHaveAttribute("aria-describedby");
+    // Typing again swaps the message for the hint.
+    expect(input).toHaveAttribute("aria-describedby", screen.getByTestId("list-hint").id);
   });
 });

@@ -17,7 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -138,9 +138,12 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
             </Field>
             <Field orientation="horizontal">
               <Switch id="custom-envs" checked={custom} onCheckedChange={setCustom} data-testid="custom-envs" />
-              <FieldLabel htmlFor="custom-envs" className="font-normal">
-                Choose environments (defaults are development, staging and production)
-              </FieldLabel>
+              <FieldContent>
+                <FieldLabel htmlFor="custom-envs" className="font-normal">
+                  Customise environments
+                </FieldLabel>
+                <FieldDescription>Otherwise you get Development, Staging and Production.</FieldDescription>
+              </FieldContent>
             </Field>
             {custom && (
               <div className="space-y-2" data-testid="custom-env-list">

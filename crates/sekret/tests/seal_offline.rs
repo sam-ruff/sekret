@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::Context;
-use sekret_core::crypto::RootKey;
+use sekret_core::crypto::{IntegrityKey, RootKey};
 use sekret_core::seal::{
     SealBinding, SealFlags, SealMode, UnlockPolicy, seal_config_mac, unwrap_root_key, wrap_root_key,
 };
 use sekret_server::seal::{Signature, accepted_roots, check_signature, high_water, record_epoch, signed};
-use sekret_store::{SealConfig, SqlStore, Store};
+use sekret_store::{INTEGRITY_KEY_META, SealConfig, SqlStore, Store};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sekret");
 const PASSPHRASE: &str = "violet tractor sings beneath";
@@ -683,14 +683,180 @@ async fn offline_commands_never_restart_the_migrations_for_a_replayed_configurat
     Ok(())
 }
 
-/// A 32-character password in a key file is refused rather than taken as 32 raw key bytes.
+/// A 32-character password in a key file, in any language, is refused rather than taken as 32
+/// raw key bytes, and so is encoded key material with an obvious pattern, such as all zeros.
 #[tokio::test]
 async fn a_password_is_not_accepted_as_a_raw_root_key() -> anyhow::Result<()> {
     let (fixture, _) = rolled_forward().await?;
-    std::fs::write(fixture.path().join("root.key"), b"correct horse battery staple 123").context("key file")?;
-    let refused = fixture.admin_output(&["bootstrap", "--root-key-file", "root.key"])?;
+    let mut accented = "pässwörd-für-den-sekret-server".as_bytes().to_vec();
+    accented.resize(32, b'!');
+    let zeros = "0".repeat(64);
+    let materials: [&[u8]; 4] = [
+        b"correct horse battery staple 123",
+        &accented,
+        zeros.as_bytes(),
+        b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    ];
+    for material in materials {
+        std::fs::write(fixture.path().join("root.key"), material).context("key file")?;
+        let refused = fixture.admin_output(&["bootstrap", "--root-key-file", "root.key"])?;
+        let shown = String::from_utf8_lossy(&refused.stderr).to_string();
+        assert!(!refused.status.success(), "{shown}");
+        assert!(shown.contains("password is not a key"), "{shown}");
+    }
+    Ok(())
+}
+
+/// The audit's mode flip: a database writer sets the stored mode to key-file. The passphrase still
+/// opens the wrap, which proves passphrase mode, so `reset-epoch` repairs it without a key file.
+#[tokio::test]
+async fn reset_epoch_with_the_passphrase_repairs_a_tampered_mode() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    let tampered = SealConfig {
+        mode: SealMode::KeyFile,
+        ..fixture.config().await?
+    };
+    fixture.store().await?.update_seal_config(tampered.clone()).await?;
+    fixture.admin(&["reset-epoch"])?;
+    let repaired = fixture.config().await?;
+    assert_eq!(repaired.mode, SealMode::Passphrase);
+    assert_eq!(repaired.wrapped, tampered.wrapped);
+    assert_eq!(repaired.unlock_policy, UnlockPolicy::Manual);
+    let root = Fixture::root(&repaired)?;
+    assert_eq!(check_signature(&root, &repaired), Signature::Valid);
+    fixture.admin(&["bootstrap"])?;
+    Ok(())
+}
+
+async fn live_tokens(fixture: &Fixture) -> anyhow::Result<i64> {
+    let pool = sqlx::SqlitePool::connect(&fixture.db).await.context("pool")?;
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM access_tokens WHERE revoked = 0")
+        .fetch_one(&pool)
+        .await
+        .context("count")?;
+    Ok(row.0)
+}
+
+async fn integrity_key(fixture: &Fixture) -> anyhow::Result<IntegrityKey> {
+    let root = Fixture::root(&fixture.config().await?)?;
+    let wrapped = fixture
+        .store()
+        .await?
+        .get_meta(INTEGRITY_KEY_META)
+        .await?
+        .context("integrity key")?;
+    IntegrityKey::unwrap(&root, &wrapped).context("unwrap")
+}
+
+/// After a root key leak, `--new-integrity-key` replaces the key that authenticates credentials,
+/// so the leaked key cannot forge them against the live database, and revokes every token.
+/// Without it, a rotation keeps both.
+#[tokio::test]
+async fn rotate_root_key_can_replace_the_integrity_key() -> anyhow::Result<()> {
+    let (fixture, _) = rolled_forward().await?;
+    fixture.admin(&["bootstrap"])?;
+    let before = integrity_key(&fixture).await?;
+    fixture.admin(&["rotate-root-key"])?;
+    let kept = integrity_key(&fixture).await?;
+    assert_eq!(
+        kept.lookup("t", "x")?,
+        before.lookup("t", "x")?,
+        "a plain rotation keeps it"
+    );
+    assert!(live_tokens(&fixture).await? > 0);
+
+    let printed = fixture.admin(&["rotate-root-key", "--new-integrity-key"])?;
+    assert!(printed.contains("revoked every token and client secret"), "{printed}");
+    let replaced = integrity_key(&fixture).await?;
+    assert_ne!(replaced.lookup("t", "x")?, before.lookup("t", "x")?);
+    assert_eq!(live_tokens(&fixture).await?, 0);
+    fixture.admin(&["bootstrap"])?;
+    assert_eq!(live_tokens(&fixture).await?, 1, "a new admin token works as before");
+    Ok(())
+}
+
+fn exits_with(mut child: std::process::Child) -> anyhow::Result<Output> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().context("wait")?.is_some() {
+            return child.wait_with_output().context("output");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    anyhow::bail!("the server kept running")
+}
+
+/// A Postgres server whose only mark would sit beside a key file on a read-only mount has nowhere
+/// to record the seal epoch, so the server and the admin commands refuse to start until
+/// `seal.epoch_file` is set.
+#[tokio::test]
+async fn a_read_only_key_file_alone_is_not_enough_for_the_marks() -> anyhow::Result<()> {
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    let container = match Postgres::default().start().await {
+        Ok(container) => container,
+        Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
+            eprintln!("skipping postgres test: {error}");
+            return Ok(());
+        }
+        Err(error) => anyhow::bail!("postgres container failed: {error}"),
+    };
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let dir = tempfile::tempdir().context("dir")?;
+    let keys = dir.path().join("keys");
+    std::fs::create_dir(&keys).context("keys")?;
+    let key_file = keys.join("root.key");
+    let key_arg = key_file.display().to_string();
+    let mark = dir.path().join("seal.epoch").display().to_string();
+    let admin = |args: &[&str]| {
+        let mut full = vec!["admin"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["--database-url", &url, "--root-key-file", &key_arg]);
+        run(&full, dir.path())
+    };
+    ok(admin(&["init", "--key-file-mode", "--epoch-file", &mark])?)?;
+    // A key file mounted from a secret never had a mark beside it.
+    std::fs::remove_file(keys.join("root.key.epoch")).context("mark beside the key")?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o500)).context("chmod")?;
+
+    let refused = admin(&["bootstrap"]);
+    let server = Command::new(BIN)
+        .args([
+            "server",
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1",
+            "--database-url",
+            &url,
+            "--root-key-file",
+            &key_arg,
+        ])
+        .env_clear()
+        .env("HOME", dir.path())
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("server")
+        .and_then(exits_with);
+    let with_mark = admin(&["bootstrap", "--epoch-file", &mark]);
+    // Put back before asserting, so the temporary directory can be removed.
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).context("chmod back")?;
+
+    let refused = refused?;
     let shown = String::from_utf8_lossy(&refused.stderr).to_string();
     assert!(!refused.status.success(), "{shown}");
-    assert!(shown.contains("password is not a key"), "{shown}");
+    assert!(shown.contains("none can be written"), "{shown}");
+    assert!(shown.contains("seal.epoch_file"), "{shown}");
+    let server = server?;
+    let shown = String::from_utf8_lossy(&server.stderr).to_string();
+    assert!(!server.status.success(), "{shown}");
+    assert!(shown.contains("none can be written"), "{shown}");
+    ok(with_mark?)?;
     Ok(())
 }

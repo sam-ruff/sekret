@@ -10,6 +10,7 @@ test("saves the longest OIDC token lifetime and flags a cloud metadata URL", asy
   await expect(page).toHaveURL(/\/org\/identities\/[^/]+\/auth$/);
 
   const oidc = page.getByTestId("auth-method-oidc");
+  await oidc.getByTestId("auth-method-oidc-setup").click();
   await oidc.getByTestId("oidc-preset-github").click();
   await expect(oidc.getByTestId("oidc-max-lifetime")).toHaveValue("1h");
   await oidc.getByTestId("oidc-jwks-url").fill("http://169.254.169.254/latest/meta-data");
@@ -50,6 +51,7 @@ test("creates an identity with universal auth and a client secret", async ({ pag
   await expect(page).toHaveURL(/\/org\/identities\/[^/]+\/auth$/);
 
   const oidc = page.getByTestId("auth-method-oidc");
+  await oidc.getByTestId("auth-method-oidc-setup").click();
   await oidc.getByTestId("oidc-preset-github").click();
   await oidc.getByTestId("oidc-save").click();
   await expect(oidc.getByTestId("auth-method-oidc-status")).toHaveText(/^\s*Configured/);

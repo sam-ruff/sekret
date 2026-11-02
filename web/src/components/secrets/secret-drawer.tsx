@@ -369,7 +369,7 @@ export function SecretDrawer({
           open={target !== null}
           onOpenChange={(open) => !open && setTarget(null)}
           title={`Roll back to version ${target}?`}
-          description={`This writes a new version of ${secretKey} with the value and tags from version ${target}. Its comment becomes "Rolled back to version ${target}" followed by that version's comment. Nothing is lost; the current value stays in history.`}
+          description={`${secretKey} gets a new version with the value and tags from version ${target}. The current value stays in history.`}
           confirmLabel="Roll back"
           onConfirm={() => rollback.mutateAsync(target ?? 0)}
           testId="rollback-confirm"

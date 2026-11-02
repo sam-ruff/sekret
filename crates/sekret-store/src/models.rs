@@ -41,6 +41,9 @@ pub struct Rekey {
     pub seal: Option<SealConfig>,
     /// The integrity key wrapped under the new root key, replacing the stored one.
     pub integrity_key: Option<String>,
+    /// Revoke every token and client secret and close every pending CLI login, for a new
+    /// integrity key under which none of them verify.
+    pub revoke_credentials: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

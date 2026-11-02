@@ -115,22 +115,14 @@ export function checkLogoFile(bytes: Uint8Array): LogoCheck {
   return { ok: true, type: image.type };
 }
 
-const FORBIDDEN_SVG_ELEMENTS = ["script", "foreignObject", "iframe", "embed", "object", "audio", "video", "handler", "listener"];
-
-function svgProblem(text: string): string | undefined {
-  if (/<!DOCTYPE/i.test(text)) return "DTDs are not allowed";
-  if (/<\?(?!xml\s)/i.test(text)) return "processing instructions are not allowed";
+/** What stops an SVG being drawn into a PNG in the browser, if anything. */
+export function svgProblem(bytes: Uint8Array): string | undefined {
+  const text = decodeText(bytes) ?? "";
+  // Entity definitions can expand without limit, so a document type is refused outright.
+  if (/<!DOCTYPE/i.test(text)) return "SVGs with a document type cannot be used. Save the logo as a PNG instead.";
   const root = text.match(/<svg\b[^>]*>/i)?.[0] ?? "";
   if (!/xmlns\s*=\s*["']http:\/\/www\.w3\.org\/2000\/svg["']/.test(root)) {
-    return "the root element is not an SVG element";
-  }
-  const forbidden = FORBIDDEN_SVG_ELEMENTS.find((name) => new RegExp(`<(\\w+:)?${name}\\b`, "i").test(text));
-  if (forbidden) return `<${forbidden}> elements are not allowed`;
-  const handler = text.match(/\s(on\w+)\s*=/i);
-  if (handler) return `the event handler ${handler[1]} is not allowed`;
-  if (/href\s*=\s*["']\s*[^#\s"']/i.test(text)) return "links and references outside the image are not allowed";
-  if (/url\(\s*["']?\s*[^#\s"')]/i.test(text) || /@import|javascript:|expression\(/i.test(text)) {
-    return "styles may not load anything";
+    return "That SVG has no SVG namespace, so browsers cannot draw it. Save the logo as a PNG instead.";
   }
   return undefined;
 }
@@ -139,14 +131,13 @@ export type ImageValidation = { ok: true; type: ImageType } | { ok: false; messa
 
 /**
  * The server decodes raster images fully; this approximates that with header checks so the mock
- * refuses the same kinds of file with the same messages.
+ * refuses the same kinds of file with the same messages. Like the server, it refuses SVG.
  */
 export function validateImage(bytes: Uint8Array): ImageValidation {
   const image = sniffImage(bytes);
-  if (!image) return { ok: false, message: "the file is not a PNG, JPEG, GIF, WebP or SVG image" };
+  if (!image) return { ok: false, message: "the file is not a PNG, JPEG, GIF or WebP image" };
   if (image.type === "image/svg+xml") {
-    const problem = svgProblem(decodeText(bytes) ?? "");
-    return problem ? { ok: false, message: `the SVG is not allowed: ${problem}` } : { ok: true, type: image.type };
+    return { ok: false, message: "SVG files are not accepted; convert the logo to PNG first" };
   }
   const { width, height } = image;
   if (width === undefined || height === undefined) {

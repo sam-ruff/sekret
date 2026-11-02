@@ -4,6 +4,8 @@ import { isMobile } from "./helpers";
 test("an unknown address has a page heading and a way back", async ({ page }) => {
   await page.goto("/nope");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Nothing lives here");
+  // The header does not claim the page belongs to the projects.
+  await expect(page.getByRole("navigation", { name: "Location" })).toHaveText("Not found");
 });
 
 test("a missing project explains itself and links back to the projects", async ({ page }) => {

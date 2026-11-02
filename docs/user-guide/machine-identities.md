@@ -6,7 +6,7 @@ Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a max
 
 Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Lifetime fields there take a number of seconds or a unit, such as `30m`, `1h`, `7d` or `1h 30m`. The identity's *Usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. It also has example snippets, led by the ones for auth methods the identity has set up. Disabling an identity revokes its tokens straight away.
 
-There are three auth methods, and an identity can have any of them.
+There are three auth methods, and an identity can have any of them. On the identity's *Auth methods* tab, methods that are not set up stay folded away behind a *Set up* button.
 
 ## OIDC
 

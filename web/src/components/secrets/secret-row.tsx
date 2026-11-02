@@ -89,13 +89,14 @@ export function SecretRow({
 
   return (
     <div
+      role="row"
       className={cn(
         "group grid grid-cols-[minmax(0,1fr)_auto] gap-x-2 gap-y-2 border-b px-4 py-3 last:border-b-0 md:items-center",
         SECRET_ROW_COLUMNS,
       )}
       data-testid={`secret-row-${secret.key}`}
     >
-      <div className="min-w-0">
+      <div role="cell" className="min-w-0">
         <button
           type="button"
           onClick={(event) => onHistory(event.currentTarget)}
@@ -125,7 +126,7 @@ export function SecretRow({
         </div>
       </div>
 
-      <div className="col-span-2 row-start-2 flex min-w-0 items-center gap-1 md:col-span-1 md:row-start-auto">
+      <div role="cell" className="col-span-2 row-start-2 flex min-w-0 items-center gap-1 md:col-span-1 md:row-start-auto">
         <div
           className="min-w-0 flex-1 rounded-md bg-muted/60 px-2.5 py-1.5 font-mono text-sm"
           data-testid="secret-value"
@@ -161,7 +162,7 @@ export function SecretRow({
         <CopyButton value={onCopyValue} label={`Copy ${secret.key}`} disabled={hidden} testId="secret-copy" sensitive />
       </div>
 
-      <div className="col-start-2 row-start-1 flex items-start justify-end md:col-start-auto md:row-start-auto md:items-center">
+      <div role="cell" className="col-start-2 row-start-1 flex items-start justify-end md:col-start-auto md:row-start-auto md:items-center">
         <span
           className="mr-2 hidden w-28 truncate text-right text-xs whitespace-nowrap text-muted-foreground tabular-nums lg:inline"
           title={secret.updated_by}
