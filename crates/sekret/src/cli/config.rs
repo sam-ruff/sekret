@@ -978,6 +978,13 @@ pub fn resolve(
 /// Plain `http://` is only for this machine unless explicitly allowed, because tokens and secret
 /// values would cross the network unencrypted. Plain http never goes through a proxy.
 pub fn check_transport(server: &str, allow_insecure_http: bool) -> anyhow::Result<()> {
+    // The URL parser would percent-encode these, but the raw string is what gets shown.
+    if server.contains(['\n', '\t', '\r']) || sekret_client::terminal_safe(server) != server {
+        bail!(
+            "the server URL {} holds control or direction characters",
+            sekret_client::terminal_safe(server).escape_debug()
+        );
+    }
     let url = url::Url::parse(server).with_context(|| format!("the server URL {server} is not valid"))?;
     if url.scheme() != "http" || allow_insecure_http || sekret_client::is_loopback(&url) {
         return Ok(());
@@ -2221,6 +2228,23 @@ mod tests {
         assert!(check_transport("http://sekret.example.com", false).is_err());
         assert!(check_transport("http://192.168.1.10", false).is_err());
         assert!(check_transport("http://sekret.example.com", true).is_ok());
+    }
+
+    #[test]
+    fn a_server_holding_control_or_direction_characters_is_refused() {
+        for server in [
+            "https://x.test/\u{1b}[2J",
+            "https://x.test/a\nb",
+            "https://x.test/\u{9b}31m",
+            "https://x.test/\u{202e}evil",
+        ] {
+            let refused = check_transport(server, false).err().map(|e| format!("{e:#}"));
+            assert!(
+                refused.as_deref().is_some_and(|e| e.contains("control or direction")),
+                "{server:?}: {refused:?}"
+            );
+            assert!(refused.is_some_and(|e| !e.contains('\u{1b}') && !e.contains('\u{202e}')));
+        }
     }
 
     #[test]

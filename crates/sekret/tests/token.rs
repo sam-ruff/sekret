@@ -271,6 +271,22 @@ fn context_refuses_plain_http_to_another_machine() -> anyhow::Result<()> {
 }
 
 #[test]
+fn context_refuses_a_project_file_server_with_control_characters() -> anyhow::Result<()> {
+    let dir = home()?;
+    std::fs::write(
+        dir.path().join("work/.sekret.toml"),
+        "server = \"https://x.test/\\u001b[2J\"\n",
+    )
+    .context("project file")?;
+    let output = run(&["token", "--context", "-p", "p", "-e", "e"], &[], dir.path())?;
+    assert!(!output.status.success());
+    let err = text(&output.stderr);
+    assert!(err.contains("control or direction"), "{err}");
+    assert!(!err.contains('\u{1b}') && output.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
 fn values_given_with_equals_are_never_taken_for_flags() -> anyhow::Result<()> {
     let dir = home()?;
     save_login(dir.path(), "https://saved.test", "saved-token", LATER)?;
