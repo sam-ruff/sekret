@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import ssl
@@ -376,10 +377,29 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def bypasses_proxy(url: str) -> bool:
+    """Whether requests to `url` must ignore HTTP_PROXY, HTTPS_PROXY and the like, as the CLI does:
+    a proxy would read plain http, tokens included, and would reach its own loopback, not ours."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").rstrip(".").lower()
+    if parts.scheme != "https" or not host or host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or bool(mapped and mapped.is_loopback)
+
+
 class UrllibTransport:
-    def __init__(self, context: ssl.SSLContext):
+    def __init__(self, context: ssl.SSLContext, url: str | None = None):
         https = urllib.request.HTTPSHandler(context=context)
-        self._opener = urllib.request.build_opener(https, _NoRedirect())
+        handlers: list = [https, _NoRedirect()]
+        if url is None or bypasses_proxy(url):
+            # An empty ProxyHandler replaces the default one, which reads the environment's proxies.
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def __call__(
         self, method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float
@@ -404,7 +424,8 @@ def _origin(url: str) -> str:
 
 def default_transport(settings: Settings) -> Transport:
     return UrllibTransport(
-        ssl_context(settings.validate_certs, settings.ca_path, settings.client_cert, settings.client_key)
+        ssl_context(settings.validate_certs, settings.ca_path, settings.client_cert, settings.client_key),
+        settings.url,
     )
 
 

@@ -43,6 +43,7 @@ FAILED_FOR = 60
 # Within one process a produced token that is rejected always counts.
 PRODUCED_FOR = 300
 NUL_IN_SETTING = "a sekret setting passed to the CLI holds a NUL character"
+NOT_UTF8_OUTPUT = "the sekret CLI printed something that is not UTF-8; check cli_path names the sekret CLI"
 
 Notify = Callable[[str], None]
 Run = Callable[[list[str]], subprocess.CompletedProcess]
@@ -130,6 +131,8 @@ def _cli_call(cli_path: str, call: Callable[[], object]):
         return call()
     except FileNotFoundError:
         raise _missing_cli(cli_path) from None
+    except UnicodeDecodeError:
+        raise ConfigError(NOT_UTF8_OUTPUT) from None
     except ValueError:
         # subprocess refuses an argument holding a NUL character.
         raise ConfigError(NUL_IN_SETTING) from None
@@ -492,6 +495,8 @@ def cli_context(cli_path: str, known: Mapping[str, str | None], runner: Run = ru
         result = runner(argv)
     except FileNotFoundError:
         return None
+    except UnicodeDecodeError:
+        raise ConfigError(NOT_UTF8_OUTPUT) from None
     except ValueError:
         raise ConfigError(NUL_IN_SETTING) from None
     if result.returncode != 0:

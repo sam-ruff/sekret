@@ -7,6 +7,7 @@ import socket
 import ssl
 import threading
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     TokenCache,
     TransportError,
     UrllibTransport,
+    bypasses_proxy,
     resolve_auth,
     ssl_context,
 )
@@ -506,6 +508,74 @@ def test_urllib_transport_does_not_follow_redirects():
         server.shutdown()
     assert response.status == 302
     assert seen_auth == []
+
+
+def _recording_server():
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_plain_http_never_goes_through_a_proxy(monkeypatch):
+    target, reached = _recording_server()
+    proxy, proxied = _recording_server()
+    try:
+        for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.setenv(name, f"http://127.0.0.1:{proxy.server_port}")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        url = f"http://127.0.0.1:{target.server_port}/api"
+        transport = UrllibTransport(ssl_context(True, None), url)
+        assert transport("GET", url, {"Authorization": "Bearer saved-login"}, None, 15).status == 200
+    finally:
+        target.shutdown()
+        proxy.shutdown()
+    assert proxied == []
+    assert reached == [("/api", "Bearer saved-login")]
+
+
+@pytest.mark.parametrize(
+    ("url", "bypass"),
+    [
+        ("http://sekret.example.com", True),
+        ("http://127.0.0.1:8080", True),
+        ("https://localhost", True),
+        ("https://app.localhost.", True),
+        ("https://127.0.0.2", True),
+        ("https://[::1]:8443", True),
+        ("https://[::ffff:127.0.0.1]", True),
+        ("https://sekret.example.com", False),
+        ("https://192.168.1.10", False),
+    ],
+)
+def test_only_https_to_another_host_may_use_a_proxy(url, bypass):
+    assert bypasses_proxy(url) is bypass
+
+
+def test_https_to_another_host_keeps_the_environments_proxy(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    remote = UrllibTransport(ssl_context(True, None), "https://sekret.example.com")
+    local = UrllibTransport(ssl_context(True, None), "https://127.0.0.1:8443")
+
+    def proxies(transport):
+        handlers = [h for h in transport._opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+        return [h.proxies for h in handlers]
+
+    assert proxies(remote) and proxies(remote)[0].get("https") == "http://proxy.example.com:3128"
+    # An empty ProxyHandler registers nothing, but stops build_opener adding the environment's.
+    assert not any(proxies(local))
 
 
 def test_urllib_transport_returns_error_bodies(monkeypatch):

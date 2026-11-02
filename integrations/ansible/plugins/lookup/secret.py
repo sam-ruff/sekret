@@ -312,7 +312,8 @@ def ansible_cfg_values() -> dict:
     config_file = C.CONFIG_FILE
     if not config_file:
         return {}
-    parser = configparser.ConfigParser(interpolation=None)
+    # As Ansible's own config manager reads it, so a `;` comment after a value is dropped here too.
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";",))
     try:
         parser.read(config_file)
     except configparser.Error:
@@ -335,7 +336,7 @@ def _ask_cli_about_the_shell(here: Path, loaded: str, place: dict, cli_path: str
             f"these settings were loaded by `sekret-env` under {loaded or 'no project file'}, and this "
             f"Python cannot read {here} to check they are meant for this folder, nor is the sekret CLI "
             "installed to check it instead. Install the CLI or Python 3.11, run `sekret-env off`, or pass "
-            "project and environment to the lookup"
+            "project, environment and path to the lookup"
         )
 
 
@@ -374,7 +375,8 @@ def check_shell(
     if clashes:
         raise ConfigError(
             f"{'; '.join(clashes)}; these were loaded by `sekret-env` under {loaded or 'no project file'}, "
-            "so not using them here. Run `sekret-env off`, or pass project and environment to the lookup"
+            "so not using them here. Run `sekret-env off`, or pass project, environment and path to the "
+            "lookup"
         )
 
 
@@ -412,15 +414,15 @@ def same_path(first: str | None, second: str | None) -> bool:
 
 
 def check_destination(plan, place_origins: dict, ca_vouched: bool = False) -> None:
-    """Refuses to send anything through a CA the inventory chose, which replaces every other CA
-    the server is checked against, unless a trusted setting names the same file. Refuses to send a
+    """Refuses to send anything through a CA the inventory chose, which would let any server it
+    vouches for pass as this one, unless a trusted setting names the same file. Refuses to send a
     token or machine identity, however it was given, to a server the inventory or a project file
     chose: only the login `sekret login` saved for that server may go there."""
     if _from_inventory(place_origins.get("ca_path")) and not ca_vouched:
         raise ConfigError(
             "sekret_ca_path comes from an inventory variable, so nothing is sent through it, neither your "
-            "sekret login nor a credential passed to the lookup: it replaces the CAs the server is checked "
-            "against. Set ca_path in SEKRET_CA_PATH, ansible.cfg or the lookup's own arguments; naming "
+            "sekret login nor a credential passed to the lookup: any server that CA vouches for would pass "
+            "as this one. Set ca_path in SEKRET_CA_PATH, ansible.cfg or the lookup's own arguments; naming "
             "the same file there is enough"
         )
     if isinstance(plan, CliLogin):

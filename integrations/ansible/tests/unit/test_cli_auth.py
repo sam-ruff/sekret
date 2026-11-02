@@ -761,8 +761,12 @@ class TestShellLoadedElsewhere:
     def test_a_stale_folder_is_refused(self, lookup, monkeypatch):
         lookup.read_ansible_cfg = staticmethod(lambda: {"path": "/b"})
         self.shell(monkeypatch, "/repo-a/.sekret.toml", path="/a")
-        with pytest.raises(AnsibleError, match="SEKRET_PATH is /a"):
+        with pytest.raises(AnsibleError, match="SEKRET_PATH is /a") as caught:
             self.run(lookup)
+        assert "project, environment and path" in str(caught.value)
+        # Following the advice: the lookup's own arguments are a deliberate choice.
+        lookup.run([], {}, url=URL, token="static-token", project="a", environment="prod", path="/a")
+        assert lookup.server.asked() == ("a", "prod", "/a")
 
     @pytest.mark.skipif(sys.version_info < (3, 11), reason="reading .sekret.toml needs tomllib")
     def test_a_shell_loaded_under_another_file_is_refused_against_this_folders_file(
@@ -1062,6 +1066,38 @@ class TestApprovedCaPath:
         )
         lookup.run([], {"sekret_ca_path": str(link)}, url=URL, project="p", environment="e")
         assert used == [str(real)]
+
+
+class TestAnsibleCfgParsing:
+    def test_a_semicolon_comment_after_a_value_is_dropped_as_ansible_drops_it(
+        self, lookup, tmp_path, monkeypatch
+    ):
+        config = tmp_path / "ansible.cfg"
+        config.write_text("[sekret]\nproject = repo-b ; the shared project\nenvironment = prod\n")
+        module = sys.modules[type(lookup).__module__]
+        monkeypatch.setattr(module.C, "CONFIG_FILE", str(config))
+        assert module.ansible_cfg_values() == {"project": "repo-b", "environment": "prod"}
+
+
+class TestCliOutputThatIsNotUtf8:
+    @pytest.fixture
+    def garbled_cli(self, tmp_path):
+        cli = tmp_path / "garbled-sekret"
+        cli.write_text("#!/bin/sh\nprintf '\\377\\376'\n")
+        cli.chmod(0o755)
+        return str(cli)
+
+    def test_a_token_that_is_not_utf8_is_named_as_such(self, garbled_cli, state):
+        with pytest.raises(ConfigError, match="not UTF-8"):
+            CliTokens(garbled_cli, URL, lock_dir=state.dir).token()
+
+    def test_context_that_is_not_utf8_is_named_as_such(self, garbled_cli):
+        with pytest.raises(ConfigError, match="not UTF-8"):
+            cli_context(garbled_cli, {"url": URL})
+
+    def test_a_nul_is_still_named_as_a_nul(self, state):
+        with pytest.raises(ConfigError, match="NUL"):
+            cli_context(state.cli, {"url": URL + "\x00"})
 
 
 class TestOddSettings:
