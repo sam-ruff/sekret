@@ -780,7 +780,9 @@ pub struct Overrides {
     pub env_environment: Option<String>,
     /// [`LOADED_FILE_VAR`]: set by `env use` to the project file it loaded under, empty for none.
     pub loaded_file: Option<String>,
+    /// From `--path` or `SEKRET_PATH`; `env_path` holds `SEKRET_PATH` when no flag gave it.
     pub path: Option<String>,
+    pub env_path: Option<String>,
     /// From `--ca-file` or `SEKRET_CA_FILE`.
     pub ca_file: Option<PathBuf>,
     /// The user config, the lowest priority of all.
@@ -829,6 +831,12 @@ fn stale_shell_choice(overrides: &Overrides, file: &ProjectFile) -> Option<Strin
             &file.environment,
             "SEKRET_ENVIRONMENT",
         ),
+        clash(
+            &overrides.env_path.is_none().then(|| overrides.path.clone()).flatten(),
+            &overrides.env_path,
+            &file.path,
+            "SEKRET_PATH",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -844,7 +852,7 @@ fn stale_shell_choice(overrides: &Overrides, file: &ProjectFile) -> Option<Strin
     Some(
         format!(
             "{}; these were loaded by `sekret-env` under {shown_from}, so not using them here. Run `sekret-env off` \
-             to use this folder's file, or pass --project and --env to choose",
+             to use this folder's file, or pass --project, --env and --path to choose",
             clashes.join(" and ")
         )
         .replace(['\n', '\t'], " "),
@@ -864,8 +872,8 @@ Settings are taken from the first of these that sets them:
      (server, ca_file)
 An empty value for the server, token, project, environment or path, as a flag or a variable, counts
 as unset; an empty CA file is an error. The token, when neither --token nor SEKRET_TOKEN is set, is
-the one `sekret login` saved for the chosen server. SEKRET_PROJECT and SEKRET_ENVIRONMENT left by
-`sekret-env` under a different .sekret.toml are refused rather than used.";
+the one `sekret login` saved for the chosen server. SEKRET_PROJECT, SEKRET_ENVIRONMENT and
+SEKRET_PATH left by `sekret-env` under a different .sekret.toml are refused rather than used.";
 
 /// Flags (which already include environment variables via clap) win over the project file, which
 /// wins over the user config. The stored login is used when no token was given.
@@ -978,6 +986,13 @@ pub fn resolve(
 /// Plain `http://` is only for this machine unless explicitly allowed, because tokens and secret
 /// values would cross the network unencrypted. Plain http never goes through a proxy.
 pub fn check_transport(server: &str, allow_insecure_http: bool) -> anyhow::Result<()> {
+    // The URL parser would percent-encode these, but the raw string is what gets shown.
+    if server.contains(['\n', '\t', '\r']) || sekret_client::terminal_safe(server) != server {
+        bail!(
+            "the server URL {} holds control or direction characters",
+            sekret_client::terminal_safe(server).escape_debug()
+        );
+    }
     let url = url::Url::parse(server).with_context(|| format!("the server URL {server} is not valid"))?;
     if url.scheme() != "http" || allow_insecure_http || sekret_client::is_loopback(&url) {
         return Ok(());
@@ -2157,6 +2172,49 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_loaded_for_another_project_file_is_refused_too() -> anyhow::Result<()> {
+        let mut file: ProjectFile =
+            toml::from_str("server = \"https://s\"\nproject = \"a\"\nenvironment = \"prod\"\npath = \"/b\"\n")?;
+        file.location = Some("/repo-b/.sekret.toml".into());
+        let mut shell = shell_from_a("/repo-a/.sekret.toml");
+        shell.path = Some("/a".into());
+        shell.env_path = Some("/a".into());
+        let stale = resolve(shell.clone(), file.clone(), &Credentials::default(), 0)?;
+        let reason = stale.stale_shell.context("the folder clash is reported")?;
+        assert!(
+            reason.contains("SEKRET_PATH is /a") && reason.contains("says /b"),
+            "{reason}"
+        );
+
+        assert!(reason.contains("--path"), "the advice covers the folder: {reason}");
+
+        shell.env_path = None;
+        let flagged = resolve(shell, file.clone(), &Credentials::default(), 0)?;
+        assert_eq!(flagged.stale_shell, None, "--path is a deliberate choice");
+        assert_eq!(flagged.path, "/a");
+
+        // Following the advice for all three clears every clash.
+        let mut all_stale = shell_from_a("/repo-a/.sekret.toml");
+        all_stale.path = Some("/a".into());
+        all_stale.env_path = Some("/a".into());
+        let mut file_b = file;
+        file_b.project = Some("b".into());
+        let reason = resolve(all_stale.clone(), file_b.clone(), &Credentials::default(), 0)?
+            .stale_shell
+            .context("all three clash")?;
+        assert!(
+            reason.contains("SEKRET_PROJECT") && reason.contains("SEKRET_PATH"),
+            "{reason}"
+        );
+        all_stale.project = Some("a".into());
+        all_stale.environment = Some("prod".into());
+        all_stale.env_path = None;
+        let advised = resolve(all_stale, file_b, &Credentials::default(), 0)?;
+        assert_eq!(advised.stale_shell, None, "--project, --env and --path as advised");
+        Ok(())
+    }
+
+    #[test]
     fn project_file_parse_errors_carry_no_escape_sequences() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("dir")?;
         #[cfg(unix)]
@@ -2221,6 +2279,23 @@ mod tests {
         assert!(check_transport("http://sekret.example.com", false).is_err());
         assert!(check_transport("http://192.168.1.10", false).is_err());
         assert!(check_transport("http://sekret.example.com", true).is_ok());
+    }
+
+    #[test]
+    fn a_server_holding_control_or_direction_characters_is_refused() {
+        for server in [
+            "https://x.test/\u{1b}[2J",
+            "https://x.test/a\nb",
+            "https://x.test/\u{9b}31m",
+            "https://x.test/\u{202e}evil",
+        ] {
+            let refused = check_transport(server, false).err().map(|e| format!("{e:#}"));
+            assert!(
+                refused.as_deref().is_some_and(|e| e.contains("control or direction")),
+                "{server:?}: {refused:?}"
+            );
+            assert!(refused.is_some_and(|e| !e.contains('\u{1b}') && !e.contains('\u{202e}')));
+        }
     }
 
     #[test]

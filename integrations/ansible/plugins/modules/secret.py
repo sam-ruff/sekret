@@ -106,6 +106,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     SekretError,
     Settings,
     option_or_env,
+    skip_verify_warning,
 )
 
 HIDDEN = "(hidden)"
@@ -251,7 +252,14 @@ def main():
         supports_check_mode=True,
     )
     try:
-        client = SekretClient(Settings.from_options(module.params))
+        settings = Settings.from_options(module.params)
+    except SekretError as e:
+        module.fail_json(msg=e.message)
+    # Before anything can fail, so a failed run still says the certificate went unchecked.
+    if not settings.validate_certs:
+        module.warn(skip_verify_warning(settings.url))
+    try:
+        client = SekretClient(settings)
         result, warnings = ensure(client, module.params, module.check_mode)
     except SekretError as e:
         module.fail_json(msg=e.message)

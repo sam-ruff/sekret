@@ -33,7 +33,7 @@ sekret-env off        # unload
 
 The project comes from `-p`, `SEKRET_PROJECT` or `.sekret.toml`, so `sekret-env` in a repository with a `.sekret.toml` loads that repository's project.
 
-`sekret-env` leaves `SEKRET_PROJECT` and `SEKRET_ENVIRONMENT` set in the shell, so later `sekret` commands use the same place, and records which `.sekret.toml` was in force in `SEKRET_LOADED_FILE`. If you then move into another repository whose `.sekret.toml` names a different project or environment, sekret refuses to use the shell's values there instead of quietly loading the first repository's secrets, which might be production ones. Run `sekret-env off`, which also clears those variables, to use the new folder's file, or pass `-p` and `-e`. Values you set yourself, or that CI sets, are not checked and still win over the file.
+`sekret-env` leaves `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT` and `SEKRET_PATH` set in the shell, so later `sekret` commands use the same place, and records which `.sekret.toml` was in force in `SEKRET_LOADED_FILE`. If you then move into another repository whose `.sekret.toml` names a different project, environment or folder, sekret refuses to use the shell's values there instead of quietly loading the first repository's secrets, which might be production ones. Run `sekret-env off`, which also clears those variables, to use the new folder's file, or pass `-p` and `-e`. Values you set yourself, or that CI sets, are not checked and still win over the file.
 
 !!! warning "Loading secrets runs code chosen by whoever can write them"
 

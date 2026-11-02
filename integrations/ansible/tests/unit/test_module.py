@@ -229,6 +229,23 @@ class TestMain:
         assert "authentication failed" in out["msg"]
         assert "wrong-token" not in json.dumps(out)
 
+    def test_certificate_checks_off_warns(self, monkeypatch, capsys, server):
+        # Where ansible-core sends a warning depends on process-wide state, so record the call.
+        warned = []
+        monkeypatch.setattr(secret_module.AnsibleModule, "warn", lambda self, message: warned.append(message))
+        run_main(monkeypatch, capsys, server, {**CONNECTION, **params(value="old-value")})
+        assert warned == []
+        args = {**CONNECTION, **params(value="old-value"), "validate_certs": False}
+        run_main(monkeypatch, capsys, server, args)
+        assert len(warned) == 1 and "validate_certs is off" in warned[0]
+
+    def test_a_failed_run_still_warns_that_checks_were_off(self, monkeypatch, capsys, server):
+        warned = []
+        monkeypatch.setattr(secret_module.AnsibleModule, "warn", lambda self, message: warned.append(message))
+        args = {**CONNECTION, **params(value="x"), "token": "wrong-token", "validate_certs": False}
+        assert run_main(monkeypatch, capsys, server, args)["failed"] is True
+        assert len(warned) == 1 and "validate_certs is off" in warned[0]
+
     def test_value_required_when_present(self, monkeypatch, capsys, server):
         out = run_main(monkeypatch, capsys, server, {**CONNECTION, **params()})
         assert out["failed"] is True

@@ -14,6 +14,7 @@ Every command is part of the single `sekret` binary. `sekret <command> --help` p
 | `--path` | `SEKRET_PATH` | Folder, default `/`. |
 | `--ca-file` | `SEKRET_CA_FILE` | Extra PEM CA certificates to trust. Falls back to the [user config](#where-settings-come-from). A file holding no PEM certificate is an error rather than ignored. |
 | `--client-cert`, `--client-key` | `SEKRET_CLIENT_CERT`, `SEKRET_CLIENT_KEY` | PEM client certificate and key, for servers or proxies that require mTLS. |
+| `--insecure-skip-verify` | `SEKRET_CLIENT_INSECURE_SKIP_VERIFY` | Do not check the server's TLS certificate or host name at all, and ignore any CA file. Anyone on the network path can then read your token and secrets, so every command that uses it says so on standard error, and says when it ignores a CA file. Only this flag or variable can turn it on, never the user config or a `.sekret.toml`. For a server whose certificate you cannot fix yet; `--ca-file` is the safe way to trust a private CA. `sekret token --context` reports it as `insecure_skip_verify`. |
 
 ### Where settings come from
 
@@ -57,7 +58,7 @@ A `.sekret.toml` in the current directory or one above it can set `server`, `pro
 - `sekret sys` commands, which send passphrases and setup codes, need the server named by `--server` or `SEKRET_URL`, or one you have logged in to.
 - `sekret login` in the browser to a server only a project file names shows its address and host and asks you to confirm at a terminal. Without a terminal it stops.
 - A saved login token only ever goes to the server it was saved for.
-- A project and environment only the file picks are confirmed once at a terminal before `sekret run`, `sekret export` or `sekret env use` loads from them, or `secrets set`, `delete`, `rollback`, `generate`, a policy change or `snapshots restore` changes something there. Without a terminal, pass `-p` and `-e`. Commands that only read name the file on standard error.
+- A project and environment only the file picks are confirmed once at a terminal before `sekret run`, `sekret export` or `sekret env use` loads from them, or `secrets set`, `delete`, `rollback`, `generate`, a policy change or `snapshots restore` changes something there. Without a terminal, pass `-p` and `-e`. Commands that only read name the file on standard error. The confirmation covers the server, project and environment, not the folder: within a project and environment you confirmed, the file may pick any folder, limited to what you can already read there.
 
 Otherwise the command stops with an error. Project files are skipped with a warning when they, or a symlink to them, belong to another user, when their directory belongs to another user (root is fine), or when they or their directory can be written by every user or by a shared group. A group-writable file or directory is fine when the group is your own private group, the usual setup with `umask 002`, and `/etc/group` and `/etc/passwd` show nobody else in it. The file is checked on the same open handle it is read from.
 
@@ -78,6 +79,8 @@ Text from the server, such as error messages, table cells, the login code and it
 | `sekret login --client-id ID --client-secret-file F` | Universal auth; `SEKRET_CLIENT_SECRET` also works. |
 | `sekret logout` | Revokes and forgets the saved token. |
 | `sekret whoami` | Shows who the token belongs to. |
+| `sekret token` | Prints the token `sekret login` saved for the chosen server, for another program such as the [Ansible lookup](integrations/ansible.md) to use. It never prints `--token` or `SEKRET_TOKEN`, only a saved login. Exits 3 when there is no saved login for the server and 4 when it has expired, with nothing on standard output. It refuses to print to a terminal, where the token would stay in the scrollback, unless you pass `--show`. A login for a plain `http://` server on another machine is not printed without `--allow-insecure-http`. A program calling it should pass `--server`: a server only a project file names is refused unless you logged in to it, and then standard error says which file chose it. |
+| `sekret token --context` | Prints, as JSON, the server, project, environment, path and CA file the settings pick, each with where it came from (`flag`, `environment`, `project_file`, `logged_in`, `user_config` or `default`), and the project file in use. Never the token. `server_confirmed` is false for a server only a project file names and you have not logged in to; send it nothing. A project and environment only an unconfirmed project file picks are refused, as `sekret export` would refuse them without a terminal, and so are a user config CA file others could change, plain `http://` to another machine and a server holding control or direction characters. Every character outside ASCII is written as `\uXXXX`, which a JSON parser undoes, so a program showing these values should escape them again. |
 
 Add `--print-token` to any machine login to print the token rather than save it.
 

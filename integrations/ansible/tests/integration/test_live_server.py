@@ -22,6 +22,8 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
 
 URL = os.environ.get("SEKRET_TEST_URL")
 TOKEN = os.environ.get("SEKRET_TEST_TOKEN")
+# The sekret binary the lookup runs for the saved login.
+CLI = os.environ.get("SEKRET_TEST_CLI")
 COLLECTION_DIR = Path(__file__).resolve().parents[2]
 ENVIRONMENT = "prod"
 BIN = Path(sys.executable).parent
@@ -85,7 +87,7 @@ def collections_path(tmp_path_factory):
     return root / "install"
 
 
-def run_playbook(playbook, collections_path, extra_env, *args):
+def run_playbook(playbook, collections_path, extra_env, *args, cwd=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("SEKRET_")}
     env.update(
         ANSIBLE_COLLECTIONS_PATH=str(collections_path),
@@ -98,6 +100,7 @@ def run_playbook(playbook, collections_path, extra_env, *args):
     return subprocess.run(
         [str(BIN / "ansible-playbook"), str(playbook), *args],
         env=env,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=300,
@@ -166,6 +169,89 @@ class TestPlaybooks:
         second = run_playbook(workdir / "playbook.yml", collections_path, {"SEKRET_TOKEN": TOKEN}, *extra)
         assert second.returncode == 0, second.stdout + second.stderr
         assert recap_changed(second.stdout) == 0
+
+    @pytest.mark.skipif(not CLI, reason="SEKRET_TEST_CLI is not set")
+    @pytest.mark.parametrize("expired", [False, True])
+    def test_lookup_uses_the_cli_login_and_ansible_cfg(self, project, collections_path, tmp_path, expired):
+        config = tmp_path / "config" / "sekret"
+        config.mkdir(parents=True, mode=0o700)
+        credentials = config / "credentials.toml"
+        expires_at = 1 if expired else 4_102_444_800
+        credentials.write_text(f'[servers."{URL}"]\ntoken = "{TOKEN}"\nexpires_at = {expires_at}\n')
+        credentials.chmod(0o600)
+        ansible_cfg = tmp_path / "ansible.cfg"
+        ansible_cfg.write_text(
+            f"[sekret]\nproject = {project}\nenvironment = {ENVIRONMENT}\ncli_login = false\n"
+        )
+        playbook = tmp_path / "cli.yml"
+        playbook.write_text(
+            "- hosts: localhost\n"
+            "  gather_facts: false\n"
+            "  tasks:\n"
+            "    - ansible.builtin.assert:\n"
+            "        that: lookup('sekret.secrets.secret', 'DB_PASSWORD', path='/db') == 'db-pass-7f3a'\n"
+            "      no_log: true\n"
+        )
+        result = run_playbook(
+            playbook,
+            collections_path,
+            {
+                "ANSIBLE_CONFIG": str(ansible_cfg),
+                "SEKRET_CLI": CLI,
+                "XDG_CONFIG_HOME": str(tmp_path / "config"),
+                "XDG_CACHE_HOME": str(tmp_path / "cache"),
+            },
+        )
+        output = result.stdout + result.stderr
+        assert TOKEN not in output
+        if expired:
+            assert result.returncode != 0
+            assert "cli_login is off" in output
+        else:
+            assert result.returncode == 0, output
+
+    @pytest.mark.skipif(not CLI, reason="SEKRET_TEST_CLI is not set")
+    @pytest.mark.parametrize("loaded", ["elsewhere", "here", "by hand"])
+    def test_a_shell_loaded_for_another_project_file_is_refused(
+        self, project, collections_path, tmp_path, loaded
+    ):
+        config = tmp_path / "config" / "sekret"
+        config.mkdir(parents=True, mode=0o700)
+        credentials = config / "credentials.toml"
+        credentials.write_text(f'[servers."{URL}"]\ntoken = "{TOKEN}"\nexpires_at = 4102444800\n')
+        credentials.chmod(0o600)
+        work = tmp_path / "repo-b"
+        work.mkdir()
+        project_file = work / ".sekret.toml"
+        project_file.write_text('project = "repo-b-project"\nenvironment = "staging"\n')
+        playbook = work / "read.yml"
+        playbook.write_text(
+            "- hosts: localhost\n"
+            "  gather_facts: false\n"
+            "  tasks:\n"
+            "    - ansible.builtin.assert:\n"
+            "        that: lookup('sekret.secrets.secret', 'DB_PASSWORD', path='/db') == 'db-pass-7f3a'\n"
+            "      no_log: true\n"
+        )
+        env = {
+            "SEKRET_CLI": CLI,
+            "SEKRET_CLI_LOGIN": "false",
+            "SEKRET_PROJECT": project,
+            "SEKRET_ENVIRONMENT": ENVIRONMENT,
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        }
+        if loaded == "elsewhere":
+            env["SEKRET_LOADED_FILE"] = str(tmp_path / "repo-a" / ".sekret.toml")
+        elif loaded == "here":
+            env["SEKRET_LOADED_FILE"] = str(project_file)
+        result = run_playbook(playbook, collections_path, env, cwd=work)
+        output = result.stdout + result.stderr
+        if loaded == "elsewhere":
+            assert result.returncode != 0
+            assert "sekret-env" in output, output
+        else:
+            assert result.returncode == 0, output
 
     def test_module_and_lookup_as_machine_identity(self, project, machine, collections_path):
         values = {"value_one": f"first-{uuid.uuid4().hex}", "value_two": f"second-{uuid.uuid4().hex}"}

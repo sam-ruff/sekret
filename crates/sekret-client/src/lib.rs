@@ -319,6 +319,8 @@ pub struct ClientOptions {
     /// PEM client certificate chain followed by its private key, for servers that require mTLS.
     pub identity_pem: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
+    /// Accept any certificate for any host name: no TLS verification at all, and `ca_pem` unused.
+    pub insecure_skip_verify: bool,
 }
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -418,7 +420,9 @@ impl HttpClient {
         if bypasses_proxy(&base) {
             builder = builder.no_proxy();
         }
-        if let Some(pem) = options.ca_pem {
+        if options.insecure_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        } else if let Some(pem) = options.ca_pem {
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| ClientError::Config(format!("CA bundle: {e}")))?;
             // A file of something else yields no certificates and would quietly trust only the
@@ -840,6 +844,7 @@ mod tests {
             ca_pem: Some(b"token = \"skt_SECRET\"\n".to_vec()),
             identity_pem: None,
             timeout: None,
+            insecure_skip_verify: false,
         };
         let refused = HttpClient::new("https://sekret.test", None, options).err();
         let message = refused.map(|e| e.to_string()).unwrap_or_default();

@@ -132,6 +132,8 @@ Creating a project or an environment answers `conflict` when the slug is taken, 
 
 ## Transport
 
+The CLI and the Ansible collection check the server's certificate unless told not to with `--insecure-skip-verify` or `SEKRET_CLIENT_INSECURE_SKIP_VERIFY` (the CLI) or `validate_certs: false` (Ansible, never from an inventory variable). Then anyone on the network path can read tokens and secrets, so each use warns, and neither the CLI's user config nor a `.sekret.toml` can turn it on. The collection, like the CLI, never sends plain `http://` or loopback requests through a proxy.
+
 By default sekret speaks plain HTTP and expects a reverse proxy to provide TLS. It can also serve HTTPS itself and require client certificates (mutual TLS); see [Configuration](configuration.md#tls-and-mutual-tls).
 
 Outgoing requests, to OIDC issuers and Kubernetes API servers, must use HTTPS unless `--allow-insecure-http` is set, never carry credentials in the URL, and do not follow redirects. Only HTTPS requests to another machine use the `HTTPS_PROXY` or `ALL_PROXY` set in the environment (`NO_PROXY` is honoured); plain HTTP and loopback requests always go direct, so a proxy never sees a client secret or token in the clear. They may go to private and internal addresses, since an in-house identity provider or cluster is the usual target. So someone allowed to edit identities can make the server send requests to internal HTTPS hosts by pointing an issuer, JWKS URL or Kubernetes host at them. The responses are never shown to them, so this only reveals whether the host answered; keep `identities: edit` for people you would trust with that.
@@ -145,6 +147,10 @@ Text from the server is printed with control characters, terminal escape sequenc
 The CLI refuses plain `http://` to anything but this machine unless `--allow-insecure-http` is given, and refuses a login approval link that points to a different site from the server.
 
 `sekret run` never passes `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET`, `SEKRET_UNLOCK_PASSPHRASE` or `SEKRET_REMEMBER_SECRET` to the command it starts, and overwrites them in its own environment first, so the command cannot read them from `/proc` either. `sekret run`, `sekret env use` and `sekret export --format dotenv` or `shell` only load valid variable names, never `SEKRET_*`, and block a broad set of names that change what programs run or where they connect, such as `LD_PRELOAD`, `GIT_EXTERNAL_DIFF`, `PAGER` or `HTTPS_PROXY`, unless the person allows a name with `--allow` or the project file's `allow`. Because a list of tool settings is never complete, names without an underscore are also held back unless they are one of a few common app settings such as `PORT`: tools mostly read single words like `CC`, `SED` or `TMPDIR`, so a setting nobody has listed yet fails safe. The list is in [Shells and AI agents](integrations/shells-and-agents.md).
+
+## Ansible
+
+The lookup never sends a token or machine identity to a server, or anything through a CA file, that inventory variables (`sekret_url`, `sekret_ca_path`) chose, and only sends your saved `sekret login` to such a server. This is defence in depth, not a boundary against a hostile inventory: an inventory can set `ansible_connection` or `ansible_python_interpreter` and run code as the operator, which no lookup can prevent. Run only inventories you trust. See [Ansible](integrations/ansible.md#what-may-choose-the-server).
 
 ## The web interface
 

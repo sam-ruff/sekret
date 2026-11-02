@@ -41,6 +41,9 @@ enum Command {
     Logout,
     /// Show who the current token belongs to.
     Whoami,
+    /// Print the token `sekret login` saved for this server, for another program to use. Exits 3
+    /// when not logged in and 4 when the login has expired. Ignores --token and SEKRET_TOKEN.
+    Token(cli::token::TokenArgs),
     /// List the projects you can see, or create one.
     Projects {
         #[command(subcommand)]
@@ -145,6 +148,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::Openapi => println!("{}", sekret_server::openapi_json()),
         Command::Login(args) => cli::run_login(&cli.client, args).await?,
         Command::Logout => cli::run_logout(&cli.client).await?,
+        Command::Token(args) => return cli::token::run(&cli.client, &args, &mut out),
         Command::Whoami => {
             let (resolved, api) = authenticated(&cli.client).await?;
             let me = api.me().await?;

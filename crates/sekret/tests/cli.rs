@@ -1068,6 +1068,115 @@ async fn run_and_export_hold_back_tool_settings() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn skipping_certificate_checks_is_only_ever_asked_for() -> anyhow::Result<()> {
+    let pki = Pki::new()?;
+    let dir = tempfile::tempdir().context("dir")?;
+    let key_file = dir.path().join("root.key");
+    std::fs::write(
+        &key_file,
+        ok(run(&["admin", "generate-root-key"], &[], dir.path(), None)?)?,
+    )
+    .context("key")?;
+    let db = format!("sqlite://{}?mode=rwc", dir.path().join("sekret.db").display());
+    let key_path = key_file.display().to_string();
+    let server = spawn_on(
+        "https",
+        &[
+            "--database-url",
+            &db,
+            "--root-key-file",
+            &key_path,
+            "--tls-cert-file",
+            &pki.path("server.pem"),
+            "--tls-key-file",
+            &pki.path("server-key.pem"),
+        ],
+        &[],
+        dir.path(),
+    )
+    .await?;
+    let url = server.url.clone();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca_pem = std::fs::read(pki.path("ca.pem")).context("ca")?;
+    let probe = reqwest::Client::builder()
+        .tls_certs_only(reqwest::Certificate::from_pem_bundle(&ca_pem).context("ca bundle")?)
+        .build()
+        .context("probe client")?;
+    let mut up = false;
+    for _ in 0..150 {
+        if probe.get(format!("{url}/api/v1/health")).send().await.is_ok() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(up, "the TLS server did not come up in 15 seconds");
+    let home = tempfile::tempdir().context("home")?;
+    let h = home.path();
+    let admin = ok(run(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &db,
+            "--root-key-file",
+            &key_path,
+        ],
+        &[],
+        h,
+        None,
+    )?)?
+    .trim()
+    .to_string();
+    let base = [("SEKRET_URL", url.as_str()), ("SEKRET_TOKEN", admin.as_str())];
+    let whoami = |args: &[&str], extra: &[(&str, &str)]| {
+        let mut all = vec!["whoami"];
+        all.extend_from_slice(args);
+        let env: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        run(&all, &env, h, None)
+    };
+
+    let checked = whoami(&[], &[])?;
+    assert!(
+        !checked.status.success(),
+        "a certificate nobody vouches for is refused by default"
+    );
+    let refused = String::from_utf8_lossy(&checked.stderr);
+    assert!(!refused.contains("not checking"), "{refused}");
+    let off = whoami(&[], &[("SEKRET_CLIENT_INSECURE_SKIP_VERIFY", "false")])?;
+    assert!(!off.status.success(), "false keeps checking");
+
+    let flagged = whoami(&["--insecure-skip-verify"], &[])?;
+    let warned = String::from_utf8_lossy(&flagged.stderr);
+    assert!(flagged.status.success(), "{warned}");
+    assert_eq!(
+        warned.matches("not checking").count(),
+        1,
+        "one warning per use: {warned}"
+    );
+    assert!(warned.contains("can read your token and secrets"), "{warned}");
+
+    let by_env = whoami(&[], &[("SEKRET_CLIENT_INSECURE_SKIP_VERIFY", "true")])?;
+    assert!(by_env.status.success(), "{}", String::from_utf8_lossy(&by_env.stderr));
+
+    let missing_ca = dir.path().join("no-such-ca.pem").display().to_string();
+    let over_ca = whoami(&["--insecure-skip-verify", "--ca-file", &missing_ca], &[])?;
+    let warned = String::from_utf8_lossy(&over_ca.stderr);
+    assert!(over_ca.status.success(), "the CA file is not even read: {warned}");
+    assert!(warned.contains("ignores the CA file"), "{warned}");
+
+    let context = |args: &[&str]| -> anyhow::Result<serde_json::Value> {
+        let mut all = vec!["token", "--context", "-p", "p", "-e", "e"];
+        all.extend_from_slice(args);
+        let output = ok(run(&all, &[("SEKRET_URL", url.as_str())], h, None)?)?;
+        serde_json::from_str(&output).context("context json")
+    };
+    assert_eq!(context(&[])?["insecure_skip_verify"], false);
+    assert_eq!(context(&["--insecure-skip-verify"])?["insecure_skip_verify"], true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mutual_tls_end_to_end() -> anyhow::Result<()> {
     let pki = Pki::new()?;
     let dir = tempfile::tempdir().context("dir")?;

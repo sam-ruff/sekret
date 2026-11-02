@@ -1,11 +1,21 @@
+import contextlib
+import datetime
 import http.server
 import io
 import json
+import socket
 import ssl
 import threading
 import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from fake_server import FakeServer, error, respond
 
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (
@@ -23,11 +33,93 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     TokenCache,
     TransportError,
     UrllibTransport,
+    bypasses_proxy,
     resolve_auth,
     ssl_context,
 )
 
 URL = "https://sekret.test"
+
+
+@dataclass
+class LocalCa:
+    ca_file: Path
+    server_context: ssl.SSLContext
+
+
+def make_ca(directory: Path, name: str) -> LocalCa:
+    """A CA and a localhost server certificate it signed, as files and a server context."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{name} CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, True, True, False, False), critical=True
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(ca_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False
+        )
+        .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_file = directory / f"{name}-ca.pem"
+    ca_file.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    chain = directory / f"{name}-server.pem"
+    chain.write_bytes(
+        leaf.public_bytes(serialization.Encoding.PEM)
+        + key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(chain)
+    return LocalCa(ca_file, server_context)
+
+
+def handshake(client: ssl.SSLContext, ca: LocalCa) -> bool:
+    """Whether `client` accepts a localhost server whose certificate `ca` signed."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def serve():
+        connection, _ = listener.accept()
+        with contextlib.suppress(OSError), ca.server_context.wrap_socket(connection, server_side=True):
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=15) as raw,
+            client.wrap_socket(raw, server_hostname="localhost"),
+        ):
+            return True
+    except ssl.SSLCertVerificationError:
+        return False
+    finally:
+        thread.join(timeout=15)
+        listener.close()
 
 
 class FakeClock:
@@ -357,6 +449,18 @@ class TestTls:
     def test_ca_directory(self, tmp_path):
         assert ssl_context(True, str(tmp_path)).verify_mode == ssl.CERT_REQUIRED
 
+    def test_a_ca_file_is_added_to_the_system_cas_not_in_their_place(self, tmp_path, monkeypatch):
+        private = make_ca(tmp_path, "private")
+        system = make_ca(tmp_path, "system")
+        unknown = make_ca(tmp_path, "unknown")
+        # OpenSSL's default paths honour SSL_CERT_FILE, which stands in for the system store here.
+        monkeypatch.setenv("SSL_CERT_FILE", str(system.ca_file))
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        context = ssl_context(True, str(private.ca_file))
+        assert handshake(context, private)
+        assert handshake(context, system)
+        assert not handshake(context, unknown)
+
     def test_client_certificate_is_loaded(self, monkeypatch):
         loaded = []
         monkeypatch.setattr(
@@ -404,6 +508,78 @@ def test_urllib_transport_does_not_follow_redirects():
         server.shutdown()
     assert response.status == 302
     assert seen_auth == []
+
+
+def _recording_server():
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_plain_http_never_goes_through_a_proxy(monkeypatch):
+    target, reached = _recording_server()
+    proxy, proxied = _recording_server()
+    try:
+        for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.setenv(name, f"http://127.0.0.1:{proxy.server_port}")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        url = f"http://127.0.0.1:{target.server_port}/api"
+        transport = UrllibTransport(ssl_context(True, None), url)
+        assert transport("GET", url, {"Authorization": "Bearer saved-login"}, None, 15).status == 200
+    finally:
+        target.shutdown()
+        proxy.shutdown()
+    assert proxied == []
+    assert reached == [("/api", "Bearer saved-login")]
+
+
+@pytest.mark.parametrize(
+    ("url", "bypass"),
+    [
+        ("http://sekret.example.com", True),
+        ("http://127.0.0.1:8080", True),
+        ("https://localhost", True),
+        ("https://app.localhost.", True),
+        ("https://127.0.0.2", True),
+        ("https://[::1]:8443", True),
+        ("https://[::ffff:127.0.0.1]", True),
+        ("https://sekret.example.com", False),
+        ("https://192.168.1.10", False),
+    ],
+)
+def test_only_https_to_another_host_may_use_a_proxy(url, bypass):
+    assert bypasses_proxy(url) is bypass
+
+
+def test_https_to_another_host_keeps_the_environments_proxy(monkeypatch):
+    # The runner may have its own proxy settings, and urllib prefers the lower-case names.
+    for name in ("https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    remote = UrllibTransport(ssl_context(True, None), "https://sekret.example.com")
+    local = UrllibTransport(ssl_context(True, None), "https://127.0.0.1:8443")
+
+    def proxies(transport):
+        handlers = [h for h in transport._opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+        return [h.proxies for h in handlers]
+
+    assert proxies(remote) and proxies(remote)[0].get("https") == "http://proxy.example.com:3128"
+    # An empty ProxyHandler registers nothing, but stops build_opener adding the environment's.
+    assert not any(proxies(local))
 
 
 def test_urllib_transport_returns_error_bodies(monkeypatch):
