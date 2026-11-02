@@ -1459,7 +1459,42 @@ mod tests {
         Ok(())
     }
 
-    /// Needs `setfacl` and a filesystem with POSIX ACLs.
+    /// Grants `uid` rwx on `dir` by writing the access ACL xattr directly, as `setfacl -m u:<uid>:rwx`
+    /// would on a 0770 directory, so the test needs no `acl` package.
+    #[cfg(target_os = "linux")]
+    fn grant_user_rwx(dir: &Path, uid: u32) -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        const UNDEFINED: u32 = u32::MAX;
+        // posix_acl_xattr: a version header, then (tag, perm, id) entries sorted by tag.
+        let entries: [(u16, u16, u32); 5] = [
+            (0x01, 7, UNDEFINED), // owner
+            (0x02, 7, uid),       // named user
+            (0x04, 7, UNDEFINED), // owning group
+            (0x10, 7, UNDEFINED), // mask
+            (0x20, 0, UNDEFINED), // other
+        ];
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).context("path")?;
+        // SAFETY: both strings are NUL-terminated and the value pointer and length describe `acl`.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                c"system.posix_acl_access".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        anyhow::ensure!(result == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    }
+
+    /// Needs a filesystem with POSIX ACLs.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_acl_on_a_directory_along_the_path_is_seen() -> anyhow::Result<()> {
@@ -1471,12 +1506,7 @@ mod tests {
             return Ok(());
         }
         assert!(load_user_config(&path).is_ok(), "a private group may write");
-        let status = std::process::Command::new("setfacl")
-            .args(["-m", "u:nobody:rwx"])
-            .arg(real.path())
-            .status()
-            .context("setfacl")?;
-        anyhow::ensure!(status.success(), "setfacl failed");
+        grant_user_rwx(real.path(), 65534)?;
         let refused = format!("{:#}", load_user_config(&path).err().context("directory ACL")?);
         assert!(refused.contains("which leads to it"), "{refused}");
         Ok(())
