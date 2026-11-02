@@ -203,6 +203,51 @@ class TestAccess:
         assert result["changed"] is True
         assert not server.secrets[("/db", "DB_PASSWORD")].restricted
 
+    def test_unrestricting_clears_the_list(self, client, server):
+        stored = server.secrets[("/db", "DB_PASSWORD")]
+        stored.restricted = True
+        stored.grants = {("group", "ops"): ["read"]}
+        result, _ = ensure(client, params(value="old-value", restricted=False))
+        assert result["changed"] is True
+        assert result["access_changed"] is True
+        assert result["diff"]["before"]["access"] == [{"kind": "group", "id": "ops", "allow": ["read"]}]
+        assert result["diff"]["after"]["access"] == []
+        assert server.access_changes[0].body == {"restricted": False}
+        assert stored.grants == {}
+
+    def test_unrestricting_with_a_list_grants_it_again_in_the_same_request(self, client, server):
+        stored = server.secrets[("/db", "DB_PASSWORD")]
+        stored.restricted = True
+        stored.grants = {("identity", "pod-1"): ["read", "read-value"], ("group", "ops"): ["read"]}
+        result, _ = ensure(client, params(value="old-value", restricted=False, access=[POD]))
+        assert result["changed"] is True
+        assert result["diff"]["after"]["access"] == [
+            {"kind": "identity", "id": "pod-1", "allow": ["read", "read-value"]}
+        ]
+        assert server.access_changes[0].body == {
+            "restricted": False,
+            "grant": [
+                {"principal_kind": "identity", "principal_id": "pod-1", "actions": ["read", "read-value"]}
+            ],
+        }
+        assert len(server.access_changes) == 1
+        assert stored.grants == {("identity", "pod-1"): ["read", "read-value"]}
+        assert not stored.restricted
+
+    def test_a_deleted_open_secret_comes_back_restricted_in_one_write(self, client, server):
+        server.secrets[("/db", "DB_PASSWORD")].deleted = True
+        result, _ = ensure(client, params(value="again", restricted=True))
+        assert result["operation"] == "created"
+        assert result["restricted"] is True
+        assert server.writes[0].body["upserts"][0]["restricted"] is True
+        assert server.secrets[("/db", "DB_PASSWORD")].restricted
+        assert server.access_changes == []
+
+    def test_a_server_that_writes_it_open_fails_the_task(self, client, server):
+        server.ignore_restricted = True
+        with pytest.raises(SekretError, match="did not restrict it, so it is open"):
+            ensure(client, params(key="NEW", value="v", restricted=True))
+
     def test_make_the_list_match(self, client, server):
         stored = server.secrets[("/db", "DB_PASSWORD")]
         stored.restricted = True

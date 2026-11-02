@@ -45,7 +45,10 @@ options:
     description:
       - Whether only the principals on the secret's access list, project admins and organisation admins may
         reach it. Leave unset to keep it as it is.
-      - A new secret created with C(true) is restricted in the same write, so it is never open even briefly.
+      - A new secret created with C(true), or a deleted one brought back, is restricted in the same write,
+        so it is never open even briefly. The task fails if the server writes it without restricting it.
+      - Unrestricting clears the access list. With O(access) set too, that list is granted in the same
+        request; otherwise the list ends up empty.
       - Restricting needs per-secret access turned on for the project, and changing it needs a project or
         organisation admin.
       - Ignored when O(state=absent).
@@ -298,11 +301,14 @@ def _apply_access(
 ) -> None:
     """Brings a secret that now exists to the requested flag and list, in one request."""
     listing = client.get_access(target.project, target.environment, target.key, target.path)
+    was_restricted = bool(listing.get("restricted"))
     change: dict = {}
-    if restricted is not None and restricted != bool(listing.get("restricted")):
+    if restricted is not None and restricted != was_restricted:
         change["restricted"] = restricted
+    # Unrestricting clears the list before the request's grants apply, so the whole list is granted.
+    have = {} if was_restricted and restricted is False else current_access(listing.get("grants") or [])
     if want is not None:
-        grant, revoke = plan_access(current_access(listing.get("grants") or []), want)
+        grant, revoke = plan_access(have, want)
         if grant:
             change["grant"] = grant
         if revoke:
@@ -343,24 +349,28 @@ def _ensure_present(
         "after": {"value": HIDDEN_CHANGED if value_changed else HIDDEN, "tags": after_tags},
     }
 
-    # The list is only read when it is managed, since reading it needs an admin.
+    # The list is only read when it is managed or about to be cleared, since reading it needs an admin.
     before_restricted = current.restricted if current else False
+    unrestricting = before_restricted and restricted is False
     have: dict[Principal, list[str]] = {}
-    if current is not None and want is not None:
+    if current is not None and (want is not None or unrestricting):
         listing = client.get_access(target.project, target.environment, target.key, target.path)
         before_restricted = bool(listing.get("restricted"))
+        unrestricting = before_restricted and restricted is False
         have = current_access(listing.get("grants") or [])
     after_restricted = before_restricted if restricted is None else restricted
+    # Unrestricting clears the list, so afterwards it holds only what is granted with it.
+    after = (want if want is not None else {}) if unrestricting else want
     grant, revoke = plan_access(have, want) if want is not None else ([], [])
     access_changed = after_restricted != before_restricted or bool(grant or revoke)
     if restricted is not None:
         if current is not None:
             diff["before"]["restricted"] = before_restricted
         diff["after"]["restricted"] = after_restricted
-    if want is not None:
+    if after is not None:
         if current is not None:
             diff["before"]["access"] = _entries(have)
-        diff["after"]["access"] = _entries(want)
+        diff["after"]["access"] = _entries(after)
 
     result = {
         "changed": operation != "unchanged" or access_changed,
@@ -380,6 +390,11 @@ def _ensure_present(
             # Restricted in the same write, so the new secret is never open.
             upsert["restricted"] = True
         outcome = client.batch(target.project, target.environment, target.path, upserts=[upsert])
+        if upsert.get("restricted") and target.key not in (outcome.get("restricted") or []):
+            raise SekretError(
+                f"sekret wrote {target.key} but did not restrict it, so it is open to everyone its roles "
+                "allow; the server may be too old for per-secret access. Restrict or delete it by hand."
+            )
         if target.key in outcome.get("created", []):
             operation = "created"
         elif target.key in outcome.get("updated", []):

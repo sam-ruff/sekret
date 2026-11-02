@@ -77,7 +77,7 @@ A key that doesn't exist fails the task. Pass `default=` if you would rather get
 
 The module compares against what is stored before writing, so it only reports a change when there is one, and check mode works. It never returns the value, and `--diff` only tells you whether the value changed. The `comment` is attached to the new version when a write happens and isn't compared.
 
-When per-secret access is on for the project, `restricted: true` keeps a secret to its access list and admins, and `access` sets that list to exactly what you give, each entry a `kind` (`identity`, `user` or `group`), an `id` and what to `allow` (`read`, `read-value`, `edit`, `delete`; `read` and `read-value` by default). A new secret is restricted in the same write that creates it. Leave either option out to keep what is there. Managing access needs a project or organisation admin.
+When per-secret access is on for the project, `restricted: true` keeps a secret to its access list and admins, and `access` sets that list to exactly what you give, each entry a `kind` (`identity`, `user` or `group`), an `id` and what to `allow` (`read`, `read-value`, `edit`, `delete`; `read` and `read-value` by default). A new or deleted secret is restricted in the same write that creates it, and the task fails if the server writes it open. Leave either option out to keep what is there, except that `restricted: false` clears the list unless `access` is given with it. Managing access needs a project or organisation admin.
 
 ```yaml
 - name: Only the payments workload reads the Stripe key
