@@ -3,6 +3,7 @@ pub mod format;
 pub mod login;
 pub mod shell;
 pub mod sys;
+pub mod token;
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -346,6 +347,17 @@ pub fn token_flag_warning(argv: &[String]) -> Option<&'static str> {
 }
 
 pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let token = args
+        .token
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| var("SEKRET_TOKEN"));
+    resolve_with_token(args, token)
+}
+
+/// [`resolve`] with the token given here in place of `--token` and `SEKRET_TOKEN`.
+pub fn resolve_with_token(args: &ClientArgs, token: Option<String>) -> anyhow::Result<Resolved> {
     let cwd = std::env::current_dir()?;
     let mut warnings = Vec::new();
     let argv: Vec<String> = std::env::args_os()
@@ -372,7 +384,7 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
     config::resolve(
         Overrides {
             server,
-            token: set(&args.token, "SEKRET_TOKEN"),
+            token,
             project: args.project.clone().filter(|v| !v.is_empty()),
             environment: args.environment.clone().filter(|v| !v.is_empty()),
             env_project: var("SEKRET_PROJECT"),

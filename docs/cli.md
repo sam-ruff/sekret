@@ -78,6 +78,8 @@ Text from the server, such as error messages, table cells, the login code and it
 | `sekret login --client-id ID --client-secret-file F` | Universal auth; `SEKRET_CLIENT_SECRET` also works. |
 | `sekret logout` | Revokes and forgets the saved token. |
 | `sekret whoami` | Shows who the token belongs to. |
+| `sekret token` | Prints the token `sekret login` saved for the chosen server, for another program such as the [Ansible lookup](integrations/ansible.md) to use. It never prints `--token` or `SEKRET_TOKEN`, only a saved login. Exits 3 when there is no saved login for the server and 4 when it has expired, with nothing on standard output. It refuses to print to a terminal, where the token would stay in the scrollback, unless you pass `--show`. |
+| `sekret token --context` | Prints, as JSON, the server, project, environment, path and CA file the settings pick, each with where it came from (`flag`, `environment`, `project_file`, `user_config` or `default`), and the project file in use. Never the token. A project and environment only an unconfirmed project file picks are refused, as `sekret export` would refuse them without a terminal. |
 
 Add `--print-token` to any machine login to print the token rather than save it.
 
