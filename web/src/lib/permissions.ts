@@ -11,6 +11,19 @@ export interface Resource {
   path?: string;
   key?: string;
   tags?: readonly string[];
+  /**
+   * For a restricted secret, the actions its access list grants the caller; absent when the
+   * secret is open or the caller is exempt. It narrows what rules allow and never widens it.
+   */
+  granted?: readonly Action[];
+}
+
+/** Subjects about one secret, which answer to its access list. */
+const LISTED_SUBJECTS: readonly Subject[] = ["secrets", "secret-versions"];
+
+function listPermits(granted: readonly Action[] | undefined, subject: Subject, action: Action): boolean {
+  if (granted === undefined || !LISTED_SUBJECTS.includes(subject)) return true;
+  return granted.includes(action === "create" ? "edit" : action);
 }
 
 function listed(values: readonly string[] | undefined): readonly string[] {
@@ -63,6 +76,7 @@ export function authorise(rules: readonly Rule[], subject: Subject, action: Acti
   const relevant = rules.filter((r) => r.subject === subject && r.actions.includes(action));
   const conditionsOf = (r: Rule): Conditions => r.conditions ?? {};
   if (relevant.some((r) => r.effect === "deny" && denyApplies(conditionsOf(r), resource))) return false;
+  if (!listPermits(resource.granted, subject, action)) return false;
   return relevant.some((r) => r.effect === "allow" && allowApplies(conditionsOf(r), resource));
 }
 

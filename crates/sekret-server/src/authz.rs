@@ -161,6 +161,16 @@ impl SecretAccess {
         self.exempt
     }
 
+    /// Whether the caller is exempt or on the list of the secret with this id, which always
+    /// includes reading it.
+    pub fn lists_for_read(&self, secret_id: &str) -> bool {
+        self.exempt
+            || self
+                .granted
+                .get(secret_id)
+                .is_some_and(|actions| actions.contains(&Action::Read))
+    }
+
     /// How lists bear on a check that spans every secret in the project, such as "may this
     /// caller read them all": open only when the caller is exempt or nothing there can be
     /// restricted, since the store refuses turning the setting off while any secret is.
@@ -184,10 +194,14 @@ impl SecretAccess {
 pub async fn secret_access(
     state: &AppState,
     principal: &Principal,
-    project_id: &str,
+    project: &Project,
     environment_id: &str,
 ) -> ApiResult<SecretAccess> {
-    if manages_secret_access(state, principal, project_id).await? {
+    // Nothing can be restricted with the setting off; should anything be, it stays closed.
+    if !project.secret_access {
+        return Ok(SecretAccess::default());
+    }
+    if manages_secret_access(state, principal, &project.id).await? {
         return Ok(SecretAccess::exempt());
     }
     let grants = state.store.list_environment_grants(environment_id).await?;
@@ -272,6 +286,16 @@ pub fn deny_needs_admin() -> ApiError {
         axum::http::StatusCode::FORBIDDEN,
         "escalation",
         "only an admin can bind deny rules to an admin",
+    )
+}
+
+/// The built-in admin roles carry more than their rules, such as exemption from per-secret
+/// access lists, so a principal whose rules merely match them cannot hand them out.
+pub fn admin_role_needs_admin(role: &str) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::FORBIDDEN,
+        "escalation",
+        format!("only an admin can grant the built-in {role} role"),
     )
 }
 

@@ -664,6 +664,12 @@ async fn snapshots_leave_hidden_secrets_out(db: String) -> anyhow::Result<()> {
     // Change the restricted secret, then look at what restoring the first snapshot would do.
     h.set_secrets("app", "prod", "/payments", &[("STRIPE", "rotated")])
         .await?;
+    let (_, after) = h.get(&format!("{base}/snapshots"), &bot).await?;
+    assert_eq!(after, snapshots, "a change only to the hidden secret leaves no trace");
+    let (_, as_admin) = h.get(&format!("{base}/snapshots"), &h.admin).await?;
+    let rotation = as_admin[0]["id"].as_str().context("rotation snapshot")?;
+    let (status, _) = h.get(&format!("{base}/snapshots/{rotation}"), &bot).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let id = first["id"].as_str().context("id")?;
     let (status, detail) = h.get(&format!("{base}/snapshots/{id}?path=/"), &bot).await?;
     assert_eq!(status, StatusCode::OK, "{detail}");
@@ -685,11 +691,18 @@ async fn snapshots_leave_hidden_secrets_out(db: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The audit log names a restricted secret only to those who may see it, and its filters cannot
-/// be used to find one.
+/// The audit log leaves out every entry about a restricted secret for those off its list, so
+/// neither entries, totals, filters nor searches show it exists. Entries are marked when written.
 async fn audit_names_restricted_secrets_only_to_those_listed(db: String) -> anyhow::Result<()> {
     let h = start(options(db)).await?;
-    restricted_project(&h).await?;
+    h.create_project("app").await?;
+    set_setting(&h, &h.admin, true).await?;
+    let stripe = "/api/v1/projects/app/environments/prod/secrets/STRIPE?path=/payments";
+    let (status, body) = h
+        .put(stripe, &h.admin, json!({"value": "sk_live", "restricted": true}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    h.set_secrets("app", "prod", "/payments", &[("OPEN", "fine")]).await?;
     let (pod, pod_token) = h.machine("payments-pod", "app", "developer").await?;
     let (_, bot) = h.machine("dev-bot", "app", "developer").await?;
     change(
@@ -697,48 +710,258 @@ async fn audit_names_restricted_secrets_only_to_those_listed(db: String) -> anyh
         &h.admin,
         "/payments",
         "STRIPE",
-        json!({"grant": [{"principal_kind": "identity", "principal_id": pod, "actions": ["read-value"]}]}),
+        json!({"grant": [{"principal_kind": "identity", "principal_id": pod, "actions": ["read-value", "edit"]}]}),
     )
     .await?;
-    let (status, _) = h
-        .get(
-            "/api/v1/projects/app/environments/prod/secrets/STRIPE?path=/payments",
-            &pod_token,
-        )
-        .await?;
+    let (status, _) = h.get(stripe, &pod_token).await?;
     assert_eq!(status, StatusCode::OK);
-    let (status, page) = h.get("/api/v1/projects/app/audit?limit=200", &bot).await?;
+    h.put(stripe, &pod_token, json!({"value": "sk_live_2"})).await?;
+    let audit = |query: &str| format!("/api/v1/projects/app/audit?limit=200&{query}");
+    let (status, page) = h.get(&audit(""), &bot).await?;
     assert_eq!(status, StatusCode::OK, "{page}");
-    assert!(!page.to_string().contains("STRIPE"), "{page}");
-    assert!(!page.to_string().contains("sk_live"), "{page}");
-    let access_entry = page["entries"]
+    let text = page.to_string();
+    assert!(!text.contains("STRIPE") && !text.contains("sk_live"), "{page}");
+    let actions: Vec<&str> = page["entries"]
         .as_array()
         .context("entries")?
         .iter()
-        .find(|e| e["action"] == "secret.access")
-        .context("access entry")?;
-    assert_eq!(access_entry["detail"], json!({"redacted": true}));
-    for filter in ["key=STRIPE", "path=/payments", "environment=prod&key=STRIPE"] {
-        let (status, body) = h.get(&format!("/api/v1/projects/app/audit?{filter}"), &bot).await?;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{filter}: {body}");
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    assert!(!actions.contains(&"secret.access"), "{actions:?}");
+    assert_eq!(
+        actions.iter().filter(|a| a.starts_with("secret.")).count(),
+        1,
+        "only the open write remains: {actions:?}"
+    );
+    // Filters and searches behave as if the secret never existed.
+    for query in [
+        "key=STRIPE",
+        "environment=prod&key=STRIPE",
+        "q=STRIPE",
+        "action=secret.access",
+    ] {
+        let (status, body) = h.get(&audit(query), &bot).await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["total"], json!(0), "{query}: {body}");
     }
-    let (_, searched) = h.get("/api/v1/projects/app/audit?q=STRIPE", &bot).await?;
-    assert_eq!(searched["total"], json!(0), "a search cannot find it: {searched}");
 
-    // The listed pod and the admin see the names.
-    for token in [&pod_token, &h.admin] {
-        let (_, page) = h.get("/api/v1/projects/app/audit?limit=200", token).await?;
-        assert!(page.to_string().contains("STRIPE"), "{page}");
-    }
-    let (_, page) = h
-        .get("/api/v1/projects/app/audit?action=secret.access", &h.admin)
-        .await?;
+    // The listed pod sees entries naming the secret, but not who else is listed, nor batch
+    // writes, which may name other restricted secrets too.
+    let (_, page) = h.get(&audit("key=STRIPE"), &pod_token).await?;
+    let actions: Vec<&str> = page["entries"]
+        .as_array()
+        .context("entries")?
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    assert_eq!(actions, ["secret.read"], "{page}");
+
+    // Admins see everything, access-list changes included, and never a value.
+    let (_, page) = h.get(&audit("action=secret.access"), &h.admin).await?;
     let detail = &page["entries"][0]["detail"];
     assert_eq!(detail["granted"][0]["principal_id"], json!(pod), "{page}");
-    assert!(
-        !page.to_string().contains("sk_live"),
-        "entries hold names, never values"
+    let (_, everything) = h.get(&audit(""), &h.admin).await?;
+    assert!(!everything.to_string().contains("sk_live"), "names, never values");
+
+    // The organisation log keeps them from anyone but organisation admins.
+    let (status, body) = h
+        .put(
+            "/api/v1/org/roles/auditor",
+            &h.admin,
+            json!({"name": "Auditor", "rules": [{"effect": "allow", "subject": "org-audit-log", "actions": ["read"]}]}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let auditor = h.org_identity_as("auditor", "auditor", &h.admin).await?;
+    let (_, org) = h.get("/api/v1/audit?limit=200&q=STRIPE", &auditor).await?;
+    assert_eq!(org["total"], json!(0), "{org}");
+    let (_, org) = h.get("/api/v1/audit?limit=200&q=STRIPE", &h.admin).await?;
+    assert!(org["total"].as_i64().is_some_and(|n| n > 0), "{org}");
+
+    // Unrestricting does not open entries written while it was restricted.
+    change(&h, &h.admin, "/payments", "STRIPE", json!({"restricted": false})).await?;
+    let (_, page) = h.get(&audit("key=STRIPE&action=secret.read"), &bot).await?;
+    assert_eq!(page["total"], json!(0), "{page}");
+    Ok(())
+}
+
+/// Writing to a hidden secret answers exactly as a missing key would, short of a genuine clash
+/// for someone who could create it; that refusal is recorded for admins.
+async fn writes_cannot_probe_for_hidden_secrets(db: String) -> anyhow::Result<()> {
+    let h = start(options(db)).await?;
+    restricted_project(&h).await?;
+    let (_, viewer) = h.machine("viewer-bot", "app", "viewer").await?;
+    let (_, developer) = h.machine("dev-bot", "app", "developer").await?;
+    let url = |key: &str| format!("/api/v1/projects/app/environments/prod/secrets/{key}?path=/payments");
+    let normalise = |body: Value, key: &str| body.to_string().replace(key, "KEY");
+    for body in [json!({"value": "x"}), json!({"value": "x", "restricted": true})] {
+        let (hidden_status, hidden) = h.put(&url("STRIPE"), &viewer, body.clone()).await?;
+        let (missing_status, missing) = h.put(&url("NOPE"), &viewer, body).await?;
+        assert_eq!(hidden_status, missing_status, "{hidden} / {missing}");
+        assert_eq!(normalise(hidden, "STRIPE"), normalise(missing, "NOPE"));
+    }
+    // A malformed batch fails before any key is looked up.
+    let batch = "/api/v1/projects/app/environments/prod/secrets/batch";
+    let probe = json!({"path": "/payments", "upserts": [
+        {"key": "STRIPE", "value": "x"},
+        {"key": "LAST", "value": "x", "comment": "c".repeat(5000)},
+    ]});
+    let (status, _) = h.post(batch, &developer, probe).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Someone who could create there meets the clash, which is recorded but not for them.
+    let (status, _) = h.put(&url("STRIPE"), &developer, json!({"value": "x"})).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, refused) = h
+        .get("/api/v1/projects/app/audit?action=secret.write-refused", &h.admin)
+        .await?;
+    assert_eq!(refused["entries"][0]["secret_key"], "STRIPE", "{refused}");
+    let (_, theirs) = h
+        .get("/api/v1/projects/app/audit?action=secret.write-refused", &developer)
+        .await?;
+    assert_eq!(theirs["total"], json!(0), "{theirs}");
+    let (status, _) = h
+        .post(
+            "/api/v1/projects/app/environments/prod/secrets/STRIPE/generate?path=/payments",
+            &developer,
+            json!({}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "generating meets the same answer");
+    Ok(())
+}
+
+/// Unrestricting clears the list and turning the setting off clears every list, so no stale entry
+/// comes back with a later restriction.
+async fn lists_never_outlive_their_restriction(db: String) -> anyhow::Result<()> {
+    let h = start(options(db)).await?;
+    restricted_project(&h).await?;
+    let ops = json!({"grant": [{"principal_kind": "group", "principal_id": "ops", "actions": ["read"]}]});
+    change(&h, &h.admin, "/payments", "STRIPE", ops.clone()).await?;
+    let (status, body) = change(&h, &h.admin, "/payments", "STRIPE", json!({"restricted": false})).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"restricted": false, "grants": []}));
+    let (_, audit) = h
+        .get("/api/v1/projects/app/audit?action=secret.access", &h.admin)
+        .await?;
+    assert_eq!(
+        audit["entries"][0]["detail"]["cleared"][0]["principal_id"], "ops",
+        "the cleared entries are recorded: {audit}"
     );
+    // A list made ready on an open secret goes when the setting is turned off.
+    change(&h, &h.admin, "/payments", "OPEN", ops).await?;
+    let (status, body) = set_setting(&h, &h.admin, false).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    set_setting(&h, &h.admin, true).await?;
+    let (_, open) = h.get(&access_url("/payments", "OPEN"), &h.admin).await?;
+    assert_eq!(open["grants"], json!([]), "{open}");
+    Ok(())
+}
+
+/// The built-in admin roles lift access lists, so a principal whose rules merely match them
+/// cannot hand them out, to others or to themselves.
+async fn only_admins_grant_the_admin_roles(db: String) -> anyhow::Result<()> {
+    let h = start(options(db)).await?;
+    restricted_project(&h).await?;
+    let everything: Vec<Value> = [
+        "secrets",
+        "secret-versions",
+        "snapshots",
+        "folders",
+        "environments",
+        "members",
+        "roles",
+        "audit-log",
+        "settings",
+    ]
+    .iter()
+    .map(|s| json!({"effect": "allow", "subject": s, "actions": ["read", "read-value", "create", "edit", "delete"]}))
+    .collect();
+    let (status, body) = h
+        .put(
+            "/api/v1/projects/app/roles/maintainer",
+            &h.admin,
+            json!({"name": "Maintainer", "rules": everything}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (maintainer_id, maintainer) = h.machine("maintainer", "app", "maintainer").await?;
+    let (status, body) = h
+        .post(
+            "/api/v1/projects/app/members",
+            &maintainer,
+            json!({"principal_kind": "identity", "principal_id": maintainer_id, "role": "admin"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "escalation");
+    let (status, _) = h
+        .get(
+            "/api/v1/projects/app/environments/prod/secrets/STRIPE?path=/payments",
+            &maintainer,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "still off the list");
+
+    // A real admin still can.
+    let (status, body) = h
+        .post(
+            "/api/v1/projects/app/members",
+            &h.admin,
+            json!({"principal_kind": "identity", "principal_id": maintainer_id, "role": "admin"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    Ok(())
+}
+
+/// Each secret says what its list grants the caller, and a write that asked for restriction
+/// confirms it.
+async fn secrets_report_the_callers_entry(db: String) -> anyhow::Result<()> {
+    let h = start(options(db)).await?;
+    restricted_project(&h).await?;
+    let (pod, pod_token) = h.machine("pod", "app", "developer").await?;
+    change(
+        &h,
+        &h.admin,
+        "/payments",
+        "STRIPE",
+        json!({"grant": [{"principal_kind": "identity", "principal_id": pod, "actions": ["read"]}]}),
+    )
+    .await?;
+    let url = "/api/v1/projects/app/environments/prod/secrets/STRIPE?path=/payments";
+    let (_, secret) = h.get(url, &pod_token).await?;
+    assert_eq!(secret["granted"], json!(["read"]), "{secret}");
+    let (_, secret) = h.get(url, &h.admin).await?;
+    assert_eq!(secret.get("granted"), None, "an admin is not bound: {secret}");
+    let (_, written) = h
+        .put(
+            "/api/v1/projects/app/environments/prod/secrets/NEW?path=/",
+            &h.admin,
+            json!({"value": "v", "restricted": true}),
+        )
+        .await?;
+    assert_eq!(written["restricted"], json!(["NEW"]), "{written}");
+    let (_, plain) = h
+        .put(
+            "/api/v1/projects/app/environments/prod/secrets/PLAIN?path=/",
+            &h.admin,
+            json!({"value": "v"}),
+        )
+        .await?;
+    assert_eq!(plain["restricted"], json!([]), "{plain}");
+    let (_, generated) = h
+        .post(
+            "/api/v1/projects/app/environments/prod/secrets/GEN/generate?path=/",
+            &h.admin,
+            json!({"restricted": true}),
+        )
+        .await?;
+    assert_eq!(generated["restricted"], json!(["GEN"]), "{generated}");
+    // Deleting an environment that still has live secrets says so before anything about
+    // restrictions.
+    let (status, body) = h.delete("/api/v1/projects/app/environments/prod", &h.admin).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "not_empty");
     Ok(())
 }
 
@@ -751,4 +974,8 @@ on_both_backends!(
     secrets_can_be_created_restricted,
     snapshots_leave_hidden_secrets_out,
     audit_names_restricted_secrets_only_to_those_listed,
+    writes_cannot_probe_for_hidden_secrets,
+    lists_never_outlive_their_restriction,
+    only_admins_grant_the_admin_roles,
+    secrets_report_the_callers_entry,
 );

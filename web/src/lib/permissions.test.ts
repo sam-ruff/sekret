@@ -77,6 +77,18 @@ describe("authorise", () => {
     expect(authorise(admin, "projects", "create")).toBe(false);
   });
 
+  it("narrows secrets to what an access list grants and never widens", () => {
+    const listed = { ...secret("prod", "/", "A"), granted: ["read", "edit"] as const };
+    expect(authorise(admin, "secrets", "read", listed)).toBe(true);
+    expect(authorise(admin, "secrets", "edit", listed)).toBe(true);
+    expect(authorise(admin, "secrets", "create", listed)).toBe(true);
+    expect(authorise(admin, "secrets", "read-value", listed)).toBe(false);
+    expect(authorise(admin, "secret-versions", "read-value", listed)).toBe(false);
+    expect(authorise(viewer, "secrets", "edit", listed)).toBe(false);
+    expect(authorise(admin, "secrets", "read", { ...secret("prod", "/", "A"), granted: [] })).toBe(false);
+    expect(authorise(admin, "snapshots", "read", { environment: "prod", granted: [] })).toBe(true);
+  });
+
   it("treats missing conditions as unconditional", () => {
     expect(authorise([{ effect: "allow", subject: "roles", actions: ["read"] }], "roles", "read")).toBe(true);
   });

@@ -30,6 +30,7 @@ fn change(secret_id: &str, path: &str, key: &str, previous: i64, deleted: bool) 
             deleted,
         ),
         restricted: false,
+        access_epoch: 0,
     }
 }
 
@@ -599,6 +600,7 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
                 secret_key: key.map(String::from),
                 detail: serde_json::json!({}),
                 ip: "10.0.0.1".into(),
+                restricted: key == Some("DB_PASS"),
             })
             .await
             .context("audit")?;
@@ -690,6 +692,64 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
         }
         assert_eq!(seen, expected, "oldest_first = {oldest_first}");
     }
+
+    // a1 is about a restricted secret; a5 changes its access list.
+    store
+        .insert_audit(AuditEntry {
+            id: "a5".into(),
+            created_at: 11,
+            actor_kind: "user".into(),
+            actor_id: "admin".into(),
+            actor_name: "Admin".into(),
+            action: "secret.access".into(),
+            project_id: Some("p".into()),
+            environment: Some("prod".into()),
+            path: Some("/app/db".into()),
+            secret_key: Some("DB_PASS".into()),
+            detail: serde_json::json!({}),
+            ip: "10.0.0.1".into(),
+            restricted: true,
+        })
+        .await
+        .context("access entry")?;
+    let visible = |list: Option<Vec<(&str, &str, &str)>>| AuditQuery {
+        restricted_visible: list.map(|l| {
+            l.into_iter()
+                .map(|(e, p, k)| (e.to_string(), p.to_string(), k.to_string()))
+                .collect()
+        }),
+        limit: 50,
+        oldest_first: true,
+        ..Default::default()
+    };
+    let restricted_ids = |query: AuditQuery| async move {
+        let entries = store.list_audit(query.clone()).await.context("audit")?;
+        let total = store.count_audit(query).await.context("count")?;
+        anyhow::Ok((entries.into_iter().map(|a| a.id).collect::<Vec<_>>(), total))
+    };
+    let named = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        restricted_ids(visible(None)).await?,
+        (named(&["a0", "a1", "a2", "a3", "a4", "a5"]), 6),
+        "an admin sees every entry"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![]))).await?,
+        (named(&["a0", "a2", "a3", "a4"]), 4),
+        "entries about restricted secrets are left out, and the total agrees"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![("prod", "/app/db", "DB_PASS")]))).await?,
+        (named(&["a0", "a1", "a2", "a3", "a4"]), 5),
+        "a listed reader sees the secret's entries but never its access-list changes"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![("dev", "/app/db", "DB_PASS")])))
+            .await?
+            .1,
+        4,
+        "the environment must match too"
+    );
     Ok(())
 }
 
@@ -1036,6 +1096,37 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             .context("project")?
             .secret_access
     );
+    // Every access change moves the epoch on, so a write planned before it is refused.
+    let o1 = store.get_secret_by_id("o1").await.context("get")?.context("o1")?;
+    assert_eq!(o1.secret.access_epoch, 2, "restricted and granted, then regranted");
+    let stale = SecretChange {
+        access_epoch: 1,
+        ..change("o1", "/", "OPEN", 1, false)
+    };
+    assert!(matches!(
+        store.write_secrets(batch("a4", vec![stale])).await,
+        Err(StoreError::Conflict)
+    ));
+    let current = SecretChange {
+        access_epoch: 2,
+        ..change("o1", "/", "OPEN", 1, false)
+    };
+    store
+        .write_secrets(batch("a5", vec![current]))
+        .await
+        .context("current epoch")?;
+    assert_eq!(
+        store
+            .list_restricted_secrets("p1")
+            .await
+            .context("restricted")?
+            .iter()
+            .map(|s| (s.environment.as_str(), s.key.as_str()))
+            .collect::<Vec<_>>(),
+        [("dev", "OPEN"), ("dev", "R")]
+    );
+    assert_eq!(store.list_project_grants("p1").await.context("grants")?.len(), 1);
+
     for id in ["o1", "r1"] {
         store
             .update_secret_access(AccessChange {
@@ -1047,16 +1138,48 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             .await
             .context("unrestrict")?;
     }
-    assert_eq!(
-        store.list_secret_grants("o1").await.context("grants")?.len(),
-        1,
-        "unrestricting keeps the list, which then has no effect"
+    assert!(
+        store.list_secret_grants("o1").await.context("grants")?.is_empty(),
+        "unrestricting clears the list, so it cannot come back later"
     );
+    assert!(
+        store
+            .list_restricted_secrets("p1")
+            .await
+            .context("restricted")?
+            .is_empty()
+    );
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            restricted: None,
+            grant: vec![grant("o1", PrincipalKind::Group, "ops", &[Action::Read])],
+            revoke: vec![],
+        })
+        .await
+        .context("prepare a list on an open secret")?;
     store.set_project_secret_access("p1", false).await.context("disable")?;
+    assert!(
+        store.list_project_grants("p1").await.context("grants")?.is_empty(),
+        "turning the setting off clears every list"
+    );
     assert!(matches!(
         store.set_project_secret_access("missing", true).await,
         Err(StoreError::NotFound)
     ));
+    store
+        .set_project_secret_access("p1", true)
+        .await
+        .context("enable again")?;
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            restricted: None,
+            grant: vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
+            revoke: vec![],
+        })
+        .await
+        .context("grant the identity")?;
 
     store
         .create_identity(Identity {

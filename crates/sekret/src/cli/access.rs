@@ -21,8 +21,8 @@ pub enum AccessCommand {
         key: String,
         #[command(flatten)]
         who: Principals,
-        /// What they may do. Read is always included. A list narrows what roles allow and
-        /// never widens it.
+        /// What they may do. Read is always included, and granting someone already listed
+        /// replaces what they had. A list narrows what roles allow and never widens it.
         #[arg(long, value_enum, value_delimiter = ',', default_value = "read,read-value")]
         allow: Vec<AccessAction>,
     },
@@ -35,8 +35,7 @@ pub enum AccessCommand {
     /// Restrict a secret to its access list, project admins and organisation admins. Needs
     /// per-secret access on for the project.
     Restrict { key: String },
-    /// Open a restricted secret to everyone its role rules allow again. The list is kept but has
-    /// no effect until the secret is restricted again.
+    /// Open a restricted secret to everyone its role rules allow again, and clear its list.
     Unrestrict { key: String },
 }
 
@@ -125,20 +124,53 @@ pub fn pick_user(wanted: &str, candidates: &[User]) -> anyhow::Result<String> {
     }
 }
 
+/// A search that matched more than it returned may have left out the one meant, or a second
+/// with the same name, so only an exact id is trusted from it.
+fn complete<T>(wanted: &str, total: i64, items: &[T], id_of: impl Fn(&T) -> &str) -> anyhow::Result<()> {
+    let shown = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    if total > shown && !items.iter().any(|i| id_of(i) == wanted) {
+        bail!(
+            "{} matches {total} principals, too many to tell which is meant; give the id instead",
+            one_line(wanted)
+        );
+    }
+    Ok(())
+}
+
+/// Whether the caller may not search principals, in which case what they typed is sent as an
+/// id for the server to check.
+fn may_not_search(error: &sekret_client::ClientError) -> bool {
+    matches!(error, sekret_client::ClientError::Api { status: 403, .. })
+}
+
 async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<PrincipalRef>> {
     let mut resolved = Vec::new();
     for wanted in &who.identities {
-        let page = api.find_identities(wanted.clone()).await?;
+        let principal_id = match api.find_identities(wanted.clone()).await {
+            Ok(page) => {
+                complete(wanted, page.total, &page.items, |i| &i.id)?;
+                pick_identity(wanted, &page.items)?
+            }
+            Err(error) if may_not_search(&error) => wanted.clone(),
+            Err(error) => return Err(error.into()),
+        };
         resolved.push(PrincipalRef {
             principal_kind: PrincipalKind::Identity,
-            principal_id: pick_identity(wanted, &page.items)?,
+            principal_id,
         });
     }
     for wanted in &who.users {
-        let page = api.find_users(wanted.clone()).await?;
+        let principal_id = match api.find_users(wanted.clone()).await {
+            Ok(page) => {
+                complete(wanted, page.total, &page.items, |u| &u.id)?;
+                pick_user(wanted, &page.items)?
+            }
+            Err(error) if may_not_search(&error) => wanted.clone(),
+            Err(error) => return Err(error.into()),
+        };
         resolved.push(PrincipalRef {
             principal_kind: PrincipalKind::User,
-            principal_id: pick_user(wanted, &page.items)?,
+            principal_id,
         });
     }
     for group in &who.groups {
@@ -169,10 +201,10 @@ fn action_label(action: Action) -> &'static str {
 }
 
 pub fn describe_access(access: &SecretAccess) -> String {
-    let state = if access.restricted {
-        "restricted: yes, only the principals below and admins can reach it\n"
-    } else {
-        "restricted: no, role rules alone decide who can reach it\n"
+    let state = match (access.restricted, access.grants.is_empty()) {
+        (true, _) => "restricted: yes, only the principals below and admins can reach it\n",
+        (false, true) => "restricted: no, role rules alone decide who can reach it\n",
+        (false, false) => "restricted: no, so the list below has no effect until the secret is restricted\n",
     };
     if access.grants.is_empty() {
         return format!("{state}no one is on the access list\n");
@@ -328,6 +360,47 @@ mod tests {
                 .is_some_and(|e| e.to_string().contains("more than one"))
         );
         assert!(pick_identity("missing", &all).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_search_only_trusts_an_exact_id() {
+        let page = [identity("i1", "web"), identity("i2", "web-2")];
+        assert!(complete("web", 2, &page, |i| &i.id).is_ok(), "every match is here");
+        let refused = complete("web", 150, &page, |i| &i.id);
+        assert!(refused.err().is_some_and(|e| e.to_string().contains("give the id")));
+        assert!(complete("i2", 150, &page, |i| &i.id).is_ok(), "an exact id is enough");
+    }
+
+    #[tokio::test]
+    async fn without_search_rights_the_id_is_sent_for_the_server_to_check() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let forbidden = || sekret_client::ClientError::Api {
+            status: 403,
+            code: "forbidden".into(),
+            message: "no".into(),
+            retry_after: None,
+        };
+        let mut api = sekret_client::MockSekretApi::new();
+        api.expect_find_identities().returning(move |_| Err(forbidden()));
+        api.expect_change_secret_access()
+            .withf(|_, _, change| change.grant.len() == 1 && change.grant[0].principal_id == "raw-id")
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(SecretAccess {
+                    restricted: true,
+                    grants: vec![],
+                })
+            });
+        let command = AccessCommand::Grant {
+            key: "DB".into(),
+            who: Principals {
+                identities: vec!["raw-id".into()],
+                ..Default::default()
+            },
+            allow: vec![AccessAction::Read],
+        };
+        run(&api, at(), command, &mut Vec::new()).await.context("grant")?;
         Ok(())
     }
 

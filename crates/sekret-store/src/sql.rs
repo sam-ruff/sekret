@@ -188,7 +188,7 @@ fn environment_from(row: &AnyRow) -> StoreResult<Environment> {
 }
 
 const SECRET_COLUMNS: &str = "s.id, s.project_id, s.environment_id, s.path, s.key, s.current_version, s.deleted, \
-     s.created_at, s.updated_at, s.policy, s.restricted, v.version, v.value, v.comment, v.tags, v.deleted AS v_deleted, v.actor, \
+     s.created_at, s.updated_at, s.policy, s.restricted, s.access_epoch, v.version, v.value, v.comment, v.tags, v.deleted AS v_deleted, v.actor, \
      v.created_at AS v_created_at, v.generated";
 
 const SECRET_JOIN: &str =
@@ -226,6 +226,7 @@ fn secret_with_version_from(row: &AnyRow) -> StoreResult<SecretWithVersion> {
         updated_at: row.try_get("updated_at")?,
         policy: row.try_get("policy")?,
         restricted: get_flag(row, "restricted")?,
+        access_epoch: row.try_get("access_epoch")?,
     };
     let version = version_from(row, secret.id.clone(), "v_deleted", "v_created_at")?;
     Ok(SecretWithVersion { secret, version })
@@ -256,6 +257,7 @@ fn audit_from(row: &AnyRow) -> StoreResult<AuditEntry> {
         secret_key: row.try_get("secret_key")?,
         detail: from_json(&row.try_get::<String, _>("detail")?)?,
         ip: row.try_get("ip")?,
+        restricted: get_flag(row, "restricted")?,
     })
 }
 
@@ -351,6 +353,28 @@ fn audit_filter(query: &AuditQuery) -> Filter {
     if let Some(until) = query.until {
         let p = filter.bind(SqlParam::Int(until));
         filter.clauses.push(format!("created_at <= {p}"));
+    }
+    if let Some(visible) = &query.restricted_visible {
+        let mut allowed = Vec::with_capacity(visible.len());
+        for (environment, path, key) in visible {
+            let (e, p, k) = (
+                filter.bind(SqlParam::Text(environment.clone())),
+                filter.bind(SqlParam::Text(path.clone())),
+                filter.bind(SqlParam::Text(key.clone())),
+            );
+            allowed.push(format!(
+                "(COALESCE(environment, '') = {e} AND COALESCE(path, '') = {p} AND COALESCE(secret_key, '') = {k})"
+            ));
+        }
+        let clause = if allowed.is_empty() {
+            "restricted = 0".to_string()
+        } else {
+            format!(
+                "(restricted = 0 OR (action <> 'secret.access' AND ({})))",
+                allowed.join(" OR ")
+            )
+        };
+        filter.clauses.push(clause);
     }
     if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let p = filter.bind(SqlParam::Text(format!("%{}%", like_literal(&search.to_lowercase()))));
@@ -1446,6 +1470,15 @@ impl Store for SqlStore {
             if restricted > 0 {
                 return Err(StoreError::Conflict);
             }
+            // Lists left on open secrets would come back to life if the setting returned.
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id IN (SELECT id FROM secrets WHERE project_id = $1)")
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE secrets SET access_epoch = access_epoch + 1 WHERE project_id = $1")
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query("UPDATE projects SET secret_access = $1 WHERE id = $2")
             .bind(flag(enabled))
@@ -1463,6 +1496,43 @@ impl Store for SqlStore {
                 .fetch_one(&self.pool)
                 .await?
                 .try_get("n")?,
+        )
+    }
+
+    async fn list_restricted_secrets(&self, project_id: &str) -> StoreResult<Vec<RestrictedSecret>> {
+        let rows = sqlx::query(
+            "SELECT s.id, e.slug, s.path, s.key, s.deleted, v.tags FROM secrets s \
+             JOIN environments e ON e.id = s.environment_id \
+             JOIN secret_versions v ON v.secret_id = s.id AND v.version = s.current_version \
+             WHERE s.project_id = $1 AND s.restricted = 1 ORDER BY e.position, e.slug, s.path, s.key",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RestrictedSecret {
+                    secret_id: row.try_get("id")?,
+                    environment: row.try_get("slug")?,
+                    path: row.try_get("path")?,
+                    key: row.try_get("key")?,
+                    deleted: get_flag(row, "deleted")?,
+                    tags: from_json(&row.try_get::<String, _>("tags")?)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_project_grants(&self, project_id: &str) -> StoreResult<Vec<SecretGrant>> {
+        collect(
+            sqlx::query(
+                "SELECT g.* FROM secret_grants g JOIN secrets s ON s.id = g.secret_id WHERE s.project_id = $1 \
+                 ORDER BY g.secret_id, g.principal_kind, g.principal_id",
+            )
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?,
+            grant_from,
         )
     }
 
@@ -1511,6 +1581,16 @@ impl Store for SqlStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        if change.restricted == Some(false) {
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1")
+                .bind(&change.secret_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE secrets SET access_epoch = access_epoch + 1 WHERE id = $1")
+            .bind(&change.secret_id)
+            .execute(&mut *tx)
+            .await?;
         for (kind, id) in &change.revoke {
             sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1 AND principal_kind = $2 AND principal_id = $3")
                 .bind(&change.secret_id)
@@ -2095,7 +2175,7 @@ impl Store for SqlStore {
             } else {
                 let result = sqlx::query(
                     "UPDATE secrets SET current_version = $1, deleted = $2, updated_at = $3 \
-                     WHERE id = $4 AND current_version = $5 AND environment_id = $6",
+                     WHERE id = $4 AND current_version = $5 AND environment_id = $6 AND access_epoch = $7",
                 )
                 .bind(v.version)
                 .bind(flag(v.deleted))
@@ -2103,6 +2183,7 @@ impl Store for SqlStore {
                 .bind(&change.secret_id)
                 .bind(change.previous_version)
                 .bind(&batch.environment_id)
+                .bind(change.access_epoch)
                 .execute(&mut *tx)
                 .await?;
                 if result.rows_affected() != 1 {
@@ -2195,7 +2276,7 @@ impl Store for SqlStore {
     async fn insert_audit(&self, entry: AuditEntry) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO audit_log (id, created_at, actor_kind, actor_id, actor_name, action, project_id, environment, \
-             path, secret_key, detail, ip) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             path, secret_key, detail, ip, restricted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&entry.id)
         .bind(entry.created_at)
@@ -2209,6 +2290,7 @@ impl Store for SqlStore {
         .bind(entry.secret_key.clone())
         .bind(to_json(&entry.detail)?)
         .bind(&entry.ip)
+        .bind(flag(entry.restricted))
         .execute(&self.pool)
         .await?;
         Ok(())

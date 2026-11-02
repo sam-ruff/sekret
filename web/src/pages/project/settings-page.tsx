@@ -14,6 +14,7 @@ import { RolesPanel } from "@/components/roles/roles-panel";
 import { EnvironmentsSection } from "@/components/settings/environments-section";
 import { LogoCard } from "@/components/settings/logo-card";
 import { MembersSection } from "@/components/settings/members-section";
+import { SecretAccessCard } from "@/components/settings/secret-access-card";
 import { SecretDefaultsCard } from "@/components/settings/secret-defaults-card";
 import { ErrorState } from "@/components/states";
 import { Button } from "@/components/ui/button";
@@ -24,7 +25,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { keys, useApiMutation, useEnvironments, useProject, useRoles } from "@/hooks/queries";
-import { useProjectPermissions, type Permissions } from "@/hooks/use-permissions";
+import { useManagesSecretAccess, useProjectPermissions, type Permissions } from "@/hooks/use-permissions";
 
 const TABS = [
   { id: "general", label: "General" },
@@ -38,6 +39,7 @@ type TabId = (typeof TABS)[number]["id"];
 
 function GeneralSection({ project, perms }: { project: string; perms: Permissions }) {
   const query = useProject(project);
+  const managesAccess = useManagesSecretAccess(project);
   if (query.isPending) return <Skeleton className="h-56 rounded-xl" />;
   if (query.error) return <ErrorState error={query.error} onRetry={() => void query.refetch()} />;
   const canEdit = perms.can("settings", "edit");
@@ -46,6 +48,7 @@ function GeneralSection({ project, perms }: { project: string; perms: Permission
       <GeneralForm key={query.data.id} project={query.data} perms={perms} />
       <LogoCard project={query.data} canEdit={canEdit} />
       {perms.can("settings", "read") && <SecretDefaultsCard project={query.data.slug} canEdit={canEdit} />}
+      {managesAccess && perms.can("settings", "read") && <SecretAccessCard project={query.data.slug} canEdit={canEdit} />}
     </div>
   );
 }

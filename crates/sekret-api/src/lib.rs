@@ -286,6 +286,10 @@ pub struct Secret {
     /// Only principals on its access list, and admins, may reach it.
     #[serde(default)]
     pub restricted: bool,
+    /// For a restricted secret, what its list grants the caller; absent when the list does not
+    /// bind them, because the secret is open or they are an admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted: Option<Vec<Action>>,
 }
 
 /// Request to fill a secret with a newly generated value, creating it if needed.
@@ -296,6 +300,9 @@ pub struct GenerateSecret {
     pub generator: Option<Generator>,
     #[serde(default)]
     pub comment: String,
+    /// See [`SecretUpsert::restricted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restricted: Option<bool>,
 }
 
 /// A secret's own policy setting together with what actually applies to it.
@@ -362,6 +369,11 @@ pub struct BatchResult {
     pub deleted: Vec<String>,
     pub unchanged: Vec<String>,
     pub snapshot_id: Option<String>,
+    /// The keys that asked for `restricted: true` and are restricted after this write. A client
+    /// should treat a key missing here as open, since a server that predates per-secret access
+    /// ignores the request.
+    #[serde(default)]
+    pub restricted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

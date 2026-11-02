@@ -10,7 +10,7 @@ use sekret_api::{
     GrantRequest, PrincipalRef, RestrictedSecret, SecretAccess as ApiSecretAccess, SecretAccessChange,
     SecretAccessSetting, SecretGrant, SetSecretAccessSetting,
 };
-use sekret_core::permissions::{Access, Action, LISTABLE_ACTIONS, Resource, Rule, Subject};
+use sekret_core::permissions::{Access, Action, LISTABLE_ACTIONS, Rule, Subject};
 use sekret_core::validate;
 use sekret_store::{AccessChange, Environment, PrincipalKind, Project, SecretWithVersion, StoreError};
 use serde::Deserialize;
@@ -64,37 +64,27 @@ async fn load_for_access(
 
 /// Restricted secrets in the project the rules let the caller read, with their list sizes.
 async fn restricted_secrets(state: &AppState, project: &Project, rules: &[Rule]) -> ApiResult<Vec<RestrictedSecret>> {
-    let mut found = Vec::new();
-    for env in state.store.list_environments(&project.id).await? {
-        let restricted: Vec<SecretWithVersion> = state
-            .store
-            .list_secrets(&env.id, "/", true, true)
-            .await?
-            .into_iter()
-            .filter(|s| s.secret.restricted)
-            .collect();
-        if restricted.is_empty() {
-            continue;
-        }
-        let mut sizes: HashMap<String, i64> = HashMap::new();
-        for grant in state.store.list_environment_grants(&env.id).await? {
-            *sizes.entry(grant.secret_id).or_default() += 1;
-        }
-        for s in restricted {
-            let resource = secret_resource(&env.slug, &s.secret.path, &s.secret.key, &s.version.tags, Access::Open);
-            if !allowed(rules, Subject::Secrets, Action::Read, &resource) {
-                continue;
-            }
-            found.push(RestrictedSecret {
-                environment: env.slug.clone(),
-                grants: sizes.get(&s.secret.id).copied().unwrap_or(0),
-                path: s.secret.path,
-                key: s.secret.key,
-                deleted: s.secret.deleted,
-            });
-        }
+    let mut sizes: HashMap<String, i64> = HashMap::new();
+    for grant in state.store.list_project_grants(&project.id).await? {
+        *sizes.entry(grant.secret_id).or_default() += 1;
     }
-    Ok(found)
+    Ok(state
+        .store
+        .list_restricted_secrets(&project.id)
+        .await?
+        .into_iter()
+        .filter(|s| {
+            let resource = secret_resource(&s.environment, &s.path, &s.key, &s.tags, Access::Open);
+            allowed(rules, Subject::Secrets, Action::Read, &resource)
+        })
+        .map(|s| RestrictedSecret {
+            grants: sizes.get(&s.secret_id).copied().unwrap_or(0),
+            environment: s.environment,
+            path: s.path,
+            key: s.key,
+            deleted: s.deleted,
+        })
+        .collect())
 }
 
 async fn setting(state: &AppState, project: &Project, rules: &[Rule]) -> ApiResult<SecretAccessSetting> {
@@ -345,7 +335,9 @@ async fn patch_secret_access(
     }
     let (grant, revoke) = plan_change(&state, &s.secret.id, state.clock.now(), request.grant, request.revoke).await?;
     let existing = state.store.list_secret_grants(&s.secret.id).await?;
-    let kept = existing
+    // Unrestricting clears the list, so a later restriction never brings back stale entries.
+    let clears = request.restricted == Some(false);
+    let survivors: Vec<&sekret_store::SecretGrant> = existing
         .iter()
         .filter(|e| {
             let key = (e.principal_kind, e.principal_id.clone());
@@ -354,14 +346,24 @@ async fn patch_secret_access(
                     .iter()
                     .any(|g| g.principal_kind == key.0 && g.principal_id == key.1)
         })
-        .count();
+        .collect();
+    let kept = if clears { 0 } else { survivors.len() };
     if kept + grant.len() > MAX_GRANTS {
         return Err(ApiError::bad_request(format!(
             "a secret's access list holds at most {MAX_GRANTS} entries"
         )));
     }
+    let cleared: Vec<serde_json::Value> = if clears {
+        survivors
+            .iter()
+            .map(|e| json!({"principal_kind": e.principal_kind.as_str(), "principal_id": e.principal_id}))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let detail = json!({
         "restricted": request.restricted,
+        "cleared": cleared,
         "granted": grant.iter().map(|g| json!({
             "principal_kind": g.principal_kind.as_str(),
             "principal_id": g.principal_id,
@@ -380,7 +382,8 @@ async fn patch_secret_access(
     };
     let changes_anything = change.restricted.is_some_and(|r| r != s.secret.restricted)
         || !change.grant.is_empty()
-        || !change.revoke.is_empty();
+        || !change.revoke.is_empty()
+        || !cleared.is_empty();
     state.store.update_secret_access(change).await.map_err(|e| match e {
         StoreError::Conflict => secret_access_off(),
         StoreError::NotFound => ApiError::not_found("secret"),
@@ -397,6 +400,8 @@ async fn patch_secret_access(
                 environment: Some(&env.slug),
                 path: Some(&s.secret.path),
                 key: Some(&s.secret.key),
+                // Access-list changes are for admins, whatever the secret is now.
+                restricted: true,
             },
             detail,
         )
@@ -410,90 +415,30 @@ async fn patch_secret_access(
     Ok(Json(describe(&state, &updated).await?))
 }
 
-/// Restricted secrets an audit reader may not see, so entries naming them are redacted the way
-/// entries about secrets hidden by their roles are.
-#[derive(Debug, Default)]
-pub struct HiddenSecrets {
-    /// Environment slug to the `(path, key)` pairs hidden there.
-    by_environment: HashMap<String, HashSet<(String, String)>>,
-}
-
-impl HiddenSecrets {
-    /// Whether any are hidden in `environment`, or anywhere when it is `None`.
-    pub fn any_in(&self, environment: Option<&str>) -> bool {
-        match environment {
-            Some(env) => self.by_environment.get(env).is_some_and(|keys| !keys.is_empty()),
-            None => self.by_environment.values().any(|keys| !keys.is_empty()),
-        }
+/// Which audit entries about restricted secrets `principal` may have in the project: all of them
+/// for an admin, otherwise those about the restricted secrets their lists let them read, as
+/// `(environment, path, key)`. Entries are marked when written, so a secret restricted then and
+/// gone or opened since stays hidden.
+pub async fn restricted_visible(
+    state: &AppState,
+    principal: &Principal,
+    project: &Project,
+) -> ApiResult<Option<Vec<(String, String, String)>>> {
+    if manages_secret_access(state, principal, &project.id).await? {
+        return Ok(None);
     }
-
-    /// How lists bear on a check spanning every secret in `environment`, or in the project.
-    pub fn spanning(&self, environment: Option<&str>) -> Access<'static> {
-        if self.any_in(environment) {
-            return Access::Unknown;
-        }
-        Access::Open
+    let restricted = state.store.list_restricted_secrets(&project.id).await?;
+    if restricted.is_empty() {
+        return Ok(Some(Vec::new()));
     }
-
-    /// How lists bear on one named secret.
-    pub fn of(&self, environment: &str, path: Option<&str>, key: &str) -> Access<'static> {
-        let Some(keys) = self.by_environment.get(environment) else {
-            return Access::Open;
-        };
-        let hidden = match path {
-            Some(path) => keys.contains(&(path.to_string(), key.to_string())),
-            // Without a folder, a key hidden in any folder stays hidden.
-            None => keys.iter().any(|(_, k)| k == key),
-        };
-        if hidden {
-            return Access::Listed(&[]);
-        }
-        Access::Open
-    }
-}
-
-/// The restricted secrets in the project whose lists keep `principal` from reading them.
-pub async fn hidden_secrets(state: &AppState, principal: &Principal, project: &Project) -> ApiResult<HiddenSecrets> {
-    let mut hidden = HiddenSecrets::default();
-    if !project.secret_access || manages_secret_access(state, principal, &project.id).await? {
-        return Ok(hidden);
-    }
-    for env in state.store.list_environments(&project.id).await? {
-        let restricted: Vec<SecretWithVersion> = state
-            .store
-            .list_secrets(&env.id, "/", true, true)
-            .await?
+    let access = SecretAccess::listed(principal, state.store.list_project_grants(&project.id).await?);
+    Ok(Some(
+        restricted
             .into_iter()
-            .filter(|s| s.secret.restricted)
-            .collect();
-        if restricted.is_empty() {
-            continue;
-        }
-        let access = SecretAccess::listed(principal, state.store.list_environment_grants(&env.id).await?);
-        let keys: HashSet<(String, String)> = restricted
-            .into_iter()
-            .filter(|s| !access.of(&s.secret).permits(Action::Read))
-            .map(|s| (s.secret.path, s.secret.key))
-            .collect();
-        hidden.by_environment.insert(env.slug, keys);
-    }
-    Ok(hidden)
-}
-
-/// A resource for an audit entry about one secret, whose tags an entry does not record.
-pub fn audit_resource<'a>(
-    hidden: &HiddenSecrets,
-    environment: &'a str,
-    path: Option<&'a str>,
-    key: &'a str,
-) -> Resource<'a> {
-    Resource {
-        environment: Some(environment),
-        path,
-        key: Some(key),
-        tags: None,
-        access: hidden.of(environment, path, key),
-    }
+            .filter(|s| access.lists_for_read(&s.secret_id))
+            .map(|s| (s.environment, s.path, s.key))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -518,25 +463,5 @@ mod tests {
         assert!(check_principal_id("  ").is_err());
         assert!(check_principal_id("a\nb").is_err());
         assert!(check_principal_id(&"x".repeat(MAX_PRINCIPAL_ID + 1)).is_err());
-    }
-
-    #[test]
-    fn hidden_secrets_hide_by_place_and_key() {
-        let mut hidden = HiddenSecrets::default();
-        hidden.by_environment.insert(
-            "prod".into(),
-            HashSet::from([("/payments".to_string(), "STRIPE".to_string())]),
-        );
-        hidden.by_environment.insert("dev".into(), HashSet::new());
-        assert!(hidden.any_in(None));
-        assert!(hidden.any_in(Some("prod")));
-        assert!(!hidden.any_in(Some("dev")));
-        assert_eq!(hidden.spanning(Some("dev")), Access::Open);
-        assert_eq!(hidden.spanning(Some("prod")), Access::Unknown);
-        assert_eq!(hidden.of("prod", Some("/payments"), "STRIPE"), Access::Listed(&[]));
-        assert_eq!(hidden.of("prod", None, "STRIPE"), Access::Listed(&[]));
-        assert_eq!(hidden.of("prod", Some("/"), "STRIPE"), Access::Open);
-        assert_eq!(hidden.of("dev", Some("/payments"), "STRIPE"), Access::Open);
-        assert_eq!(hidden.of("staging", Some("/payments"), "STRIPE"), Access::Open);
     }
 }

@@ -241,6 +241,20 @@ pub struct Secret {
     pub policy: Option<String>,
     /// Only the principals on its access list, and admins, may reach it.
     pub restricted: bool,
+    /// Goes up with every change to its restriction or list.
+    pub access_epoch: i64,
+}
+
+/// A restricted secret, without its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedSecret {
+    pub secret_id: String,
+    pub environment: String,
+    pub path: String,
+    pub key: String,
+    pub deleted: bool,
+    /// The current version's tags.
+    pub tags: Vec<String>,
 }
 
 /// One entry on a secret's access list.
@@ -297,6 +311,9 @@ pub struct SecretChange {
     /// Restricts the secret in the same write, which needs the project setting on. False leaves
     /// an existing secret's flag as it is.
     pub restricted: bool,
+    /// The access epoch the write was planned against, for an existing secret; a change to its
+    /// access since then is a `Conflict`.
+    pub access_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,10 +357,15 @@ pub struct AuditEntry {
     pub secret_key: Option<String>,
     pub detail: serde_json::Value,
     pub ip: String,
+    /// About a restricted secret, so kept from readers off its list.
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditQuery {
+    /// `None` returns entries about restricted secrets too. Otherwise only those about one of
+    /// these `(environment, path, key)` secrets are returned, and never access-list changes.
+    pub restricted_visible: Option<Vec<(String, String, String)>>,
     pub project_id: Option<String>,
     /// Case-insensitive substring over action, actor, environment, path, key and address.
     pub search: Option<String>,

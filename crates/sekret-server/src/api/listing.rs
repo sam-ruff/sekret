@@ -57,15 +57,19 @@ fn empty_to_none(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-/// `search_actors_only` keeps `q` off environments, folders and keys the reader may not see.
+/// `search_actors_only` keeps `q` off environments, folders and keys the reader may not see, and
+/// `restricted_visible` says which entries about restricted secrets they may have, as in
+/// [`AuditQuery::restricted_visible`].
 pub async fn audit_page(
     state: &AppState,
     project_id: Option<String>,
     params: AuditParams,
     search_actors_only: bool,
+    restricted_visible: Option<Vec<(String, String, String)>>,
 ) -> ApiResult<AuditPage> {
     let limit = params.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     let query = AuditQuery {
+        restricted_visible,
         project_id,
         search: empty_to_none(params.q),
         search_actors_only,

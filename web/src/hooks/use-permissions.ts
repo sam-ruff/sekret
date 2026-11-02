@@ -45,6 +45,16 @@ export function useProjectPermissions(project: string): Permissions {
   return useMemo(() => withAdminManagement(permissionsFrom(rules), orgAdmin), [rules, orgAdmin]);
 }
 
+/** Whether the caller is a project or organisation admin, who manages per-secret access. */
+export function useManagesSecretAccess(project: string): boolean {
+  const { data } = useQuery({
+    queryKey: keys.permissions(project),
+    queryFn: () => api.permissions(project),
+    staleTime: 30_000,
+  });
+  return data?.manages_secret_access === true;
+}
+
 export function useOrgPermissions(): Permissions {
   const { data } = useMe();
   const rules = data?.org_rules;

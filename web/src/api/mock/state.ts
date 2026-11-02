@@ -1,4 +1,5 @@
 import type {
+  Action,
   AuditEntry,
   AuthMethodConfig,
   ClientSecret,
@@ -8,6 +9,7 @@ import type {
   Membership,
   OrgBinding,
   PolicyOverride,
+  PrincipalKind,
   Project,
   Role,
   SealMode,
@@ -56,6 +58,18 @@ export interface StoredSecret {
   versions: StoredVersion[];
   /** Absent means inherit the project policy. */
   policy?: PolicyOverride;
+  /** Only those on its access list, and admins, may reach it. */
+  restricted?: boolean;
+}
+
+/** One entry on a secret's access list. */
+export interface StoredGrant {
+  secretId: string;
+  principal_kind: PrincipalKind;
+  principal_id: string;
+  /** Always holds `read`. */
+  actions: Action[];
+  created_at: number;
 }
 
 export interface StoredLogo {
@@ -120,6 +134,8 @@ export interface MockState {
   logos: Record<string, StoredLogo>;
   /** Keyed by project id; absent means off. */
   projectPolicies: Record<string, SecretPolicy>;
+  /** Access list entries of every secret. */
+  grants: StoredGrant[];
   sys: MockSys;
 }
 

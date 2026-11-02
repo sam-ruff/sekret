@@ -31,6 +31,8 @@ pub struct AuditTarget<'a> {
     pub environment: Option<&'a str>,
     pub path: Option<&'a str>,
     pub key: Option<&'a str>,
+    /// About a restricted secret, so only readers who may see it get the entry.
+    pub restricted: bool,
 }
 
 /// Records an audit entry. Failures are logged rather than failing the request.
@@ -97,6 +99,7 @@ fn audit_entry(
         secret_key: target.key.map(String::from),
         detail: crate::peer::annotate(detail, &ip.to_string()),
         ip: ip.to_string(),
+        restricted: target.restricted,
     }
 }
 
@@ -146,6 +149,7 @@ pub fn secret_ctx<'a>(state: &'a AppState, principal: &Principal) -> ApiResult<S
         actor: principal.actor(),
         snapshots_to_keep: state.config.snapshots_to_keep,
         generated: false,
+        hidden_collision: std::sync::Mutex::new(None),
     })
 }
 

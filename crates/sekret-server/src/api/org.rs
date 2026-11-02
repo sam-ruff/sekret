@@ -7,7 +7,7 @@ use sekret_api::{
     UpdateIdentity, UpdateUser, User, UserPage,
 };
 use sekret_core::crypto::generate_token;
-use sekret_core::permissions::{Action, Subject, covers, dropped_rules, may_remove};
+use sekret_core::permissions::{Action, BuiltinRole, Subject, covers, dropped_rules, may_remove};
 use sekret_core::validate;
 use sekret_store::{Binding, PrincipalKind};
 use serde_json::json;
@@ -19,8 +19,8 @@ use super::projects::{api_role, builtin_roles, ensure_principal_exists, removal_
 use super::{AuditTarget, audit, from_api_kind, to_api_kind};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{
-    added_denies, admin_bindings, deny_needs_admin, has_denies, is_org_admin, org_management_rules, org_rules,
-    project_rules, reaches_admin, require_any, role_rules,
+    added_denies, admin_bindings, admin_role_needs_admin, deny_needs_admin, has_denies, is_org_admin,
+    org_management_rules, org_rules, project_rules, reaches_admin, require_any, role_rules,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::machine::{
@@ -719,6 +719,9 @@ async fn add_binding(
             "you cannot grant a role with more access than you have",
         ));
     }
+    if request.role == BuiltinRole::OrgAdmin.slug() && !is_org_admin(&state, &principal).await? {
+        return Err(admin_role_needs_admin(&request.role));
+    }
     let kind = from_api_kind(request.principal_kind);
     ensure_principal_exists(&state, kind, &request.principal_id).await?;
     if has_denies(&granted)
@@ -929,5 +932,11 @@ async fn org_audit(
         Subject::OrgAuditLog,
         Action::Read,
     )?;
-    Ok(Json(audit_page(&state, None, params, false).await?))
+    // Only organisation admins, whom no access list binds, see entries about restricted secrets.
+    let visible = if is_org_admin(&state, &principal).await? {
+        None
+    } else {
+        Some(Vec::new())
+    };
+    Ok(Json(audit_page(&state, None, params, false, visible).await?))
 }

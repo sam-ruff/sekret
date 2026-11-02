@@ -40,6 +40,8 @@ export const keys = {
   projectAudit: (p: string) => ["project", p, "audit"] as const,
   projectPolicy: (p: string) => ["project", p, "secret-policy"] as const,
   secretPolicy: (p: string, env: string, path: string, key: string) => ["project", p, "policy", env, path, key] as const,
+  secretAccess: (p: string, env: string, path: string, key: string) => ["project", p, "access", env, path, key] as const,
+  secretAccessSetting: (p: string) => ["project", p, "secret-access"] as const,
   /** Prefix for every page and search of users. */
   users: ["users"] as const,
   userPage: (query: UserQuery) => ["users", query] as const,

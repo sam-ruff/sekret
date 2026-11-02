@@ -40,7 +40,7 @@ import { folderQuery, useProjectEnv } from "@/hooks/use-project-env";
 import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useOptionalQuery, useProject, useSealWatch } from "@/hooks/queries";
 import { useIdle, useOnPageHidden } from "@/hooks/use-idle";
 import { useIsMobile } from "@/hooks/use-mobile";
-import { useProjectPermissions } from "@/hooks/use-permissions";
+import { useManagesSecretAccess, useProjectPermissions } from "@/hooks/use-permissions";
 import { isValidSecretKey } from "@/lib/dotenv";
 import { generatorFromDraft } from "@/lib/generation";
 import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
@@ -247,6 +247,7 @@ function SecretsView() {
   const { project, envParam, env, envs, path, environments } = useProjectEnv();
   const projectQuery = useProject(project);
   const perms = useProjectPermissions(project);
+  const managesAccess = useManagesSecretAccess(project);
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
 
@@ -351,7 +352,12 @@ function SecretsView() {
     mutationFn: ({ draft }: { draft: SecretDraft; isNew: boolean }) =>
       draft.generator
         ? api.generateSecret(at, draft.key, { generator: generatorFromDraft(draft.generator), comment: draft.comment })
-        : api.setSecret(at, draft.key, { value: draft.value, comment: draft.comment, tags: draft.tags }),
+        : api.setSecret(at, draft.key, {
+            value: draft.value,
+            comment: draft.comment,
+            tags: draft.tags,
+            ...(draft.restricted && { restricted: true }),
+          }),
     invalidate: [...invalidate, ["project", project, "policy"]],
     success: (r, { draft, isNew }) => {
       if (draft.generator) return isNew ? `Generated ${draft.key}` : `Generated a new value for ${draft.key}`;
@@ -586,6 +592,7 @@ function SecretsView() {
           {adding !== null && canCreateSecret && (
             <SecretEditor
               isNew
+              canRestrict={managesAccess && projectQuery.data?.secret_access === true}
               initial={{ key: adding, value: "", comment: "", tags: [] }}
               busy={save.isPending}
               onCancel={() => {
@@ -805,6 +812,7 @@ function SecretsView() {
             secretKey={drawerKey}
             canRollback={canRollback}
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
+            restricted={drawerSecret?.restricted === true}
             onRotate={(key) => {
               rotateReturnFocus.current = null;
               setRotating(key);

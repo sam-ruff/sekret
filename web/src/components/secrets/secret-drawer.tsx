@@ -19,6 +19,7 @@ import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { HISTORY_PAGE, mergeHistory, nextHistoryCursor, sameContent } from "@/lib/versions";
+import { AccessSection } from "./access-section";
 import { PolicySection } from "./policy-section";
 
 interface SecretDrawerProps {
@@ -30,6 +31,8 @@ interface SecretDrawerProps {
   canRollback: boolean;
   /** May change this secret's generation policy and rotate it. */
   canEditPolicy: boolean;
+  /** Only those on its access list, and admins, can reach it. */
+  restricted?: boolean;
   onRotate: (key: string) => void;
   onClose: () => void;
   onCloseAutoFocus?: (event: Event) => void;
@@ -238,6 +241,7 @@ export function SecretDrawer({
   secretKey,
   canRollback,
   canEditPolicy,
+  restricted = false,
   onRotate,
   onClose,
   onCloseAutoFocus,
@@ -407,6 +411,7 @@ export function SecretDrawer({
                 )}
               </>
             )}
+            {secretKey && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
             {secretKey && (
               <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />
             )}

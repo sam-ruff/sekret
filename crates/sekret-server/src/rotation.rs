@@ -42,14 +42,23 @@ pub struct Target<'a> {
     pub key: &'a str,
 }
 
+/// What to generate, and how to store it.
+#[derive(Debug, Clone, Default)]
+pub struct Generation {
+    /// Overrides the secret's policy generator for this value only.
+    pub generator: Option<Generator>,
+    pub comment: String,
+    /// As [`SecretUpsert::restricted`].
+    pub restricted: Option<bool>,
+}
+
 /// Plans writing a freshly generated value to the target, creating the secret when it does not
 /// exist. The caller's rules are checked exactly as for a normal write.
 pub async fn plan_generated(
     ctx: &SecretCtx<'_>,
     caller: Caller<'_>,
     target: Target<'_>,
-    generator: Option<Generator>,
-    comment: String,
+    request: Generation,
 ) -> ApiResult<PlannedWrite> {
     let Target {
         project,
@@ -57,6 +66,11 @@ pub async fn plan_generated(
         path,
         key,
     } = target;
+    let Generation {
+        generator,
+        comment,
+        restricted,
+    } = request;
     let path = sekret_core::validate::folder_path(path)?;
     let path = path.as_str();
     let generator = match generator {
@@ -96,7 +110,7 @@ pub async fn plan_generated(
         value: value.to_string(),
         comment,
         tags: None,
-        restricted: None,
+        restricted,
     };
     plan_batch(ctx, caller, project, env, path, vec![upsert], vec![]).await
 }
@@ -171,7 +185,11 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
                         key: &s.secret.key,
                     };
                     let comment = rotation_comment(&s.version.comment);
-                    let planned = plan_generated(&ctx, caller, target, None, comment).await?;
+                    let request = Generation {
+                        comment,
+                        ..Generation::default()
+                    };
+                    let planned = plan_generated(&ctx, caller, target, request).await?;
                     apply(&ctx, planned).await
                 }
                 .await;
@@ -189,6 +207,7 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
                         environment: Some(&env.slug),
                         path: Some(&s.secret.path),
                         key: Some(&s.secret.key),
+                        restricted: s.secret.restricted,
                     },
                     json!({"automatic": true}),
                 )

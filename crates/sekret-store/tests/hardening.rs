@@ -51,6 +51,7 @@ async fn seed(store: &SqlStore) -> anyhow::Result<(String, String)> {
                 created_at: version,
             },
             restricted: false,
+            access_epoch: 0,
         });
     }
     for change in changes {

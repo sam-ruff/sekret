@@ -106,15 +106,21 @@ pub trait Store: Send + Sync {
     async fn set_project_policy(&self, project_id: &str, policy: Option<String>) -> StoreResult<()>;
     async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
     /// Turns per-secret access on or off. Turning it off is a `Conflict` while any secret in the
-    /// project is restricted, so no restriction is ever dropped silently.
+    /// project is restricted, so no restriction is ever dropped silently, and otherwise clears
+    /// every access list in the project.
     async fn set_project_secret_access(&self, project_id: &str, enabled: bool) -> StoreResult<()>;
     /// Restricted secrets in the project, deleted ones included.
     async fn count_restricted_secrets(&self, project_id: &str) -> StoreResult<i64>;
+    /// Restricted secrets in the project, deleted ones included, without their values.
+    async fn list_restricted_secrets(&self, project_id: &str) -> StoreResult<Vec<RestrictedSecret>>;
     /// Every access list entry on secrets in the environment.
     async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    /// Every access list entry on secrets in the project.
+    async fn list_project_grants(&self, project_id: &str) -> StoreResult<Vec<SecretGrant>>;
     async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>>;
-    /// Applies one secret's access changes atomically. Restricting is a `Conflict` when the
-    /// project setting is off.
+    /// Applies one secret's access changes atomically and moves its access epoch on.
+    /// Restricting is a `Conflict` when the project setting is off, and unrestricting clears the
+    /// list before any grants in the same change.
     async fn update_secret_access(&self, change: AccessChange) -> StoreResult<()>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
     async fn delete_project(&self, id: &str) -> StoreResult<()>;
