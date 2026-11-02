@@ -852,7 +852,7 @@ fn stale_shell_choice(overrides: &Overrides, file: &ProjectFile) -> Option<Strin
     Some(
         format!(
             "{}; these were loaded by `sekret-env` under {shown_from}, so not using them here. Run `sekret-env off` \
-             to use this folder's file, or pass --project and --env to choose",
+             to use this folder's file, or pass --project, --env and --path to choose",
             clashes.join(" and ")
         )
         .replace(['\n', '\t'], " "),
@@ -2186,10 +2186,31 @@ mod tests {
             "{reason}"
         );
 
+        assert!(reason.contains("--path"), "the advice covers the folder: {reason}");
+
         shell.env_path = None;
-        let flagged = resolve(shell, file, &Credentials::default(), 0)?;
+        let flagged = resolve(shell, file.clone(), &Credentials::default(), 0)?;
         assert_eq!(flagged.stale_shell, None, "--path is a deliberate choice");
         assert_eq!(flagged.path, "/a");
+
+        // Following the advice for all three clears every clash.
+        let mut all_stale = shell_from_a("/repo-a/.sekret.toml");
+        all_stale.path = Some("/a".into());
+        all_stale.env_path = Some("/a".into());
+        let mut file_b = file;
+        file_b.project = Some("b".into());
+        let reason = resolve(all_stale.clone(), file_b.clone(), &Credentials::default(), 0)?
+            .stale_shell
+            .context("all three clash")?;
+        assert!(
+            reason.contains("SEKRET_PROJECT") && reason.contains("SEKRET_PATH"),
+            "{reason}"
+        );
+        all_stale.project = Some("a".into());
+        all_stale.environment = Some("prod".into());
+        all_stale.env_path = None;
+        let advised = resolve(all_stale, file_b, &Credentials::default(), 0)?;
+        assert_eq!(advised.stale_shell, None, "--project, --env and --path as advised");
         Ok(())
     }
 
