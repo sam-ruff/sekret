@@ -192,6 +192,101 @@ fn context_reports_each_setting_and_its_source_without_a_token() -> anyhow::Resu
 }
 
 #[test]
+fn a_server_only_a_project_file_names_is_reported_unconfirmed_and_never_given_a_token() -> anyhow::Result<()> {
+    let dir = home()?;
+    std::fs::write(dir.path().join("work/.sekret.toml"), "server = \"https://file.test\"\n").context("project file")?;
+    let value = context(&[], &["--project", "p", "--env", "e"], dir.path())?;
+    assert_eq!(value["server"], "https://file.test");
+    assert_eq!(value["server_source"], "project_file");
+    assert_eq!(value["server_confirmed"], false);
+    let plain = run(&["token"], &[], dir.path())?;
+    assert!(!plain.status.success());
+    assert!(text(&plain.stderr).contains("--server"), "{}", text(&plain.stderr));
+
+    save_login(dir.path(), "https://file.test", "file-token", LATER)?;
+    let value = context(&[], &["--project", "p", "--env", "e"], dir.path())?;
+    assert_eq!(value["server_source"], "logged_in");
+    assert_eq!(value["server_confirmed"], true);
+    let plain = run(&["token"], &[], dir.path())?;
+    assert_eq!(text(&plain.stdout), "file-token\n");
+    assert!(text(&plain.stderr).contains(".sekret.toml"), "{}", text(&plain.stderr));
+    Ok(())
+}
+
+#[test]
+fn context_refuses_a_user_config_ca_file_others_can_change() -> anyhow::Result<()> {
+    let dir = home()?;
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, "not really a certificate\n").context("ca")?;
+    std::fs::set_permissions(&ca, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
+    private_file(
+        &dir.path().join("config/sekret/config.toml"),
+        &format!("server = \"https://saved.test\"\nca_file = \"{}\"\n", ca.display()),
+    )?;
+    let output = run(&["token", "--context", "-p", "p", "-e", "e"], &[], dir.path())?;
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("CA file"), "{}", text(&output.stderr));
+
+    std::fs::set_permissions(&ca, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+    let value = context(&[], &["-p", "p", "-e", "e"], dir.path())?;
+    assert_eq!(value["ca_file_source"], "user_config");
+    Ok(())
+}
+
+#[test]
+fn context_tells_the_ca_variable_from_the_flag() -> anyhow::Result<()> {
+    let dir = home()?;
+    let base = ["--server", "https://saved.test", "-p", "p", "-e", "e"];
+    let value = context(&[("SEKRET_CA_FILE", "/env-ca.pem")], &base, dir.path())?;
+    assert_eq!(value["ca_file_source"], "environment");
+    let mut flagged = base.to_vec();
+    flagged.push("--ca-file=/flag-ca.pem");
+    let value = context(&[], &flagged, dir.path())?;
+    assert_eq!(
+        (value["ca_file"].as_str(), value["ca_file_source"].as_str()),
+        (Some("/flag-ca.pem"), Some("flag"))
+    );
+    Ok(())
+}
+
+#[test]
+fn context_refuses_plain_http_to_another_machine() -> anyhow::Result<()> {
+    let dir = home()?;
+    let output = run(
+        &[
+            "token",
+            "--context",
+            "--server=http://remote.test",
+            "-p",
+            "p",
+            "-e",
+            "e",
+        ],
+        &[],
+        dir.path(),
+    )?;
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("plain http"), "{}", text(&output.stderr));
+    Ok(())
+}
+
+#[test]
+fn values_given_with_equals_are_never_taken_for_flags() -> anyhow::Result<()> {
+    let dir = home()?;
+    save_login(dir.path(), "https://saved.test", "saved-token", LATER)?;
+    let output = run(&["token", "--server=https://saved.test"], &[], dir.path())?;
+    assert_eq!(text(&output.stdout), "saved-token\n");
+    let value = context(
+        &[],
+        &["--server=https://saved.test", "--project=-p", "--env=e"],
+        dir.path(),
+    )?;
+    assert_eq!(value["project"], "-p");
+    assert_eq!(value["server_source"], "flag");
+    Ok(())
+}
+
+#[test]
 fn context_refuses_a_project_file_choice_nobody_confirmed() -> anyhow::Result<()> {
     let dir = home()?;
     std::fs::write(
