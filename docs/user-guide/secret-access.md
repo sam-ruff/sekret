@@ -15,7 +15,7 @@ sekret projects secret-access on -p payments
 
 Everyone who can see the project can see whether the setting is on, through the `secret_access` field of the project. The list of restricted secrets is for admins only.
 
-Turning the setting off is refused while any secret in the project is restricted, deleted secrets included, with an answer that says how many there are. This is deliberate: switching it off must never quietly open a secret that someone restricted. Unrestrict them first; the setting page and `sekret projects secret-access` both list them, with their environment, folder, whether they are deleted and how many entries their list holds. An admin whose own roles hide a folder does not see the secrets in it, and the CLI says how many more there are.
+Turning the setting off is refused while any secret in the project is restricted, deleted secrets included, with an answer that says how many there are. This is deliberate: switching it off must never quietly open a secret that someone restricted. Unrestrict them first; the setting page and `sekret projects secret-access` both list them, with their environment, folder, whether they are deleted and how many entries their list holds. An admin whose own roles hide a folder does not see the secrets in it, and the CLI says how many more there are. Once it is off, every access list in the project is cleared, so turning it on again starts from nothing.
 
 ## Restricting a secret
 
@@ -27,9 +27,9 @@ sekret secrets access grant STRIPE_KEY --identity checkout-pod -p payments -e pr
 sekret secrets access list STRIPE_KEY -p payments -e prod --path /stripe
 ```
 
-Restricting needs the setting on. So does granting. Unrestricting and revoking always work, so a project can be cleaned up before the setting is switched off. Unrestricting keeps the list, which then has no effect until the secret is restricted again; check it before you do.
+Restricting needs the setting on. So does granting, which also works on an open secret, so a list can be ready before the secret is restricted and nobody loses access in between. Unrestricting and revoking always work, so a project can be cleaned up before the setting is switched off. Unrestricting clears the list, and the audit entry records who was on it; a list never comes back to life when a secret is restricted again later.
 
-Restricting an existing secret leaves a moment when it was open. To avoid that, create it restricted in the same write: `sekret secrets set --restricted KEY=-`, the restricted option in the web interface's new secret form, or `"restricted": true` in a `PUT` or batch write. A secret created that way starts with an empty list, so only admins can reach it until someone is granted access. Only a project admin can create a secret restricted, and the same goes for bringing a deleted secret back restricted. On a live secret the field must match what it is now, and anything else is refused with a pointer to the access settings, so a routine write never changes who can see a secret.
+Restricting an existing secret leaves a moment when it was open, and does nothing about what was read before. To avoid that, create it restricted in the same write: `sekret secrets set --restricted KEY=-`, `sekret secrets generate --restricted KEY`, the restricted option in the web interface's new secret form, or `"restricted": true` in a `PUT`, batch or generate request. The answer to such a write lists the keys that are now restricted; the CLI, the web interface and the Ansible module fail if a key is missing from it, since a server from before per-secret access ignores the request and writes the secret open. A secret created that way starts with an empty list, so only admins can reach it until someone is granted access. Only a project admin can create a secret restricted, and the same goes for bringing a deleted secret back restricted. On a live secret the field must match what it is now, and anything else is refused with a pointer to the access settings, so a routine write never changes who can see a secret.
 
 Restrictions belong to one secret in one environment. Restricting `STRIPE_KEY` in `prod` does nothing to `STRIPE_KEY` in `dev`.
 
@@ -44,11 +44,15 @@ Each entry names a user, a group from your identity provider, or a machine ident
 | `edit` | Writing a new value, rolling back, and bringing the secret back after it was deleted. |
 | `delete` | Deleting it. |
 
-`sekret secrets access grant` takes `--identity` (an id or a name), `--user` (an id or an email), `--group` (a group name) and `--allow`, which defaults to `read,read-value`. Each flag can be repeated, and granting someone already on the list replaces their actions. `revoke` takes the same principal flags. Users must have signed in once before they can be listed, and an identity that is deleted leaves the lists it was on.
+`sekret secrets access grant` takes `--identity` (an id or a name), `--user` (an id or an email), `--group` (a group name) and `--allow`, which defaults to `read,read-value`. Each flag can be repeated, and granting someone already on the list replaces their actions. `revoke` takes the same principal flags. A name that matches more principals than one search returns is refused, so give the id. Users must have signed in once before they can be listed, and an identity that is deleted leaves the lists it was on. Group names are not checked, so a typo grants nothing.
+
+A restricted secret tells each caller on its list what their entry allows, in the `granted` field, so the web interface only offers what will work.
 
 A list holds at most 100 entries. Seeing a list and changing it are for project and organisation admins only, and only for secrets their own roles let them read. Every change is recorded as `secret.access`, with the entries added and removed.
 
-Admin here means the built-in `org-admin` role, or the project's built-in `admin` role held directly or through a group. A custom role that allows everything is not enough. Admins are still held to their own deny rules, so a deny on `/payments/**` keeps an admin out of a restricted secret there as it would any other.
+Admin here means the built-in `org-admin` role, or the project's built-in `admin` role held directly or through a group. A custom role that allows everything is not enough, and since the built-in admin roles carry this exemption, only an admin can grant them; someone whose custom role merely matches them is refused. Admins are still held to their own deny rules, so a deny on `/payments/**` keeps an admin out of a restricted secret there as it would any other.
+
+A write is planned against a secret as it stands. If its restriction or list changes before the write lands, the write is refused as a conflict and has to be tried again, so a change of access always takes effect at once.
 
 ## What someone off the list sees
 
@@ -58,22 +62,24 @@ Nothing. Every route answers for a restricted secret exactly as for a key that d
 - Folder listings, recursive reads, `sekret export`, `sekret run`, `sekret env use` and the `raw` endpoint the operator and Ansible use leave it out.
 - The project overview leaves out its row.
 - Its history, rollback, generation, and its rotation policy answer not found.
-- Writing to it or deleting it answers not found, and never changes it.
-- Snapshot secret counts leave it out, a snapshot's list of changes never names it, and restoring a snapshot leaves it as it is.
+- Writing to it or deleting it answers exactly as for a missing key, and never changes it. A malformed batch fails before any key in it is looked up.
+- Snapshot secret counts leave it out, a snapshot's list of changes never names it, and restoring a snapshot leaves it as it is. A snapshot that only changed secrets hidden from you is not listed at all, and a rollback's reason does not give the version number.
 
 Someone listed with only `read` sees the key with its value hidden, and needs `read-value` before it appears in `export`, `run` or the `raw` endpoint.
 
-There is one thing a hidden secret cannot hide. Creating a secret with the same environment, folder and key is refused as not found, as for a secret your roles hide, so a person who tries to create that exact name learns that it is taken. Folder names are not hidden either: a folder holding only restricted secrets is still listed, and still cannot be deleted while those secrets are in it.
+There is one thing a hidden secret cannot hide from someone allowed to create secrets in its folder: creating a secret with the same environment, folder and key fails, so they learn the name is taken. Anyone who could not create it there gets exactly the answer a missing key gives. Each of these refusals is recorded as `secret.write-refused`, which only admins see. Folder names are not hidden either: a folder holding only restricted secrets is still listed, and still cannot be deleted while those secrets are in it.
 
 ## The audit log
 
-The project audit log names a restricted secret only to readers who could see it. For anyone else, entries about it lose the key name and details, as entries do for a key hidden by a role, and in an environment holding such a secret their `key` and `path` filters are refused with `filter_hidden` and the search box does not search key names. See [Audit log](audit-log.md#searching-and-filtering).
+Entries about a restricted secret are marked when they are written. Readers off its list never get them: the log, its totals, filters and search all behave as if they were never written. Someone on the list gets the entries that name the secret, but not access-list changes, and not batch writes or folder reads that touched it, since those can name other restricted secrets. Admins get everything. Entries written before a secret was restricted stay as they were, and entries written while it was restricted stay hidden after it is opened again. See [Audit log](audit-log.md#searching-and-filtering).
 
-The organisation audit log is not redacted. Anyone who holds `read` on `org-audit-log` sees the names of restricted secrets there, though never their values, which no audit entry holds.
+The organisation audit log leaves the same entries out for everyone but organisation admins. No audit entry ever holds a value.
 
 ## Deleting and backing up
 
 Deleting a project, or an environment, destroys the history of every secret in it. When any of those secrets is restricted, only a project admin or an organisation admin can do it.
+
+Downgrading to a release from before per-secret access is refused: an older server will not start on a database that has this release's schema, since it would ignore every restriction.
 
 Backups hold the whole database, restricted secrets and their lists included. Anyone who can download and decrypt a backup can read everything in it, so treat `backup-reader` as access to every secret.
 
