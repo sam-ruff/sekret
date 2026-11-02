@@ -67,7 +67,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Pinned: without a version the action looks up the latest release and, when that lookup
+      # fails, falls back to an old helm whose client-side dry run needs a cluster.
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
       - run: helm lint deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com
       - run: helm template sekret deploy/helm/sekret-operator --set sekret.serverUrl=https://sekret.example.com > /dev/null
       - name: The chart never binds the operator's rights to the namespace's default account
@@ -122,6 +126,8 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # The operator suite installs the chart's RBAC and admission policies with helm template.
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
       # A freshly booted runner may still be running apt itself; wait for its lock, not fail on it.
       - run: echo 'DPkg::Lock::Timeout "600";' | sudo tee /etc/apt/apt.conf.d/90sekret-lock-timeout
       - run: cd web && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
