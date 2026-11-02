@@ -29,7 +29,7 @@ helm install sekret-operator deploy/helm/sekret-operator \
 |---|---|---|
 | `sekret.serverUrl` | none | The sekret server. Required. |
 | `sekret.allowInsecureHttp` | `false` | Allows a plain `http://` server that is not on loopback. Service account tokens and secret values then cross the network unencrypted, so the operator refuses such a URL without it. |
-| `sekret.caBundle.configMapName` | none | A ConfigMap holding the CA certificate of a server with a private CA. |
+| `sekret.caBundle.configMapName` | none | A ConfigMap holding the CA certificate of a server with a private CA. The operator refuses to start if the key holds no PEM certificate, such as an empty key or a DER file, rather than quietly trusting only the system roots. |
 | `sekret.clientCertificate.secretName` | none | A `kubernetes.io/tls` Secret to present to a server that requires mutual TLS. |
 | `watchNamespaces` | the release namespace | The namespaces to watch, each with its own `Role`. |
 | `clusterWide` | `false` | Watches every namespace with a `ClusterRole`. Cannot be combined with `watchNamespaces`. |
