@@ -37,7 +37,7 @@ The lookup tries these in order and uses the first that is set:
 
 The module runs on the target host, so it never uses a CLI login; give it a token or a machine identity.
 
-A login is cached in each worker process, so a template full of lookups logs in once there. For a private CA, set `ca_path` or `SEKRET_CA_PATH`. Without one, a lookup using a token or machine identity trusts the system's CAs. With your `sekret login`, the lookup checks the server against the same CA file as the CLI does: `ca_path` when it is set, otherwise the CLI's own `SEKRET_CA_FILE` or the `ca_file` in its user config. `ca_path` must then be a file, not a directory of certificates, since the CLI reads it too, and `validate_certs` must stay on: your login is never sent without checking the server's certificate.
+A login is cached in each worker process, so a template full of lookups logs in once there. For a private CA, set `ca_path` or `SEKRET_CA_PATH`: like the CLI, the lookup then trusts that CA as well as the system's, not instead of them. Without one, a lookup using a token or machine identity trusts the system's CAs alone. With your `sekret login`, the lookup checks the server against the same CA file as the CLI does: `ca_path` when it is set, otherwise the CLI's own `SEKRET_CA_FILE` or the `ca_file` in its user config. `ca_path` must then be a file, not a directory of certificates, since the CLI reads it too, and `validate_certs` must stay on: your login is never sent without checking the server's certificate.
 
 The lookup runs the CLI without `SEKRET_TOKEN`, `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET`, `SEKRET_IDENTITY_ID`, the OIDC and Kubernetes token variables, the GitHub Actions token variables or `SEKRET_URL`, so `sekret login` is always your own browser login, never a machine login, and a machine credential on the controller never reaches the CLI.
 
@@ -65,14 +65,24 @@ Whoever chooses the server is choosing where your credentials go, so the lookup 
 
 - `sekret_url` and `sekret_ca_path` are inventory variables, and anyone who can change the inventory or a group's variables can set them.
 - The lookup never sends a token, client secret or OIDC token to a server `sekret_url` names, wherever the credential came from, even passed to the lookup itself, and says why. Only a login you already saved for that server is sent there, since it was only ever valid at that address, and the lookup never opens a browser login for it: run `sekret login --server=...` yourself if you trust it.
-- A CA file is different: it replaces every other CA the server is checked against, so a `sekret_ca_path` of the inventory's choosing could let someone else pose as the server. The lookup sends nothing through one, neither your saved login nor any credential, unless `SEKRET_CA_PATH`, `ansible.cfg`, the lookup's own `ca_path=` or the CLI's own CA file names the same file, and then it loads that setting's file.
+- A CA file is different: the server is accepted if that CA vouches for it, so a `sekret_ca_path` of the inventory's choosing could let someone else pose as the server. The lookup sends nothing through one, neither your saved login nor any credential, unless `SEKRET_CA_PATH`, `ansible.cfg`, the lookup's own `ca_path=` or the CLI's own CA file names the same file, and then it loads that setting's file.
 - A server that only a `.sekret.toml` names is used only once you have logged in to it, and then only with that saved login, never with a token or machine identity. One you have not logged in to is refused.
 - A `.sekret.toml` can also choose the folder. Once you have confirmed its project and environment, it may pick any folder within them without asking again; you can still only read what your login can already read there.
 - Set the server yourself, in `SEKRET_URL`, as the lookup's `url=` or in your own `ansible.cfg`, when anything else is to be sent to it.
 
+These rules are defence in depth, not a boundary against an inventory written by someone hostile. An inventory can set `ansible_connection`, `ansible_python_interpreter` and the like, and so run code as you on the controller, which no lookup can stop. They keep a careless or copied inventory from sending your credentials somewhere unexpected; only run inventories you trust.
+
 A repository's own `ansible.cfg` is code you are trusting, like its playbooks: as well as `[sekret]` it can set plugin paths and so run anything. In a repository you have not reviewed, only `SEKRET_URL`, `SEKRET_CA_PATH`, an `ansible.cfg` of your own (through `ANSIBLE_CONFIG`) and the lookup's own arguments are safe places for the server and CA.
 
 Errors and the `-v` line show anything a project file or an inventory chose with control and direction characters escaped, so such a value cannot rewrite your terminal.
+
+## Upgrading
+
+This release changes how the lookup reads its settings, in ways an older playbook can notice:
+
+- **`sekret_*` variables are read, above `SEKRET_*`.** The lookup now takes `sekret_url`, `sekret_project`, `sekret_environment`, `sekret_path` and `sekret_ca_path` from inventory and play variables, and they outrank the `SEKRET_*` environment variables. If your group_vars already used those names, say to feed the module, the lookup now reads from what they name rather than from the environment. When such a variable overrides a different `SEKRET_*` value, the lookup warns once in each worker process, naming both. A token or machine identity is then refused for a `sekret_url` server (see [What may choose the server](#what-may-choose-the-server)). Rename the variables, or pass the values to the lookup, to keep the old behaviour.
+- **Your own `sekret login` is used** when no token, machine identity or OIDC token is set, where the lookup used to fail.
+- **A CA file is added to the system's CAs** rather than replacing them.
 
 ## Read
 
