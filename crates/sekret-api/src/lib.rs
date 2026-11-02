@@ -334,9 +334,9 @@ pub struct SecretUpsert {
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     /// `true` creates the secret restricted, with an empty access list, so it is never open
-    /// even for a moment; that needs a project admin and the project setting on. For a secret
-    /// that already exists it must match whether it is restricted, which only the access
-    /// route changes.
+    /// even for a moment; that needs a project admin and the project setting on. A deleted
+    /// secret can be brought back restricted the same way. Otherwise, for a secret that already
+    /// exists it must match whether it is restricted, which only the access route changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restricted: Option<bool>,
 }

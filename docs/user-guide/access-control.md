@@ -4,6 +4,8 @@ Access is granted by roles. A role is a list of rules, each of which allows or d
 
 There are two scopes. Organisation roles cover projects in general, machine identities, users and the organisation audit log. Project roles cover everything inside one project.
 
+Roles decide access to whole groups of secrets. To limit one secret to a few named users, groups or machine identities, turn on [per-secret access](secret-access.md) for the project; its lists narrow what roles allow and never widen it.
+
 ## Built-in roles
 
 | Role | Scope | What it allows |
@@ -85,7 +87,7 @@ A project's *Members* tab lists who holds which project role. Someone can hold m
 
 ## How a decision is made
 
-For a given action on a given secret, sekret collects every rule from every role the person holds, through their own membership, their groups and their organisation roles. If any matching rule denies, the answer is no. Otherwise, if any matching rule allows, the answer is yes. Otherwise it is no.
+For a given action on a given secret, sekret collects every rule from every role the person holds, through their own membership, their groups and their organisation roles. If any matching rule denies, the answer is no. Otherwise, if the secret is [restricted](secret-access.md) and its access list does not allow the action for them, the answer is no, unless they are a project or organisation admin. Otherwise, if any matching rule allows, the answer is yes. Otherwise it is no.
 
 A deny whose condition cannot be checked, for example a tag condition when the tags are not known yet, counts as matching. An allow in the same position does not. Both mistakes fail closed. Checks that are not about one secret, such as on a whole environment, a folder or an audit log entry, never know the tags, so a deny scoped by tag applies to them too: someone denied reading `restricted` secrets also sees key names hidden in the project audit log.
 

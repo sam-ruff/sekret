@@ -340,7 +340,7 @@ async fn write(
         .batch
         .iter()
         .flat_map(|b| &b.changes)
-        .filter(|c| c.previous_version == 0 && c.restricted)
+        .filter(|c| c.restricted)
         .map(|c| c.key.clone())
         .collect();
     let result = apply(&ctx, planned).await?;

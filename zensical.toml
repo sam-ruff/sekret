@@ -18,6 +18,7 @@ nav = [
     { "Projects and environments" = "user-guide/projects.md" },
     { "Secrets, history and snapshots" = "user-guide/secrets.md" },
     { "Access control" = "user-guide/access-control.md" },
+    { "Per-secret access" = "user-guide/secret-access.md" },
     { "Machine identities" = "user-guide/machine-identities.md" },
     { "Generation and rotation" = "user-guide/rotation.md" },
     { "Audit log" = "user-guide/audit-log.md" },

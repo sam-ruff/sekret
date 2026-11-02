@@ -1641,9 +1641,9 @@ export interface components {
             key: string;
             /**
              * @description `true` creates the secret restricted, with an empty access list, so it is never open
-             *     even for a moment; that needs a project admin and the project setting on. For a secret
-             *     that already exists it must match whether it is restricted, which only the access
-             *     route changes.
+             *     even for a moment; that needs a project admin and the project setting on. A deleted
+             *     secret can be brought back restricted the same way. Otherwise, for a secret that already
+             *     exists it must match whether it is restricted, which only the access route changes.
              */
             restricted?: boolean | null;
             tags?: string[] | null;

@@ -41,6 +41,46 @@ options:
       - Tags are lowercase slugs and are compared ignoring order and duplicates.
     type: list
     elements: str
+  restricted:
+    description:
+      - Whether only the principals on the secret's access list, project admins and organisation admins may
+        reach it. Leave unset to keep it as it is.
+      - A new secret created with C(true) is restricted in the same write, so it is never open even briefly.
+      - Restricting needs per-secret access turned on for the project, and changing it needs a project or
+        organisation admin.
+      - Ignored when O(state=absent).
+    type: bool
+  access:
+    description:
+      - The secret's access list. When set, the list is made to match exactly, adding, changing and removing
+        entries in one request. Leave unset to keep the list as it is.
+      - An empty list removes every entry.
+      - Entries only narrow what each principal's roles allow and never widen it. They apply while the secret
+        is restricted.
+      - Reading and changing the list needs a project or organisation admin, and adding entries needs
+        per-secret access turned on for the project.
+      - Ignored when O(state=absent).
+    type: list
+    elements: dict
+    suboptions:
+      kind:
+        description:
+          - What the entry names.
+        type: str
+        choices: [identity, user, group]
+        required: true
+      id:
+        description:
+          - The id of the machine identity or user, or the name of the group.
+        type: str
+        required: true
+      allow:
+        description:
+          - What the principal may do with the secret. C(read) is always included.
+        type: list
+        elements: str
+        choices: [read, read-value, edit, delete]
+        default: [read, read-value]
 attributes:
   check_mode:
     support: full
@@ -60,6 +100,20 @@ EXAMPLES = r"""
     value: "{{ lookup('ansible.builtin.password', '/dev/null length=32') }}"
     comment: rotated by ansible
     tags: [database]
+  delegate_to: localhost
+
+- name: Keep a payment key to the one workload that needs it
+  sekret.secrets.secret:
+    project: app
+    environment: prod
+    path: /payments
+    key: STRIPE_KEY
+    value: "{{ stripe_key }}"
+    restricted: true
+    access:
+      - kind: identity
+        id: 0b9f2c1e-5d4a-4c7e-9a51-2f8d6e3b7c10
+        allow: [read, read-value]
   delegate_to: localhost
 
 - name: Remove a secret that is no longer used
@@ -92,6 +146,14 @@ snapshot_id:
   description: ID of the environment snapshot recorded for the write.
   returned: when a write was made
   type: str
+restricted:
+  description: Whether the secret is restricted to its access list afterwards.
+  returned: when O(state=present)
+  type: bool
+access_changed:
+  description: Whether the restricted flag or the access list changed, or would change in check mode.
+  returned: when O(state=present)
+  type: bool
 """
 
 from dataclasses import dataclass  # noqa: E402
@@ -139,7 +201,24 @@ ARGUMENT_SPEC = {
     "state": {"type": "str", "choices": ["present", "absent"], "default": "present"},
     "comment": {"type": "str"},
     "tags": {"type": "list", "elements": "str"},
+    "restricted": {"type": "bool"},
+    "access": {
+        "type": "list",
+        "elements": "dict",
+        "options": {
+            "kind": {"type": "str", "choices": ["identity", "user", "group"], "required": True},
+            "id": {"type": "str", "required": True},
+            "allow": {
+                "type": "list",
+                "elements": "str",
+                "choices": ["read", "read-value", "edit", "delete"],
+                "default": ["read", "read-value"],
+            },
+        },
+    },
 }
+
+ACTIONS = ("read", "read-value", "edit", "delete")
 
 
 @dataclass(frozen=True)
@@ -160,6 +239,78 @@ def _describe(record: SecretRecord | None, changed_value: bool = False) -> dict:
     return {"value": HIDDEN_CHANGED if changed_value else HIDDEN, "tags": record.tags}
 
 
+Principal = tuple[str, str]
+
+
+def normalise_allow(allow: list[str] | None) -> list[str]:
+    """The actions an entry grants, in a fixed order, with read always included."""
+    wanted = set(allow or []) | {"read"}
+    unknown = sorted(wanted - set(ACTIONS))
+    if unknown:
+        raise ConfigError(f"access allows unknown actions: {', '.join(unknown)}; use {', '.join(ACTIONS)}")
+    return [a for a in ACTIONS if a in wanted]
+
+
+def desired_access(entries: list[dict]) -> dict[Principal, list[str]]:
+    wanted: dict[Principal, list[str]] = {}
+    for entry in entries:
+        kind, principal_id = entry.get("kind"), entry.get("id")
+        if kind not in ("identity", "user", "group") or not principal_id:
+            raise ConfigError("each access entry needs a kind (identity, user or group) and an id")
+        if (kind, principal_id) in wanted:
+            raise ConfigError(f"access names {kind} {principal_id} more than once")
+        allow = entry["allow"] if entry.get("allow") is not None else ["read", "read-value"]
+        wanted[(kind, principal_id)] = normalise_allow(allow)
+    return wanted
+
+
+def current_access(grants: list[dict]) -> dict[Principal, list[str]]:
+    return {
+        (g["principal_kind"], g["principal_id"]): [a for a in ACTIONS if a in (g.get("actions") or [])]
+        for g in grants
+    }
+
+
+def plan_access(have: dict[Principal, list[str]], want: dict[Principal, list[str]]) -> tuple[list, list]:
+    """Grants and revocations that turn `have` into `want`."""
+    grant = [
+        {"principal_kind": kind, "principal_id": principal_id, "actions": actions}
+        for (kind, principal_id), actions in sorted(want.items())
+        if have.get((kind, principal_id)) != actions
+    ]
+    revoke = [
+        {"principal_kind": kind, "principal_id": principal_id}
+        for kind, principal_id in sorted(have)
+        if (kind, principal_id) not in want
+    ]
+    return grant, revoke
+
+
+def _entries(access: dict[Principal, list[str]]) -> list[dict]:
+    return [
+        {"kind": kind, "id": principal_id, "allow": allow}
+        for (kind, principal_id), allow in sorted(access.items())
+    ]
+
+
+def _apply_access(
+    client: SekretClient, target: Target, restricted: bool | None, want: dict[Principal, list[str]] | None
+) -> None:
+    """Brings a secret that now exists to the requested flag and list, in one request."""
+    listing = client.get_access(target.project, target.environment, target.key, target.path)
+    change: dict = {}
+    if restricted is not None and restricted != bool(listing.get("restricted")):
+        change["restricted"] = restricted
+    if want is not None:
+        grant, revoke = plan_access(current_access(listing.get("grants") or []), want)
+        if grant:
+            change["grant"] = grant
+        if revoke:
+            change["revoke"] = revoke
+    if change:
+        client.change_access(target.project, target.environment, target.key, target.path, change)
+
+
 def _ensure_present(
     client: SekretClient, target: Target, params: dict, check_mode: bool
 ) -> tuple[dict, list[str]]:
@@ -167,6 +318,8 @@ def _ensure_present(
     value = params["value"]
     tags = None if params.get("tags") is None else normalise_tags(params["tags"])
     comment = params.get("comment") or ""
+    restricted = params.get("restricted")
+    want = None if params.get("access") is None else desired_access(params["access"])
     current = client.get_secret(target.project, target.environment, target.key, target.path)
 
     after_tags = tags if tags is not None else (current.tags if current else [])
@@ -189,23 +342,55 @@ def _ensure_present(
         "before": _describe(current),
         "after": {"value": HIDDEN_CHANGED if value_changed else HIDDEN, "tags": after_tags},
     }
-    result = {"changed": operation != "unchanged", "operation": operation, "diff": diff}
-    if check_mode or operation == "unchanged":
+
+    # The list is only read when it is managed, since reading it needs an admin.
+    before_restricted = current.restricted if current else False
+    have: dict[Principal, list[str]] = {}
+    if current is not None and want is not None:
+        listing = client.get_access(target.project, target.environment, target.key, target.path)
+        before_restricted = bool(listing.get("restricted"))
+        have = current_access(listing.get("grants") or [])
+    after_restricted = before_restricted if restricted is None else restricted
+    grant, revoke = plan_access(have, want) if want is not None else ([], [])
+    access_changed = after_restricted != before_restricted or bool(grant or revoke)
+    if restricted is not None:
+        if current is not None:
+            diff["before"]["restricted"] = before_restricted
+        diff["after"]["restricted"] = after_restricted
+    if want is not None:
+        if current is not None:
+            diff["before"]["access"] = _entries(have)
+        diff["after"]["access"] = _entries(want)
+
+    result = {
+        "changed": operation != "unchanged" or access_changed,
+        "operation": operation,
+        "restricted": after_restricted,
+        "access_changed": access_changed,
+        "diff": diff,
+    }
+    if check_mode:
         return result, warnings
 
-    upsert = {"key": target.key, "value": value, "comment": comment}
-    if tags is not None:
-        upsert["tags"] = tags
-    outcome = client.batch(target.project, target.environment, target.path, upserts=[upsert])
-    if target.key in outcome.get("created", []):
-        operation = "created"
-    elif target.key in outcome.get("updated", []):
-        operation = "updated"
-    else:
-        operation = "unchanged"
-    result.update(changed=operation != "unchanged", operation=operation)
-    if outcome.get("snapshot_id"):
-        result["snapshot_id"] = outcome["snapshot_id"]
+    if operation != "unchanged":
+        upsert = {"key": target.key, "value": value, "comment": comment}
+        if tags is not None:
+            upsert["tags"] = tags
+        if current is None and restricted:
+            # Restricted in the same write, so the new secret is never open.
+            upsert["restricted"] = True
+        outcome = client.batch(target.project, target.environment, target.path, upserts=[upsert])
+        if target.key in outcome.get("created", []):
+            operation = "created"
+        elif target.key in outcome.get("updated", []):
+            operation = "updated"
+        else:
+            operation = "unchanged"
+        if outcome.get("snapshot_id"):
+            result["snapshot_id"] = outcome["snapshot_id"]
+    if access_changed:
+        _apply_access(client, target, restricted, want)
+    result.update(changed=operation != "unchanged" or access_changed, operation=operation)
     return result, warnings
 
 

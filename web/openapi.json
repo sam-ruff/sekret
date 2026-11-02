@@ -6041,7 +6041,7 @@
               "boolean",
               "null"
             ],
-            "description": "`true` creates the secret restricted, with an empty access list, so it is never open\neven for a moment; that needs a project admin and the project setting on. For a secret\nthat already exists it must match whether it is restricted, which only the access\nroute changes."
+            "description": "`true` creates the secret restricted, with an empty access list, so it is never open\neven for a moment; that needs a project admin and the project setting on. A deleted\nsecret can be brought back restricted the same way. Otherwise, for a secret that already\nexists it must match whether it is restricted, which only the access route changes."
           },
           "tags": {
             "type": [

@@ -253,6 +253,44 @@ class TestPlaybooks:
         else:
             assert result.returncode == 0, output
 
+    def test_restricting_a_secret_to_one_identity(self, admin, project, machine, collections_path):
+        admin.request("PUT", f"/api/v1/projects/{project}/secret-access", {"enabled": True})
+        other = admin.request("POST", "/api/v1/identities", {"name": f"{project}-other"})
+        admin.request(
+            "POST",
+            f"/api/v1/projects/{project}/members",
+            {"principal_kind": "identity", "principal_id": other["id"], "role": "developer"},
+        )
+        admin.request("PUT", f"/api/v1/identities/{other['id']}/auth/universal", {"kind": "universal"})
+        other_secret = admin.request("POST", f"/api/v1/identities/{other['id']}/client-secrets", {})
+        value = f"restricted-{uuid.uuid4().hex}"
+        try:
+            result = run_playbook(
+                COLLECTION_DIR / "tests/integration/playbooks/access.yml",
+                collections_path,
+                {"SEKRET_TOKEN": TOKEN},
+                "-e",
+                f"project={project}",
+                "-e",
+                f"sekret_environment={ENVIRONMENT}",
+                "-e",
+                f"secret_value={value}",
+                "-e",
+                f"identity_id={machine['client_id']}",
+                "--diff",
+            )
+            output = result.stdout + result.stderr
+            assert result.returncode == 0, output
+            assert value not in output
+            listed = make_client(**machine).list_raw(project, ENVIRONMENT, "/restricted")
+            assert [(s["key"], s["value"]) for s in listed] == [("PAYMENT_KEY", value)]
+            unlisted = make_client(
+                client_id=other_secret["client_id"], client_secret=other_secret["client_secret"]
+            )
+            assert unlisted.list_raw(project, ENVIRONMENT, "/restricted") == []
+        finally:
+            admin.request("DELETE", f"/api/v1/identities/{other['id']}")
+
     def test_module_and_lookup_as_machine_identity(self, project, machine, collections_path):
         values = {"value_one": f"first-{uuid.uuid4().hex}", "value_two": f"second-{uuid.uuid4().hex}"}
         result = run_playbook(

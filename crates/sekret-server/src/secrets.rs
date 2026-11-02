@@ -156,6 +156,8 @@ fn readable(rules: &[Rule], env: &Environment, path: &str, key: &str, tags: &[St
 }
 
 /// Checks a request to create a secret restricted, or to write one whose restriction it states.
+/// Returns whether the write restricts it. A deleted secret may be brought back restricted, but
+/// a write never lifts a restriction.
 fn check_restricted(
     caller: Caller<'_>,
     project: &Project,
@@ -167,12 +169,15 @@ fn check_restricted(
         return Ok(false);
     };
     if let Some(current) = existing {
-        if current.secret.restricted != wanted {
+        let revives_restricted = current.secret.deleted && wanted && !current.secret.restricted;
+        if current.secret.restricted != wanted && !revives_restricted {
             return Err(ApiError::bad_request(format!(
                 "{key} already exists; change whether it is restricted through its access settings"
             )));
         }
-        return Ok(false);
+        if !revives_restricted {
+            return Ok(false);
+        }
     }
     if !wanted {
         return Ok(false);

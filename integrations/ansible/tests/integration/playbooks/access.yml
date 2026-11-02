@@ -1,0 +1,51 @@
+- name: Restrict a secret to one machine identity against a live server
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    sekret.secrets.secret:
+      project: "{{ project }}"
+      environment: "{{ sekret_environment }}"
+      path: /restricted
+      key: PAYMENT_KEY
+  tasks:
+    - name: Create the secret restricted, with the identity on its list
+      sekret.secrets.secret:
+        value: "{{ secret_value }}"
+        restricted: true
+        access: "{{ entries }}"
+      register: created
+
+    - name: Run the same task again
+      sekret.secrets.secret:
+        value: "{{ secret_value }}"
+        restricted: true
+        access: "{{ entries }}"
+      register: again
+
+    - name: Change what the identity may do, in check mode
+      sekret.secrets.secret:
+        value: "{{ secret_value }}"
+        access:
+          - kind: identity
+            id: "{{ identity_id }}"
+            allow: [read]
+      check_mode: true
+      register: checked
+
+    - name: Check the restriction and idempotence
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - created is changed
+          - created.operation == 'created'
+          - created.restricted
+          - again is not changed
+          - not again.access_changed
+          - checked is changed
+          - checked.access_changed
+          - checked.operation == 'unchanged'
+  vars:
+    entries:
+      - kind: identity
+        id: "{{ identity_id }}"
+        allow: [read, read-value]

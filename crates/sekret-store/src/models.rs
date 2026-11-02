@@ -294,8 +294,8 @@ pub struct SecretChange {
     pub key: String,
     pub previous_version: i64,
     pub version: SecretVersion,
-    /// For a new secret, whether it starts restricted, which needs the project setting on.
-    /// Ignored for existing secrets.
+    /// Restricts the secret in the same write, which needs the project setting on. False leaves
+    /// an existing secret's flag as it is.
     pub restricted: bool,
 }
 

@@ -50,6 +50,8 @@ When running the binary directly, `sekret operator` needs either `--namespace we
 
 Create a machine identity with a [Kubernetes auth method](../user-guide/machine-identities.md#kubernetes) that allows the namespace and service account you will use, and give it a role on the project.
 
+A role reaches every secret it covers. To give a workload only the few secrets its pod needs, turn on [per-secret access](../user-guide/secret-access.md) for the project, restrict those secrets and put the identity on their lists. The operator then receives only what the identity may read; that page has a worked example.
+
 ## Let a service account be used
 
 The operator only mints a token for a service account that carries the annotation `sekret.sam-ruff.github.io/allow-sekretsecret: "true"`. Without it, the `SekretSecret` stays not ready with the reason `ServiceAccountNotAllowed`, and no token is requested.

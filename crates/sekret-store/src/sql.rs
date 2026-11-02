@@ -2063,7 +2063,7 @@ impl Store for SqlStore {
 
     async fn write_secrets(&self, batch: WriteBatch) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
-        if batch.changes.iter().any(|c| c.previous_version == 0 && c.restricted) {
+        if batch.changes.iter().any(|c| c.restricted) {
             let project = sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
                 .bind(&batch.project_id)
                 .fetch_optional(&mut *tx)
@@ -2107,6 +2107,12 @@ impl Store for SqlStore {
                 .await?;
                 if result.rows_affected() != 1 {
                     return Err(StoreError::Conflict);
+                }
+                if change.restricted {
+                    sqlx::query("UPDATE secrets SET restricted = 1 WHERE id = $1")
+                        .bind(&change.secret_id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
             }
             sqlx::query(

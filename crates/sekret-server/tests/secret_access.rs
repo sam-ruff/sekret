@@ -580,6 +580,27 @@ async fn secrets_can_be_created_restricted(db: String) -> anyhow::Result<()> {
         .await?;
     assert_eq!(audit["entries"][0]["detail"]["restricted"], json!(["NEW"]), "{audit}");
 
+    // A deleted, open secret can be brought back restricted in one write, by an admin only.
+    let old = "/api/v1/projects/app/environments/prod/secrets/OLD?path=/";
+    h.put(old, &h.admin, json!({"value": "first"})).await?;
+    let (status, _) = h.delete(old, &h.admin).await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h.put(old, &bot, json!({"value": "again", "restricted": true})).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = h
+        .put(old, &h.admin, json!({"value": "again", "restricted": true}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h.get(old, &bot).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "revived restricted");
+    let (status, _) = h
+        .get(
+            "/api/v1/projects/app/environments/prod/secrets/OLD/versions?path=/",
+            &bot,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "its history went with it");
+
     // Deleting a project or environment that holds restricted secrets is for admins only.
     let (status, body) = h
         .put(
@@ -608,7 +629,7 @@ async fn secrets_can_be_created_restricted(db: String) -> anyhow::Result<()> {
         .post(
             "/api/v1/projects/app/environments/prod/secrets/batch",
             &h.admin,
-            json!({"deletes": ["NEW"]}),
+            json!({"deletes": ["NEW", "OLD"]}),
         )
         .await?;
     assert_eq!(status, StatusCode::OK);

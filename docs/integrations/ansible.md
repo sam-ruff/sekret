@@ -131,3 +131,21 @@ A whole folder is fetched once in each worker process and kept there, for each s
 ```
 
 The module reports a change only when the stored value differs, and supports check mode. It never returns the value.
+
+In a project with [per-secret access](../user-guide/secret-access.md) on, a project admin can also set who may reach the secret. `restricted` restricts or unrestricts it; when the secret is being created, `restricted: true` goes in the same write, so it is never open. `access` is the access list, each entry a `kind` (`identity`, `user` or `group`), an `id` and an `allow` list that defaults to `[read, read-value]`. When `access` is set the list is made to match it exactly, and leaving either option unset leaves that part alone.
+
+```yaml
+- name: Give the checkout pod its Stripe key and nothing else
+  sekret.secrets.secret:
+    project: payments
+    environment: prod
+    path: /checkout
+    key: STRIPE_KEY
+    value: "{{ stripe_key }}"
+    restricted: true
+    access:
+      - kind: identity
+        id: 0192d4a8-0000-7000-8000-000000000000
+  delegate_to: localhost
+  no_log: true
+```
