@@ -287,6 +287,36 @@ fn context_refuses_a_project_file_server_with_control_characters() -> anyhow::Re
 }
 
 #[test]
+fn a_login_for_plain_http_elsewhere_is_printed_only_when_allowed() -> anyhow::Result<()> {
+    let dir = home()?;
+    save_login(dir.path(), "http://remote.test", "remote-token", LATER)?;
+    let refused = run(&["token", "--server=http://remote.test"], &[], dir.path())?;
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(
+        text(&refused.stderr).contains("plain http"),
+        "{}",
+        text(&refused.stderr)
+    );
+    let flagged = run(
+        &["token", "--server=http://remote.test", "--allow-insecure-http"],
+        &[],
+        dir.path(),
+    )?;
+    assert_eq!(text(&flagged.stdout), "remote-token\n");
+    let by_env = run(
+        &["token", "--server=http://remote.test"],
+        &[("SEKRET_CLIENT_ALLOW_INSECURE_HTTP", "true")],
+        dir.path(),
+    )?;
+    assert_eq!(text(&by_env.stdout), "remote-token\n");
+    save_login(dir.path(), "http://127.0.0.1:9", "local-token", LATER)?;
+    let local = run(&["token", "--server=http://127.0.0.1:9"], &[], dir.path())?;
+    assert_eq!(text(&local.stdout), "local-token\n");
+    Ok(())
+}
+
+#[test]
 fn values_given_with_equals_are_never_taken_for_flags() -> anyhow::Result<()> {
     let dir = home()?;
     save_login(dir.path(), "https://saved.test", "saved-token", LATER)?;

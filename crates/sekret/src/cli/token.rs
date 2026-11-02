@@ -269,6 +269,8 @@ pub fn run(args: &ClientArgs, token: &TokenArgs, out: &mut dyn Write) -> anyhow:
         return Ok(0);
     }
     token_server(&resolved, &mut std::io::stderr())?;
+    // A login for a plain http server elsewhere would cross the network in the clear once used.
+    config::check_transport(&resolved.server, args.allow_insecure_http.unwrap_or(false))?;
     let credentials = super::read_credentials(&config::credentials_path()?)?;
     let to_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
     emit(
