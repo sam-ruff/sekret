@@ -174,13 +174,23 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_cli import (
     cli_context,
 )
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (  # noqa: E402
+    CliLogin,
     ConfigError,
     SekretClient,
     SekretError,
     Settings,
+    StaticToken,
+    resolve_auth,
 )
 
 display = Display()
+CLI_ORIGIN = "the sekret CLI"
+# The options each way of logging in sends to the server.
+CREDENTIALS = {
+    "universal": ("client_id", "client_secret"),
+    "oidc": ("identity_id", "oidc_token", "oidc_token_file"),
+    "kubernetes": ("identity_id", "kubernetes_token_file"),
+}
 
 # Where to read from: each can come from the lookup, a variable, the environment or ansible.cfg,
 # and failing those from the CLI's own settings.
@@ -268,13 +278,53 @@ def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_co
     context = _CONTEXTS[key]
     if not context:
         return
+    if not place.get("url") and context.get("server") and context.get("server_confirmed") is not True:
+        raise ConfigError(
+            f"{context.get('project_file') or '.sekret.toml'} names {context['server']}, which you have "
+            "not confirmed; set url, sekret_url, SEKRET_URL or url in the [sekret] section of ansible.cfg, "
+            "or run `sekret login` at a terminal"
+        )
     for name, field in CONTEXT_KEYS.items():
         if not place.get(name) and context.get(field):
             place[name] = context[field]
-            origins[name] = f"the sekret CLI ({context.get(field + '_source') or 'its settings'})"
+            origins[name] = f"{CLI_ORIGIN} ({context.get(field + '_source') or 'its settings'})"
     if not place.get("ca_path") and context.get("ca_file"):
         place["ca_path"] = context["ca_file"]
-        origins["ca_path"] = "the sekret CLI"
+        origins["ca_path"] = CLI_ORIGIN
+
+
+def _from_inventory(origin: str | None) -> bool:
+    return (origin or "").startswith("var:")
+
+
+def check_destination(plan, place_origins: dict, credential_origins: dict) -> None:
+    """Refuses to send a token or machine identity to a server, or through a CA, that the inventory
+    or a project file chose, unless the same playbook passed the credential to the lookup itself."""
+    if isinstance(plan, CliLogin):
+        return
+    if (place_origins.get("url") or "").startswith(CLI_ORIGIN):
+        raise ConfigError(
+            "the server came from the sekret CLI's settings, so only your own `sekret login` is sent to it, "
+            "never a token or machine identity; set url, SEKRET_URL or url in the [sekret] section of "
+            "ansible.cfg to send those"
+        )
+    steered = [f"sekret_{name}" for name in ("url", "ca_path") if _from_inventory(place_origins.get(name))]
+    outside = {name: origin for name, origin in credential_origins.items() if origin != "Direct"}
+    if steered and outside:
+        sources = ", ".join(f"{name} ({origin})" for name, origin in sorted(outside.items()))
+        raise ConfigError(
+            f"{' and '.join(steered)} come from inventory variables, so {sources} is not sent there: an "
+            "inventory could point it at any server. Pass the credential to the lookup itself, or set the "
+            "server in SEKRET_URL or ansible.cfg"
+        )
+
+
+def credential_options(plan) -> tuple[str, ...]:
+    if isinstance(plan, CliLogin):
+        return ()
+    if isinstance(plan, StaticToken):
+        return ("token",)
+    return CREDENTIALS.get(plan.method, ())
 
 
 def announce(place: dict, origins: dict) -> None:
@@ -294,14 +344,23 @@ class LookupModule(LookupBase):
     cli_tokens = CliTokens
     read_context = staticmethod(cli_context)
 
-    def _token_source(self, settings: Settings) -> CliTokens:
+    def _token_source(self, settings: Settings, no_login_reason: str | None = None) -> CliTokens:
         return self.cli_tokens(
             settings.cli_path,
             settings.url,
             ca_path=settings.ca_path,
             login=settings.cli_login,
             notify=display.display,
+            no_login_reason=no_login_reason,
         )
+
+    def _credential_origins(self, plan) -> dict:
+        origins = {}
+        for name in credential_options(plan):
+            value, origin = self.get_option_and_origin(name)
+            if value:
+                origins[name] = origin
+        return origins
 
     def _place(self) -> tuple[dict, dict]:
         place, origins = {}, {}
@@ -327,7 +386,19 @@ class LookupModule(LookupBase):
                     "ansible.cfg, or a .sekret.toml"
                 )
             settings = Settings.from_options(options)
-            client = self.client_factory(settings, token_source=self._token_source)
+            plan = resolve_auth(settings, allow_cli=True)
+            check_destination(plan, origins, self._credential_origins(plan))
+            # A browser login only to a server the person named, never one an inventory chose.
+            no_login_reason = None
+            if _from_inventory(origins.get("url")) or _from_inventory(origins.get("ca_path")):
+                no_login_reason = (
+                    "the server or CA comes from an inventory variable, so the lookup will not open a "
+                    f"browser login for it; run `sekret login --server={settings.url}` yourself if you "
+                    "trust it"
+                )
+            client = self.client_factory(
+                settings, token_source=lambda s: self._token_source(s, no_login_reason)
+            )
             announce(place, origins)
             terms = list(terms or [])
             if terms:

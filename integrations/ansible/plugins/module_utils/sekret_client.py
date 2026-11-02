@@ -174,8 +174,11 @@ class StaticToken:
 class CliLogin:
     """The login `sekret login` saved, read through the CLI on the controller."""
 
+    cli_path: str = "sekret"
+    ca_path: str | None = None
+
     def cache_key(self, url: str) -> str:
-        return hashlib.sha256(json.dumps(["cli", url]).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(["cli", url, self.cli_path, self.ca_path]).encode()).hexdigest()
 
 
 class TokenSource(Protocol):
@@ -256,7 +259,7 @@ def resolve_auth(
     if method == "cli":
         if not allow_cli:
             raise ConfigError("cli auth only works in the lookup, which runs where `sekret login` was run")
-        return CliLogin()
+        return CliLogin(settings.cli_path, settings.ca_path)
     if method == "token":
         if not settings.token:
             raise ConfigError("token auth needs token (or SEKRET_TOKEN)")
@@ -275,7 +278,7 @@ def resolve_auth(
     if settings.identity_id and (settings.oidc_token or settings.oidc_token_file):
         return _oidc(settings, read_file)
     if allow_cli:
-        return CliLogin()
+        return CliLogin(settings.cli_path, settings.ca_path)
     raise ConfigError(
         "no sekret credentials found: set token, client_id and client_secret, "
         "identity_id with oidc_token or oidc_token_file, or auth_method=kubernetes"

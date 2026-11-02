@@ -2,6 +2,7 @@
 once, the 401 retry, and the precedence of arguments, variables, environment, ansible.cfg and the
 CLI's own settings."""
 
+import fcntl
 import http.server
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +22,9 @@ from ansible.plugins.loader import lookup_loader
 from conftest import COLLECTIONS_ROOT
 from fake_server import FakeServer, error
 
+from ansible_collections.sekret.secrets.plugins.module_utils import sekret_cli
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_cli import (
+    FAILED_FOR,
     CliTokens,
     cli_context,
     login_lock,
@@ -96,6 +100,7 @@ def state(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("FAKE_SEKRET_STATE", str(directory))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    sekret_cli._FAILED.clear()
     return State(directory, str(cli))
 
 
@@ -130,6 +135,17 @@ class TestAuthOrder:
         plan = resolve_auth(self.settings(identity_id="i", oidc_token="jwt"), allow_cli=True)
         assert plan.method == "oidc"
 
+    def test_the_cli_login_cache_key_covers_the_cli_and_the_ca(self):
+        keys = {
+            CliLogin().cache_key(URL),
+            CliLogin("/other/sekret").cache_key(URL),
+            CliLogin(ca_path="/ca.pem").cache_key(URL),
+            CliLogin().cache_key("https://other.test"),
+        }
+        assert len(keys) == 4
+        plan = resolve_auth(self.settings(cli_path="/x/sekret", ca_path="/ca.pem"), allow_cli=True)
+        assert plan == CliLogin("/x/sekret", "/ca.pem")
+
     def test_the_cli_comes_last_and_only_where_it_may_run(self):
         assert resolve_auth(self.settings(), allow_cli=True) == CliLogin()
         with pytest.raises(ConfigError, match="no sekret credentials"):
@@ -151,7 +167,7 @@ class TestSavedLogin:
         assert tokens(state).token() == "saved"
         assert logins(state) == []
         (argv,) = calls(state)
-        assert argv == ["token", "--server", URL]
+        assert argv == ["token", f"--server={URL}"]
 
     @pytest.mark.parametrize("expired", [False, True])
     def test_missing_or_expired_logs_in_and_relays_the_link(self, state, expired):
@@ -188,7 +204,12 @@ class TestSavedLogin:
     def test_the_ca_file_reaches_the_cli(self, state):
         (state / "token").write_text("saved\n")
         CliTokens(state.cli, URL, ca_path="/ca.pem", lock_dir=state.dir).token()
-        assert calls(state)[-1][-2:] == ["--ca-file", "/ca.pem"]
+        assert calls(state)[-1][-1] == "--ca-file=/ca.pem"
+
+    def test_a_value_starting_with_a_dash_stays_a_value(self, state):
+        (state / "token").write_text("saved\n")
+        CliTokens(state.cli, "-not-a-flag", ca_path="-odd.pem", lock_dir=state.dir).token()
+        assert calls(state)[-1] == ["token", "--server=-not-a-flag", "--ca-file=-odd.pem"]
 
 
 def _log_in_together(cli, lock_dir, barrier, results):
@@ -236,6 +257,75 @@ class TestLockDirectory:
         directory = tmp_path / "new" / "sekret"
         with login_lock(directory):
             assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700
+
+
+class Ticking:
+    """A clock that moves on by `step` each time it is read."""
+
+    def __init__(self, start=1000.0, step=1.0):
+        self.now = start
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+class TestStuckAndFailedLogins:
+    def test_a_lock_held_too_long_gives_up_with_a_clear_error(self, tmp_path):
+        directory = tmp_path / "sekret"
+        with login_lock(directory):
+            held = os.open(directory / sekret_cli.LOCK_NAME, os.O_RDWR)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            waits = []
+            with (
+                pytest.raises(AuthenticationError, match="giving up"),
+                login_lock(directory, wait=5, clock=Ticking(), sleep=waits.append),
+            ):
+                pass
+            assert waits and len(waits) <= 6
+        finally:
+            os.close(held)
+
+    def test_a_failed_login_is_not_tried_again_in_the_same_run(self, state):
+        (state / "login_fails").write_text("")
+        with pytest.raises(AuthenticationError, match="did not finish"):
+            tokens(state).token()
+        with pytest.raises(AuthenticationError, match="already failed in this run"):
+            tokens(state).token()
+        assert logins(state) == [URL]
+
+    def test_other_runs_fail_fast_for_a_while_after_a_failed_login(self, state):
+        (state / "login_fails").write_text("")
+        with pytest.raises(AuthenticationError, match="did not finish"):
+            tokens(state).token()
+        sekret_cli._FAILED.clear()
+        lock_dir = state.parent / "cache" / "sekret"
+        soon = CliTokens(state.cli, URL, lock_dir=lock_dir, clock=lambda: time.time() + 1)
+        with pytest.raises(AuthenticationError, match="failed less than"):
+            soon.token()
+        assert logins(state) == [URL]
+        sekret_cli._FAILED.clear()
+        (state / "login_fails").unlink()
+        later = CliTokens(state.cli, URL, lock_dir=lock_dir, clock=lambda: time.time() + FAILED_FOR + 1)
+        assert later.token() == "cli-token-2"
+        assert not list(lock_dir.glob("*.failed"))
+
+    def test_a_failure_marker_that_is_a_link_is_refused(self, state, tmp_path):
+        lock_dir = state.parent / "cache" / "sekret"
+        lock_dir.mkdir(parents=True, mode=0o700)
+        marker = sekret_cli._marker(lock_dir, (state.cli, URL, None))
+        marker.symlink_to(tmp_path / "elsewhere")
+        with pytest.raises(ConfigError, match="symbolic link"):
+            tokens(state).token()
+        assert logins(state) == []
+
+    def test_no_browser_login_when_the_caller_forbids_it(self, state):
+        refusing = CliTokens(state.cli, URL, lock_dir=state.dir, no_login_reason="the inventory chose it")
+        with pytest.raises(AuthenticationError, match="the inventory chose it"):
+            refusing.token()
+        assert logins(state) == []
 
 
 class TestRetryAndRedaction:
@@ -349,8 +439,8 @@ class TestPrecedence:
         monkeypatch.setenv("SEKRET_ENVIRONMENT", "env-e")
         lookup.server.calls.clear()
         assert self.where(lookup)[:2] == ("file-p", "env-e")
-        (argv,) = [c for c in calls(state) if "--env" in c]
-        assert argv[argv.index("--env") + 1] == "env-e"
+        (argv,) = [c for c in calls(state) if any(a.startswith("--env=") for a in c)]
+        assert "--env=env-e" in argv
 
     def test_an_unconfirmed_project_file_is_refused(self, lookup, state):
         (state / "context_error").write_text(
@@ -399,6 +489,84 @@ class TestCaching:
         assert result == [{"WHERE": "here"}]
         assert logins(state) == [URL]
         assert any("approve" in note for note in lookup.shown.shown)
+
+
+CONTEXT_SERVER = "https://named-by-file.test"
+
+
+def context_naming(state, confirmed):
+    (state / "context.json").write_text(
+        json.dumps(
+            {
+                "server": CONTEXT_SERVER,
+                "server_source": "logged_in" if confirmed else "project_file",
+                "server_confirmed": confirmed,
+                "project_file": "/repo/.sekret.toml",
+            }
+        )
+    )
+
+
+class TestWhereCredentialsGo:
+    """Nothing chosen by an inventory or a project file is sent a token or machine identity."""
+
+    def run(self, lookup, variables=None, **direct):
+        return lookup.run([], variables or {}, **{"project": "p", "environment": "e", **direct})
+
+    def test_an_unconfirmed_project_file_server_is_refused(self, lookup, state):
+        context_naming(state, confirmed=False)
+        with pytest.raises(AnsibleError, match="not confirmed") as caught:
+            self.run(lookup)
+        assert "/repo/.sekret.toml" in str(caught.value)
+        assert lookup.server.calls == []
+
+    def test_a_project_file_server_never_gets_a_token_from_the_environment(self, lookup, state, monkeypatch):
+        context_naming(state, confirmed=True)
+        monkeypatch.setenv("SEKRET_TOKEN", "static-token")
+        with pytest.raises(AnsibleError, match="only your own `sekret login`"):
+            self.run(lookup)
+        monkeypatch.setenv("SEKRET_CLIENT_ID", "client-1")
+        monkeypatch.setenv("SEKRET_CLIENT_SECRET", "client-secret-1")
+        monkeypatch.delenv("SEKRET_TOKEN")
+        with pytest.raises(AnsibleError, match="only your own `sekret login`"):
+            self.run(lookup)
+        assert lookup.server.calls == []
+
+    def test_a_logged_in_project_file_server_gets_only_the_cli_login(self, lookup, state):
+        context_naming(state, confirmed=True)
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        assert self.run(lookup) == [{"WHERE": "here"}]
+        assert "--server=" + CONTEXT_SERVER in calls(state)[-1]
+
+    def test_an_inventory_server_never_gets_the_environments_token(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_TOKEN", "static-token")
+        with pytest.raises(AnsibleError, match="sekret_url come from inventory") as caught:
+            self.run(lookup, {"sekret_url": URL})
+        assert "SEKRET_TOKEN" in str(caught.value)
+        assert lookup.server.calls == []
+
+    def test_an_inventory_ca_never_gets_the_environments_machine_identity(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_CLIENT_ID", "client-1")
+        monkeypatch.setenv("SEKRET_CLIENT_SECRET", "client-secret-1")
+        with pytest.raises(AnsibleError, match="sekret_ca_path"):
+            self.run(lookup, {"sekret_ca_path": "/attacker-ca.pem"}, url=URL)
+
+    def test_an_inventory_server_with_a_credential_the_playbook_passed_is_fine(self, lookup):
+        assert self.run(lookup, {"sekret_url": URL}, token="static-token") == [{"WHERE": "here"}]
+
+    def test_the_environments_server_and_token_together_are_fine(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_URL", URL)
+        monkeypatch.setenv("SEKRET_TOKEN", "static-token")
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+    def test_an_inventory_server_gets_a_saved_cli_login_but_no_browser_login(self, lookup, state):
+        lookup.server.tokens = {"cli-token-saved"}
+        with pytest.raises(AnsibleError, match="will not open a browser"):
+            self.run(lookup, {"sekret_url": URL})
+        assert logins(state) == []
+        (state / "token").write_text("cli-token-saved\n")
+        assert self.run(lookup, {"sekret_url": URL}) == [{"WHERE": "here"}]
 
 
 class TestContextCommand:

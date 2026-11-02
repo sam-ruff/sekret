@@ -21,10 +21,12 @@ FLAGS = {"--server": "server", "--project": "project", "--env": "environment", "
 
 
 def flags(argv):
+    """Only the `--flag=value` form, which is all the lookup sends."""
     found = {}
     for flag, name in [*FLAGS.items(), ("--ca-file", "ca_file")]:
-        if flag in argv:
-            found[name] = argv[argv.index(flag) + 1]
+        for arg in argv:
+            if arg.startswith(flag + "="):
+                found[name] = arg.split("=", 1)[1]
     return found
 
 

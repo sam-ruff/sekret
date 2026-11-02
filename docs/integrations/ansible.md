@@ -57,6 +57,14 @@ The server, project, environment, folder and CA file are each taken from the fir
 
 The folder is `/` when nothing sets it. So `sekret env use staging` switches a run that relies on `ansible.cfg`, but not a play or group that names its environment in a variable: a group pinned to `prod` keeps reading `prod` whatever your shell has loaded. A `.sekret.toml` counts only once you have confirmed it, as for `sekret export`; until then a lookup that needs it fails and says so. Run with `-v` to see, once a run, where the project and environment came from.
 
+### What may choose the server
+
+Whoever chooses the server is choosing where your credentials go, so the lookup is careful about who that is:
+
+- `sekret_url` and `sekret_ca_path` are inventory variables, and anyone who can change the inventory or a group's variables can set them. When either comes from a variable, the lookup sends a token, client secret or OIDC token only if the same playbook passed it to the lookup itself. One from `SEKRET_TOKEN`, `SEKRET_CLIENT_SECRET` or the like is refused, with an error saying why. It also never opens a browser login for such a server: run `sekret login --server=...` yourself if you trust it. A login you already saved for that server is used, since it was only ever valid there.
+- A server that only a `.sekret.toml` names is used only once you have logged in to it, and then only with that saved login, never with a token or machine identity. One you have not logged in to is refused.
+- Set the server yourself, in `url` in `ansible.cfg`, in `SEKRET_URL` or as the lookup's `url=`, when anything else is to be sent to it.
+
 ## Read
 
 ```yaml
