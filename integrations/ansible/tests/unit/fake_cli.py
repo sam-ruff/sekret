@@ -10,6 +10,7 @@ $FAKE_SEKRET_STATE:
   login_fails    `login` exits 1
   logins         one line per `login`
   calls          one JSON argv per call
+  envs           the SEKRET_* and ACTIONS_* names each call saw
 """
 
 import json
@@ -35,6 +36,9 @@ def main():
     argv = sys.argv[1:]
     with open(state / "calls", "a") as calls:
         calls.write(json.dumps(argv) + "\n")
+    with open(state / "envs", "a") as envs:
+        names = sorted(n for n in os.environ if n.startswith(("SEKRET_", "ACTIONS_")))
+        envs.write(json.dumps(names) + "\n")
     given = flags(argv)
     if argv[:2] == ["token", "--context"]:
         if (state / "context_error").exists():

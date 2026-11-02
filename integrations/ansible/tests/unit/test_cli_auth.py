@@ -804,6 +804,122 @@ class TestOddSettings:
         assert not isinstance(caught.value, OSError)
 
 
+def envs(state):
+    path = state / "envs"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+class TestCliEnvironment:
+    """The CLI runs without the controller's machine credentials, so `sekret login` is always the
+    person's own browser login and nothing else reaches a server the CLI was pointed at."""
+
+    def test_no_machine_credential_reaches_token_login_or_context(self, lookup, state, monkeypatch):
+        for name in sekret_cli.MACHINE_CREDENTIALS:
+            monkeypatch.setenv(name, "x")
+        monkeypatch.setenv("SEKRET_AUTH_METHOD", "cli")
+        monkeypatch.setenv("SEKRET_PROJECT", "p")
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", "e")
+        monkeypatch.setenv("SEKRET_LOADED_FILE", "/repo/.sekret.toml")
+        monkeypatch.setenv("SEKRET_CA_FILE", "/ca.pem")
+        lookup.server.tokens = {"cli-token-1"}
+        assert lookup.run([], {}, url=URL) == [{"WHERE": "here"}]
+        kinds = {tuple(argv[:2]) for argv in calls(state)}
+        assert {("token", "--context"), ("token", f"--server={URL}"), ("login", f"--server={URL}")} <= kinds
+        assert logins(state) == [URL]
+        for seen in envs(state):
+            assert not set(seen) & set(sekret_cli.MACHINE_CREDENTIALS), seen
+            assert {"SEKRET_PROJECT", "SEKRET_ENVIRONMENT", "SEKRET_LOADED_FILE", "SEKRET_CA_FILE"} <= set(
+                seen
+            )
+
+    def test_the_environment_given_to_the_cli_keeps_everything_else(self):
+        environ = {"PATH": "/bin", "SEKRET_CLIENT_SECRET": "s", "SEKRET_PATH": "/x", "SEKRET_URL": "u"}
+        assert sekret_cli.cli_environment(environ) == {"PATH": "/bin", "SEKRET_PATH": "/x"}
+
+
+class TestProducedTokensAcrossRuns:
+    def test_a_token_another_process_produced_long_ago_gets_one_new_login(self, state):
+        lock_dir = state.parent / "cache" / "sekret"
+        first = tokens(state).token()
+        sekret_cli._PRODUCED.clear()
+        later = CliTokens(
+            state.cli, URL, lock_dir=lock_dir, clock=lambda: time.time() + sekret_cli.PRODUCED_FOR + 1
+        )
+        assert later.refresh(first) == "cli-token-2"
+        assert logins(state) == [URL, URL]
+
+    def test_within_the_same_process_it_still_counts_however_old(self, state):
+        lock_dir = state.parent / "cache" / "sekret"
+        first = tokens(state).token()
+        later = CliTokens(
+            state.cli, URL, lock_dir=lock_dir, clock=lambda: time.time() + 10 * sekret_cli.PRODUCED_FOR
+        )
+        with pytest.raises(AuthenticationError, match="just produced"):
+            later.refresh(first)
+        assert logins(state) == [URL]
+
+
+class TestLockPerServer:
+    def test_a_pending_login_to_one_server_does_not_hold_up_another(self, state):
+        lock_dir = state.parent / "cache" / "sekret"
+        lock_dir.mkdir(parents=True, mode=0o700)
+        other = "https://other.test"
+        held = os.open(
+            sekret_cli._beside_lock(lock_dir, (state.cli, other, None), "lock"), os.O_RDWR | os.O_CREAT, 0o600
+        )
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            quick = CliTokens(state.cli, URL, lock_dir=lock_dir, lock_wait=5)
+            assert quick.token() == "cli-token-1"
+            # The fake CLI keeps one saved token for every server, so make the other one need a login.
+            sekret_cli._PRODUCED.clear()
+            blocked = CliTokens(state.cli, other, lock_dir=lock_dir, lock_wait=0)
+            with pytest.raises(AuthenticationError, match="giving up"):
+                blocked.refresh("cli-token-1")
+        finally:
+            os.close(held)
+
+
+class TestFolderCacheAndCa:
+    def test_a_folder_read_through_another_ca_is_fetched_again(self, lookup, tmp_path):
+        base = {"url": URL, "token": "static-token", "project": "p", "environment": "e"}
+        lookup.run([], {}, **base)
+        lookup.run([], {}, ca_path=str(tmp_path / "ca.pem"), **base)
+        lookup.run([], {}, validate_certs=False, **base)
+        assert len(lookup.server.calls_to("GET", "/api/v1/secrets/raw")) == 3
+
+    def test_the_cli_login_with_a_ca_directory_is_refused(self, lookup, state, tmp_path):
+        (state / "token").write_text("cli-token-saved\n")
+        with pytest.raises(AnsibleError, match="needs a CA file"):
+            lookup.run([], {}, url=URL, project="p", environment="e", ca_path=str(tmp_path))
+        assert lookup.server.calls == []
+
+    def test_without_a_ca_path_the_cli_login_uses_the_clis_own_ca(self, lookup, state, monkeypatch):
+        (state / "token").write_text("cli-token-saved\n")
+        (state / "context.json").write_text(
+            json.dumps({"ca_file": "/home/me/ca.pem", "ca_file_source": "user_config"})
+        )
+        lookup.server.tokens = {"cli-token-saved"}
+        used = []
+        factory = lookup.client_factory
+        lookup.client_factory = lambda settings, token_source=None: (
+            used.append(settings.ca_path) or factory(settings, token_source=token_source)
+        )
+        lookup.run([], {}, url=URL, project="p", environment="e")
+        assert used == ["/home/me/ca.pem"]
+        assert calls(state)[-1][-1] == "--ca-file=/home/me/ca.pem"
+
+    def test_a_token_from_elsewhere_keeps_the_system_cas(self, lookup, state):
+        (state / "context.json").write_text(json.dumps({"ca_file": "/home/me/ca.pem"}))
+        used = []
+        factory = lookup.client_factory
+        lookup.client_factory = lambda settings, token_source=None: (
+            used.append(settings.ca_path) or factory(settings, token_source=token_source)
+        )
+        lookup.run([], {}, url=URL, token="static-token", project="p", environment="e")
+        assert used == [None]
+
+
 class TestContextCommand:
     def test_known_settings_are_passed_as_flags(self, state):
         context = cli_context(state.cli, {"url": URL, "project": "p", "ca_path": "/ca.pem"})

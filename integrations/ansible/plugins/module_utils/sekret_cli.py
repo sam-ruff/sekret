@@ -37,14 +37,33 @@ LOCK_WAIT = LOGIN_WAIT + 60
 LOCK_POLL = 0.5
 # How long a failed or declined login stops other workers and runs from opening the browser again.
 FAILED_FOR = 60
-# How long a token a login produced counts as fresh: one rejected in that time means the login
-# cannot help, so asking again would only open the browser again.
-PRODUCED_FOR = 3600
+# How long another process counts a token a login produced as fresh: long enough for one run's
+# workers, short enough that a token revoked later only costs a later run one ordinary login.
+# Within one process a produced token that is rejected always counts.
+PRODUCED_FOR = 300
 NUL_IN_SETTING = "a sekret setting passed to the CLI holds a NUL character"
 
 Notify = Callable[[str], None]
 Run = Callable[[list[str]], subprocess.CompletedProcess]
 RunLogin = Callable[[list[str], Notify], int]
+
+# What would make the CLI log in as a machine, or send something, rather than run the person's own
+# browser login and read their saved one. The server is always passed as --server.
+MACHINE_CREDENTIALS = (
+    "SEKRET_TOKEN",
+    "SEKRET_CLIENT_ID",
+    "SEKRET_CLIENT_SECRET",
+    "SEKRET_IDENTITY_ID",
+    "SEKRET_OIDC_TOKEN",
+    "SEKRET_OIDC_TOKEN_FILE",
+    "SEKRET_KUBERNETES_TOKEN_FILE",
+    "SEKRET_AUTH_METHOD",
+    "SEKRET_UNLOCK_PASSPHRASE",
+    "SEKRET_REMEMBER_SECRET",
+    "SEKRET_URL",
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+)
 
 # Logins that failed in this process, so later lookups fail at once instead of asking again.
 _FAILED: set[tuple] = set()
@@ -52,15 +71,28 @@ _FAILED: set[tuple] = set()
 _PRODUCED: set[str] = set()
 
 
+def cli_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment for the CLI, without any machine credential the controller holds."""
+    environ = os.environ if environ is None else environ
+    return {name: value for name, value in environ.items() if name not in MACHINE_CREDENTIALS}
+
+
 def run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, env=cli_environment()
+    )
 
 
 def run_login(argv: list[str], notify: Notify, limit: float = LOGIN_WAIT) -> int:
     """Runs `sekret login`, passing each line it prints (the link and the code) to `notify`, and
     stops it after `limit` seconds."""
     with subprocess.Popen(
-        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=cli_environment(),
     ) as process:
         timer = threading.Timer(limit, process.kill)
         timer.start()
@@ -135,12 +167,13 @@ def login_lock(
     wait: float = LOCK_WAIT,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    name: str = LOCK_NAME,
 ) -> Iterator[None]:
     """Holds an exclusive lock so that of several Ansible workers, only one runs `sekret login`.
     Gives up after `wait` seconds rather than hang behind a login nobody finishes."""
     _private_directory(directory)
     try:
-        fd = _open_own(directory / LOCK_NAME, os.O_RDWR | os.O_CREAT)
+        fd = _open_own(directory / name, os.O_RDWR | os.O_CREAT)
     except OSError as e:
         raise ConfigError(f"could not open the sekret login lock in {directory}: {e.strerror}") from None
     try:
@@ -289,7 +322,9 @@ class CliTokens:
             raise AuthenticationError(f"no usable sekret login for {self._url}; {self._no_login_reason}")
         if self._key in _FAILED:
             raise AuthenticationError(f"`sekret login` to {self._url} already failed in this run; {yourself}")
-        with login_lock(self._lock_dir, self._lock_wait):
+        # One lock per server, CLI and CA, so a login waiting on one server holds up no other.
+        lock_name = _beside_lock(self._lock_dir, self._key, "lock").name
+        with login_lock(self._lock_dir, self._lock_wait, name=lock_name):
             marker = _marker(self._lock_dir, self._key)
             produced = _beside_lock(self._lock_dir, self._key, "produced")
             if rejected is not None and (

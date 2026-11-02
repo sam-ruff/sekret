@@ -310,9 +310,6 @@ def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_co
         if not place.get(name) and context.get(field):
             place[name] = context[field]
             origins[name] = f"{CLI_ORIGIN} ({context.get(field + '_source') or 'its settings'})"
-    if not place.get("ca_path") and context.get("ca_file"):
-        place["ca_path"] = context["ca_file"]
-        origins["ca_path"] = CLI_ORIGIN
 
 
 def _from_inventory(origin: str | None) -> bool:
@@ -416,6 +413,13 @@ class LookupModule(LookupBase):
             return context["ca_file"]
         return None
 
+    def _cli_ca(self, place: dict) -> str | None:
+        """The CA file the CLI itself would use (SEKRET_CA_FILE or its user config, which it checks
+        nobody else can change), or None."""
+        known = {name: place.get(name) for name in ("url", "project", "environment")}
+        context = cached_context(self.get_option("cli_path") or "sekret", known, self.read_context)
+        return (context or {}).get("ca_file") or None
+
     def _credential_origins(self, plan) -> dict:
         origins = {}
         for name in credential_options(plan):
@@ -452,6 +456,19 @@ class LookupModule(LookupBase):
                 place["ca_path"] = options["ca_path"] = vouched_ca
             settings = Settings.from_options(options)
             plan = resolve_auth(settings, allow_cli=True)
+            if isinstance(plan, CliLogin) and not place.get("ca_path"):
+                # The CLI checks the server with its own CA file; check it with the same one here.
+                cli_ca = self._cli_ca(place)
+                if cli_ca:
+                    place["ca_path"] = options["ca_path"] = cli_ca
+                    origins["ca_path"] = CLI_ORIGIN
+                    settings = Settings.from_options(options)
+                    plan = resolve_auth(settings, allow_cli=True)
+            if isinstance(plan, CliLogin) and settings.ca_path and os.path.isdir(settings.ca_path):
+                raise ConfigError(
+                    f"ca_path {settings.ca_path} is a directory, but the sekret CLI that holds your login "
+                    "needs a CA file; name the file instead"
+                )
             check_destination(plan, origins, self._credential_origins(plan), vouched_ca is not None)
             # A browser login only to a server the person named, never one an inventory chose.
             no_login_reason = None
@@ -480,6 +497,8 @@ class LookupModule(LookupBase):
             recursive = bool(self.get_option("recursive"))
             key = (
                 settings.url,
+                settings.ca_path,
+                settings.validate_certs,
                 client.identity(),
                 place["project"],
                 place["environment"],
