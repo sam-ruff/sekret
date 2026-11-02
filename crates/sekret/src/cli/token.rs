@@ -119,6 +119,8 @@ pub struct Context {
     pub ca_file: Option<PathBuf>,
     pub ca_file_source: Option<Source>,
     pub project_file: Option<PathBuf>,
+    /// `--insecure-skip-verify` or SEKRET_CLIENT_INSECURE_SKIP_VERIFY: no certificate is checked.
+    pub insecure_skip_verify: bool,
 }
 
 fn named(flag: bool, env: bool) -> Option<Source> {
@@ -181,6 +183,7 @@ pub fn context(resolved: &Resolved, given: Given, file: &ProjectFile) -> anyhow:
         ca_file,
         ca_file_source,
         project_file: resolved.project_file.clone(),
+        insecure_skip_verify: false,
     })
 }
 
@@ -264,7 +267,8 @@ pub fn run(args: &ClientArgs, token: &TokenArgs, out: &mut dyn Write) -> anyhow:
         }
         let mut ignored = Vec::new();
         let (file, _) = config::load_project_file(&std::env::current_dir()?, &mut ignored)?;
-        let context = context(&resolved, given(args), &file)?;
+        let mut context = context(&resolved, given(args), &file)?;
+        context.insecure_skip_verify = args.insecure_skip_verify.unwrap_or(false);
         writeln!(out, "{}", ascii_json(&context)?)?;
         return Ok(0);
     }

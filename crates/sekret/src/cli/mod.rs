@@ -56,7 +56,26 @@ pub struct ClientArgs {
     #[arg(long, global = true, env = "SEKRET_CLIENT_ALLOW_INSECURE_HTTP", num_args = 0..=1,
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub allow_insecure_http: Option<bool>,
+    /// Do not check the server's TLS certificate or host name, ignoring any CA file. Anyone on the
+    /// network path can then read your token and secrets. Never set in a config or project file.
+    #[arg(long, global = true, env = "SEKRET_CLIENT_INSECURE_SKIP_VERIFY", num_args = 0..=1,
+        default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub insecure_skip_verify: Option<bool>,
 }
+
+/// What skipping certificate checks costs, said once per command.
+pub fn skip_verify_warnings(server: &str, ca_file: bool) -> Vec<String> {
+    let mut warnings = vec![format!(
+        "sekret: not checking {}'s certificate; anyone on the network path can read your token and secrets",
+        format::one_line(server)
+    )];
+    if ca_file {
+        warnings.push("sekret: --insecure-skip-verify ignores the CA file".to_string());
+    }
+    warnings
+}
+
+static SKIP_VERIFY_WARNED: std::sync::Once = std::sync::Once::new();
 
 #[derive(Debug, Clone, Args)]
 pub struct LoginArgs {
@@ -409,9 +428,18 @@ pub fn resolve_with_token(args: &ClientArgs, token: Option<String>) -> anyhow::R
 
 pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> anyhow::Result<HttpClient> {
     config::check_transport(&resolved.server, args.allow_insecure_http.unwrap_or(false))?;
+    let insecure_skip_verify = args.insecure_skip_verify.unwrap_or(false);
+    if insecure_skip_verify {
+        SKIP_VERIFY_WARNED.call_once(|| {
+            for warning in skip_verify_warnings(&resolved.server, resolved.ca_file.is_some()) {
+                eprintln!("{warning}");
+            }
+        });
+    }
     let ca_pem = resolved
         .ca_file
         .as_ref()
+        .filter(|_| !insecure_skip_verify)
         .map(config::CaFile::read)
         .transpose()
         .context("reading CA file")?
@@ -427,6 +455,7 @@ pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> 
             ca_pem,
             identity_pem,
             timeout: None,
+            insecure_skip_verify,
         },
     )?)
 }
@@ -1275,6 +1304,20 @@ mod tests {
     use anyhow::Context;
     use sekret_api::{RawSecret, RawSecrets, Secret, SecretList};
     use sekret_client::MockSekretApi;
+
+    #[test]
+    fn skipping_names_the_server_and_a_ca_file_it_ignores() {
+        let plain = skip_verify_warnings("https://s.test", false);
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].contains("https://s.test") && plain[0].contains("can read your token"));
+        let with_ca = skip_verify_warnings("https://s.test", true);
+        assert!(with_ca.get(1).is_some_and(|w| w.contains("ignores the CA file")));
+    }
+
+    #[test]
+    fn verification_is_on_unless_asked_otherwise() {
+        assert!(!ClientOptions::default().insecure_skip_verify);
+    }
 
     fn at() -> Location {
         Location {
