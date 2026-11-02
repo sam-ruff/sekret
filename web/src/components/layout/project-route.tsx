@@ -2,7 +2,7 @@ import { Outlet, useParams } from "react-router";
 import { MissingState } from "@/components/states";
 import { isNotFound } from "@/lib/errors";
 import { useProject } from "@/hooks/queries";
-import { usePageTitle } from "@/hooks/use-page-title";
+import { PageTitleScope, usePageTitle } from "@/hooks/use-page-title";
 
 function MissingProject({ slug }: { slug: string }) {
   usePageTitle("Project not found");
@@ -22,5 +22,9 @@ export function ProjectRoute() {
   const { project = "" } = useParams();
   const query = useProject(project);
   if (isNotFound(query.error)) return <MissingProject slug={project} />;
-  return <Outlet />;
+  return (
+    <PageTitleScope.Provider value={query.data?.name}>
+      <Outlet />
+    </PageTitleScope.Provider>
+  );
 }

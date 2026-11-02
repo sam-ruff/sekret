@@ -187,7 +187,7 @@ export function CliLoginPage() {
       ? { title: "Command line sign-in approved", page: "CLI sign-in approved", description: `The CLI now acts as ${who}.` }
       : outcome === "cancelled"
         ? { title: "Command line sign-in denied", page: "CLI sign-in denied", description: "The CLI was not given access." }
-        : { title: "Sign-in request ended", page: "CLI sign-in ended", description: "Nothing can be approved from this link." };
+        : { title: "Sign-in request ended", page: "CLI sign-in ended", description: "There is nothing to approve from this link." };
   const showBlocker = asking && blocker !== undefined && !request.error && !busy;
 
   return (
@@ -199,7 +199,6 @@ export function CliLoginPage() {
             {outcome === "pending" && ended && (
               <Alert data-testid="cli-unknown">
                 <XCircle />
-                <AlertTitle>This sign-in request has ended</AlertTitle>
                 <AlertDescription>
                   It expired, was already used or refused, or the link is wrong. Run{" "}
                   <code className="font-mono">sekret login</code> again to get a new link.
@@ -301,13 +300,22 @@ export function CliLoginPage() {
           </CardContent>
           {asking && (
             <CardFooter className="mt-6 flex flex-col items-stretch gap-2">
-              <div className="flex justify-end gap-2">
-                <Button type="button" variant="outline" onClick={cancel} disabled={busy} data-testid="cli-cancel">
+              {/* Full width on phones with Approve on top, side by side on wider screens. */}
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={cancel}
+                  disabled={busy}
+                  data-testid="cli-cancel"
+                >
                   {deny.isPending && <Spinner />}
                   Deny
                 </Button>
                 <Button
                   type="submit"
+                  className="w-full sm:w-auto"
                   disabled={!ready || busy}
                   aria-describedby={showBlocker ? APPROVE_BLOCKER_ID : undefined}
                   data-testid="cli-approve"
@@ -317,7 +325,7 @@ export function CliLoginPage() {
                 </Button>
               </div>
               {showBlocker && (
-                <FormBlocker id={APPROVE_BLOCKER_ID} testId="cli-approve-blocker" className="text-right">
+                <FormBlocker id={APPROVE_BLOCKER_ID} testId="cli-approve-blocker" className="text-center sm:text-right">
                   {blocker}
                 </FormBlocker>
               )}

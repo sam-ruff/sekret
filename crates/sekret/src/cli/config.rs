@@ -152,13 +152,15 @@ pub struct Ownership {
 pub struct Me {
     pub uid: u32,
     pub gid: u32,
+    /// Nobody else is listed in the primary group or has it as their own.
+    pub private_group: bool,
 }
 
 impl Me {
-    /// With user private groups (the usual `umask 002` setups) a person's primary group shares
-    /// their user id and holds only them, so it writing to a file is them writing to it.
+    /// With user private groups (the usual `umask 002` setups) a person's primary group holds
+    /// only them, so it writing to a file is them writing to it.
     fn group_is_private(self, gid: u32) -> bool {
-        gid == self.gid && gid == self.uid
+        self.private_group && gid == self.gid
     }
 
     fn group_can_write(self, item: Ownership) -> bool {
@@ -201,7 +203,18 @@ pub fn file_writers(file: Ownership, me: Me) -> Option<&'static str> {
 fn current_user() -> Me {
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    Me { uid, gid }
+    let private_group = match (
+        std::fs::read_to_string("/etc/group"),
+        std::fs::read_to_string("/etc/passwd"),
+    ) {
+        (Ok(group), Ok(passwd)) => crate::settings::group_holds_only(&group, &passwd, gid, uid),
+        _ => false,
+    };
+    Me {
+        uid,
+        gid,
+        private_group,
+    }
 }
 
 #[cfg(unix)]
@@ -725,7 +738,11 @@ mod tests {
         Ok(())
     }
 
-    const ME: Me = Me { uid: 1000, gid: 1000 };
+    const ME: Me = Me {
+        uid: 1000,
+        gid: 1000,
+        private_group: true,
+    };
     /// A group shared with other people, such as `users`.
     const SHARED: u32 = 100;
 
@@ -768,8 +785,20 @@ mod tests {
             "umask 002 with a private group writes only as this user"
         );
         assert!(
-            distrust_reason(&[1000], private, Me { uid: 1000, gid: 1001 }).is_some(),
+            distrust_reason(&[1000], private, Me { gid: 1001, ..ME }).is_some(),
             "a primary group that is not the user's own is shared"
+        );
+        assert!(
+            distrust_reason(
+                &[1000],
+                private,
+                Me {
+                    private_group: false,
+                    ..ME
+                }
+            )
+            .is_some(),
+            "a group with the user's id that holds someone else is shared"
         );
         assert_eq!(
             distrust_reason(&[1000], dir(1001, 0o755), ME),

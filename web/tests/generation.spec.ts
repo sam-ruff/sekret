@@ -146,8 +146,10 @@ test("project defaults apply to secrets that inherit them", async ({ page }) => 
   await page.goto("/projects/storefront/settings/general");
   const card = page.getByTestId("secret-defaults");
   await expect(card.getByTestId("defaults-enabled")).not.toBeChecked();
-  await expect(card.getByTestId("defaults-summary")).toContainText("Off");
+  await expect(card.getByTestId("defaults-summary")).toHaveText("Off.");
+  // Said once, in the description, not again in the status line.
   await expect(card).toContainText("Without project defaults, Generate makes 32 letters and digits");
+  expect((await card.textContent())?.match(/Generate makes 32/g)).toHaveLength(1);
   await expect(card.getByText("Set project-wide generation and rotation")).toBeVisible();
 
   await card.getByTestId("defaults-enabled").click();

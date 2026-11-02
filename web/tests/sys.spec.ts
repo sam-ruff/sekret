@@ -262,9 +262,11 @@ test.describe("unlocking", () => {
     await expect(page).toHaveTitle("Unlock · sekret");
     await expect(page.getByRole("heading", { level: 1 })).toHaveText("Unlock sekret");
     await expect(page.getByTestId("sidebar")).toHaveCount(0);
+    // Opened while locked, as after a restart: nobody was interrupted and nobody is known to be signed in.
     await expect(page.getByTestId("unlock-description")).toHaveText(
-      "The server was locked while you were using it. The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.",
+      "The server is locked, so secrets cannot be read until someone with the server passphrase unlocks it.",
     );
+    await expect(page.getByTestId("unlock-sign-out")).toHaveCount(0);
     await expect(page.getByTestId("unlock-card")).not.toContainText("restarted");
 
     // The passphrase can be shown to check it, and hidden again.
@@ -326,10 +328,15 @@ test.describe("unlocking", () => {
     await expect(page).toHaveURL(/\/projects$/);
   });
 
-  test("explains the lock to anyone and lets them sign out instead", async ({ page }) => {
-    await page.goto("/?mock-state=sealed");
+  test("explains a lock that interrupted a session and lets them sign out instead", async ({ page }) => {
+    await page.clock.install();
+    await openProject(page);
+    await sealBehindTheScenes(page);
+    // The status check notices the lock by itself.
+    await page.clock.fastForward(16_000);
+    await expect(page).toHaveURL(/\/unlock\?return_to=/);
     await expect(page.getByTestId("unlock-description")).toHaveText(
-      "The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.",
+      "The server was locked while you were using it, so secrets cannot be read until someone with the server passphrase unlocks it.",
     );
     await page.getByTestId("unlock-sign-out").click();
     // Signed out, the login page still sits behind the locked server.

@@ -139,6 +139,7 @@ export interface AuditNames {
   user?: (id: string) => string | undefined;
   identity?: (id: string) => string | undefined;
   role?: (slug: string) => string | undefined;
+  project?: (id: string) => string | undefined;
 }
 
 const METHOD_NAMES: Record<string, string> = { universal: "Universal", oidc: "OIDC", kubernetes: "Kubernetes" };
@@ -180,6 +181,9 @@ function summary(action: string, detail: Detail, names: AuditNames): string[] {
   const parts: string[] = [];
   const identity = identitySummary(action, detail, names);
   if (identity) parts.push(identity);
+  if (action === "auth.machine-login" && typeof detail.method === "string") {
+    parts.push(`Signed in with ${METHOD_NAMES[detail.method] ?? detail.method} auth`);
+  }
   if (typeof detail.count === "number") {
     const what = action === "secret.read" ? count(detail.count, "value read", "values read") : String(detail.count);
     parts.push(detail.recursive === true ? `${what}, including sub-folders` : what);
@@ -218,8 +222,9 @@ export function describeDetail(action: string, detail: unknown, names: AuditName
   const fields = detail as Detail;
   const known = summary(action, fields, names);
   const skip = action.startsWith("identity.") && typeof fields.identity === "string" ? IDENTITY_SUMMARISED : null;
+  const methodSaid = action === "auth.machine-login" && typeof fields.method === "string";
   const rest = Object.entries(fields)
-    .filter(([k]) => !SUMMARISED.has(k) && !skip?.has(k))
+    .filter(([k]) => !SUMMARISED.has(k) && !skip?.has(k) && !(methodSaid && k === "method"))
     .filter(([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0))
     .map(([k, v]) => `${k.replace(/_/g, " ")}: ${rawValue(v)}`);
   return [...known, ...rest].join(" · ");

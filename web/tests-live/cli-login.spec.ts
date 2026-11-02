@@ -135,7 +135,8 @@ test("cancelling refuses the CLI login, so the terminal stops waiting", async ({
   expect(poll.status()).not.toBe(429);
   // Reopening the link says the request has ended.
   await openApproval(page, started.verification_url);
-  await expect(page.getByTestId("cli-unknown")).toContainText("This sign-in request has ended");
+  await expect(page.getByTestId("standalone-title")).toHaveText("Sign-in request ended");
+  await expect(page.getByTestId("cli-unknown")).toContainText("It expired, was already used or refused");
   await expect(page.getByTestId("cli-code-input")).toHaveCount(0);
   await cli.dispose();
 });

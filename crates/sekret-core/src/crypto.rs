@@ -217,6 +217,35 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     getrandom::fill(buf).map_err(|_| CryptoError::Random)
 }
 
+/// The index into an alphabet of `len` entries that a random byte picks, or `None` for the
+/// bytes past the last whole multiple of `len`, which would favour the first entries.
+pub fn uniform_index(byte: u8, len: usize) -> Option<usize> {
+    let byte = usize::from(byte);
+    if len == 0 || len > 256 || byte >= 256 / len * len {
+        return None;
+    }
+    Some(byte % len)
+}
+
+/// `count` characters drawn uniformly from an ASCII `alphabet` of at most 256 entries.
+pub fn random_chars(alphabet: &[u8], count: usize) -> Result<Zeroizing<String>, CryptoError> {
+    if alphabet.is_empty() || alphabet.len() > 256 || !alphabet.is_ascii() {
+        return Err(CryptoError::Malformed);
+    }
+    let mut out = Zeroizing::new(String::with_capacity(count));
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    while out.len() < count {
+        fill_random(bytes.as_mut())?;
+        for index in bytes.iter().filter_map(|b| uniform_index(*b, alphabet.len())) {
+            if out.len() == count {
+                break;
+            }
+            out.push(char::from(alphabet[index]));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::InvalidKey)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -407,6 +436,39 @@ mod tests {
             secret_id,
             version,
         }
+    }
+
+    #[test]
+    fn every_byte_value_favours_no_character() {
+        for len in [1, 7, 28, 31, 32, 255, 256] {
+            let mut counts = vec![0usize; len];
+            for byte in 0..=255u8 {
+                if let Some(index) = uniform_index(byte, len) {
+                    counts[index] += 1;
+                }
+            }
+            assert!(counts.iter().all(|c| *c == 256 / len), "{len}: {counts:?}");
+        }
+        assert_eq!(uniform_index(251, 28), Some(27));
+        assert_eq!(
+            uniform_index(252, 28),
+            None,
+            "the bytes that made B C D F likelier are drawn again"
+        );
+        assert_eq!(uniform_index(0, 0), None);
+    }
+
+    #[test]
+    fn random_chars_come_only_from_the_alphabet() -> anyhow::Result<()> {
+        let chars = random_chars(b"BCDF", 500).context("chars")?;
+        assert_eq!(chars.len(), 500);
+        assert!(chars.chars().all(|c| "BCDF".contains(c)));
+        for c in "BCDF".chars() {
+            assert!(chars.contains(c), "500 draws use every character of four");
+        }
+        assert_eq!(random_chars(b"", 1).err(), Some(CryptoError::Malformed));
+        assert_eq!(random_chars("é".as_bytes(), 1).err(), Some(CryptoError::Malformed));
+        Ok(())
     }
 
     #[test]

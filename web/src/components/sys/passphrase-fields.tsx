@@ -28,7 +28,10 @@ export function PassphraseFields({
   disabled,
 }: PassphraseFieldsProps) {
   const [left, setLeft] = useState(false);
-  const mismatch = confirm !== "" && confirm !== passphrase;
+  const [leftConfirm, setLeftConfirm] = useState(false);
+  // Not while the second copy is still being typed, which would be red from the first key.
+  const confirmDone = leftConfirm || Array.from(confirm).length >= Array.from(passphrase).length;
+  const mismatch = confirm !== "" && confirm !== passphrase && confirmDone;
   // Only once the person has moved on, so the error does not flash while they type.
   const short = left && passphrase !== "" && Array.from(passphrase).length < MIN_PASSPHRASE_LENGTH;
   const meterId = `${idPrefix}-meter`;
@@ -65,6 +68,7 @@ export function PassphraseFields({
           disabled={disabled}
           aria-invalid={mismatch}
           aria-describedby={mismatch ? mismatchId : undefined}
+          onBlur={() => setLeftConfirm(true)}
           onChange={(e) => onConfirmChange(e.target.value)}
           data-testid={`${idPrefix}-confirm`}
         />

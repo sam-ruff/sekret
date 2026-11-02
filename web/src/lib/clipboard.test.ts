@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CLIPBOARD_CLEAR_MS, ClipboardGuard, warnBeforeUnload, type ClipboardDeps } from "./clipboard";
+import {
+  CLIPBOARD_CLEAR_MS,
+  ClipboardGuard,
+  clearBeforeLeaving,
+  dismissNotClearedNotice,
+  hasNotClearedNotice,
+  rememberNotCleared,
+  warnBeforeUnload,
+  type ClipboardDeps,
+} from "./clipboard";
 import { beginLeaving, stopLeaving } from "./leaving";
 
 function setup(overrides: Partial<ClipboardDeps> = {}) {
@@ -7,7 +16,6 @@ function setup(overrides: Partial<ClipboardDeps> = {}) {
   let focused = true;
   const scheduled: { run: () => void; delay: number }[] = [];
   const clipboard = {
-    readText: vi.fn(() => Promise.resolve(contents)),
     writeText: vi.fn((text: string) => {
       contents = text;
       return Promise.resolve();
@@ -16,7 +24,6 @@ function setup(overrides: Partial<ClipboardDeps> = {}) {
   const onNotCleared = vi.fn();
   const guard = new ClipboardGuard({
     clipboard,
-    canRead: () => Promise.resolve(false),
     hasFocus: () => focused,
     schedule: (run, delay) => scheduled.push({ run, delay }),
     onNotCleared,
@@ -24,7 +31,7 @@ function setup(overrides: Partial<ClipboardDeps> = {}) {
   });
   const copy = async (text: string) => {
     await clipboard.writeText(text);
-    guard.clearLater(text);
+    guard.clearLater();
   };
   const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
   const runTimers = async () => {
@@ -62,37 +69,20 @@ describe("ClipboardGuard", () => {
     expect(c.onNotCleared).not.toHaveBeenCalled();
   });
 
-  it("leaves the clipboard alone when it may have changed and cannot be read, and says so", async () => {
+  it("leaves the clipboard alone when it may have changed, and says so", async () => {
     const c = setup();
     await c.copy("s3cret");
     c.guard.noteActivity();
     c.contents = "their own text";
     await c.runTimers();
     expect(c.contents).toBe("their own text");
-    expect(c.clipboard.readText).not.toHaveBeenCalled();
     expect(c.onNotCleared).toHaveBeenCalledTimes(1);
   });
 
-  it("reads the clipboard when allowed and clears only if it still holds the secret", async () => {
-    const c = setup({ canRead: () => Promise.resolve(true) });
-    await c.copy("s3cret");
-    c.guard.noteActivity();
-    await c.runTimers();
-    expect(c.contents).toBe("");
-
-    await c.copy("s3cret");
-    c.guard.noteActivity();
-    c.contents = "something else";
-    await c.runTimers();
-    expect(c.contents).toBe("something else");
-    expect(c.onNotCleared).not.toHaveBeenCalled();
-  });
-
-  it("waits for focus when the clear falls due in the background, then clears if allowed", async () => {
-    const c = setup({ canRead: () => Promise.resolve(true) });
+  it("waits for focus when the clear falls due in the background, then clears", async () => {
+    const c = setup();
     await c.copy("s3cret");
     c.setFocused(false);
-    c.guard.noteActivity();
     await c.runTimers();
     expect(c.contents).toBe("s3cret");
     expect(c.guard.hasPending()).toBe(true);
@@ -136,7 +126,7 @@ describe("ClipboardGuard", () => {
   });
 
   it("drops a waiting clear when a new secret is copied", async () => {
-    const c = setup({ canRead: () => Promise.resolve(true) });
+    const c = setup();
     await c.copy("first");
     c.setFocused(false);
     await c.runTimers();
@@ -159,6 +149,24 @@ describe("ClipboardGuard", () => {
     await c.runTimers();
     expect(c.contents).toBe("later text");
     await expect(c.guard.clearNow()).resolves.toBeNull();
+  });
+
+  it("overwrites the clipboard when the page is going, even after the window lost focus", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    // Switching to a terminal to paste, then coming back to sign out.
+    c.guard.noteActivity();
+    await expect(c.guard.clearNow()).resolves.toBe("cleared");
+    expect(c.contents).toBe("");
+    expect(c.onNotCleared).not.toHaveBeenCalled();
+  });
+
+  it("reports when the browser refuses the clear as the page goes", async () => {
+    const c = setup();
+    await c.copy("s3cret");
+    c.clipboard.writeText.mockImplementationOnce(() => Promise.reject(new Error("NotAllowedError")));
+    await expect(c.guard.clearNow()).resolves.toBe("unverifiable");
+    expect(c.contents).toBe("s3cret");
   });
 
   it("clears nothing at once when no secret is outstanding", async () => {
@@ -186,16 +194,43 @@ describe("ClipboardGuard", () => {
     const onNotCleared = vi.fn();
     const missing = new ClipboardGuard({
       clipboard: undefined,
-      canRead: () => Promise.resolve(true),
       hasFocus: () => true,
       schedule: () => undefined,
       onNotCleared,
     });
-    await expect(missing.clearIfUnchanged("s3cret", 0)).resolves.toBe("unverifiable");
+    await expect(missing.clearIfUnchanged(0)).resolves.toBe("unverifiable");
 
     const failing = setup();
     failing.clipboard.writeText.mockImplementationOnce(() => Promise.reject(new Error("denied")));
-    await expect(failing.guard.clearIfUnchanged("x", 0)).resolves.toBe("unverifiable");
+    await expect(failing.guard.clearIfUnchanged(0)).resolves.toBe("unverifiable");
+  });
+});
+
+describe("clearBeforeLeaving", () => {
+  afterEach(() => dismissNotClearedNotice());
+
+  it("leaves a notice for the sign-in page only when the clear could not be done", async () => {
+    await clearBeforeLeaving(() => Promise.resolve("cleared"));
+    expect(hasNotClearedNotice()).toBe(false);
+    await clearBeforeLeaving(() => Promise.resolve(null));
+    expect(hasNotClearedNotice()).toBe(false);
+    await clearBeforeLeaving(() => Promise.resolve("unverifiable"));
+    expect(hasNotClearedNotice()).toBe(true);
+    dismissNotClearedNotice();
+    expect(hasNotClearedNotice()).toBe(false);
+  });
+
+  it("copes with storage that throws", () => {
+    const broken = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+    };
+    expect(() => rememberNotCleared(broken)).not.toThrow();
+    expect(hasNotClearedNotice(broken)).toBe(false);
   });
 });
 

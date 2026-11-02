@@ -49,22 +49,29 @@ describe("UnlockPage", () => {
     renderUnlock();
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Unlock sekret");
     expect(screen.getByTestId("unlock-description")).toHaveTextContent(
-      "The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.",
+      "The server is locked, so secrets cannot be read until someone with the server passphrase unlocks it.",
     );
-    expect(screen.getByTestId("unlock-description")).not.toHaveTextContent("while you were using it");
     expect(screen.getByTestId("unlock-card")).not.toHaveTextContent(/restart/i);
     expect(document.title).toBe("Unlock · sekret");
     expect(screen.getByTestId("passphrase-account")).toHaveAttribute("autocomplete", "username");
-    expect(screen.getByTestId("unlock-sign-out")).toHaveTextContent("Sign out");
   });
 
-  it("says the server was locked mid-session when there is a page to return to", () => {
+  it("does not claim a session was interrupted, or offer to end one, on a deep link after a restart", () => {
     const client = testQueryClient();
     client.setQueryData(keys.sysStatus, sealed);
     renderWithProviders(<UnlockPage />, { client, path: "/unlock?return_to=%2Fprojects" });
+    expect(screen.getByTestId("unlock-description")).not.toHaveTextContent("while you were using it");
+    expect(screen.queryByTestId("unlock-sign-out")).not.toBeInTheDocument();
+  });
+
+  it("says the server was locked mid-session, once, and offers to sign out", () => {
+    const client = testQueryClient();
+    client.setQueryData(keys.sysStatus, sealed);
+    renderWithProviders(<UnlockPage />, { client, path: "/unlock?return_to=%2Fprojects", state: { interrupted: true } });
     expect(screen.getByTestId("unlock-description")).toHaveTextContent(
-      "The server was locked while you were using it. The server is locked",
+      "The server was locked while you were using it, so secrets cannot be read until someone with the server passphrase unlocks it.",
     );
+    expect(screen.getByTestId("unlock-sign-out")).toHaveTextContent("Sign out");
   });
 
   it("shows and hides the passphrase on request", () => {
@@ -157,6 +164,17 @@ describe("UnlockPage", () => {
     const alert = screen.getByTestId("unlock-key-not-recognised");
     expect(alert).toHaveTextContent("This passphrase opened a key this server does not recognise");
     expect(alert).toHaveTextContent("sekret admin reset-epoch");
+    expect(screen.queryByTestId("unlock-error")).toBeNull();
+    expect(screen.queryByTestId("unlock-wrong")).toBeNull();
+  });
+
+  it("says a refusal from a proxy in front was not a wrong passphrase", async () => {
+    unseal.mockRejectedValue(new ApiError("You do not have permission to do that.", 403, "http-403"));
+    renderUnlock();
+    await attempt("plum orbit gravel lantern");
+    const alert = screen.getByTestId("unlock-blocked");
+    expect(alert).toHaveTextContent("the passphrase was not checked");
+    expect(alert).toHaveTextContent("sekret sys unseal --socket");
     expect(screen.queryByTestId("unlock-error")).toBeNull();
     expect(screen.queryByTestId("unlock-wrong")).toBeNull();
   });

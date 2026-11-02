@@ -71,6 +71,13 @@ test("previews and restores a snapshot", async ({ page }) => {
   // A restore that removes secrets is styled and described as one.
   const restore = sheet.getByTestId("restore-snapshot");
   await expect(restore).toHaveAttribute("data-variant", "destructive");
+  // The question sits inside the sheet; Escape dismisses only it and focus goes back to Restore.
+  await restore.click();
+  await expect(page.getByTestId("restore-confirm").getByTestId("confirm-cancel")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("restore-confirm")).toHaveCount(0);
+  await expect(sheet).toBeVisible();
+  await expect(restore).toBeFocused();
   await restore.click();
   const confirm = page.getByTestId("restore-confirm");
   await expect(confirm).toContainText(/Restoring \/ in Development removes .*FEATURE_FLAGS/);

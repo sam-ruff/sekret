@@ -1,5 +1,5 @@
-import { AlertCircle, ExternalLink, LogIn } from "lucide-react";
-import { useState } from "react";
+import { AlertCircle, ClipboardX, ExternalLink, LogIn } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router";
 import { startSignIn } from "@/api/client";
 import { StandaloneHeader, StandalonePage } from "@/components/sys/standalone-page";
@@ -9,6 +9,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/hooks/queries";
+import { dismissNotClearedNotice, hasNotClearedNotice } from "@/lib/clipboard";
 import { DOCS_URL } from "@/lib/links";
 import { loginErrorText } from "@/lib/login-errors";
 
@@ -18,6 +19,11 @@ export function LoginPage() {
   const returnTo = params.get("return_to") ?? "/";
   const { data: config, isPending } = useAuthConfig();
   const [leaving, setLeaving] = useState(false);
+  const [clipboardNotice] = useState(() => hasNotClearedNotice());
+
+  useEffect(() => {
+    if (clipboardNotice) dismissNotClearedNotice();
+  }, [clipboardNotice]);
 
   const signIn = () => {
     setLeaving(true);
@@ -38,6 +44,15 @@ export function LoginPage() {
               <AlertCircle />
               <AlertTitle>Sign-in failed</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+          {clipboardNotice && (
+            <Alert data-testid="clipboard-not-cleared">
+              <ClipboardX />
+              <AlertTitle>Clear your clipboard</AlertTitle>
+              <AlertDescription>
+                A secret you copied may still be on the clipboard, because the browser would not let sekret clear it.
+              </AlertDescription>
             </Alert>
           )}
           {isPending ? (

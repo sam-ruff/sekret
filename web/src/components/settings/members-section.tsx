@@ -25,6 +25,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { keys, useApiMutation, useRoles } from "@/hooks/queries";
 import { useOrgPermissions, type Permissions } from "@/hooks/use-permissions";
 import { errorMessage, isEscalation } from "@/lib/errors";
@@ -95,8 +96,14 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
                 {(["user", "group", "identity"] as const).map((k) => {
                   const Icon = KIND_ICON[k];
                   return (
-                    <ToggleGroupItem key={k} value={k} className="flex-1" data-testid={`member-kind-${k}`}>
-                      <Icon /> {k === "identity" ? "Machine" : KIND_LABEL[k]}
+                    <ToggleGroupItem
+                      key={k}
+                      value={k}
+                      // Sized to their labels, and without icons on phones, so "Machine identity" fits.
+                      className="flex-auto max-sm:[&_svg]:hidden"
+                      data-testid={`member-kind-${k}`}
+                    >
+                      <Icon /> {KIND_LABEL[k]}
                     </ToggleGroupItem>
                   );
                 })}
@@ -321,26 +328,36 @@ export function MembersSection({ project, perms }: { project: string; perms: Per
               cell: (m) => (
                 <div className="flex justify-end gap-1">
                   {canChange && (
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => setChanging(m)}
-                      aria-label={`Change ${m.principal_name}'s role`}
-                      data-testid="member-change-role"
-                    >
-                      <UserCog />
-                    </Button>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => setChanging(m)}
+                          aria-label={`Change ${m.principal_name}'s role`}
+                          data-testid="member-change-role"
+                        >
+                          <UserCog />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Change role</TooltipContent>
+                    </Tooltip>
                   )}
                   {perms.can("members", "delete") && (
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => setRemoving(m)}
-                      aria-label={`Remove ${m.principal_name}`}
-                      data-testid="member-remove"
-                    >
-                      <Trash2 />
-                    </Button>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => setRemoving(m)}
+                          aria-label={`Remove ${m.principal_name}`}
+                          data-testid="member-remove"
+                        >
+                          <Trash2 />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Remove</TooltipContent>
+                    </Tooltip>
                   )}
                 </div>
               ),

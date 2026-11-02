@@ -1,6 +1,6 @@
 import type { Me, User } from "../types";
 import { fromBase64, MockBackend } from "./backend";
-import type { MockState } from "./state";
+import { isDeleted, type MockState, type StoredIdentity } from "./state";
 import { mockSys } from "./sys";
 
 const DAY = 24 * 3600;
@@ -246,6 +246,7 @@ export function seededState(realNow: number): MockState {
   });
   backend.putAuthMethod(worker.id, "universal", { kind: "universal" });
   backend.createClientSecret(worker.id, { description: "Initial secret", ttl: null, max_uses: null });
+  backend.addMember("payments-api", { principal_kind: "identity", principal_id: worker.id, role: "viewer" });
   backend.addOrgBinding({ principal_kind: "group", principal_id: "engineering", role: "org-member" });
   backend.addOrgBinding({ principal_kind: "user", principal_id: "user-priya", role: "org-member" });
 
@@ -305,9 +306,18 @@ function seedIdentities(backend: MockBackend, state: MockState, realNow: number)
     });
     const stored = state.identities.find((x) => x.id === identity.id);
     if (stored) stored.created_at = realNow - Math.floor(random() * 200 + 2) * DAY;
+    const project = IDENTITY_PROJECTS[name];
+    if (project) backend.addMember(project, { principal_kind: "identity", principal_id: identity.id, role: "viewer" });
     return identity.id;
   });
 }
+
+/** A few of the generated identities read secrets, so the audit log shows machines other than the named ones. */
+const IDENTITY_PROJECTS: Record<string, string> = {
+  "ansible-runner": "storefront",
+  "etl-nightly": "payments-api",
+  "queue-worker": "storefront",
+};
 
 /** Everyday reads and logins from people and machines, so the audit log has enough to filter and page. */
 function seedActivity(
@@ -319,43 +329,57 @@ function seedActivity(
 ): void {
   const random = seededRandom(23);
   const people = state.users.filter((u) => !u.disabled).slice(0, 12);
-  const projects = state.projects.map((p) => ({
-    id: p.id,
-    envs: state.environments.filter((e) => e.projectId === p.id).map((e) => e.slug),
-  }));
-  const paths = ["/", "/", "/", "/payments", "/email"];
-  const keys = ["DATABASE_URL", "STRIPE_SECRET_KEY", "REDIS_URL", "SESSION_SECRET", "HSM_PIN"];
+  // Only enabled identities act: those with an auth method sign in, and project members read.
+  const machines = machineIds
+    .map((id) => state.identities.find((x) => x.id === id))
+    .filter((identity): identity is StoredIdentity => identity !== undefined && !identity.disabled)
+    .map((identity) => ({
+      id: identity.id,
+      name: identity.name,
+      methods: (state.authMethods[identity.id] ?? []).map((m) => m.kind),
+      projects: state.memberships.filter((m) => m.principal_kind === "identity" && m.principal_id === identity.id).map((m) => m.projectId),
+    }));
+  const signers = machines.filter((m) => m.methods.length > 0);
+  const readers = machines.filter((m) => m.projects.length > 0);
+  // Reads name folders and keys that exist in the environment read.
+  const envSecrets = (projectId: string) =>
+    state.environments
+      .filter((e) => e.projectId === projectId)
+      .map((e) => ({ slug: e.slug, secrets: state.secrets.filter((s) => s.envId === e.id && !isDeleted(s)) }))
+      .filter((e) => e.secrets.length > 0);
   const start = realNow - 30 * DAY;
+  const machineIp = () => `10.20.${Math.floor(random() * 8)}.${Math.floor(random() * 250) + 2}`;
 
   for (let i = 0; i < 150; i += 1) {
     setClock(start + Math.floor(random() * (30 * DAY - 3600)));
-    const project = pick(random, projects);
-    const environment = pick(random, project.envs);
     const machine = random() < 0.45;
-    const actor = machine
-      ? (() => {
-          const id = pick(random, machineIds);
-          const identity = state.identities.find((x) => x.id === id);
-          return { kind: "identity", id, name: identity?.name ?? id, ip: `10.20.${Math.floor(random() * 8)}.${Math.floor(random() * 250) + 2}` };
-        })()
-      : (() => {
-          const user = pick(random, people);
-          return { kind: "user", id: user.id, name: user.email, ip: `192.0.2.${Math.floor(random() * 250) + 2}` };
-        })();
     const roll = random();
     if (machine && roll < 0.3) {
-      backend.recordAudit("auth.machine-login", actor, {}, { method: pick(random, ["oidc", "kubernetes", "universal"]) });
-    } else if (roll < 0.75) {
-      backend.recordAudit("secret.read", actor, { project_id: project.id, environment, path: pick(random, paths) }, {
+      const who = pick(random, signers);
+      const actor = { kind: "identity", id: who.id, name: who.name, ip: machineIp() };
+      backend.recordAudit("auth.machine-login", actor, {}, { method: pick(random, who.methods) });
+      continue;
+    }
+    const reader = machine ? pick(random, readers) : undefined;
+    const user = pick(random, people);
+    const actor = reader
+      ? { kind: "identity", id: reader.id, name: reader.name, ip: machineIp() }
+      : { kind: "user", id: user.id, name: user.email, ip: `192.0.2.${Math.floor(random() * 250) + 2}` };
+    const projectId = reader ? pick(random, reader.projects) : pick(random, state.projects).id;
+    const environment = pick(random, envSecrets(projectId));
+    if (!environment) continue;
+    const secret = pick(random, environment.secrets);
+    if (roll < 0.75) {
+      backend.recordAudit("secret.read", actor, { project_id: projectId, environment: environment.slug, path: secret.path }, {
         count: Math.floor(random() * 6) + 1,
         recursive: random() < 0.3,
       });
     } else if (roll < 0.9 || machine) {
       backend.recordAudit("secret.history-read", actor, {
-        project_id: project.id,
-        environment,
-        path: "/",
-        secret_key: pick(random, keys),
+        project_id: projectId,
+        environment: environment.slug,
+        path: secret.path,
+        secret_key: secret.key,
       });
     } else {
       backend.recordAudit("auth.cli-approve", actor);

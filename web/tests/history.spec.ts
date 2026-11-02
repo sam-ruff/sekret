@@ -147,6 +147,55 @@ test("says when two versions are too different to compare instead of failing", a
   await expect(drawer.getByTestId("version-2")).toBeVisible();
 });
 
+test("the row menu says the drawer holds rotation too, and a cancelled confirm gives focus back", async ({ page }) => {
+  await openProject(page);
+  await secretRow(page, "LOG_LEVEL").getByTestId("secret-actions").click();
+  await expect(page.getByTestId("secret-history")).toHaveText("History and rotation");
+  await page.getByTestId("secret-history").click();
+  const drawer = page.getByTestId("secret-drawer");
+  await expect(drawer.getByTestId("version-list")).toBeVisible();
+
+  const rollback = drawer.getByTestId("rollback-2");
+  await rollback.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("rollback-confirm").getByTestId("confirm-cancel")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("rollback-confirm")).toHaveCount(0);
+  await expect(rollback).toBeFocused();
+  await expect(drawer).toBeVisible();
+
+  // Rotate now asks in a dialog over the drawer; Escape closes only that dialog.
+  await drawer.getByTestId("policy-rotate-now").click();
+  const rotate = page.getByRole("alertdialog");
+  await expect(rotate).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(rotate).toHaveCount(0);
+  await expect(drawer).toBeVisible();
+});
+
+test("revealed values are hidden as soon as the page is hidden", async ({ page }) => {
+  await openProject(page);
+  const row = secretRow(page, "LOG_LEVEL");
+  await row.getByTestId("secret-reveal").click();
+  await expect(row.getByTestId("secret-value")).toHaveText("warn");
+  await secretAction(page, "LOG_LEVEL", "secret-history");
+  const drawer = page.getByTestId("secret-drawer");
+  await drawer.getByTestId("history-values-toggle").click();
+  await expect(drawer.getByTestId("version-value-1")).toHaveText("debug");
+
+  // As on switching tab or app.
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(drawer.getByTestId("history-values-hidden")).toBeVisible();
+  await expect(drawer).not.toContainText("debug");
+  await drawer.getByRole("button", { name: "Close" }).click();
+  await expect(row.getByTestId("secret-value")).not.toHaveText("warn");
+});
+
 test("hides history values until asked, then diffs versions and rolls back", async ({ page }) => {
   await openProject(page);
   await secretAction(page, "LOG_LEVEL", "secret-history");

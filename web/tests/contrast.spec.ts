@@ -9,8 +9,8 @@ const AA = 4.5;
  * translucent background up the tree. Colours are turned into sRGB by a canvas, so any CSS colour
  * the browser understands, oklch included, works.
  */
-async function contrastOf(locator: Locator): Promise<number> {
-  return locator.evaluate((el) => {
+async function contrastOf(locator: Locator, part: "color" | "borderTopColor" = "color"): Promise<number> {
+  return locator.evaluate((el, part) => {
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 1;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -33,7 +33,7 @@ async function contrastOf(locator: Locator): Promise<number> {
     }
     let behind = [255, 255, 255];
     for (const layer of layers.reverse()) behind = over(layer, behind);
-    const text = over(rgba(getComputedStyle(el).color), behind);
+    const text = over(rgba(getComputedStyle(el)[part]), behind);
 
     const luminance = (c: number[]) => {
       const [r, g, b] = c.map((v) => {
@@ -44,8 +44,11 @@ async function contrastOf(locator: Locator): Promise<number> {
     };
     const [hi, lo] = [luminance(text), luminance(behind)].sort((a, b) => b - a);
     return (hi + 0.05) / (lo + 0.05);
-  });
+  }, part);
 }
+
+/** WCAG 1.4.11 for the outlines of controls. */
+const NON_TEXT = 3;
 
 async function useTheme(page: Page, theme: "light" | "dark"): Promise<void> {
   await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
@@ -126,6 +129,20 @@ for (const theme of ["light", "dark"] as const) {
       // The toast slides in; wait for it to settle before measuring.
       await expect.poll(() => toast.evaluate((el) => getComputedStyle(el.closest("[data-sonner-toast]") ?? el).opacity)).toBe("1");
       expect(await contrastOf(toast)).toBeGreaterThanOrEqual(AA);
+    });
+
+    test("empty text fields and selects have outlines that stand out from the card", async ({ page }) => {
+      await page.goto("/projects/storefront/settings/roles");
+      await page.getByTestId("new-role").click();
+      const name = page.getByTestId("role-name");
+      await expect(name).toBeVisible();
+      await expect(name).toHaveValue("");
+      expect(await contrastOf(name, "borderTopColor")).toBeGreaterThanOrEqual(NON_TEXT);
+
+      await page.goto("/projects/storefront/secrets/dev?add=");
+      const key = page.getByTestId("secret-key-input");
+      await expect(key).toBeVisible();
+      expect(await contrastOf(key, "borderTopColor")).toBeGreaterThanOrEqual(NON_TEXT);
     });
 
     test("avatar initials and the Configured badge meet AA", async ({ page }) => {

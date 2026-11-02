@@ -23,8 +23,9 @@ A `.sekret.toml` in the current directory or one above it can set `server`, `pro
 - `sekret sys` commands, which send passphrases and setup codes, need the server named by `--server` or `SEKRET_URL`, or one you have logged in to.
 - `sekret login` in the browser to a server only a project file names shows its address and host and asks you to confirm at a terminal. Without a terminal it stops.
 - A saved login token only ever goes to the server it was saved for.
+- A project and environment only the file picks are confirmed once at a terminal before `sekret run`, `sekret export` or `sekret env use` loads from them, or `secrets set`, `delete`, `rollback`, `generate`, a policy change or `snapshots restore` changes something there. Without a terminal, pass `-p` and `-e`. Commands that only read name the file on standard error.
 
-Otherwise the command stops with an error. Project files are skipped with a warning when they, or a symlink to them, belong to another user, when their directory belongs to another user (root is fine), or when they or their directory can be written by every user or by a shared group. A group-writable file or directory is fine when the group is your own private group, the usual setup with `umask 002`. The file is checked on the same open handle it is read from.
+Otherwise the command stops with an error. Project files are skipped with a warning when they, or a symlink to them, belong to another user, when their directory belongs to another user (root is fine), or when they or their directory can be written by every user or by a shared group. A group-writable file or directory is fine when the group is your own private group, the usual setup with `umask 002`, and `/etc/group` and `/etc/passwd` show nobody else in it. The file is checked on the same open handle it is read from.
 
 Saved logins live in `$XDG_CONFIG_HOME/sekret/credentials.toml`, or `~/.config/sekret/credentials.toml` when that variable is unset or not an absolute path. The CLI writes the file with mode 0600 in a 0700 directory, refuses it if it belongs to someone else or others can change it or its directory, and warns if others can read it. Project files, credentials, CA and client certificate files are limited to 1 MiB.
 
@@ -39,7 +40,7 @@ Text from the server, such as error messages, table cells, the login code and it
 | `sekret login` | Opens the browser to approve this CLI, then saves a token. The approval page shows the address the request came from, whether it matches your browser's, and the program it reported, which can be faked; none of that proves the request is yours, so only approve a code you started. You type the code the CLI prints to approve it, or refuse a request you did not start, which ends it at once. `--no-browser` prints the link instead, and a link to a different site from the server is refused. When the server sets `auth.cli_login_max_auth_age`, approving may ask you to sign in to your identity provider again. |
 | `sekret login --github-actions --identity-id ID` | Logs in as a machine identity with the job's GitHub OIDC token. |
 | `sekret login --oidc-token-file F --identity-id ID` | The same with any OIDC token in a file; `--oidc-token-env VAR` reads a variable. |
-| `sekret login --kubernetes --identity-id ID` | Logs in with the pod's service account token. |
+| `sekret login --kubernetes --kubernetes-token-file F --identity-id ID` | Logs in with a projected service account token whose audience the identity accepts, such as `sekret`. There is no default file: the pod's standard token also works against the Kubernetes API, so it is never sent. |
 | `sekret login --client-id ID --client-secret-file F` | Universal auth; `SEKRET_CLIENT_SECRET` also works. |
 | `sekret logout` | Revokes and forgets the saved token. |
 | `sekret whoami` | Shows who the token belongs to. |
@@ -126,6 +127,6 @@ For an org admin, `sekret sys status` also says how the server was unlocked (`pa
 | `sekret operator crd` | Prints the CustomResourceDefinition. |
 | `sekret openapi` | Prints the server's OpenAPI document. |
 
-The admin commands work on the database directly, so run them on the server host. They take `--database-url`, `--root-key-file` and `--config` like the server does, and warn on standard error, as the server does at start, about a configuration file other users can change or replace, and about a root key, remember, database URL or new root key file other users can read or replace.
+The admin commands work on the database directly, so run them on the server host. They take `--database-url`, `--root-key-file` and `--config` like the server does. Like the server, they refuse to run when other users can change or replace the configuration file, root key file, epoch file or database URL file, or could plant one that does not exist yet, unless `--allow-shared-config` (or `SEKRET_ALLOW_SHARED_CONFIG`, or `server.allow_shared_config` for files other than the configuration itself) is given. They warn on standard error about a root key, remember, database URL or new root key file other users can read.
 
 The server also serves the OpenAPI document at `/api/openapi.json`.

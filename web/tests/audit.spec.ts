@@ -27,12 +27,59 @@ test("rows name actions in plain words and describe details without raw JSON", a
   const actions = page.getByTestId("audit-action");
   await expect(actions.first()).toBeVisible();
   const labels = await actions.allTextContents();
-  // Labels are words, with the raw code kept beside them for searching.
+  // Labels are words, with the raw code kept in the tooltip for CLI users.
   expect(labels.every((label) => !/^[a-z]+\.[a-z_.-]+$/.test(label))).toBe(true);
-  const codes = await page.getByTestId("audit-action-code").allTextContents();
+  const codes = await actions.evaluateAll((els) => els.map((el) => el.getAttribute("title") ?? ""));
   expect(codes.every((code) => /^[a-z]+\.[a-z_.-]+$/.test(code))).toBe(true);
   const details = await page.getByTestId("audit-detail").allTextContents();
   expect(details.some((detail) => detail.includes('{"'))).toBe(false);
+  expect(details.some((detail) => /^method: /.test(detail))).toBe(false);
+});
+
+test("the organisation log names each entry's project and links to that project's log", async ({ page }) => {
+  await page.goto("/org/audit?action=secret.");
+  await settled(page);
+  const rows = page.getByTestId("audit-row");
+  await expect(rows.first()).toBeVisible();
+  const projects = await page.getByTestId("audit-project").allTextContents();
+  expect(projects.length).toBe(await rows.count());
+  expect(new Set(projects)).toEqual(new Set(["Storefront", "Payments API"]));
+
+  // Payments API has no /payments folder or DATABASE_URL, so its entries never name them.
+  const payments = rows.filter({ has: page.getByTestId("audit-project").getByText("Payments API", { exact: true }) });
+  const targets = await payments.getByTestId("audit-target").allTextContents();
+  expect(targets.length).toBeGreaterThan(0);
+  expect(targets.some((t) => t.includes("/payments") || t.includes("DATABASE_URL"))).toBe(false);
+
+  await payments.first().getByTestId("audit-project").click();
+  await expect(page).toHaveURL(/\/projects\/payments-api\/audit$/);
+  await expect(page.getByTestId("audit-project")).toHaveCount(0);
+});
+
+test("the project of a project settings entry is named in the organisation log", async ({ page }) => {
+  await page.goto("/org/audit?action=project.");
+  await settled(page);
+  const row = page.getByTestId("audit-row").filter({ has: page.locator('[data-action="project.create"]') }).first();
+  await expect(row.getByTestId("audit-project")).toHaveText(/Storefront|Payments API/);
+});
+
+test("disabled machine identities and ones without project access never read secrets in the log", async ({ page }) => {
+  for (const name of ["cert-renewer", "inventory-sync"]) {
+    await page.goto(`/org/audit?q=${name}`);
+    await settled(page);
+    await expect(page.getByTestId("audit-actor").filter({ hasText: name })).toHaveCount(0);
+  }
+  await page.goto("/org/audit?q=billing-worker&action=secret.");
+  await settled(page);
+  const projects = await page.getByTestId("audit-project").allTextContents();
+  expect(projects.every((p) => p === "Payments API")).toBe(true);
+});
+
+test("a reader without access to the organisation log sees why, not a toolbar that does nothing", async ({ page }) => {
+  await page.goto("/org/audit?mock-org-role=org-member");
+  await expect(page.getByTestId("audit-no-access")).toContainText("Only organisation admins");
+  await expect(page.getByTestId("audit-search")).toHaveCount(0);
+  await expect(page.getByTestId("audit-total")).toHaveCount(0);
 });
 
 test("pages through the organisation log with the cursor", async ({ page }) => {

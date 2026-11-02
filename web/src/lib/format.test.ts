@@ -10,6 +10,7 @@ import {
   initials,
   parseDuration,
   slugify,
+  upperFirst,
   UNKNOWN_DATE,
 } from "./format";
 import { crumbs, folderFromLink, folderLabel, isValidFolderName, joinPath, MAX_PATH_LENGTH, normalisePath, parentPath } from "./paths";
@@ -89,6 +90,8 @@ describe("text helpers", () => {
     expect(initials("Sam Taylor")).toBe("ST");
     expect(initials("priya@example.com")).toBe("PE");
     expect(slugify("  My Shiny App!  ")).toBe("my-shiny-app");
+    expect(upperFirst("org admin")).toBe("Org admin");
+    expect(upperFirst("")).toBe("");
   });
 });
 

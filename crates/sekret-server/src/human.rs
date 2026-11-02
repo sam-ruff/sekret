@@ -8,7 +8,7 @@ use sekret_api::{
     AuthConfig, CliApproveRequest, CliDenyRequest, CliPollRequest, CliStartResponse, LogoutResponse, PendingCliLogin,
     TokenResponse,
 };
-use sekret_core::crypto::{constant_time_eq, fill_random, generate_token, hash_token};
+use sekret_core::crypto::{constant_time_eq, generate_token, hash_token, random_chars};
 use sekret_store::{CliLogin, CliPoll, LoginState, PrincipalKind, UserLogin};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -115,12 +115,7 @@ pub fn extract_groups(claims: &Value, group_claims: &[String]) -> Vec<String> {
 }
 
 pub fn user_code() -> ApiResult<String> {
-    let mut bytes = [0u8; 8];
-    fill_random(&mut bytes)?;
-    let chars: String = bytes
-        .iter()
-        .map(|b| USER_CODE_ALPHABET[usize::from(*b) % USER_CODE_ALPHABET.len()] as char)
-        .collect();
+    let chars = random_chars(USER_CODE_ALPHABET, 8)?;
     Ok(format!("{}-{}", &chars[..4], &chars[4..]))
 }
 

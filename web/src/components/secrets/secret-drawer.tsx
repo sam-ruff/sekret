@@ -1,9 +1,9 @@
 import { useInfiniteQuery, useQueries } from "@tanstack/react-query";
-import { Eye, EyeOff, History, Lock, RotateCcw, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Eye, EyeOff, KeyRound, Lock, RotateCcw, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/api/endpoints";
 import type { SecretVersion } from "@/api/types";
-import { ConfirmDialog } from "@/components/confirm-dialog";
+import { InlineConfirm } from "@/components/inline-confirm";
 import { ErrorState, ListSkeleton } from "@/components/states";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useSealWatch } from "@/hooks/queries";
-import { useIdle } from "@/hooks/use-idle";
+import { useIdle, useOnPageHidden } from "@/hooks/use-idle";
 import { diffLines } from "@/lib/diff";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel } from "@/lib/paths";
@@ -134,7 +134,11 @@ function VersionItem({
   shown,
   canRollback,
   sameAsCurrent,
+  confirming,
+  secretKey,
   onRollback,
+  onCancelRollback,
+  onConfirmRollback,
 }: {
   version: SecretVersion;
   current: boolean;
@@ -143,8 +147,21 @@ function VersionItem({
   canRollback: boolean;
   /** Rolling back would change nothing; only known once values are shown. */
   sameAsCurrent: boolean;
+  /** Asking whether to roll back to this version. */
+  confirming: boolean;
+  secretKey: string;
   onRollback: () => void;
+  onCancelRollback: () => void;
+  onConfirmRollback: () => Promise<unknown>;
 }) {
+  const button = useRef<HTMLButtonElement>(null);
+  const wasConfirming = useRef(confirming);
+  // Back to the button once the question is answered or dismissed, rather than to the page body.
+  useEffect(() => {
+    if (wasConfirming.current && !confirming) button.current?.focus();
+    wasConfirming.current = confirming;
+  }, [confirming]);
+
   return (
     <li className="space-y-2 rounded-lg border bg-card p-3" data-testid={`version-${version.version}`}>
       <div className="flex items-start justify-between gap-2">
@@ -168,12 +185,29 @@ function VersionItem({
           </span>
         )}
         {!current && !version.deleted && canRollback && !sameAsCurrent && (
-          <Button variant="outline" size="sm" onClick={onRollback} data-testid={`rollback-${version.version}`}>
+          <Button
+            ref={button}
+            variant="outline"
+            size="sm"
+            onClick={onRollback}
+            aria-expanded={confirming}
+            data-testid={`rollback-${version.version}`}
+          >
             <RotateCcw />
             Roll back
           </Button>
         )}
       </div>
+      {confirming && (
+        <InlineConfirm
+          title={`Roll back to version ${version.version}?`}
+          description={`${secretKey} gets a new version with the value and tags from version ${version.version}. The current value stays in history.`}
+          confirmLabel="Roll back"
+          onConfirm={onConfirmRollback}
+          onCancel={onCancelRollback}
+          testId="rollback-confirm"
+        />
+      )}
       {version.comment && <p className="text-sm text-muted-foreground first-letter:uppercase">{version.comment}</p>}
       {!version.deleted && (
         <div
@@ -258,6 +292,7 @@ export function SecretDrawer({
     : undefined;
   useSealWatch(showValues);
   useIdle(showValues, () => setValuesFor(null));
+  useOnPageHidden(showValues, () => setValuesFor(null));
 
   const close = () => {
     setValuesFor(null);
@@ -279,16 +314,21 @@ export function SecretDrawer({
       <SheetContent
         className="w-full gap-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl"
         onCloseAutoFocus={onCloseAutoFocus}
+        // Escape answers an open rollback question first, and only then closes the drawer.
+        onEscapeKeyDown={(event) => {
+          if (target === null) return;
+          event.preventDefault();
+          setTarget(null);
+        }}
         data-testid="secret-drawer"
       >
         <SheetHeader className="border-b pr-12">
           <SheetTitle className="flex min-w-0 items-center gap-2 font-mono">
-            <History className="size-4 shrink-0 text-muted-foreground" />
+            <KeyRound className="size-4 shrink-0 text-muted-foreground" />
             <span className="truncate">{secretKey}</span>
           </SheetTitle>
           <SheetDescription data-testid="secret-drawer-where">
-            {envName} · <span className="font-mono break-all">{folderLabel(path)}</span>
-          </SheetDescription>
+            {envName} · <span className="font-mono break-all">{folderLabel(path)}</span>          </SheetDescription>
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
@@ -329,7 +369,14 @@ export function SecretDrawer({
                         shown={revealed !== undefined && index < revealed.length}
                         canRollback={canRollback}
                         sameAsCurrent={revealed !== undefined && index < revealed.length && sameContent(v, revealed[0])}
+                        confirming={target === v.version}
+                        secretKey={secretKey ?? ""}
                         onRollback={() => setTarget(v.version)}
+                        onCancelRollback={() => setTarget(null)}
+                        onConfirmRollback={async () => {
+                          await rollback.mutateAsync(v.version);
+                          setTarget(null);
+                        }}
                       />
                     ))}
                   </ol>
@@ -365,15 +412,6 @@ export function SecretDrawer({
             )}
           </div>
         </ScrollArea>
-        <ConfirmDialog
-          open={target !== null}
-          onOpenChange={(open) => !open && setTarget(null)}
-          title={`Roll back to version ${target}?`}
-          description={`${secretKey} gets a new version with the value and tags from version ${target}. The current value stays in history.`}
-          confirmLabel="Roll back"
-          onConfirm={() => rollback.mutateAsync(target ?? 0)}
-          testId="rollback-confirm"
-        />
       </SheetContent>
     </Sheet>
   );

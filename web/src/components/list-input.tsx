@@ -66,7 +66,7 @@ export function ListInput({
     <div className="min-w-0 space-y-1">
       <div
         className={cn(
-          "flex min-h-8 min-w-0 flex-wrap items-center gap-1 rounded-lg border border-input bg-transparent px-1.5 py-1 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30",
+          "flex min-h-8 min-w-0 flex-wrap items-center gap-1 rounded-lg border border-input-border bg-transparent px-1.5 py-1 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30",
           problem && "border-destructive",
           disabled && "opacity-50",
         )}

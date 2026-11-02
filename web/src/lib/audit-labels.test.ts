@@ -83,6 +83,14 @@ describe("describeDetail", () => {
     expect(describeDetail("identity.revoke-tokens", { identity: "ident-2" })).toBe("Machine identity ident-2");
   });
 
+  it("says how a machine signed in instead of showing the raw method", () => {
+    expect(describeDetail("auth.machine-login", { method: "universal" })).toBe("Signed in with Universal auth");
+    expect(describeDetail("auth.machine-login", { method: "oidc", claims: { sub: "repo:x" } })).toBe(
+      'Signed in with OIDC auth · claims: {"sub":"repo:x"}',
+    );
+    expect(describeDetail("auth.machine-login", { method: "carrier-pigeon" })).toBe("Signed in with carrier-pigeon auth");
+  });
+
   it("falls back to plain fields for anything unknown", () => {
     expect(describeDetail("identity.auth-put", { identity: "id-1", method: "oidc", empty: "", none: null })).toBe(
       "OIDC auth on id-1",

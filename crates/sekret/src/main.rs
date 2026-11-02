@@ -206,6 +206,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
                 *raw |= !std::io::IsTerminal::is_terminal(&std::io::stdout());
             }
             let (resolved, api) = authenticated(&cli.client).await?;
+            cli::confirm_target(&resolved, command.changes())?;
             cli::secrets(
                 &api,
                 cli::location(&resolved)?,
@@ -232,6 +233,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         Command::ShellInit { shell } => print!("{}", cli::shell::init_script(shell)),
         Command::Policy(flags) => {
             let (resolved, api) = authenticated(&cli.client).await?;
+            cli::confirm_target(&resolved, !flags.is_empty())?;
             let project = resolved
                 .checked_project()?
                 .ok_or_else(|| anyhow::anyhow!("no project; pass -p or set SEKRET_PROJECT"))?;
@@ -290,6 +292,7 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
         }
         Command::Snapshots(command) => {
             let (resolved, api) = authenticated(&cli.client).await?;
+            cli::confirm_target(&resolved, command.changes())?;
             cli::snapshots(&api, cli::location(&resolved)?, command, &mut out).await?;
         }
     }

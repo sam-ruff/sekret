@@ -1425,6 +1425,7 @@ pub async fn open_keyring(
         check_mode(settings, config.mode)?;
         return match (config.mode, key) {
             (mode, Some(key)) => {
+                drop_stale_remember_file(settings, &config);
                 check_root(store, &settings.epoch_files, &key)
                     .await
                     .map_err(|e| key_file_refused(e, settings))?;
@@ -1445,6 +1446,9 @@ pub async fn open_keyring(
                     )
                     .map_err(startup)?;
                 audit_unlock_at_start(store, now, UnsealedBy::KeyFile).await;
+                if !checked.tampered {
+                    forget_stale_remember(store, now, settings, &keyring).await;
+                }
                 Ok(opened(keyring))
             }
             (SealMode::KeyFile, None) => Err(key_file_refused(StartupError::MissingRootKey, settings)),
@@ -1598,6 +1602,7 @@ async fn unlock_at_start(
     config: SealConfig,
     passphrase: Option<Zeroizing<String>>,
 ) -> Result<(), StartupError> {
+    drop_stale_remember_file(settings, &config);
     let mut proven = None;
     let (root, by, rewrap) = match effective_policy(settings, keyring) {
         UnlockPolicy::Manual => return Ok(()),
@@ -1652,6 +1657,7 @@ async fn unlock_at_start(
     if let Some((passphrase, force)) = rewrap {
         upgrade_wrap(store, settings, now, keyring, &root, passphrase, force).await;
     }
+    forget_stale_remember(store, now, settings, keyring).await;
     Ok(())
 }
 
@@ -1770,6 +1776,82 @@ pub async fn remember_after_unlock(
     keyring.record(&config)?;
     tracing::info!(path = %path.display(), "remembered the unlock for later starts");
     Ok(())
+}
+
+/// Whether configuration has moved the policy off `remember`, so a remembered unlock is stale.
+fn remember_ruled_out(settings: &SealSettings) -> bool {
+    settings.unlock.is_some_and(|policy| policy != UnlockPolicy::Remember)
+}
+
+/// At start, before any unlock: when configuration rules out `remember`, the remember file goes
+/// at once, and the database wrap with the next unlock, which needs the root key to sign.
+fn drop_stale_remember_file(settings: &SealSettings, config: &SealConfig) {
+    if !remember_ruled_out(settings) {
+        return;
+    }
+    if let Some(path) = &settings.remember_file
+        && path.symlink_metadata().is_ok()
+    {
+        match remove_device_key_file(path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "the unlock policy is not remember, so the remember file was deleted"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "the unlock policy is not remember, but the remember file could not be deleted")
+            }
+        }
+    }
+    if config.remembered.is_some() {
+        tracing::warn!(
+            "the unlock policy is not remember, but the database still holds a remembered unlock; it is forgotten at \
+             the next unlock"
+        );
+    }
+}
+
+/// After an unlock, forgets a remembered unlock that the policy in force no longer uses, as
+/// after `seal.unlock` moved off `remember`. Unlike [`forget`] it keeps the remember secret
+/// required. Best effort; the caller holds the keyring gate.
+async fn forget_stale_remember(store: &dyn Store, now: i64, settings: &SealSettings, keyring: &Keyring) {
+    if effective_policy(settings, keyring) == UnlockPolicy::Remember {
+        return;
+    }
+    if let Some(path) = &settings.remember_file
+        && let Err(error) = remove_device_key_file(path)
+    {
+        tracing::warn!(%error, "could not remove the remember file");
+    }
+    if !keyring.remembered() {
+        return;
+    }
+    let result: ApiResult<bool> = async {
+        let root = keyring.root()?;
+        let mut config = load_trusted(store, settings, now, LOCAL, &root).await?;
+        if config.remembered.is_none() {
+            return Ok(false);
+        }
+        config.remembered = None;
+        let config = save(store, settings, &root, now, config).await?;
+        keyring.record(&config)?;
+        Ok(true)
+    }
+    .await;
+    match result {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::warn!("forgot the remembered unlock, since the unlock policy is no longer remember");
+            audit_system(
+                store,
+                now,
+                LOCAL,
+                "sys.forget_unlock",
+                serde_json::json!({"reason": "policy"}),
+            )
+            .await;
+        }
+        Err(error) => tracing::warn!(error = %error.message, "could not forget the remembered unlock"),
+    }
 }
 
 /// Deletes the remember file and the database wrap, and is the only thing that stops a remember
@@ -2100,6 +2182,7 @@ pub mod ops {
         if tampered {
             return;
         }
+        forget_stale_remember(state.store.as_ref(), now, &state.config.seal, &state.keyring).await;
         if let Err(error) = remember_after_unlock(state.store.as_ref(), now, &state.config.seal, &state.keyring).await {
             tracing::warn!(error = %error.message, "could not remember the unlock");
         }
@@ -2175,9 +2258,17 @@ pub mod ops {
         };
         let (report, still_unsealed) = {
             let _writers = state.keyring.rekeying().await?;
-            let report =
-                crate::admin::rotate_root_key(state.store.as_ref(), &old_root, &new_root, Some(config), rotation)
-                    .await?;
+            let rotated =
+                crate::admin::rotate_root_key(state.store.as_ref(), &old_root, &new_root, Some(config), rotation).await;
+            let report = match rotated {
+                Ok(report) => report,
+                Err(error) if error.code == crate::admin::REKEY_OUTCOME_UNKNOWN => {
+                    // Either key may be the database's now, so seal and let the next unseal show which.
+                    state.keyring.drop_root()?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             (report, state.keyring.replace_root(new_root.clone())?)
         };
         if let Some(stored) = state.store.get_seal_config().await? {

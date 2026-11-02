@@ -160,6 +160,7 @@ test("the member picker finds machine identities beyond the first page", async (
   await page.goto("/projects/storefront/settings/members");
   await page.getByTestId("add-member").click();
   const dialog = page.getByTestId("add-member-dialog");
+  await expect(dialog.getByTestId("member-kind-identity")).toHaveText("Machine identity");
   await dialog.getByTestId("member-kind-identity").click();
   await dialog.getByTestId("member-principal").click();
   await page.getByTestId("member-principal-search").fill("webhook");

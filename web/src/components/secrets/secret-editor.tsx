@@ -139,7 +139,7 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
                 autoFocus={!isNew || !!initial.key}
                 rows={Math.min(8, Math.max(1, draft.value.split("\n").length))}
                 className="min-h-8 font-mono text-sm break-all"
-                placeholder={valueHidden ? "You cannot read the current value; enter a replacement" : "Value"}
+                placeholder={valueHidden ? "You cannot read the current value; enter a replacement" : undefined}
                 data-testid="secret-value-input"
                 onChange={(e) => setDraft({ ...draft, value: e.target.value })}
               />
@@ -185,7 +185,8 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
       </FieldGroup>
       <div className="flex flex-wrap items-center justify-end gap-2">
         {blocker && (
-          <FormBlocker id={`blocker-${id}`} testId="secret-blocker" className="mr-auto">
+          // Its own line on phones, so the buttons stay together under it.
+          <FormBlocker id={`blocker-${id}`} testId="secret-blocker" className="basis-full sm:mr-auto sm:basis-auto">
             {blocker}
           </FormBlocker>
         )}

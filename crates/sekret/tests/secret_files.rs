@@ -135,7 +135,7 @@ fn passphrase_files_others_can_read_or_replace_are_warned_about() -> anyhow::Res
 }
 
 /// Admin commands read the root key file the server would, so they warn about it the same way,
-/// however it is named.
+/// however it is named. One others could replace is refused unless allowed, as for the server.
 #[test]
 fn admin_commands_check_the_root_key_file() -> anyhow::Result<()> {
     let missing_db = "sqlite://missing.db";
@@ -147,6 +147,7 @@ fn admin_commands_check_the_root_key_file() -> anyhow::Result<()> {
             missing_db,
             "--root-key-file",
             "{file}",
+            "--allow-shared-config",
         ],
         &[],
         "not a key\n",
@@ -154,10 +155,32 @@ fn admin_commands_check_the_root_key_file() -> anyhow::Result<()> {
     )?;
     check_warnings(
         &["admin", "rotate-root-key", "--database-url", missing_db],
-        &[("SEKRET_ROOT_KEY_FILE", "{file}")],
+        &[
+            ("SEKRET_ROOT_KEY_FILE", "{file}"),
+            ("SEKRET_ALLOW_SHARED_CONFIG", "true"),
+        ],
         "not a key\n",
         &nothing,
     )?;
+    let open = tempfile::tempdir().context("dir")?;
+    let shared = open_dir(open.path())?;
+    let key = write(&shared.join("root.key"), "not a key\n", 0o600)?;
+    let text = stderr(&run(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            missing_db,
+            "--root-key-file",
+            &key,
+        ],
+        &[],
+        open.path(),
+    )?);
+    assert!(
+        text.contains("refusing to run") && text.contains("--allow-shared-config"),
+        "{text}"
+    );
     let dir = tempfile::tempdir().context("dir")?;
     let key = write(&dir.path().join("root.key"), "not a key\n", 0o644)?;
     let config = write(
@@ -174,8 +197,17 @@ fn admin_commands_check_the_root_key_file() -> anyhow::Result<()> {
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).context("chmod")?;
     let text = stderr(&run(&["admin", "bootstrap", "--config", &config], &[], dir.path())?);
     assert!(
-        text.contains("sekret: warning:") && text.contains("decides who signs in"),
+        text.contains("refusing to run") && text.contains("decides who signs in"),
         "a configuration file others can change: {text}"
+    );
+    let text = stderr(&run(
+        &["admin", "bootstrap", "--config", &config, "--allow-shared-config"],
+        &[],
+        dir.path(),
+    )?);
+    assert!(
+        text.contains("sekret: warning:") && text.contains("decides who signs in"),
+        "allowed, it is a warning: {text}"
     );
     Ok(())
 }

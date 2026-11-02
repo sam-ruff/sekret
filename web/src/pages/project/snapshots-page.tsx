@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { Camera, ChevronRight, History, Info, Minus, Plus, RefreshCw, Undo2 } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Snapshot, SnapshotChange } from "@/api/types";
-import { ConfirmDialog } from "@/components/confirm-dialog";
+import { InlineConfirm } from "@/components/inline-confirm";
 import { PageHeader } from "@/components/page-header";
 import { EnvTabs } from "@/components/project/env-tabs";
 import { MissingEnvironment } from "@/components/project/missing-environment";
@@ -141,6 +141,13 @@ function SnapshotSheet({
 }) {
   const [folder, setFolder] = useState("/");
   const [confirming, setConfirming] = useState(false);
+  const restoreButton = useRef<HTMLButtonElement>(null);
+  const wasConfirming = useRef(false);
+  // Back to the Restore button once the question is dismissed, rather than to the page body.
+  useEffect(() => {
+    if (wasConfirming.current && !confirming) restoreButton.current?.focus();
+    wasConfirming.current = confirming;
+  }, [confirming]);
   const [shownRows, setShownRows] = useState(ROW_PAGE);
   const content = useRef<HTMLDivElement>(null);
   // Each keystroke would otherwise ask the server for a full recursive comparison.
@@ -200,6 +207,12 @@ function SnapshotSheet({
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           content.current?.focus();
+        }}
+        // Escape answers an open restore question first, and only then closes the sheet.
+        onEscapeKeyDown={(event) => {
+          if (!confirming) return;
+          event.preventDefault();
+          setConfirming(false);
         }}
         data-testid="snapshot-sheet"
       >
@@ -291,27 +304,30 @@ function SnapshotSheet({
         </ScrollArea>
         {canRestore && (
           <SheetFooter className="border-t">
-            <Button
-              variant={removes ? "destructive" : "default"}
-              onClick={() => setConfirming(true)}
-              disabled={changes.length === 0 || settling || !detail.isSuccess}
-              data-testid="restore-snapshot"
-            >
-              <Undo2 />
-              Restore {changes.length > 0 ? `${changes.length} ${changes.length === 1 ? "change" : "changes"}` : ""}
-            </Button>
+            {confirming ? (
+              <InlineConfirm
+                title="Restore this snapshot?"
+                description={restoreSummary(changes, path, envName)}
+                confirmLabel="Restore"
+                destructive={removes}
+                onConfirm={() => restore.mutateAsync()}
+                onCancel={() => setConfirming(false)}
+                testId="restore-confirm"
+              />
+            ) : (
+              <Button
+                ref={restoreButton}
+                variant={removes ? "destructive" : "default"}
+                onClick={() => setConfirming(true)}
+                disabled={changes.length === 0 || settling || !detail.isSuccess}
+                data-testid="restore-snapshot"
+              >
+                <Undo2 />
+                Restore {changes.length > 0 ? `${changes.length} ${changes.length === 1 ? "change" : "changes"}` : ""}
+              </Button>
+            )}
           </SheetFooter>
         )}
-        <ConfirmDialog
-          open={confirming}
-          onOpenChange={setConfirming}
-          title="Restore this snapshot?"
-          description={restoreSummary(changes, path, envName)}
-          confirmLabel="Restore"
-          destructive={removes}
-          onConfirm={() => restore.mutateAsync()}
-          testId="restore-confirm"
-        />
       </SheetContent>
     </Sheet>
   );

@@ -8,16 +8,13 @@ export const NOT_CLEARED_NOTE = "Clipboard not cleared; clear it yourself";
 
 /**
  * - `cleared`: the secret was wiped.
- * - `changed`: the clipboard holds something else now, so it was left alone.
- * - `unverifiable`: it may still hold the secret, but checking or clearing was not allowed.
+ * - `unverifiable`: it may still hold the secret, but clearing was not safe or not allowed.
  * - `deferred`: the tab has no focus, so the browser refuses clipboard access until it comes back.
  */
-export type ClearOutcome = "cleared" | "changed" | "unverifiable" | "deferred";
+export type ClearOutcome = "cleared" | "unverifiable" | "deferred";
 
 export interface ClipboardDeps {
-  clipboard: Pick<Clipboard, "readText" | "writeText"> | undefined;
-  /** True only when reading the clipboard needs no prompt. */
-  canRead: () => Promise<boolean>;
+  clipboard: Pick<Clipboard, "writeText"> | undefined;
   hasFocus: () => boolean;
   schedule: (run: () => void, delay: number) => void;
   /** Tells the person the secret may still be on the clipboard. */
@@ -25,16 +22,16 @@ export interface ClipboardDeps {
 }
 
 interface Pending {
-  text: string;
   seen: number;
   id: number;
 }
 
 /**
- * Clears copied secrets after a delay, only when the clipboard still holds them. Reading the
- * clipboard can prompt, so it is read only when already permitted; otherwise the clipboard is
- * trusted to be unchanged while this tab kept focus and nothing else was copied in it. A clear
- * that falls due while the tab is in the background waits for the tab to come back.
+ * Clears copied secrets after a delay. The page is not allowed to read the clipboard, so the timed
+ * clear only overwrites it when this tab kept focus and nothing else was copied in it; otherwise
+ * the person may have copied something of their own, so they are told instead. A clear that falls
+ * due while the tab is in the background waits for the tab to come back. When the page is going,
+ * the clipboard is overwritten regardless, since there is no later chance.
  */
 export class ClipboardGuard {
   private readonly deps: ClipboardDeps;
@@ -76,26 +73,26 @@ export class ClipboardGuard {
     return this.outstanding !== undefined;
   }
 
-  /** Call right after `text` was written to the clipboard. */
-  clearLater(text: string, delay = CLIPBOARD_CLEAR_MS): void {
+  /** Call right after a secret was written to the clipboard. */
+  clearLater(delay = CLIPBOARD_CLEAR_MS): void {
     this.latest += 1;
     this.pending = undefined;
-    const due: Pending = { text, seen: this.activity, id: this.latest };
+    const due: Pending = { seen: this.activity, id: this.latest };
     this.outstanding = due;
     this.deps.schedule(() => void this.attempt(due), delay);
   }
 
   /**
-   * Clears an outstanding secret straight away, for when the page is about to go. Focus is not
-   * waited for, since there is no later; the browser may still refuse.
+   * Overwrites an outstanding secret straight away, for when the page is about to go, even if
+   * something else may have been copied since. Focus is not waited for, since there is no later;
+   * the browser may still refuse.
    */
   async clearNow(): Promise<ClearOutcome | null> {
-    const due = this.outstanding;
-    if (!due) return null;
+    if (!this.outstanding) return null;
     this.latest += 1;
     this.pending = undefined;
     this.outstanding = undefined;
-    return this.clearUnlessChanged(due.text, due.seen);
+    return this.overwrite();
   }
 
   /** Call when the tab regains focus or becomes visible, to finish a clear that had to wait. */
@@ -105,20 +102,17 @@ export class ClipboardGuard {
     return this.attempt(due);
   }
 
-  async clearIfUnchanged(text: string, seen: number): Promise<ClearOutcome> {
+  async clearIfUnchanged(seen: number): Promise<ClearOutcome> {
     if (!this.deps.clipboard) return "unverifiable";
     if (!this.deps.hasFocus()) return "deferred";
-    return this.clearUnlessChanged(text, seen);
+    if (seen !== this.activity) return "unverifiable";
+    return this.overwrite();
   }
 
-  private async clearUnlessChanged(text: string, seen: number): Promise<ClearOutcome> {
+  private async overwrite(): Promise<ClearOutcome> {
     const { clipboard } = this.deps;
     if (!clipboard) return "unverifiable";
     try {
-      if (seen !== this.activity) {
-        if (!(await this.deps.canRead())) return "unverifiable";
-        if ((await clipboard.readText()) !== text) return "changed";
-      }
       await clipboard.writeText("");
       return "cleared";
     } catch {
@@ -128,21 +122,12 @@ export class ClipboardGuard {
 
   private async attempt(due: Pending): Promise<ClearOutcome | null> {
     if (due.id !== this.latest) return null;
-    const outcome = await this.clearIfUnchanged(due.text, due.seen);
+    const outcome = await this.clearIfUnchanged(due.seen);
     if (due.id !== this.latest) return outcome;
     this.pending = outcome === "deferred" ? due : undefined;
     if (outcome !== "deferred") this.outstanding = undefined;
     if (outcome === "unverifiable") this.deps.onNotCleared();
     return outcome;
-  }
-}
-
-async function readPermitted(): Promise<boolean> {
-  try {
-    const status = await navigator.permissions.query({ name: "clipboard-read" as PermissionName });
-    return status.state === "granted";
-  } catch {
-    return false;
   }
 }
 
@@ -167,7 +152,6 @@ export function clipboardGuard(): ClipboardGuard {
   if (shared) return shared;
   const guard = new ClipboardGuard({
     clipboard: navigator.clipboard,
-    canRead: readPermitted,
     hasFocus: () => document.hasFocus(),
     schedule: (run, delay) => void window.setTimeout(run, delay),
     onNotCleared: () => toast.warning(NOT_CLEARED_NOTE, { duration: 10_000 }),
@@ -188,6 +172,46 @@ export function clipboardGuard(): ClipboardGuard {
 }
 
 /** Clears a copied secret now, if this page copied one that may still be there. */
-export async function clearCopiedSecret(): Promise<void> {
-  await shared?.clearNow();
+export async function clearCopiedSecret(): Promise<ClearOutcome | null> {
+  return (await shared?.clearNow()) ?? null;
+}
+
+const NOT_CLEARED_KEY = "sekret.clipboard-not-cleared";
+
+/** Leaves word for the sign-in page that a copied secret could not be cleared on the way out. */
+export function rememberNotCleared(storage: Pick<Storage, "setItem"> | undefined = safeSessionStorage()): void {
+  try {
+    storage?.setItem(NOT_CLEARED_KEY, "1");
+  } catch {
+    // Without storage the notice is lost; nothing else can carry it across the navigation.
+  }
+}
+
+export function hasNotClearedNotice(storage: Pick<Storage, "getItem"> | undefined = safeSessionStorage()): boolean {
+  try {
+    return storage?.getItem(NOT_CLEARED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function dismissNotClearedNotice(storage: Pick<Storage, "removeItem"> | undefined = safeSessionStorage()): void {
+  try {
+    storage?.removeItem(NOT_CLEARED_KEY);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+function safeSessionStorage(): Storage | undefined {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Clears a copied secret before the page leaves, leaving a notice for the next page when it could not. */
+export async function clearBeforeLeaving(clear: () => Promise<ClearOutcome | null> = clearCopiedSecret): Promise<void> {
+  if ((await clear()) === "unverifiable") rememberNotCleared();
 }

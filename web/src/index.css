@@ -25,6 +25,7 @@
   --color-chart-1: var(--chart-1);
   --color-ring: var(--ring);
   --color-input: var(--input);
+  --color-input-border: var(--input-border);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
   --color-destructive-solid: var(--destructive-solid);
@@ -75,6 +76,8 @@
   --warning: oklch(0.53 0.13 60);
   --border: oklch(0.91 0.01 190);
   --input: oklch(0.89 0.012 190);
+  /* Field outlines need 3:1 against the card and page (WCAG 1.4.11). */
+  --input-border: oklch(0.64 0.015 200);
   --ring: oklch(0.6 0.1 182);
   --chart-1: oklch(0.85 0.08 182);
   --chart-2: oklch(0.7 0.11 182);
@@ -114,6 +117,7 @@
   --warning: oklch(0.78 0.13 75);
   --border: oklch(1 0 0 / 9%);
   --input: oklch(1 0 0 / 14%);
+  --input-border: oklch(1 0 0 / 35%);
   --ring: oklch(0.6 0.09 182);
   --chart-1: oklch(0.85 0.08 182);
   --chart-2: oklch(0.72 0.1 182);

@@ -43,6 +43,10 @@ fn read_bounded(path: &Path, limit: u64, follow_symlinks: bool) -> io::Result<Ze
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
     }
+    read_handle(file, limit)
+}
+
+fn read_handle(file: File, limit: u64) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut contents = Zeroizing::new(Vec::new());
     file.take(limit + 1).read_to_end(&mut contents)?;
     if contents.len() as u64 > limit {
@@ -131,7 +135,8 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     sync_parent(path)
 }
 
-/// Creates `path` and its missing parents with mode 0700.
+/// Creates `path` and its missing parents with mode 0700. One that already exists must belong to
+/// this user or root and must not let anyone else replace what is in it.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -140,7 +145,22 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(path)
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        let meta = std::fs::metadata(path)?;
+        if let Some(why) = dir_replaceable(ownership(&meta), Account::current()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} cannot be used: {}",
+                    path.display(),
+                    why.replacen("its directory", "it", 1)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Removes `path`; a file that is already gone is not an error.
@@ -328,9 +348,132 @@ fn parse_mark(text: &str) -> Option<EpochMark> {
     Some(EpochMark { epoch, roots, migrated })
 }
 
+/// The owner and mode bits of a file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ownership {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+#[cfg(unix)]
+fn ownership(meta: &std::fs::Metadata) -> Ownership {
+    use std::os::unix::fs::MetadataExt;
+    Ownership {
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode(),
+    }
+}
+
+/// The user a check is made for, and whether their primary group holds anyone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Account {
+    pub uid: u32,
+    pub gid: u32,
+    /// Nobody else is listed in the primary group or has it as their own.
+    pub private_group: bool,
+}
+
+impl Account {
+    /// The effective user and group. A group that cannot be looked up counts as shared.
+    #[cfg(unix)]
+    pub fn current() -> Self {
+        // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let private_group = match (
+            std::fs::read_to_string("/etc/group"),
+            std::fs::read_to_string("/etc/passwd"),
+        ) {
+            (Ok(group), Ok(passwd)) => group_holds_only(&group, &passwd, gid, uid),
+            _ => false,
+        };
+        Self {
+            uid,
+            gid,
+            private_group,
+        }
+    }
+
+    /// Whether write access for group `gid` is only this user's.
+    fn group_is_private(self, gid: u32) -> bool {
+        self.private_group && gid == self.gid
+    }
+}
+
+/// Whether group `gid` is listed in `/etc/group` and holds nobody but `uid`, from the text of
+/// `/etc/group` and `/etc/passwd`. A group with the user's id can still hold others.
+pub fn group_holds_only(group: &str, passwd: &str, gid: u32, uid: u32) -> bool {
+    let gid_text = gid.to_string();
+    let listed = group
+        .lines()
+        .any(|line| line.split(':').nth(2) == Some(gid_text.as_str()));
+    listed && crate::host_socket::other_group_members(group, passwd, gid, uid).is_empty()
+}
+
+/// Why a mark file could have been written by someone other than `me`: another user owns it,
+/// or other users, or a group shared with them, may write to it.
+pub fn mark_writable_by_others(file: Ownership, me: Account) -> Option<&'static str> {
+    if file.uid != me.uid && file.uid != 0 {
+        return Some("it belongs to another user");
+    }
+    if file.mode & 0o002 != 0 {
+        return Some("every user can write to it");
+    }
+    if file.mode & 0o020 != 0 && !me.group_is_private(file.gid) {
+        return Some("its group can write to it");
+    }
+    None
+}
+
+/// Why users other than `me` could replace an entry in a directory, by the same rules as the
+/// start-up checks. A sticky directory only lets each owner replace their own.
+pub fn dir_replaceable(dir: Ownership, me: Account) -> Option<&'static str> {
+    if dir.uid != me.uid && dir.uid != 0 {
+        return Some("its directory belongs to another user, who can replace it");
+    }
+    if dir.mode & 0o1000 != 0 {
+        return None;
+    }
+    if dir.mode & 0o002 != 0 {
+        return Some("its directory is writable by every user, so anyone can replace it");
+    }
+    if dir.mode & 0o020 != 0 && !me.group_is_private(dir.gid) {
+        return Some("its directory is writable by its group, whose members can replace it");
+    }
+    None
+}
+
+/// Reads a mark through one handle, and refuses it, as damaged, when someone other than this
+/// server's user or root could have written it or swapped it in since start.
+fn read_mark_bytes(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+    let file = reading(false).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        let me = Account::current();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let dir = ownership(&std::fs::metadata(parent)?);
+        let why = mark_writable_by_others(ownership(&meta), me).or_else(|| dir_replaceable(dir, me));
+        if let Some(why) = why {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} cannot be trusted as an epoch mark: {why}", path.display()),
+            ));
+        }
+    }
+    read_handle(file, SECRET_FILE_LIMIT)
+}
+
 /// The mark in a mark file, if there is one.
 pub fn read_mark(path: &Path) -> io::Result<Option<EpochMark>> {
-    let bytes = match read_private(path) {
+    let bytes = match read_mark_bytes(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -394,6 +537,132 @@ pub fn can_create(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    const PASSWD: &str = "root:x:0:0::/root:/bin/sh\nsekret:x:1000:1000::/home/sekret:/bin/sh\n\
+                          eve:x:1001:1001::/home/eve:/bin/sh\n";
+
+    fn me(private_group: bool) -> Account {
+        Account {
+            uid: 1000,
+            gid: 1000,
+            private_group,
+        }
+    }
+
+    #[test]
+    fn a_group_is_private_only_when_it_holds_nobody_else() {
+        assert!(group_holds_only("sekret:x:1000:\n", PASSWD, 1000, 1000));
+        assert!(group_holds_only("sekret:x:1000:sekret\n", PASSWD, 1000, 1000));
+        assert!(
+            !group_holds_only("sekret:x:1000:eve\n", PASSWD, 1000, 1000),
+            "a group with the user's id that holds someone else"
+        );
+        let shares_primary = format!("{PASSWD}mallory:x:1002:1000::/home/mallory:/bin/sh\n");
+        assert!(!group_holds_only("sekret:x:1000:\n", &shares_primary, 1000, 1000));
+        assert!(
+            !group_holds_only("", PASSWD, 1000, 1000),
+            "an unknown group counts as shared"
+        );
+    }
+
+    #[test]
+    fn marks_others_could_write_are_not_trusted() {
+        let file = |uid, gid, mode| Ownership { uid, gid, mode };
+        assert_eq!(mark_writable_by_others(file(1000, 1000, 0o100600), me(false)), None);
+        assert_eq!(
+            mark_writable_by_others(file(0, 0, 0o100644), me(false)),
+            None,
+            "root's own"
+        );
+        assert_eq!(
+            mark_writable_by_others(file(1000, 1000, 0o100660), me(true)),
+            None,
+            "a private group"
+        );
+        assert!(
+            mark_writable_by_others(file(1000, 1000, 0o100660), me(false)).is_some(),
+            "a group with the user's id that holds someone else"
+        );
+        assert!(mark_writable_by_others(file(1001, 1001, 0o100600), me(true)).is_some());
+        assert!(mark_writable_by_others(file(1000, 50, 0o100620), me(true)).is_some());
+        assert!(mark_writable_by_others(file(1000, 1000, 0o100602), me(true)).is_some());
+    }
+
+    #[test]
+    fn directories_others_could_write_to_are_replaceable() {
+        let dir = |uid, gid, mode| Ownership { uid, gid, mode };
+        assert_eq!(dir_replaceable(dir(1000, 1000, 0o40700), me(false)), None);
+        assert_eq!(
+            dir_replaceable(dir(0, 0, 0o41777), me(false)),
+            None,
+            "sticky, like /tmp"
+        );
+        assert_eq!(
+            dir_replaceable(dir(1000, 1000, 0o40770), me(true)),
+            None,
+            "a private group"
+        );
+        assert!(
+            dir_replaceable(dir(1000, 1000, 0o40770), me(false)).is_some(),
+            "a group with the user's id that holds someone else"
+        );
+        assert!(dir_replaceable(dir(1000, 50, 0o40770), me(true)).is_some());
+        assert!(dir_replaceable(dir(1000, 1000, 0o40777), me(true)).is_some());
+        assert!(dir_replaceable(dir(1001, 1001, 0o40700), me(true)).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_anyone_else_could_have_written_reads_as_damaged() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = dir.path().join("epoch");
+        let mark = EpochMark {
+            epoch: 3,
+            roots: vec!["ab".repeat(16)],
+            migrated: false,
+        };
+        write_mark(&path, &mark)?;
+        assert_eq!(read_mark(&path)?, Some(mark.clone()));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o622)).context("chmod")?;
+        let refused = read_mark(&path).err().context("group and others can write it")?;
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        assert_eq!(read_mark(&path)?, Some(mark.clone()));
+
+        // A directory anyone can write to lets the mark be swapped after start.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let refused = read_mark(&path).err().context("its directory is open to everyone")?;
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).context("chmod")?;
+        assert_eq!(read_mark(&path)?, Some(mark), "a sticky directory protects its entries");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_directory_others_can_write_to_is_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let fresh = dir.path().join("a/b");
+        create_private_dir(&fresh)?;
+        let mode = std::fs::metadata(&fresh).context("meta")?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        create_private_dir(&fresh)?;
+
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).context("mkdir")?;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let refused = create_private_dir(&open)
+            .err()
+            .context("anyone could swap what is in it")?;
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).context("chmod")?;
+        create_private_dir(&open).context("readable but not writable by others is fine")?;
+        Ok(())
+    }
 
     #[test]
     fn new_private_files_are_owner_only_and_never_overwritten() -> anyhow::Result<()> {
@@ -565,7 +834,7 @@ mod tests {
             "sekret-seal-epoch 8 0123456789abcdef migrated\n"
         );
         assert_eq!(read_mark(&path).context("read")?, Some(migrated));
-        std::fs::write(&path, b"garbage").context("garbage")?;
+        write_private(&path, b"garbage").context("garbage")?;
         assert!(read_epoch(&path).is_err());
         Ok(())
     }
@@ -576,7 +845,7 @@ mod tests {
         let path = dir.path().join("sekret.db.epoch");
         let ceiling = sekret_core::seal::MAX_SEAL_EPOCH;
         for epoch in [i64::MAX, ceiling, -1] {
-            std::fs::write(&path, format!("sekret-seal-epoch {epoch}\n")).context("write")?;
+            write_private(&path, format!("sekret-seal-epoch {epoch}\n").as_bytes()).context("write")?;
             assert!(read_mark(&path).is_err(), "{epoch}");
             let mark = EpochMark {
                 epoch,
@@ -585,7 +854,7 @@ mod tests {
             };
             assert!(write_mark(&path, &mark).is_err(), "{epoch}");
         }
-        std::fs::write(&path, format!("sekret-seal-epoch {}\n", ceiling - 1)).context("write")?;
+        write_private(&path, format!("sekret-seal-epoch {}\n", ceiling - 1).as_bytes()).context("write")?;
         assert_eq!(read_epoch(&path).context("read")?, Some(ceiling - 1));
         Ok(())
     }
@@ -594,7 +863,7 @@ mod tests {
     fn marks_from_before_fingerprints_still_read() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().context("dir")?;
         let path = dir.path().join("sekret.db.epoch");
-        std::fs::write(&path, b"sekret-seal-epoch 12\n").context("old")?;
+        write_private(&path, b"sekret-seal-epoch 12\n").context("old")?;
         assert_eq!(
             read_mark(&path).context("read")?,
             Some(EpochMark {
@@ -625,7 +894,7 @@ mod tests {
             "sekret-seal-epoch 3 migrated migrated\n",
             "sekret-seal-epoch 3 migrated aaaaaaaaaaaaaaaa\n",
         ] {
-            std::fs::write(&path, bad).context("write")?;
+            write_private(&path, bad.as_bytes()).context("write")?;
             assert!(read_mark(&path).is_err(), "{bad}");
         }
         let injected = EpochMark {

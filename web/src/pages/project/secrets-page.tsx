@@ -38,7 +38,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { folderQuery, useProjectEnv } from "@/hooks/use-project-env";
 import { keys, SECRET_VALUE_GC_TIME, useApiMutation, useOptionalQuery, useProject, useSealWatch } from "@/hooks/queries";
-import { useIdle } from "@/hooks/use-idle";
+import { useIdle, useOnPageHidden } from "@/hooks/use-idle";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useProjectPermissions } from "@/hooks/use-permissions";
 import { isValidSecretKey } from "@/lib/dotenv";
@@ -166,7 +166,11 @@ function FolderRow({
   );
 
   return (
-    <div role="row" className="flex items-center gap-2 border-b px-4 py-2.5 last:border-b-0 hover:bg-muted/40" data-testid={`folder-row-${name}`}>
+    <div
+      role="row"
+      className="group/folder flex items-center gap-2 border-b px-4 py-2.5 last:border-b-0 hover:bg-muted/40"
+      data-testid={`folder-row-${name}`}
+    >
       <div role="cell" aria-colspan={2} className="flex min-w-0 flex-1 items-center gap-2">
         <Link to={href} className="-my-2.5 flex min-w-0 flex-1 items-center gap-2 py-2.5 font-mono text-sm" data-testid={`open-folder-${name}`}>
           <Folder className="size-4 shrink-0 fill-primary/20 text-primary" />
@@ -183,8 +187,13 @@ function FolderRow({
         {canDelete && count > 0 && (
           <Tooltip>
             <TooltipTrigger asChild>
-              {/* A disabled button gets no pointer events, so the wrapper carries the tooltip. */}
-              <span tabIndex={0} className="rounded-lg" data-testid={`delete-folder-blocked-${name}`}>
+              {/* A disabled button gets no pointer events, so the wrapper carries the tooltip. Shown on hover or
+                  focus only, so an unusable bin does not sit on every folder. */}
+              <span
+                tabIndex={0}
+                className="rounded-lg opacity-0 transition-opacity group-hover/folder:opacity-100 focus-visible:opacity-100"
+                data-testid={`delete-folder-blocked-${name}`}
+              >
                 {deleteButton(true)}
               </span>
             </TooltipTrigger>
@@ -361,10 +370,15 @@ function SecretsView() {
     if (!save.isPending) save.reset();
   };
 
-  useIdle(anyRevealed, () => {
+  const maskAll = () => {
     setRevealAll(false);
     setRevealed(new Set());
     setHiddenFromAll(new Set());
+  };
+  useOnPageHidden(revealAll || revealed.size > 0, maskAll);
+
+  useIdle(anyRevealed, () => {
+    maskAll();
     const closed = [
       editing !== null && `the editor for ${editing}`,
       adding !== null && "the new secret form",

@@ -174,7 +174,14 @@ test("does not offer to delete a folder that still has secrets, and says how man
   const row = page.getByTestId("folder-row-payments");
   await expect(row.getByTestId("folder-count-payments")).toHaveText(/^\d+ secrets?$/);
   await expect(row.getByTestId("delete-folder-payments")).toBeDisabled();
-  await row.getByTestId("delete-folder-blocked-payments").focus();
+  // The unusable bin stays out of sight until the row is pointed at or the bin is reached by keyboard.
+  const blocked = row.getByTestId("delete-folder-blocked-payments");
+  await expect(blocked).toHaveCSS("opacity", "0");
+  if (!isMobile(page)) {
+    await row.hover();
+    await expect(blocked).toHaveCSS("opacity", "1");
+  }
+  await blocked.focus();
   await expect(page.getByRole("tooltip")).toContainText("Delete them first to delete the folder.");
   await expect(page.getByRole("tooltip")).not.toContainText("move");
   // An empty folder shows no count and can be deleted.

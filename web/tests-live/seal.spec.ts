@@ -107,6 +107,11 @@ test("sets up a new server in the browser, then unlocks it after a restart and a
     await expect(page).toHaveURL(/\/unlock\?return_to=%2Fprojects$/);
     // The public status no longer says how the server unlocks, so the page does not either.
     await expect(page.getByTestId("unlock-card")).not.toContainText(/policy|remember/i);
+    // Opened after a restart, nobody was interrupted and nobody is known to be signed in.
+    await expect(page.getByTestId("unlock-description")).toHaveText(
+      "The server is locked, so secrets cannot be read until someone with the server passphrase unlocks it.",
+    );
+    await expect(page.getByTestId("unlock-sign-out")).toHaveCount(0);
     await page.getByTestId("unlock-passphrase").fill("not the passphrase");
     await page.getByTestId("unlock-submit").click();
     await expect(page.getByTestId("unlock-wrong")).toBeVisible({ timeout: 30_000 });

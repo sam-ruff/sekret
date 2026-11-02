@@ -68,8 +68,16 @@ test("a toast from before a drawer opened does not cover it, and drawer toasts k
 
 test("the project switcher reads as one name with the current project", async ({ page }) => {
   await page.goto("/projects/storefront/secrets/dev");
+  // The tab names the project too, so several open projects can be told apart.
+  await expect(page).toHaveTitle("Secrets · Storefront · sekret");
   if (isMobile(page)) await page.getByTestId("sidebar-trigger").click();
   await expect(page.getByTestId("project-switcher")).toHaveAccessibleName("Switch project, current: Storefront");
+  // The list marks the project you are in.
+  await page.getByTestId("project-switcher").click();
+  await expect(page.getByTestId("switcher-project-storefront")).toHaveAttribute("aria-current", "page");
+  await expect(page.getByTestId("switcher-project-storefront").getByTestId("switcher-current")).toBeVisible();
+  await expect(page.getByTestId("switcher-project-payments-api")).not.toHaveAttribute("aria-current", "page");
+  await expect(page.getByTestId("switcher-project-payments-api").getByTestId("switcher-current")).toHaveCount(0);
 });
 
 test("the sidebar becomes a sheet on narrow screens", async ({ page }) => {

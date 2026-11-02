@@ -59,6 +59,19 @@ For key-file mode, generate the key and add `Environment=SEKRET_ROOT_KEY_FILE=/e
 sudo -u sekret sh -c 'sekret admin generate-root-key > /etc/sekret/root.key && chmod 600 /etc/sekret/root.key'
 ```
 
+### Setting up with web setup off
+
+A server whose configuration is kept in code usually sets `setup.web: false`, so nobody who reaches it first can claim it. It then has no setup page or setup code; you set it up on the host instead, as the user the service runs as, so the database stays theirs:
+
+```sh
+sudo systemctl stop sekret
+sudo -u sekret sekret admin init --config /etc/sekret/sekret.yaml --unlock remember
+sudo systemctl start sekret
+sudo -u sekret sekret sys unseal --socket /run/sekret/sekret.sock
+```
+
+`admin init` asks for the passphrase twice and prints an admin token, valid for an hour, once. It needs the server stopped, since a running server holds the database lock. `--unlock` sets the unlock policy (`manual`, `remember` or `passphrase-file`); with `remember`, the first unlock afterwards writes the remember file, so later restarts unlock themselves. The server starts sealed, and the last line unlocks it through the [Unix socket](#unlocking-after-a-restart), which needs `server.unix_socket` set. Sign in through your OIDC provider, or use the admin token to grant someone a role first.
+
 ## Unlocking after a restart
 
 In passphrase mode with the default `manual` [unlock policy](unlocking.md), the server starts sealed after every restart, including a power cut. Unlock it on the web interface, which shows an unlock page while sealed, or from anywhere that can reach it:

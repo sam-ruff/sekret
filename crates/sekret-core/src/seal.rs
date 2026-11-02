@@ -14,7 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::{
     CryptoError, KEY_LEN, RootKey, constant_time_eq, fill_from_material, fill_random, fill_random_key, key_text, open,
-    seal,
+    random_chars, seal,
 };
 
 pub const MIN_PASSPHRASE_LEN: usize = 12;
@@ -780,21 +780,13 @@ pub fn verify_seal_config(root: &RootKey, binding: &SealBinding<'_>, mac: &[u8])
 
 /// A one-time code such as `ABCD-EFGH-JKMN`, shown in the log on an uninitialised server.
 pub fn generate_setup_code() -> Result<Zeroizing<String>, CryptoError> {
+    let chars = random_chars(SETUP_ALPHABET, SETUP_GROUPS * SETUP_GROUP_LEN)?;
     let mut code = Zeroizing::new(String::with_capacity(SETUP_GROUPS * (SETUP_GROUP_LEN + 1)));
-    let mut chars = 0;
-    // Rejection sampling keeps every character equally likely.
-    let limit = (256 / SETUP_ALPHABET.len() * SETUP_ALPHABET.len()) as u8;
-    while chars < SETUP_GROUPS * SETUP_GROUP_LEN {
-        let mut byte = [0u8; 1];
-        fill_random(&mut byte)?;
-        if byte[0] >= limit {
-            continue;
-        }
-        if chars > 0 && chars % SETUP_GROUP_LEN == 0 {
+    for (i, c) in chars.chars().enumerate() {
+        if i > 0 && i % SETUP_GROUP_LEN == 0 {
             code.push('-');
         }
-        code.push(char::from(SETUP_ALPHABET[usize::from(byte[0]) % SETUP_ALPHABET.len()]));
-        chars += 1;
+        code.push(c);
     }
     Ok(code)
 }

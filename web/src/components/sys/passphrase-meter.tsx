@@ -41,14 +41,15 @@ function MeterBody({ strength, testId }: { strength: PassphraseStrength | null; 
           <div key={label} className={cn("h-1.5 flex-1 rounded-full bg-muted", i < filled && barColour(strength))} />
         ))}
       </div>
-      <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="font-medium" data-testid={`${testId}-label`}>
-          {strengthLabel(strength.score)}
-        </span>
-        {strength.acceptable && (
-          <span className="flex items-center gap-1 text-success">
+      <div className="flex items-center gap-2 text-xs">
+        {strength.acceptable ? (
+          <span className="flex items-center gap-1 font-medium text-success" data-testid={`${testId}-label`}>
             <CheckCircle2 className="size-3.5" />
             Strong enough
+          </span>
+        ) : (
+          <span className="font-medium" data-testid={`${testId}-label`}>
+            {strengthLabel(strength.score)}
           </span>
         )}
       </div>

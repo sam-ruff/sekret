@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -10,6 +10,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { focusInstead } from "@/lib/return-focus";
+
+/** A select list or popover open within the dialog takes Escape for itself. */
+function popupOpenInside(): boolean {
+  return document.querySelector('[data-radix-popper-content-wrapper], [role="listbox"][data-state="open"]') !== null;
+}
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -45,6 +51,31 @@ export function ConfirmDialog({
   testId = "confirm-dialog",
 }: ConfirmDialogProps) {
   const [busy, setBusy] = useState(false);
+  // With no trigger, Radix has nowhere to return focus to, so it would land on the page body.
+  const opener = useRef<HTMLElement | null>(null);
+  const rememberOpener = () => {
+    opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  };
+  const returnFocus = (event: Event) => {
+    if (onCloseAutoFocus) onCloseAutoFocus(event);
+    else focusInstead(event, opener.current);
+    opener.current = null;
+  };
+
+  // Radix shows an Escape to every open layer, so a sheet under this dialog would close with it.
+  // Taking the key before Radix sees it closes only this dialog.
+  // A layout effect, so the key is taken from the moment the dialog shows.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || popupOpenInside()) return;
+      event.stopPropagation();
+      event.preventDefault();
+      if (!busy) onOpenChange(false);
+    };
+    window.addEventListener("keydown", onKey, { capture: true });
+    return () => window.removeEventListener("keydown", onKey, { capture: true });
+  }, [open, busy, onOpenChange]);
 
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
@@ -62,7 +93,7 @@ export function ConfirmDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
-      <AlertDialogContent data-testid={testId} onCloseAutoFocus={onCloseAutoFocus}>
+      <AlertDialogContent data-testid={testId} onOpenAutoFocus={rememberOpener} onCloseAutoFocus={returnFocus}>
         <form onSubmit={(event) => void confirm(event)} noValidate className="grid gap-4">
           <AlertDialogHeader>
             <AlertDialogTitle>{title}</AlertDialogTitle>

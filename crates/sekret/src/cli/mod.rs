@@ -73,8 +73,10 @@ pub struct LoginArgs {
     /// Log in with this pod's Kubernetes service account token.
     #[arg(long, conflicts_with = "client_id")]
     pub kubernetes: bool,
-    #[arg(long, default_value = login::DEFAULT_SA_TOKEN)]
-    pub kubernetes_token_file: PathBuf,
+    /// Projected service account token with the identity's audience, for --kubernetes. There is
+    /// no default: the pod's standard token works against the Kubernetes API and is never sent.
+    #[arg(long, requires = "kubernetes")]
+    pub kubernetes_token_file: Option<PathBuf>,
     /// Universal auth client id (the identity id).
     #[arg(long, env = "SEKRET_CLIENT_ID")]
     pub client_id: Option<String>,
@@ -156,12 +158,33 @@ pub enum SecretsCommand {
     },
 }
 
+impl SecretsCommand {
+    /// Whether it writes to the server rather than only reading.
+    pub fn changes(&self) -> bool {
+        match self {
+            SecretsCommand::List { .. } | SecretsCommand::Get { .. } | SecretsCommand::History { .. } => false,
+            SecretsCommand::Set { .. }
+            | SecretsCommand::Delete { .. }
+            | SecretsCommand::Rollback { .. }
+            | SecretsCommand::Generate { .. } => true,
+            SecretsCommand::Policy { inherit, policy, .. } => *inherit || !policy.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SnapshotsCommand {
     /// List snapshots of an environment.
     List,
     /// Restore a snapshot, limited to --path and below.
     Restore { id: String },
+}
+
+impl SnapshotsCommand {
+    /// Whether it writes to the server rather than only reading.
+    pub fn changes(&self) -> bool {
+        matches!(self, SnapshotsCommand::Restore { .. })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -216,7 +239,7 @@ pub struct PolicyFlags {
 }
 
 impl PolicyFlags {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         !self.off && self.rotate_days.is_none() && self.length.is_none() && self.charset.is_none()
     }
 
@@ -428,7 +451,12 @@ pub async fn machine_credential(
         }));
     }
     if args.kubernetes {
-        let token = read_trimmed(&args.kubernetes_token_file)?;
+        let path = args.kubernetes_token_file.as_deref().context(
+            "--kubernetes needs --kubernetes-token-file: project a service account token with the identity's \
+             audience, such as sekret, into the pod; the pod's standard token, which also works against the \
+             Kubernetes API, is never sent",
+        )?;
+        let token = read_trimmed(path)?;
         return Ok(Some(MachineCredential::Kubernetes {
             identity_id: identity()?,
             token,
@@ -929,10 +957,20 @@ pub fn ask_project_allow(
     Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// Refuses to load secrets from a project and environment only the project file chose, unless
-/// the person agrees at a terminal.
+/// What a command does at a project and environment the project file chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChoiceUse {
+    /// Reads secrets into a process or the output.
+    Load,
+    /// Writes secrets, policies or snapshots there.
+    Change,
+}
+
+/// Refuses to use a project and environment only the project file chose, unless the person
+/// agrees at a terminal.
 pub fn confirm_file_choice(
     scope: &config::ChoiceScope,
+    how: ChoiceUse,
     prompter: &dyn Prompter,
     interactive: bool,
 ) -> anyhow::Result<()> {
@@ -944,29 +982,90 @@ pub fn confirm_file_choice(
              or run this once at a terminal to confirm the file's choice"
         );
     }
-    let answer = prompter.line(&format!(
-        "{shown} asks to load secrets from:\n\n    {target}\n\nThe command you run, and anything it starts, will \
-         see them. Load from there now and whenever this file asks for it again? [y/N] "
-    ))?;
+    let question = match how {
+        ChoiceUse::Load => format!(
+            "{shown} asks to load secrets from:\n\n    {target}\n\nThe command you run, and anything it starts, \
+             will see them. Load from there now and whenever this file asks for it again? [y/N] "
+        ),
+        ChoiceUse::Change => format!(
+            "{shown} chooses where this command changes secrets:\n\n    {target}\n\nChange them there now, and \
+             use this place whenever this file chooses it again? [y/N] "
+        ),
+    };
+    let answer = prompter.line(&question)?;
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return Ok(());
     }
-    bail!("not loading secrets from {target}; pass --project and --env to choose")
+    match how {
+        ChoiceUse::Load => bail!("not loading secrets from {target}; pass --project and --env to choose"),
+        ChoiceUse::Change => bail!("not changing anything in {target}; pass --project and --env to choose"),
+    }
+}
+
+/// Asks about a project and environment only the project file chose, or names the file when it
+/// chose them and that was confirmed before. Returns the scope to remember after a yes.
+pub fn check_file_choice<'r>(
+    resolved: &'r Resolved,
+    how: ChoiceUse,
+    prompter: &dyn Prompter,
+    interactive: bool,
+    notes: &mut dyn Write,
+) -> anyhow::Result<Option<&'r config::ChoiceScope>> {
+    if let Some(scope) = &resolved.unconfirmed_choice {
+        confirm_file_choice(scope, how, prompter, interactive)?;
+        return Ok(Some(scope));
+    }
+    if let Some(note) = file_choice_note(resolved) {
+        writeln!(notes, "{note}")?;
+    }
+    Ok(None)
+}
+
+fn remember_choice(scope: &config::ChoiceScope) -> anyhow::Result<()> {
+    let path = config::credentials_path()?;
+    let mut credentials = read_credentials(&path)?;
+    credentials.confirm_choice(scope);
+    config::save_credentials(&path, &credentials)
+}
+
+fn terminal_session() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Before a command that may change something, confirms a project and environment the project
+/// file chose, saving the yes; a command that only reads names the file instead.
+pub fn confirm_target(resolved: &Resolved, changes: bool) -> anyhow::Result<()> {
+    let mut stderr = std::io::stderr();
+    if !changes {
+        if let Some(note) = file_choice_note(resolved) {
+            writeln!(stderr, "{note}")?;
+        }
+        return Ok(());
+    }
+    let confirmed = check_file_choice(
+        resolved,
+        ChoiceUse::Change,
+        &crate::prompt::Terminal,
+        terminal_session(),
+        &mut stderr,
+    )?;
+    confirmed.map_or(Ok(()), remember_choice)
 }
 
 /// Like [`load_policy`], first confirming a project and environment the project file chose and
 /// any unconfirmed `allow` list it has, and saving each yes beside the stored logins.
 pub fn load_policy_confirming(resolved: &Resolved, flags: &[String]) -> anyhow::Result<shell::LoadPolicy> {
     let mut stderr = std::io::stderr();
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&stderr);
-    if let Some(scope) = &resolved.unconfirmed_choice {
-        confirm_file_choice(scope, &crate::prompt::Terminal, interactive)?;
-        let path = config::credentials_path()?;
-        let mut credentials = read_credentials(&path)?;
-        credentials.confirm_choice(scope);
-        config::save_credentials(&path, &credentials)?;
-    } else if let Some(note) = file_choice_note(resolved) {
-        writeln!(stderr, "{note}")?;
+    let interactive = terminal_session();
+    let confirmed = check_file_choice(
+        resolved,
+        ChoiceUse::Load,
+        &crate::prompt::Terminal,
+        interactive,
+        &mut stderr,
+    )?;
+    if let Some(scope) = confirmed {
+        remember_choice(scope)?;
     }
     let Some((scope, names)) = &resolved.unconfirmed_allow else {
         return load_policy(resolved, flags);
@@ -1757,26 +1856,102 @@ mod tests {
             project: "payments".into(),
             environment: "prod\u{1b}[2J".into(),
         };
-        let refused = confirm_file_choice(&scope, &Answer("y"), false);
-        assert!(
-            refused.is_err_and(|e| {
-                let text = e.to_string();
-                text.contains("--project") && text.contains("payments/prod") && !text.contains('\u{1b}')
-            }),
-            "without a terminal the file's choice is refused, not asked"
-        );
-        assert!(confirm_file_choice(&scope, &Answer(""), true).is_err());
-        assert!(confirm_file_choice(&scope, &Answer("n"), true).is_err());
-        confirm_file_choice(&scope, &Answer("Yes"), true)?;
+        for how in [ChoiceUse::Load, ChoiceUse::Change] {
+            let refused = confirm_file_choice(&scope, how, &Answer("y"), false);
+            assert!(
+                refused.is_err_and(|e| {
+                    let text = e.to_string();
+                    text.contains("--project") && text.contains("payments/prod") && !text.contains('\u{1b}')
+                }),
+                "without a terminal the file's choice is refused, not asked"
+            );
+            assert!(confirm_file_choice(&scope, how, &Answer(""), true).is_err());
+            assert!(confirm_file_choice(&scope, how, &Answer("n"), true).is_err());
+            confirm_file_choice(&scope, how, &Answer("Yes"), true)?;
 
+            let recorded = Recorded(std::cell::RefCell::new(String::new()));
+            confirm_file_choice(&scope, how, &recorded, true)?;
+            let asked = recorded.0.into_inner();
+            assert!(
+                asked.contains("payments/prod")
+                    && asked.contains("https://s.test")
+                    && asked.contains("/repo/.sekret.toml"),
+                "{asked}"
+            );
+            assert!(!asked.contains('\u{1b}'), "{asked}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_at_a_place_only_the_project_file_chose_needs_a_yes() -> anyhow::Result<()> {
+        let mut resolved = resolved(config::ServerSource::Explicit);
+        resolved.project = Some("payments".into());
+        resolved.environment = Some("prod".into());
+        resolved.chosen_by_file = Some("/repo/.sekret.toml".into());
+        resolved.unconfirmed_choice = Some(config::ChoiceScope {
+            file: "/repo/.sekret.toml".into(),
+            server: "https://s.test".into(),
+            project: "payments".into(),
+            environment: "prod".into(),
+        });
+        let refused = check_file_choice(&resolved, ChoiceUse::Change, &Answer("y"), false, &mut Vec::new());
+        assert!(refused.is_err(), "a script cannot change a place only the file chose");
+        let declined = check_file_choice(&resolved, ChoiceUse::Change, &Answer("n"), true, &mut Vec::new());
+        assert!(declined.is_err_and(|e| e.to_string().contains("not changing anything")));
         let recorded = Recorded(std::cell::RefCell::new(String::new()));
-        confirm_file_choice(&scope, &recorded, true)?;
-        let asked = recorded.0.into_inner();
+        let confirmed = check_file_choice(&resolved, ChoiceUse::Change, &recorded, true, &mut Vec::new())?;
+        assert!(confirmed.is_some(), "the yes is remembered");
+        assert!(recorded.0.into_inner().contains("changes secrets"));
+
+        // Once confirmed, the file is still named so the person sees where the change goes.
+        resolved.unconfirmed_choice = None;
+        let mut notes = Vec::new();
+        let confirmed = check_file_choice(&resolved, ChoiceUse::Change, &Answer("n"), false, &mut notes)?;
+        assert!(confirmed.is_none());
+        let note = String::from_utf8(notes)?;
         assert!(
-            asked.contains("payments/prod") && asked.contains("https://s.test") && asked.contains("/repo/.sekret.toml"),
-            "{asked}"
+            note.contains("payments/prod") && note.contains("/repo/.sekret.toml"),
+            "{note}"
         );
-        assert!(!asked.contains('\u{1b}'), "{asked}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_commands_that_write_need_the_file_choice_confirmed() -> anyhow::Result<()> {
+        #[derive(Debug, clap::Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            secrets: SecretsCommand,
+        }
+        #[derive(Debug, clap::Parser)]
+        struct Snapshots {
+            #[command(subcommand)]
+            snapshots: SnapshotsCommand,
+        }
+        let changes = |argv: &[&str]| -> anyhow::Result<bool> {
+            let parsed = <Harness as clap::Parser>::try_parse_from(std::iter::once("t").chain(argv.iter().copied()))?;
+            Ok(parsed.secrets.changes())
+        };
+        for argv in [
+            &["set", "A=1"][..],
+            &["delete", "A"],
+            &["rollback", "A", "1"],
+            &["generate", "A"],
+            &["policy", "A", "--rotate-days", "30"],
+            &["policy", "A", "--inherit"],
+        ] {
+            assert!(changes(argv)?, "{argv:?}");
+        }
+        for argv in [&["list"][..], &["get", "A"], &["history", "A"], &["policy", "A"]] {
+            assert!(!changes(argv)?, "{argv:?}");
+        }
+        let snapshots = |argv: &[&str]| -> anyhow::Result<bool> {
+            let parsed = <Snapshots as clap::Parser>::try_parse_from(std::iter::once("t").chain(argv.iter().copied()))?;
+            Ok(parsed.snapshots.changes())
+        };
+        assert!(snapshots(&["restore", "id"])?);
+        assert!(!snapshots(&["list"])?);
         Ok(())
     }
 
@@ -1847,7 +2022,7 @@ mod tests {
             github_actions: false,
             audience: "sekret".into(),
             kubernetes: false,
-            kubernetes_token_file: token_file.clone(),
+            kubernetes_token_file: Some(token_file.clone()),
             client_id: None,
             client_secret_file: None,
             print_token: false,
@@ -1863,6 +2038,18 @@ mod tests {
         assert!(
             matches!(machine_credential(&k8s, &no_github).await.context("k8s")?, Some(MachineCredential::Kubernetes { token, .. }) if token == "jwt-from-file")
         );
+        // The pod's standard token is for the Kubernetes API, so it is never read by default.
+        let no_token_file = LoginArgs {
+            kubernetes: true,
+            kubernetes_token_file: None,
+            ..base.clone()
+        };
+        let error = machine_credential(&no_token_file, &no_github)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("--kubernetes-token-file"), "{error}");
 
         let oidc = LoginArgs {
             oidc_token_file: Some(token_file.clone()),

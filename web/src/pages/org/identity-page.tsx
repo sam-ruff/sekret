@@ -85,7 +85,7 @@ function DetailsTab({ identity, canEdit, canDelete }: { identity: Identity; canE
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>Settings</CardTitle>
+          <CardTitle>Details</CardTitle>
           <CardDescription>Created {formatDateTime(identity.created_at)}</CardDescription>
         </CardHeader>
         <CardContent>
@@ -221,7 +221,7 @@ export function IdentityPage() {
             tabs={[
               { value: "details", label: "Details", to: `/org/identities/${id}`, testId: "identity-tab-details" },
               { value: "auth", label: "Auth methods", to: `/org/identities/${id}/auth`, testId: "identity-tab-auth" },
-              { value: "usage", label: "Usage", to: `/org/identities/${id}/usage`, testId: "identity-tab-usage" },
+              { value: "usage", label: "Access and usage", to: `/org/identities/${id}/usage`, testId: "identity-tab-usage" },
             ]}
           />
           <ErrorBoundary variant="section" resetKey={current}>

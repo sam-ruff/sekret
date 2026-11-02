@@ -43,6 +43,11 @@ pub struct StoreArgs {
     /// remember or root key file. Admin commands read and raise it the way the server does.
     #[arg(long, env = "SEKRET_EPOCH_FILE")]
     pub epoch_file: Option<PathBuf>,
+    /// Go ahead even when another user can change or replace the configuration file, or a key,
+    /// passphrase, epoch or trust file it names, and only warn.
+    #[arg(long, env = "SEKRET_ALLOW_SHARED_CONFIG", num_args = 0..=1, default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new())]
+    pub allow_shared_config: Option<bool>,
 }
 
 pub const DATABASE_URL_ENV: &str = "SEKRET_DATABASE_URL";
@@ -182,8 +187,20 @@ impl StoreArgs {
             epoch_file: self.epoch_file.clone().or(file.seal.epoch_file),
             database_url: database.url,
         };
+        let shared = SharedFiles {
+            config: self.config.as_deref().and_then(config_writers),
+            others: replace_exposures(&[
+                ("root key file", location.root_key_file.as_deref()),
+                ("epoch file", location.epoch_file.as_deref()),
+                ("database URL file", database.file.as_deref()),
+            ]),
+        };
         let mut warnings = database.ignored;
-        warnings.extend(self.config.as_deref().and_then(config_writers));
+        warnings.extend(shared.check_as(
+            self.allow_shared_config,
+            file.server.allow_shared_config,
+            "refusing to run",
+        )?);
         warnings.extend(exposure_warnings(&[
             ("root key file", location.root_key_file.as_deref()),
             ("remember file", location.remember_file.as_deref()),
@@ -276,11 +293,6 @@ pub struct ServerArgs {
     #[arg(long, env = "SEKRET_ALLOW_INSECURE_HTTP", num_args = 0..=1, default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new())]
     pub allow_insecure_http: Option<bool>,
-    /// Start even when another user can change or replace the configuration file, or a key,
-    /// passphrase or trust file it names, and only warn.
-    #[arg(long, env = "SEKRET_ALLOW_SHARED_CONFIG", num_args = 0..=1, default_missing_value = "true",
-        value_parser = clap::builder::BoolishValueParser::new())]
-    pub allow_shared_config: Option<bool>,
     /// [default: 200]
     #[arg(long, env = "SEKRET_SNAPSHOTS_TO_KEEP")]
     pub snapshots_to_keep: Option<i64>,
@@ -435,7 +447,8 @@ pub struct SetupSection {
     pub code_file: Option<PathBuf>,
 }
 
-/// Hides the password in anything that looks like `scheme://user:password@host`.
+/// Hides the password in anything that looks like `scheme://user:password@host` or carries a
+/// `password=` query parameter.
 pub fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -443,25 +456,53 @@ pub fn redact_credentials(text: &str) -> String {
         let (before, after) = rest.split_at(start + 3);
         out.push_str(before);
         let end = after
-            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '`'))
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
             .unwrap_or(after.len());
-        let authority = &after[..end];
-        match authority.rfind('@') {
-            Some(at) => {
-                let userinfo = &authority[..at];
-                let user = userinfo.split(':').next().unwrap_or_default();
-                out.push_str(user);
-                if userinfo.contains(':') {
-                    out.push_str(":***");
-                }
-                out.push_str(&authority[at..]);
-            }
-            None => out.push_str(authority),
-        }
+        out.push_str(&redact_query(&redact_userinfo(&after[..end])));
         rest = &after[end..];
     }
     out.push_str(rest);
     out
+}
+
+/// `url` is what follows `scheme://`.
+fn redact_userinfo(url: &str) -> String {
+    let authority_end = url.find('/').unwrap_or(url.len());
+    let Some(at) = url[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &url[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    format!("{}:***{}", &userinfo[..colon], &url[at..])
+}
+
+/// Masks every query parameter whose decoded name is `password`, in any case, as sqlx reads it.
+/// The value runs to the next `&`, so a stray `#` in it is hidden too.
+fn redact_query(url: &str) -> String {
+    let Some(question) = url.find('?') else {
+        return url.to_string();
+    };
+    let (path, query) = url.split_at(question + 1);
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let Some((name, _)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            let decoded = url::form_urlencoded::parse(name.as_bytes())
+                .next()
+                .map(|(name, _)| name.into_owned())
+                .unwrap_or_default();
+            if decoded.eq_ignore_ascii_case("password") {
+                format!("{name}=***")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    format!("{path}{}", pairs.join("&"))
 }
 
 pub fn parse(text: &str) -> anyhow::Result<FileConfig> {
@@ -866,10 +907,55 @@ pub struct DirFacts {
     pub mode: u32,
 }
 
-/// Why users other than `uid` (with primary group `gid`) could replace a file in `dir`. A sticky
-/// directory, such as a Kubernetes secret mount, only lets each owner replace their own entries.
-pub fn replaceable_in(dir: DirFacts, uid: u32, gid: u32) -> Option<&'static str> {
-    if dir.uid != uid && dir.uid != 0 {
+/// The user sekret runs as, and whether its primary group holds no one else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Account {
+    pub uid: u32,
+    pub gid: u32,
+    /// Nobody else is listed in the primary group or has it as their own.
+    pub private_group: bool,
+}
+
+impl Account {
+    /// The effective user and group. A group that cannot be looked up counts as shared.
+    #[cfg(unix)]
+    pub fn current() -> Self {
+        // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let private_group = match (
+            std::fs::read_to_string("/etc/group"),
+            std::fs::read_to_string("/etc/passwd"),
+        ) {
+            (Ok(group), Ok(passwd)) => group_holds_only(&group, &passwd, gid, uid),
+            _ => false,
+        };
+        Self {
+            uid,
+            gid,
+            private_group,
+        }
+    }
+
+    /// Whether a group's write access is only this user's.
+    fn group_is_private(self, gid: u32) -> bool {
+        self.private_group && gid == self.gid
+    }
+}
+
+/// Whether group `gid` is listed in `/etc/group` and holds nobody but `uid`, from the text of
+/// `/etc/group` and `/etc/passwd`. A group with the user's id can still hold others.
+pub fn group_holds_only(group: &str, passwd: &str, gid: u32, uid: u32) -> bool {
+    let gid_text = gid.to_string();
+    let listed = group
+        .lines()
+        .any(|line| line.split(':').nth(2) == Some(gid_text.as_str()));
+    listed && sekret_server::host_socket::other_group_members(group, passwd, gid, uid).is_empty()
+}
+
+/// Why users other than `me` could replace a file in `dir`. A sticky directory, such as a
+/// Kubernetes secret mount, only lets each owner replace their own entries.
+pub fn replaceable_in(dir: DirFacts, me: Account) -> Option<&'static str> {
+    if dir.uid != me.uid && dir.uid != 0 {
         return Some("its directory belongs to another user, who can replace it");
     }
     if dir.mode & 0o1000 != 0 {
@@ -878,31 +964,25 @@ pub fn replaceable_in(dir: DirFacts, uid: u32, gid: u32) -> Option<&'static str>
     if dir.mode & 0o002 != 0 {
         return Some("its directory is writable by every user, so anyone can replace it");
     }
-    // With user private groups the group holds only this user.
-    let private_group = dir.gid == gid && gid == uid;
-    if dir.mode & 0o020 != 0 && !private_group {
+    if dir.mode & 0o020 != 0 && !me.group_is_private(dir.gid) {
         return Some("its directory is writable by its group, whose members can replace it");
     }
     None
 }
 
-/// Why users other than `uid` could swap a directory above a file, and so the file with it. A
-/// sticky directory is only safe when the entry the path goes through is `uid`'s or root's.
-pub fn ancestor_replaceable(
-    ancestor: &sekret_server::host_socket::Ancestor,
-    uid: u32,
-    gid: u32,
-) -> Option<&'static str> {
+/// Why users other than `me` could swap a directory above a file, and so the file with it. A
+/// sticky directory is only safe when the entry the path goes through is `me`'s or root's.
+pub fn ancestor_replaceable(ancestor: &sekret_server::host_socket::Ancestor, me: Account) -> Option<&'static str> {
     let facts = DirFacts {
         uid: ancestor.dir_uid,
         gid: ancestor.dir_gid,
         mode: ancestor.dir_mode,
     };
-    if let Some(why) = replaceable_in(facts, uid, gid) {
+    if let Some(why) = replaceable_in(facts, me) {
         return Some(why);
     }
     let shared = ancestor.dir_mode & 0o022 != 0;
-    if shared && ancestor.entry_uid != uid && ancestor.entry_uid != 0 {
+    if shared && ancestor.entry_uid != me.uid && ancestor.entry_uid != 0 {
         return Some("it is shared, and the entry in it belongs to another user, who can replace it");
     }
     None
@@ -920,8 +1000,7 @@ fn directory_exposure(path: &Path) -> Option<String> {
     if let Ok(target) = std::fs::canonicalize(path) {
         dirs.push(parent(&target));
     }
-    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let me = Account::current();
     let immediate = dirs.iter().find_map(|dir| {
         let meta = std::fs::metadata(dir).ok()?;
         let facts = DirFacts {
@@ -929,7 +1008,7 @@ fn directory_exposure(path: &Path) -> Option<String> {
             gid: meta.gid(),
             mode: meta.mode(),
         };
-        replaceable_in(facts, uid, gid).map(|why| format!("{} is in {}, and {why}", path.display(), dir.display()))
+        replaceable_in(facts, me).map(|why| format!("{} is in {}, and {why}", path.display(), dir.display()))
     });
     if immediate.is_some() {
         return immediate;
@@ -939,7 +1018,7 @@ fn directory_exposure(path: &Path) -> Option<String> {
         .filter_map(|dir| sekret_server::host_socket::ancestors(dir).ok())
         .flatten()
         .find_map(|ancestor| {
-            ancestor_replaceable(&ancestor, uid, gid)
+            ancestor_replaceable(&ancestor, me)
                 .map(|why| format!("{} is below {}, and {why}", path.display(), ancestor.dir.display()))
         })
 }
@@ -954,27 +1033,34 @@ fn directory_exposure(_path: &Path) -> Option<String> {
 /// not exist yet is made by the server, so its nearest existing ancestor is checked instead.
 #[cfg(unix)]
 fn check_staging_dir(dir: &Path) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("finding the working directory for backup.temp_dir")?;
+    check_staging_dir_from(dir, &cwd)
+}
+
+/// [`check_staging_dir`] with a relative `dir` taken from `cwd`, so its last ancestor is the
+/// working directory rather than an empty path that cannot be checked.
+#[cfg(unix)]
+fn check_staging_dir_from(dir: &Path, cwd: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let Some((existing, meta)) = dir
+    let absolute = cwd.join(dir);
+    let Some((existing, meta)) = absolute
         .ancestors()
-        .filter(|p| !p.as_os_str().is_empty())
         .find_map(|p| std::fs::metadata(p).ok().map(|m| (p, m)))
     else {
         return Ok(());
     };
-    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let me = Account::current();
     let facts = DirFacts {
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode(),
     };
-    let own = replaceable_in(facts, uid, gid).map(|why| format!("{}: {why}", existing.display()));
+    let own = replaceable_in(facts, me).map(|why| format!("{}: {why}", existing.display()));
     let above = || {
         sekret_server::host_socket::ancestors(existing)
             .ok()?
             .into_iter()
-            .find_map(|a| ancestor_replaceable(&a, uid, gid).map(|why| format!("{}: {why}", a.dir.display())))
+            .find_map(|a| ancestor_replaceable(&a, me).map(|why| format!("{}: {why}", a.dir.display())))
     };
     let Some(why) = own.or_else(above) else {
         return Ok(());
@@ -1170,7 +1256,11 @@ pub fn resolve_with(
     let insecure_in_file = server.allow_insecure_http.is_some();
     let allow_insecure_http = args.allow_insecure_http.or(server.allow_insecure_http).unwrap_or(false);
     let shared_in_file = server.allow_shared_config.is_some();
-    let allow_shared_config = args.allow_shared_config.or(server.allow_shared_config).unwrap_or(false);
+    let allow_shared_config = args
+        .store
+        .allow_shared_config
+        .or(server.allow_shared_config)
+        .unwrap_or(false);
     let role_in_file = auth.default_org_role.is_some();
     let default_org_role = args
         .default_org_role
@@ -1424,13 +1514,12 @@ pub fn resolve_with(
         shown(&args.tls_client_ca_file.clone().or(tls_file.client_ca_file.clone())),
         tls_file.client_ca_file.is_some(),
     );
-    notes.note(
+    let client_auth = args.tls_client_auth.or(tls_file.client_auth);
+    let client_auth_origin = notes.note(
         "tls.client_auth",
         "tls-client-auth",
         "SEKRET_TLS_CLIENT_AUTH",
-        args.tls_client_auth
-            .or(tls_file.client_auth)
-            .map(|a| format!("{a:?}").to_lowercase()),
+        client_auth.map(|a| format!("{a:?}").to_lowercase()),
         tls_file.client_auth.is_some(),
     );
     notes.note(
@@ -1639,6 +1728,9 @@ pub fn resolve_with(
     if let Some(warning) = unlock_from_env_warning(unlock, unlock_origin) {
         warnings.push(warning);
     }
+    if let Some(warning) = client_auth_from_env_warning(client_auth, client_auth_origin, !client_auth_without_ca) {
+        warnings.push(warning);
+    }
     if let Some(warning) = database_flag_warning(&database_choice) {
         warnings.push(warning);
     }
@@ -1654,9 +1746,10 @@ pub fn resolve_with(
             ("TLS key file", tls_key_file.as_deref()),
             ("TLS client CA file", client_ca_file.as_deref()),
             ("database URL file", database_choice.file.as_deref()),
+            ("epoch file", epoch_file.as_deref()),
         ]),
     };
-    warnings.extend(shared.check(args.allow_shared_config, server.allow_shared_config)?);
+    warnings.extend(shared.check(args.store.allow_shared_config, server.allow_shared_config)?);
     if let Some(warning) = default_role_warning(&default_org_role) {
         warnings.push(warning);
     }
@@ -1900,6 +1993,19 @@ fn unlock_from_env_warning(unlock: Option<UnlockPolicy>, origin: Origin) -> Opti
     ))
 }
 
+/// Mutual TLS made optional by the environment rather than chosen in the configuration file or
+/// on the command line. Without a client CA there is nothing to weaken, and another warning says so.
+fn client_auth_from_env_warning(client_auth: Option<ClientAuth>, origin: Origin, has_ca: bool) -> Option<String> {
+    if origin != Origin::Env || client_auth != Some(ClientAuth::Optional) || !has_ca {
+        return None;
+    }
+    Some(
+        "tls.client_auth is optional because SEKRET_TLS_CLIENT_AUTH in the environment says so; clients without a \
+         certificate are accepted although a client CA is set"
+            .into(),
+    )
+}
+
 /// A password in `--database-url` stays in the process list, which every local user can read,
 /// for as long as the server runs.
 fn database_flag_warning(choice: &DatabaseChoice) -> Option<String> {
@@ -1915,37 +2021,40 @@ fn database_flag_warning(choice: &DatabaseChoice) -> Option<String> {
 
 /// Why someone other than the server's user or root could change a file: it belongs to another
 /// user, or its mode lets its group or everyone write to it.
-pub fn writable_by_others(file: DirFacts, uid: u32, gid: u32) -> Option<&'static str> {
-    if file.uid != uid && file.uid != 0 {
+pub fn writable_by_others(file: DirFacts, me: Account) -> Option<&'static str> {
+    if file.uid != me.uid && file.uid != 0 {
         return Some("belongs to another user");
     }
     if file.mode & 0o002 != 0 {
         return Some("can be written by every user");
     }
-    let private_group = file.gid == gid && gid == uid;
-    if file.mode & 0o020 != 0 && !private_group {
+    if file.mode & 0o020 != 0 && !me.group_is_private(file.gid) {
         return Some("can be written by its group");
     }
     None
 }
 
-/// Why another user, other than root, could change or replace `path`.
+/// Why another user, other than root, could change or replace `path`. A file that does not exist
+/// yet, such as an epoch mark or a key an admin command is about to write, is judged by its
+/// directory, since whoever can write there could plant it.
 #[cfg(unix)]
 fn replace_exposure(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return directory_exposure(path),
+        Err(_) => return None,
+    };
     // Devices and FIFOs are refused when read, with a clearer reason.
     if !meta.is_file() {
         return None;
     }
-    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let facts = DirFacts {
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode(),
     };
-    writable_by_others(facts, uid, gid)
+    writable_by_others(facts, Account::current())
         .map(|why| format!("{} {why}", path.display()))
         .or_else(|| directory_exposure(path))
 }
@@ -1988,6 +2097,11 @@ impl SharedFiles {
     /// for those that were allowed. A `true` in the configuration file covers the other files but
     /// not the file itself, since whoever can change the file could have written it.
     fn check(self, from_args: Option<bool>, from_file: Option<bool>) -> anyhow::Result<Vec<String>> {
+        self.check_as(from_args, from_file, "refusing to start")
+    }
+
+    /// [`SharedFiles::check`], with the refusal worded for whoever runs it.
+    fn check_as(self, from_args: Option<bool>, from_file: Option<bool>, refusing: &str) -> anyhow::Result<Vec<String>> {
         let files_allowed = from_args.or(from_file).unwrap_or(false);
         let config_allowed = from_args.unwrap_or(false);
         let mut refused = Vec::new();
@@ -2016,8 +2130,8 @@ impl SharedFiles {
             ""
         };
         bail!(
-            "refusing to start: {}. Make these files and their directories writable only by sekret's user or \
-             root, or pass --allow-shared-config (SEKRET_ALLOW_SHARED_CONFIG) to start anyway{hint}",
+            "{refusing}: {}. Make these files and their directories writable only by sekret's user or root, or \
+             pass --allow-shared-config (SEKRET_ALLOW_SHARED_CONFIG) to go ahead anyway{hint}",
             refused.join("; ")
         )
     }
@@ -2123,6 +2237,49 @@ mod tests {
             "at postgres://u:***@h:5432/db and https://h/x"
         );
         assert_eq!(redact_credentials("sqlite://a.db"), "sqlite://a.db");
+    }
+
+    #[test]
+    fn database_passwords_in_query_parameters_are_hidden() {
+        let cases = [
+            (
+                "postgres://sekret@db/sekret?password=hunter2",
+                "postgres://sekret@db/sekret?password=***",
+            ),
+            (
+                "postgres://db/s?sslmode=require&PassWord=hunter2&application_name=x",
+                "postgres://db/s?sslmode=require&PassWord=***&application_name=x",
+            ),
+            ("postgres://db/s?pass%77ord=hunter2", "postgres://db/s?pass%77ord=***"),
+            ("postgres://db?password=hunter2@x", "postgres://db?password=***"),
+            (
+                "postgres://u:hunter2@db/s?password=hunter2#f",
+                "postgres://u:***@db/s?password=***",
+            ),
+            ("sqlite://sekret.db?mode=rwc", "sqlite://sekret.db?mode=rwc"),
+        ];
+        for (url, shown) in cases {
+            let redacted = redact_credentials(&format!("value={url} from=\"flag\""));
+            assert_eq!(redacted, format!("value={shown} from=\"flag\""));
+            assert!(!redacted.contains("hunter2"), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn the_database_url_report_line_hides_a_query_password() -> anyhow::Result<()> {
+        let flags = [
+            "--public-url",
+            "https://s.example.com",
+            "--database-url",
+            "postgres://sekret@db/sekret?password=hunter2",
+            "--epoch-file",
+            "/nonexistent-sekret-dir/seal.epoch",
+        ];
+        let resolved = resolve(&args(&flags)?, FileConfig::default())?;
+        let shown = format!("{:?}", resolved.report);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("password=***"), "{shown}");
+        Ok(())
     }
 
     #[test]
@@ -2604,19 +2761,62 @@ mod tests {
     #[test]
     fn files_others_can_write_are_recognised() {
         let file = |uid, gid, mode| DirFacts { uid, gid, mode };
-        assert_eq!(writable_by_others(file(990, 990, 0o100600), 990, 990), None);
-        assert_eq!(writable_by_others(file(0, 0, 0o100644), 990, 990), None, "root's file");
+        let me = account(990, 990, true);
+        assert_eq!(writable_by_others(file(990, 990, 0o100600), me), None);
+        assert_eq!(writable_by_others(file(0, 0, 0o100644), me), None, "root's file");
         assert_eq!(
-            writable_by_others(file(990, 990, 0o100664), 990, 990),
+            writable_by_others(file(990, 990, 0o100664), me),
             None,
             "a user private group"
         );
         assert!(
-            writable_by_others(file(990, 50, 0o100664), 990, 990).is_some(),
+            writable_by_others(file(990, 990, 0o100664), account(990, 990, false)).is_some(),
+            "a group with the user's id that holds someone else"
+        );
+        assert!(
+            writable_by_others(file(990, 50, 0o100664), me).is_some(),
             "a shared group"
         );
-        assert!(writable_by_others(file(990, 990, 0o100666), 990, 990).is_some());
-        assert!(writable_by_others(file(2000, 2000, 0o100600), 990, 990).is_some());
+        assert!(writable_by_others(file(990, 990, 0o100666), me).is_some());
+        assert!(writable_by_others(file(2000, 2000, 0o100600), me).is_some());
+    }
+
+    fn account(uid: u32, gid: u32, private_group: bool) -> Account {
+        Account {
+            uid,
+            gid,
+            private_group,
+        }
+    }
+
+    #[test]
+    fn a_group_is_private_only_when_it_holds_nobody_else() {
+        const PASSWD: &str = "root:x:0:0::/root:/bin/sh\n\
+                              sekret:x:990:990::/var/lib/sekret:/usr/sbin/nologin\n\
+                              alice:x:1000:990::/home/alice:/bin/bash\n\
+                              bob:x:1001:1001::/home/bob:/bin/bash\n";
+        assert!(group_holds_only(
+            "sekret:x:990:\n",
+            "sekret:x:990:990::/:/bin/sh\n",
+            990,
+            990
+        ));
+        assert!(
+            group_holds_only("sekret:x:990:sekret\n", "sekret:x:990:990::/:/bin/sh\n", 990, 990),
+            "listing the server's own user is fine"
+        );
+        assert!(
+            !group_holds_only("sekret:x:990:mallory\n", "sekret:x:990:990::/:/bin/sh\n", 990, 990),
+            "another listed member"
+        );
+        assert!(
+            !group_holds_only("sekret:x:990:\n", PASSWD, 990, 990),
+            "another user whose primary group it is"
+        );
+        assert!(
+            !group_holds_only("other:x:5:\n", "sekret:x:990:990::/:/bin/sh\n", 990, 990),
+            "a group that cannot be looked up"
+        );
     }
 
     #[cfg(unix)]
@@ -2958,6 +3158,18 @@ mod tests {
             root_key_file: None,
             remember_file: None,
             epoch_file: None,
+            allow_shared_config: None,
+        };
+        let refused = store.locate_checked(&Sources::none()).err().map(|e| e.to_string());
+        let refused = refused.unwrap_or_default();
+        assert!(
+            refused.contains("refusing to run") && refused.contains("decides who signs in"),
+            "a shared configuration file stops admin commands as it stops the server: {refused}"
+        );
+        assert!(!refused.contains("Hunter2Secret"), "{refused}");
+        let store = StoreArgs {
+            allow_shared_config: Some(true),
+            ..store
         };
         let (_, warnings) = store.locate_checked(&Sources::none())?;
         let text = warnings.join("\n");
@@ -2993,6 +3205,7 @@ mod tests {
             root_key_file: None,
             remember_file: None,
             epoch_file: None,
+            allow_shared_config: None,
         };
         let located = store.locate(&Sources::none())?;
         assert_eq!(located.database_url, "sqlite://x.db");
@@ -3152,29 +3365,31 @@ mod tests {
     #[test]
     fn directories_others_can_write_to_let_them_replace_files() {
         let dir = |uid, gid, mode| DirFacts { uid, gid, mode };
-        assert_eq!(replaceable_in(dir(1000, 1000, 0o40700), 1000, 1000), None);
-        assert_eq!(replaceable_in(dir(0, 0, 0o40755), 1000, 1000), None, "root's /etc");
+        let me = account(1000, 1000, true);
+        assert_eq!(replaceable_in(dir(1000, 1000, 0o40700), me), None);
+        assert_eq!(replaceable_in(dir(0, 0, 0o40755), me), None, "root's /etc");
         assert_eq!(
-            replaceable_in(dir(1000, 1000, 0o40775), 1000, 1000),
+            replaceable_in(dir(1000, 1000, 0o40775), me),
             None,
             "a user private group"
         );
+        assert!(
+            replaceable_in(dir(0, 1000, 0o40775), account(1000, 1000, false)).is_some(),
+            "root's /etc/sekret writable by a group with the user's id that holds someone else"
+        );
         assert_eq!(
-            replaceable_in(dir(0, 0, 0o41777), 1000, 1000),
+            replaceable_in(dir(0, 0, 0o41777), me),
             None,
             "sticky, like a Kubernetes secret mount"
         );
+        assert!(replaceable_in(dir(1000, 50, 0o40775), me).is_some(), "a shared group");
         assert!(
-            replaceable_in(dir(1000, 50, 0o40775), 1000, 1000).is_some(),
-            "a shared group"
-        );
-        assert!(
-            replaceable_in(dir(0, 50, 0o40770), 1000, 50).is_some(),
+            replaceable_in(dir(0, 50, 0o40770), account(1000, 50, false)).is_some(),
             "my shared group"
         );
-        assert!(replaceable_in(dir(1000, 1000, 0o40777), 1000, 1000).is_some());
+        assert!(replaceable_in(dir(1000, 1000, 0o40777), me).is_some());
         assert!(
-            replaceable_in(dir(2000, 2000, 0o41700), 1000, 1000).is_some(),
+            replaceable_in(dir(2000, 2000, 0o41700), me).is_some(),
             "another user's directory, sticky or not"
         );
     }
@@ -3214,24 +3429,29 @@ mod tests {
             dir_mode,
             entry_uid,
         };
-        assert_eq!(ancestor_replaceable(&above(0, 0, 0o40755, 0), 1000, 1000), None);
+        let me = account(1000, 1000, true);
+        assert_eq!(ancestor_replaceable(&above(0, 0, 0o40755, 0), me), None);
         assert_eq!(
-            ancestor_replaceable(&above(1000, 1000, 0o40775, 1000), 1000, 1000),
+            ancestor_replaceable(&above(1000, 1000, 0o40775, 1000), me),
             None,
             "a user private group"
         );
+        assert!(
+            ancestor_replaceable(&above(1000, 1000, 0o40775, 1000), account(1000, 1000, false)).is_some(),
+            "a group with the user's id that holds someone else"
+        );
         assert_eq!(
-            ancestor_replaceable(&above(0, 0, 0o41777, 1000), 1000, 1000),
+            ancestor_replaceable(&above(0, 0, 0o41777, 1000), me),
             None,
             "sticky, with my entry"
         );
         assert!(
-            ancestor_replaceable(&above(0, 0, 0o41777, 2000), 1000, 1000).is_some(),
+            ancestor_replaceable(&above(0, 0, 0o41777, 2000), me).is_some(),
             "sticky, with someone else's entry"
         );
-        assert!(ancestor_replaceable(&above(0, 0, 0o40777, 1000), 1000, 1000).is_some());
-        assert!(ancestor_replaceable(&above(0, 50, 0o40775, 0), 1000, 1000).is_some());
-        assert!(ancestor_replaceable(&above(2000, 2000, 0o40755, 1000), 1000, 1000).is_some());
+        assert!(ancestor_replaceable(&above(0, 0, 0o40777, 1000), me).is_some());
+        assert!(ancestor_replaceable(&above(0, 50, 0o40775, 0), me).is_some());
+        assert!(ancestor_replaceable(&above(2000, 2000, 0o40755, 1000), me).is_some());
     }
 
     #[test]
@@ -3287,6 +3507,111 @@ mod tests {
         assert_eq!(replace_exposures(&[("root key file", Some(&key))]).len(), 1);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod dir")?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_epoch_file_others_can_plant_or_change_is_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).context("mkdir")?;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let planted = open.join("seal.epoch").display().to_string();
+        let flags = ["--public-url", "https://x", "--epoch-file", planted.as_str()];
+        let refused = resolve(&args(&flags)?, FileConfig::default());
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("the epoch file")),
+            "a missing mark is judged by its directory"
+        );
+        let yaml = parse(&format!("seal:\n  epoch_file: {planted}\n"))?;
+        assert!(resolve(&args(&["--public-url", "https://x"])?, yaml).is_err());
+        let allowed = resolve(
+            &args(&[
+                "--public-url",
+                "https://x",
+                "--epoch-file",
+                &planted,
+                "--allow-shared-config",
+            ])?,
+            FileConfig::default(),
+        )?;
+        assert!(allowed.report.warnings.iter().any(|w| w.contains("the epoch file")));
+
+        let mark = dir.path().join("private.epoch");
+        std::fs::write(&mark, "sekret-seal-epoch 0\n").context("write")?;
+        let private = mark.display().to_string();
+        let flags = ["--public-url", "https://x", "--epoch-file", private.as_str()];
+        std::fs::set_permissions(&mark, std::fs::Permissions::from_mode(0o602)).context("chmod")?;
+        let refused = resolve(&args(&flags)?, FileConfig::default());
+        assert!(refused.is_err_and(|e| e.to_string().contains("can be written by every user")));
+        std::fs::set_permissions(&mark, std::fs::Permissions::from_mode(0o600)).context("chmod")?;
+        resolve(&args(&flags)?, FileConfig::default())?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_commands_refuse_an_epoch_or_key_file_others_can_plant() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).context("mkdir")?;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let store = |root_key_file: Option<PathBuf>, epoch_file: Option<PathBuf>, allow: Option<bool>| StoreArgs {
+            config: None,
+            database_url: Some("sqlite://x.db".into()),
+            database_url_file: None,
+            root_key_file,
+            remember_file: None,
+            epoch_file,
+            allow_shared_config: allow,
+        };
+        for (key, epoch, what) in [
+            (Some(open.join("new.key")), None, "the root key file"),
+            (None, Some(open.join("seal.epoch")), "the epoch file"),
+        ] {
+            let refused = store(key.clone(), epoch.clone(), None).locate_checked(&Sources::none());
+            assert!(
+                refused.is_err_and(|e| e.to_string().contains("refusing to run") && e.to_string().contains(what)),
+                "{what}"
+            );
+            assert!(
+                store(key.clone(), epoch.clone(), Some(false))
+                    .locate_checked(&Sources::none())
+                    .is_err()
+            );
+            let (_, warnings) = store(key, epoch, Some(true)).locate_checked(&Sources::none())?;
+            assert!(warnings.iter().any(|w| w.contains(what)), "{warnings:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_staging_dir_is_checked_from_the_working_directory() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().context("dir")?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        check_staging_dir_from(Path::new("staging"), dir.path())?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).context("chmod")?;
+        let refused = check_staging_dir_from(Path::new("staging"), dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).context("chmod")?;
+        assert!(refused.is_err_and(|e| e.to_string().contains("not safe")));
+        Ok(())
+    }
+
+    #[test]
+    fn optional_client_auth_from_the_environment_is_warned_about() {
+        let optional = Some(ClientAuth::Optional);
+        assert!(client_auth_from_env_warning(optional, Origin::Env, true).is_some());
+        assert!(client_auth_from_env_warning(optional, Origin::File, true).is_none());
+        assert!(client_auth_from_env_warning(optional, Origin::Flag, true).is_none());
+        assert!(client_auth_from_env_warning(Some(ClientAuth::Required), Origin::Env, true).is_none());
+        assert!(
+            client_auth_from_env_warning(optional, Origin::Env, false).is_none(),
+            "without a client CA another warning covers it"
+        );
     }
 
     #[cfg(unix)]

@@ -2,6 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, onSealResponse, redirectToLogin, unwrap } from "@/api/client";
 import { keys } from "@/hooks/queries";
+import { dismissNotClearedNotice, hasNotClearedNotice } from "./clipboard";
 import { browserNavigation, isLeaving, stopLeaving } from "./leaving";
 import { signOut } from "./session";
 
@@ -47,7 +48,7 @@ describe("signOut", () => {
     // Queries still in flight come back with the session already gone, or the server sealed.
     await hitExpiredSession();
     await hitSealedServer();
-    redirectToLogin();
+    void redirectToLogin();
     logout.resolve({ logout_url: IDP_LOGOUT });
     await done;
 
@@ -81,6 +82,25 @@ describe("signOut", () => {
     expect(isLeaving()).toBe(false);
   });
 
+  it("clears a copied secret before leaving and leaves a notice when it could not", async () => {
+    const order: string[] = [];
+    const assign = vi.fn(() => order.push("assign"));
+    const clearClipboard = vi.fn(() => {
+      order.push("clear");
+      return Promise.resolve("unverifiable" as const);
+    });
+    await signOut(new QueryClient(), { logout: () => Promise.resolve({ logout_url: null }), assign, clearClipboard });
+    expect(order).toEqual(["clear", "assign"]);
+    expect(hasNotClearedNotice()).toBe(true);
+    dismissNotClearedNotice();
+  });
+
+  it("leaves no notice when the clipboard was cleared", async () => {
+    const clearClipboard = () => Promise.resolve("cleared" as const);
+    await signOut(new QueryClient(), { logout: () => Promise.resolve({ logout_url: null }), assign: vi.fn(), clearClipboard });
+    expect(hasNotClearedNotice()).toBe(false);
+  });
+
   it("does not start a second sign-out while one is under way", async () => {
     const logout = vi.fn(() => new Promise<{ logout_url: null }>(() => undefined));
     void signOut(new QueryClient(), { logout, assign: vi.fn() });
@@ -90,12 +110,16 @@ describe("signOut", () => {
 });
 
 describe("redirectToLogin", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    stopLeaving();
+    vi.restoreAllMocks();
+  });
 
-  it("sends the browser to sign in, keeping where it was", () => {
+  it("sends the browser to sign in once, keeping where it was", async () => {
     const assign = vi.spyOn(browserNavigation, "assign").mockImplementation(() => undefined);
     window.history.replaceState(null, "", "/projects/app?x=1");
-    redirectToLogin();
+    await Promise.all([redirectToLogin(), redirectToLogin()]);
+    expect(assign).toHaveBeenCalledTimes(1);
     expect(assign).toHaveBeenCalledWith("/login?return_to=%2Fprojects%2Fapp%3Fx%3D1");
   });
 });

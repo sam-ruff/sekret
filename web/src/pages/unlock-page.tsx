@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, LockKeyhole, LockOpen, Timer } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { useSearchParams } from "react-router";
+import { useLocation } from "react-router";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import { PassphraseAccountField } from "@/components/sys/passphrase-fields";
@@ -17,13 +17,14 @@ import { useCountdown } from "@/hooks/use-countdown";
 import { useIdle } from "@/hooks/use-idle";
 import { backoffSeconds, errorMessage } from "@/lib/errors";
 import { signOut } from "@/lib/session";
+import type { UnlockState } from "@/lib/sys-gate";
 
 const INPUT_ERROR_ID = "unlock-passphrase-error";
 
 export function UnlockPage() {
   const queryClient = useQueryClient();
-  const [params] = useSearchParams();
-  const interrupted = params.has("return_to");
+  const location = useLocation();
+  const interrupted = (location.state as UnlockState | null)?.interrupted === true;
   const input = useRef<HTMLInputElement>(null);
   const [passphrase, setPassphrase] = useState("");
   const [empty, setEmpty] = useState(false);
@@ -58,7 +59,10 @@ export function UnlockPage() {
   const busy = error?.code === "kdf_busy";
   const limited = error?.status === 429 && !backingOff && !busy;
   const foreignKey = error?.code === "root_key_not_recognised";
-  const otherError = unseal.error && !wrong && !foreignKey && error?.status !== 429 ? unseal.error : null;
+  // sekret's own refusals name a code; a bare 403 came from a proxy in front of it.
+  const blockedOnTheWay = error?.code === "http-403";
+  const otherError =
+    unseal.error && !wrong && !foreignKey && !blockedOnTheWay && error?.status !== 429 ? unseal.error : null;
   const waiting = backingOff && waitSeconds > 0;
 
   const submit = (event: FormEvent) => {
@@ -81,8 +85,8 @@ export function UnlockPage() {
           pageTitle="Unlock"
           description={
             <span data-testid="unlock-description">
-              {interrupted && "The server was locked while you were using it. "}
-              The server is locked, so secrets cannot be read. Someone with the server passphrase needs to unlock it.
+              {interrupted ? "The server was locked while you were using it" : "The server is locked"}, so secrets cannot be
+              read until someone with the server passphrase unlocks it.
             </span>
           }
           icon={<LockKeyhole />}
@@ -156,6 +160,20 @@ export function UnlockPage() {
                 </AlertDescription>
               </Alert>
             )}
+            {blockedOnTheWay && (
+              <Alert variant="destructive" data-testid="unlock-blocked">
+                <AlertCircle />
+                <AlertTitle>Unlocking is not allowed from here</AlertTitle>
+                <AlertDescription>
+                  <p>
+                    Something in front of sekret, such as its gateway, refused the request, so the passphrase was not
+                    checked. Unlock on the server itself with{" "}
+                    <code className="font-mono">sekret sys unseal --socket</code>, or from an address the gateway
+                    allows.
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
             {otherError && (
               <Alert variant="destructive" data-testid="unlock-error">
                 <AlertCircle />
@@ -176,16 +194,19 @@ export function UnlockPage() {
               {unseal.isPending ? <Spinner /> : <LockOpen />}
               Unlock
             </Button>
-            <Button
-              type="button"
-              variant="link"
-              size="sm"
-              className="text-muted-foreground"
-              onClick={() => void signOut(queryClient)}
-              data-testid="unlock-sign-out"
-            >
-              Sign out
-            </Button>
+            {/* Who is signed in cannot be asked while locked, so this shows only when the lock interrupted a session. */}
+            {interrupted && (
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                className="text-muted-foreground"
+                onClick={() => void signOut(queryClient)}
+                data-testid="unlock-sign-out"
+              >
+                Sign out
+              </Button>
+            )}
           </CardFooter>
         </form>
       </Card>

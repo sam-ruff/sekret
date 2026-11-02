@@ -10,6 +10,26 @@ const ACTIVITY_EVENTS = ["pointerdown", "keydown", "wheel", "touchstart"] as con
 const RESUME_EVENTS = ["focus", "pageshow"] as const;
 
 /**
+ * While `active`, calls `onHidden` as soon as the page is hidden, such as on switching tab or app,
+ * so revealed values are gone before the system takes its app-switcher snapshot.
+ */
+export function useOnPageHidden(active: boolean, onHidden: () => void): void {
+  const callback = useRef(onHidden);
+  useEffect(() => {
+    callback.current = onHidden;
+  }, [onHidden]);
+
+  useEffect(() => {
+    if (!active) return;
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") callback.current();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [active]);
+}
+
+/**
  * While `active`, calls `onIdle` once nobody has touched the page for `ms`. Elapsed time is
  * measured with the wall clock, so a laptop that slept with values on screen hides them as soon
  * as the page is seen again rather than when a paused timer finally runs out.

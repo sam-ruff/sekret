@@ -123,6 +123,10 @@ export function SecretRow({
               {tag}
             </Badge>
           ))}
+          {/* The Updated column only fits on wide screens. */}
+          <span className="text-xs text-muted-foreground tabular-nums lg:hidden" title={secret.updated_by} data-testid="secret-updated-meta">
+            v{secret.version} · {formatRelative(secret.updated_at)}
+          </span>
         </div>
       </div>
 
@@ -175,7 +179,7 @@ export function SecretRow({
               <MoreHorizontal />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
+          <DropdownMenuContent align="end" className="min-w-48">
             {abilities.edit && (
               <DropdownMenuItem onSelect={onEdit} data-testid="secret-edit">
                 <Pencil />
@@ -192,7 +196,7 @@ export function SecretRow({
             {abilities.history && (
               <DropdownMenuItem onSelect={() => onHistory(actions.current)} data-testid="secret-history">
                 <History />
-                History
+                History and rotation
               </DropdownMenuItem>
             )}
             {abilities.remove && (

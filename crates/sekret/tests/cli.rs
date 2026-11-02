@@ -558,7 +558,16 @@ async fn machine_login_saves_and_uses_a_token(mode: Mode) -> anyhow::Result<()> 
     assert!(saved.contains(&server.url));
 
     assert!(ok(run(&["whoami"], &[], h, None)?)?.contains("ansible"));
-    let denied = run(&["secrets", "set", "X=1"], &[], h, None)?;
+    // A change goes only where the person chose, not where the project file alone says.
+    let unchosen = run(&["secrets", "set", "X=1"], &[], h, None)?;
+    assert!(!unchosen.status.success());
+    assert!(String::from_utf8_lossy(&unchosen.stderr).contains("chooses app/prod"));
+    let denied = run(
+        &["secrets", "set", "X=1", "--project", "app", "--env", "prod"],
+        &[],
+        h,
+        None,
+    )?;
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("permission"));
 

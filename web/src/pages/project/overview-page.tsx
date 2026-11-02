@@ -195,11 +195,11 @@ export function OverviewPage() {
           <table className="w-full min-w-max text-sm">
             <thead>
               <tr className="border-b bg-muted">
-                <th className="sticky left-0 z-10 bg-muted px-4 py-2 text-left text-xs font-medium text-muted-foreground shadow-[inset_-1px_0_0_var(--color-border)]">
+                <th className="sticky left-0 z-10 bg-muted px-3 py-2 text-left md:px-4 text-xs font-medium text-muted-foreground shadow-[inset_-1px_0_0_var(--color-border)]">
                   Key
                 </th>
                 {envs.map((env) => (
-                  <th key={env.id} className="px-4 py-2 text-center text-xs font-medium text-muted-foreground" data-testid={`overview-env-${env.slug}`}>
+                  <th key={env.id} className="px-3 py-2 text-center md:px-4 text-xs font-medium text-muted-foreground" data-testid={`overview-env-${env.slug}`}>
                     {env.name}
                   </th>
                 ))}
@@ -217,7 +217,7 @@ export function OverviewPage() {
                   >
                     <td
                       className={cn(
-                        "sticky left-0 z-10 max-w-[45vw] bg-card px-4 py-2.5 font-mono font-medium shadow-[inset_-1px_0_0_var(--color-border)] md:max-w-sm",
+                        "sticky left-0 z-10 max-w-[36vw] bg-card px-3 py-2.5 font-mono font-medium shadow-[inset_-1px_0_0_var(--color-border)] md:max-w-sm md:px-4",
                         missing && "bg-linear-to-r from-warning/5 to-warning/5 dark:from-warning/12 dark:to-warning/12",
                       )}
                     >
@@ -227,8 +227,8 @@ export function OverviewPage() {
                         ) : (
                           <span className="size-3.5 shrink-0" aria-hidden />
                         )}
-                        {/* Wraps rather than cuts off, so long keys can be told apart on a phone. */}
-                        <span className="max-w-[38vw] min-w-0 wrap-anywhere md:max-w-sm" data-testid="overview-key">
+                        {/* Wraps at underscores rather than cutting off, so long keys can be told apart on a phone. */}
+                        <span className="max-w-[28vw] min-w-0 break-words md:max-w-sm" data-testid="overview-key">
                           <BreakableKey value={row.key} />
                         </span>
                       </span>
@@ -236,7 +236,7 @@ export function OverviewPage() {
                     {envs.map((env) => {
                       const version = row.environments[env.slug];
                       return (
-                        <td key={env.id} className="px-4 py-2.5 text-center" data-testid={`cell-${row.key}-${env.slug}`} data-present={version !== undefined}>
+                        <td key={env.id} className="px-3 py-2.5 text-center md:px-4" data-testid={`cell-${row.key}-${env.slug}`} data-present={version !== undefined}>
                           <Link
                             to={cellHref(project, env.slug, row.path || path, version === undefined ? row.key : undefined)}
                             className="-my-1.5 inline-flex items-center justify-center py-1.5"

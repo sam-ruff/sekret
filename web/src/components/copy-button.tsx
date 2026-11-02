@@ -47,7 +47,7 @@ export function CopyButton({ value, label = "Copy", className, testId, disabled,
       const text = typeof value === "string" ? value : await value();
       if (text == null) return;
       await writeClipboard(text);
-      if (sensitive) clipboardGuard().clearLater(text);
+      if (sensitive) clipboardGuard().clearLater();
       else clipboardGuard().noteReplaced();
       setCopied(true);
       toast.success("Copied to clipboard");

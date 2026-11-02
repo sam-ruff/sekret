@@ -5,6 +5,7 @@ use sekret_core::crypto::{
     DataKey, IntegrityKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key, wrap_data_key,
 };
 use sekret_core::permissions::BuiltinRole;
+use sekret_core::seal::SealMode;
 use sekret_store::{
     AuthMethod, Binding, EncryptedValue, INTEGRITY_KEY_META, PrincipalKind, Rekey, SealConfig, Store, UserLogin,
 };
@@ -12,7 +13,7 @@ use sekret_store::{
 use crate::auth::{TokenKind, TokenRequest, mint_token};
 use crate::error::{ApiError, ApiResult};
 use crate::machine::reseal;
-use crate::seal::{HighWater, distrusted, kept_flags, verify_config};
+use crate::seal::{Distrust, HighWater, distrusted, kept_flags, verify_config};
 use crate::state::AppState;
 
 pub const BOOTSTRAP_SUBJECT: &str = "local|bootstrap-admin";
@@ -73,19 +74,45 @@ pub async fn bootstrap_admin_token(state: &AppState, ttl: i64) -> ApiResult<(Str
 /// signature holds under `old_root` and it is not older than the recorded marks, otherwise reset
 /// to grant no unlock, so a database writer's change or rollback is never signed as it stands.
 /// An unsigned one grants nothing already, but its flags are not trusted to start a migration.
+/// The root key here came from a key file, not from the passphrase wrap, so a wrap that is
+/// unsigned or failed its signature is dropped rather than signed, leaving key-file mode.
 pub fn trusted_or_reset(old_root: &RootKey, config: SealConfig, marks: HighWater) -> SealConfig {
     let verdict = verify_config(old_root, &config, marks);
-    let Err(distrust) = verdict else {
-        return SealConfig {
+    let unproven = |config: SealConfig| {
+        if config.wrapped.is_some() {
+            tracing::error!(
+                "dropping a passphrase wrap that nothing vouches for; the database stays in key-file mode. Run \
+                 `sekret admin set-seal-mode passphrase` to choose a passphrase again"
+            );
+        }
+        SealConfig {
+            mode: SealMode::KeyFile,
+            wrapped: None,
+            ..config
+        }
+    };
+    match verdict {
+        Ok(false) => SealConfig {
             flags: kept_flags(&config, verdict, marks),
             ..config
-        };
-    };
-    tracing::error!(
-        action = distrust.action(),
-        "the seal configuration failed its integrity check; resetting it to the manual unlock policy"
-    );
-    distrusted(config, distrust, marks)
+        },
+        Ok(true) => unproven(SealConfig {
+            flags: kept_flags(&config, verdict, marks),
+            ..config
+        }),
+        Err(distrust) => {
+            tracing::error!(
+                action = distrust.action(),
+                "the seal configuration failed its integrity check; resetting it to the manual unlock policy"
+            );
+            let reset = distrusted(config, distrust, marks);
+            match distrust {
+                // Every field of a rolled-back copy was signed by this root once.
+                Distrust::RolledBack => reset,
+                Distrust::Tampered => unproven(reset),
+            }
+        }
+    }
 }
 
 /// How a root key replacement treats the seal configuration and data it cannot read.
@@ -154,6 +181,47 @@ fn unreadable_rows(rows: &[String]) -> ApiError {
              (--skip-unreadable) to leave them as they are",
             rows.len(),
             rows.join("; ")
+        ),
+    )
+}
+
+/// The error code for a root key change whose commit may or may not have reached the database.
+pub const REKEY_OUTCOME_UNKNOWN: &str = "rekey_outcome_unknown";
+
+/// Whether a root key change that reported an error was committed all the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commit {
+    Committed,
+    NotCommitted,
+    Unknown,
+}
+
+/// A commit can reach the database even though the reply was lost, so the database decides,
+/// read afresh, before anything is undone.
+async fn committed_anyway(store: &dyn Store, old: &str, new: &str) -> Commit {
+    match store.get_meta(crate::ROOT_KEY_META).await {
+        Ok(Some(stored)) if stored == new => Commit::Committed,
+        Ok(Some(stored)) if stored == old => Commit::NotCommitted,
+        Ok(_) => Commit::Unknown,
+        Err(error) => {
+            tracing::error!(%error, "could not read the root key fingerprint back after a failed root key change");
+            Commit::Unknown
+        }
+    }
+}
+
+fn outcome_unknown(error: &str) -> ApiError {
+    tracing::error!(
+        %error,
+        "the root key change failed in a way that may still have been committed; keeping the new key and the epoch \
+         marks that accept both keys"
+    );
+    ApiError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        REKEY_OUTCOME_UNKNOWN,
+        format!(
+            "the root key change failed ({error}) and it is not known whether the database took it; nothing was \
+             undone, and the epoch marks accept both the old and the new root key until the next change is recorded"
         ),
     )
 }
@@ -274,17 +342,26 @@ pub async fn rotate_root_key(
             keys: rewrapped,
             values,
             auth_methods: resealed,
-            fingerprint,
+            fingerprint: fingerprint.clone(),
             seal,
             integrity_key: Some(integrity.wrap(new_root)?),
             revoke_credentials: fresh.is_some(),
         })
         .await;
     if let Err(error) = replaced {
-        if let Err(error) = crate::seal::abort_rekey(&before) {
-            tracing::warn!(%error, "could not put the seal epoch marks back to the old root key");
+        match committed_anyway(store, &old_root.fingerprint(), &fingerprint).await {
+            Commit::Committed => {
+                tracing::warn!(%error, "the root key change reported an error, but the database is under the new key");
+            }
+            Commit::NotCommitted => {
+                if let Err(error) = crate::seal::abort_rekey(&before) {
+                    tracing::warn!(%error, "could not put the seal epoch marks back to the old root key");
+                }
+                return Err(error.into());
+            }
+            // The marks keep naming both keys, so the server starts under whichever one it is.
+            Commit::Unknown => return Err(outcome_unknown(&error.to_string())),
         }
-        return Err(error.into());
     }
     // The database has moved on, so this is reported rather than undone. Marks that still name
     // both keys already sit at the new epoch, so an older copy under the old key counts as a

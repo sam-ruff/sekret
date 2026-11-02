@@ -3,7 +3,7 @@ import { toast } from "sonner";
 import { ApiError } from "@/api/client";
 import { api } from "@/api/endpoints";
 import { forgetAllButStatus } from "@/hooks/queries";
-import { clearCopiedSecret } from "./clipboard";
+import { clearBeforeLeaving, type ClearOutcome } from "./clipboard";
 import { errorMessage } from "./errors";
 import { beginLeaving, browserNavigation, isLeaving, stopLeaving } from "./leaving";
 import { safeHttpUrl } from "./safe-url";
@@ -12,6 +12,7 @@ import { broadcast } from "./tab-sync";
 export interface SignOutDeps {
   logout: () => Promise<{ logout_url?: string | null }>;
   assign: (url: string) => void;
+  clearClipboard?: () => Promise<ClearOutcome | null>;
 }
 
 const defaultDeps: SignOutDeps = {
@@ -41,7 +42,7 @@ export async function signOut(queryClient: QueryClient, deps: SignOutDeps = defa
     }
   }
   forgetAllButStatus(queryClient);
-  await clearCopiedSecret();
+  await clearBeforeLeaving(deps.clearClipboard);
   broadcast("signed-out");
   deps.assign(target);
 }

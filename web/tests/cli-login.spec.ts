@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { isMobile } from "./helpers";
 
 /** What every pending login in the fake says about where it came from. */
 const MOCK_ADDRESS = "203.0.113.24";
@@ -148,11 +149,23 @@ test("cancelling refuses the request on the server", async ({ page }) => {
   await expect(page.getByTestId("cli-unknown")).toBeVisible();
 });
 
+test("on a phone the buttons fill the width with Approve on top", async ({ page }) => {
+  test.skip(!isMobile(page), "Phones only");
+  await page.goto(`/cli-login?code=${SAME}`);
+  const approve = await page.getByTestId("cli-approve").boundingBox();
+  const deny = await page.getByTestId("cli-cancel").boundingBox();
+  const card = await page.getByTestId("cli-login").boundingBox();
+  if (!approve || !deny || !card) throw new Error("buttons not laid out");
+  expect(approve.y).toBeLessThan(deny.y);
+  expect(approve.width).toBeGreaterThan(card.width * 0.8);
+  expect(deny.width).toBeCloseTo(approve.width, 0);
+});
+
 test("a request that has ended says only that, with nothing to type or approve", async ({ page }) => {
   await page.goto("/cli-login?code=XXXX-0000");
   const ended = page.getByTestId("cli-unknown");
   await expect(ended).toHaveText(
-    "This sign-in request has endedIt expired, was already used or refused, or the link is wrong. Run sekret login again to get a new link.",
+    "It expired, was already used or refused, or the link is wrong. Run sekret login again to get a new link.",
   );
   await expect(page.getByTestId("standalone-title")).toHaveText("Sign-in request ended");
   await page.getByTestId("cli-go-home").click();

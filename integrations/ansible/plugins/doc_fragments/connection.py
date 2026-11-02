@@ -74,8 +74,9 @@ options:
       - name: SEKRET_OIDC_TOKEN_FILE
   kubernetes_token_file:
     description:
-      - Service account token file used with O(auth_method=kubernetes).
-      - Defaults to C(/var/run/secrets/kubernetes.io/serviceaccount/token).
+      - Service account token file used with O(auth_method=kubernetes). Required for that method.
+      - Use a projected token with the C(sekret) audience, never the pod's default
+        C(/var/run/secrets/kubernetes.io/serviceaccount/token), which also works against the Kubernetes API.
     type: path
     env:
       - name: SEKRET_KUBERNETES_TOKEN_FILE

@@ -17,10 +17,11 @@ function add(map: Lookup, id: string | undefined, name: string | undefined) {
 /** Names for the IDs audit entries carry, from data the reader may already see. */
 export function auditNames(
   entries: readonly AuditEntry[],
-  directory: { users?: Lookup; identities?: Lookup; roles?: Lookup },
+  directory: { users?: Lookup; identities?: Lookup; roles?: Lookup; projects?: Lookup },
 ): AuditNames {
   const users: Lookup = new Map(directory.users);
   const identities: Lookup = new Map(directory.identities);
+  const projects: Lookup = new Map(directory.projects);
   for (const e of entries) {
     if (e.actor_kind === "user") add(users, e.actor_id, e.actor_name);
     if (e.actor_kind === "identity") add(identities, e.actor_id, e.actor_name);
@@ -28,11 +29,16 @@ export function auditNames(
     if (e.action === "identity.create" && detail && typeof detail.identity === "string" && typeof detail.name === "string") {
       add(identities, detail.identity, detail.name);
     }
+    // A project the reader cannot list, or one since deleted, is still named by its slug.
+    if (e.action.startsWith("project.") && e.project_id && detail && typeof detail.slug === "string") {
+      add(projects, e.project_id, detail.slug);
+    }
   }
   return {
     user: (id) => users.get(id),
     identity: (id) => identities.get(id),
     role: (slug) => directory.roles?.get(slug),
+    project: (id) => projects.get(id),
   };
 }
 
@@ -68,6 +74,7 @@ export function useAuditDirectory(project?: string) {
     enabled: !inProject && org.can("org-members", "read"),
     retry: false,
   });
+  const projects = useQuery({ queryKey: keys.projects, queryFn: api.projects, enabled: !inProject, retry: false });
 
   const userNames: Lookup = new Map();
   const identityNames: Lookup = new Map();
@@ -79,5 +86,11 @@ export function useAuditDirectory(project?: string) {
   }
   const roleNames: Lookup = new Map();
   for (const r of [...(projectRoles.data ?? []), ...(orgRoles.data ?? [])]) add(roleNames, r.slug, r.name);
-  return { users: userNames, identities: identityNames, roles: roleNames };
+  const projectNames: Lookup = new Map();
+  const projectSlugs: Lookup = new Map();
+  for (const p of projects.data ?? []) {
+    add(projectNames, p.id, p.name);
+    add(projectSlugs, p.id, p.slug);
+  }
+  return { users: userNames, identities: identityNames, roles: roleNames, projects: projectNames, projectSlugs };
 }

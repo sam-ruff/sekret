@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { IDLE_CHECK_MS, REVEAL_IDLE_MS, useIdle } from "./use-idle";
+import { IDLE_CHECK_MS, REVEAL_IDLE_MS, useIdle, useOnPageHidden } from "./use-idle";
 
 describe("useIdle", () => {
   beforeEach(() => {
@@ -86,5 +86,34 @@ describe("useIdle", () => {
     hook.rerender({ on: false });
     act(() => vi.advanceTimersByTime(REVEAL_IDLE_MS * 2));
     expect(onIdle).not.toHaveBeenCalled();
+  });
+});
+
+describe("useOnPageHidden", () => {
+  const setVisibility = (state: DocumentVisibilityState) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  afterEach(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+  });
+
+  it("fires straight away when the page is hidden, not when it comes back", () => {
+    const onHidden = vi.fn();
+    renderHook(() => useOnPageHidden(true, onHidden));
+    act(() => setVisibility("visible"));
+    expect(onHidden).not.toHaveBeenCalled();
+    act(() => setVisibility("hidden"));
+    expect(onHidden).toHaveBeenCalledTimes(1);
+  });
+
+  it("does nothing while inactive", () => {
+    const onHidden = vi.fn();
+    const hook = renderHook(({ on }) => useOnPageHidden(on, onHidden), { initialProps: { on: false } });
+    act(() => setVisibility("hidden"));
+    hook.rerender({ on: true });
+    hook.rerender({ on: false });
+    act(() => setVisibility("hidden"));
+    expect(onHidden).not.toHaveBeenCalled();
   });
 });

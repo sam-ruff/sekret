@@ -30,6 +30,20 @@ describe("auditNames", () => {
     expect(names.identity?.("ident-9")).toBeUndefined();
   });
 
+  it("names projects from the directory, then from the slug a project entry records", () => {
+    const names = auditNames(
+      [
+        entry({ action: "project.delete", project_id: "proj-gone", detail: { slug: "old-shop" } }),
+        entry({ action: "project.create", project_id: "proj-1", detail: { slug: "storefront" } }),
+        entry({ action: "secret.read", project_id: "proj-2", detail: { slug: "not-a-project-entry" } }),
+      ],
+      { projects: new Map([["proj-1", "Storefront"]]) },
+    );
+    expect(names.project?.("proj-1")).toBe("Storefront");
+    expect(names.project?.("proj-gone")).toBe("old-shop");
+    expect(names.project?.("proj-2")).toBeUndefined();
+  });
+
   it("prefers the directory, then falls back to entries", () => {
     const names = auditNames([entry({ actor_name: "Old name" })], {
       users: new Map([["user-sam", "Sam Ruff"]]),

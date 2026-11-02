@@ -1307,6 +1307,216 @@ async fn allow_shared_config_in_a_shared_file_does_not_cover_that_file() -> anyh
     Ok(())
 }
 
+/// The epoch mark pins the seal configuration and root key, so an epoch file others could
+/// plant or rewrite stops the server like a shared key file, set any of the three ways.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_epoch_file_others_can_replace_is_refused() -> anyhow::Result<()> {
+    const ALLOW: &str = "server.allow_shared_config";
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        std::fs::create_dir(sb.path("shared")).context("mkdir")?;
+        chmod(&sb.p("shared"), 0o777)?;
+        let planted = sb.p("shared/seal.epoch");
+        let log = sb.launch().set(way, "seal.epoch_file", &planted).refused().await?;
+        assert!(
+            log.contains("refusing to start") && log.contains("the epoch file") && log.contains("every user"),
+            "{way:?}: a mark that does not exist yet could be planted: {log}"
+        );
+        let server = sb
+            .launch()
+            .set(way, "seal.epoch_file", &planted)
+            .set(way, ALLOW, "true")
+            .start()
+            .await?;
+        assert!(
+            server.log().contains("the epoch file") && server.log().contains("swap what the server trusts"),
+            "{way:?}: {}",
+            server.log()
+        );
+        drop(server);
+
+        let private = sb.write("private.epoch", "sekret-seal-epoch 0\n")?;
+        chmod(&private, 0o666)?;
+        let log = sb.launch().set(way, "seal.epoch_file", &private).refused().await?;
+        assert!(
+            log.contains("the epoch file") && log.contains("can be written by every user"),
+            "{way:?}: {log}"
+        );
+        chmod(&private, 0o600)?;
+        let server = sb.launch().set(way, "seal.epoch_file", &private).start().await?;
+        assert!(!server.log().contains("swap what the server trusts"), "{way:?}");
+    }
+    Ok(())
+}
+
+/// Admin commands write the root key and epoch marks, so they refuse shared files as the server
+/// does, and take the same override from a flag, the environment or (for files other than the
+/// configuration itself) the configuration file.
+#[cfg(unix)]
+#[test]
+fn admin_commands_refuse_shared_files_unless_allowed() -> anyhow::Result<()> {
+    let sb = Sandbox::new()?;
+    std::fs::create_dir(sb.path("shared")).context("mkdir")?;
+    chmod(&sb.p("shared"), 0o777)?;
+    let init = |db: &str, extra: &[&str], env: &[(&str, &str)]| -> anyhow::Result<Output> {
+        let mut args = vec!["admin", "init", "--key-file-mode", "--database-url", db];
+        args.extend_from_slice(extra);
+        sb.cli(&args, env, None)
+    };
+
+    let key = sb.p("shared/root.key");
+    let output = init(&sb.db_named("a.db"), &["--root-key-file", &key], &[])?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("refusing to run")
+            && text.contains("the root key file")
+            && text.contains("--allow-shared-config"),
+        "{text}"
+    );
+    assert!(
+        !sb.path("shared/root.key").exists(),
+        "no key is written where others can take it"
+    );
+
+    let epoch = sb.p("shared/seal.epoch");
+    let own_key = sb.p("own.key");
+    let output = init(
+        &sb.db_named("b.db"),
+        &["--root-key-file", &own_key, "--epoch-file", &epoch],
+        &[],
+    )?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && text.contains("the epoch file"), "{text}");
+
+    let flag = init(
+        &sb.db_named("c.db"),
+        &["--root-key-file", &sb.p("shared/c.key"), "--allow-shared-config"],
+        &[],
+    )?;
+    let text = String::from_utf8_lossy(&flag.stderr);
+    assert!(flag.status.success() && text.contains("the root key file"), "{text}");
+    let env = init(
+        &sb.db_named("d.db"),
+        &["--root-key-file", &sb.p("shared/d.key")],
+        &[("SEKRET_ALLOW_SHARED_CONFIG", "true")],
+    )?;
+    assert!(env.status.success(), "{}", String::from_utf8_lossy(&env.stderr));
+    let in_file = sb.write(
+        "allow.yaml",
+        &format!(
+            "server:\n  allow_shared_config: true\nseal:\n  root_key_file: {}\n",
+            sb.p("shared/e.key")
+        ),
+    )?;
+    chmod(&in_file, 0o600)?;
+    let file = init(&sb.db_named("e.db"), &["--config", &in_file], &[])?;
+    assert!(file.status.success(), "{}", String::from_utf8_lossy(&file.stderr));
+
+    // A configuration file others can change cannot excuse itself.
+    chmod(&in_file, 0o666)?;
+    let output = init(&sb.db_named("f.db"), &["--config", &in_file], &[])?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && text.contains("does not cover the file itself"),
+        "{text}"
+    );
+    let output = init(
+        &sb.db_named("f.db"),
+        &["--config", &in_file],
+        &[("SEKRET_ALLOW_SHARED_CONFIG", "false")],
+    )?;
+    assert!(!output.status.success());
+
+    // Commands that only read are held to the same rule.
+    let output = sb.cli(
+        &[
+            "admin",
+            "bootstrap",
+            "--database-url",
+            &sb.db_named("c.db"),
+            "--root-key-file",
+            &sb.p("shared/c.key"),
+        ],
+        &[],
+        None,
+    )?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && text.contains("refusing to run"), "{text}");
+    Ok(())
+}
+
+/// A relative staging directory is checked from the working directory, so one that does not
+/// exist yet below a directory everyone can write to is refused, set any of the three ways.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_relative_backup_temp_dir_below_an_open_directory_is_refused() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        sb.passphrase_db("manual")?;
+        let server = sb.launch().set(way, "backup.temp_dir", "staging").start().await?;
+        drop(server);
+        chmod(&sb.p(""), 0o777)?;
+        let log = sb.launch().set(way, "backup.temp_dir", "staging").refused().await;
+        chmod(&sb.p(""), 0o700)?;
+        let log = log?;
+        assert!(
+            log.contains("backup.temp_dir staging is not safe") && log.contains("every user"),
+            "{way:?}: {log}"
+        );
+    }
+    Ok(())
+}
+
+/// Making mutual TLS optional is a weakening the environment should not slip in unnoticed.
+#[tokio::test]
+async fn optional_client_auth_from_the_environment_is_warned_about() -> anyhow::Result<()> {
+    const WARNING: &str = "SEKRET_TLS_CLIENT_AUTH in the environment";
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        pki(&sb)?;
+        let key = sb.root_key("root.key")?;
+        let server = sb
+            .keyed(&key)
+            .https(tls_client(&sb, Some("client"))?)
+            .default("tls.cert_file", &sb.p("server.pem"))
+            .default("tls.key_file", &sb.p("server-key.pem"))
+            .default("tls.client_ca_file", &sb.p("ca.pem"))
+            .set(way, "tls.client_auth", "optional")
+            .start()
+            .await?;
+        assert_eq!(
+            server.log().contains(WARNING),
+            way == Way::Env,
+            "{way:?}: {}",
+            server.log()
+        );
+    }
+    Ok(())
+}
+
+/// A Postgres password given as a query parameter never reaches the startup log.
+#[tokio::test]
+async fn a_database_password_parameter_is_not_logged() -> anyhow::Result<()> {
+    for way in WAYS {
+        let sb = Sandbox::new()?;
+        let log = sb
+            .launch()
+            .set(
+                way,
+                "database.url",
+                "postgres://sekret@127.0.0.1:1/sekret?sslmode=disable&password=Hunter2Secret",
+            )
+            .refused()
+            .await?;
+        assert!(log.contains("password=***"), "{way:?}: {log}");
+        assert!(!log.contains("Hunter2Secret"), "{way:?}: {log}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn allow_insecure_http_gates_http_issuers() -> anyhow::Result<()> {
     let issuer = Issuer::start().await?;

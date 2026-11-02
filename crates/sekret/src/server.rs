@@ -373,6 +373,9 @@ pub async fn run_server(args: ServerArgs, env_secrets: EnvSecrets, sources: &Sou
         print!("{}", settings::EXAMPLE);
         return Ok(());
     }
+    if let Err(error) = sekret_server::dumps::forbid_core_dumps() {
+        tracing::warn!(%error, "could not turn off core dumps, which could then hold the root key");
+    }
     let file = settings::load(args.store.config.as_deref())?;
     let epoch_file = args.store.epoch_file.clone().or(file.seal.epoch_file.clone());
     let settings::Resolved {
@@ -578,6 +581,9 @@ async fn open_locked(store: &StoreArgs, sources: &Sources) -> anyhow::Result<(St
 }
 
 pub async fn run_admin(command: AdminCommand, sources: &Sources) -> anyhow::Result<()> {
+    if let Err(error) = sekret_server::dumps::forbid_core_dumps() {
+        eprintln!("sekret: warning: could not turn off core dumps, which could then hold the root key: {error}");
+    }
     let prompter = Terminal;
     match command {
         AdminCommand::GenerateRootKey => {
@@ -767,7 +773,7 @@ async fn rotate(
     let epoch_files = marks_of(location)?;
     let marks = high_water(&epoch_files);
     let config = sql.get_seal_config().await?;
-    let (old, seal) = match config.filter(|c| c.mode == SealMode::Passphrase) {
+    let (old, seal) = match config.clone().filter(|c| c.mode == SealMode::Passphrase) {
         Some(config) => {
             let (old, passphrase) = unwrap_with_passphrase(&config, inputs.passphrase_file, prompter)?;
             if let Some(path) = location.root_key_file.as_deref().filter(|p| p.exists())
@@ -794,6 +800,15 @@ async fn rotate(
                 .context("this database is in key-file mode; pass --root-key-file")?;
             let old = read_root_key(path)?;
             check_root(sql, &epoch_files, &old).await?;
+            warn_if_tampered(&old, config.as_ref(), marks);
+            if let Some(config) = &config
+                && config.wrapped.is_some()
+                && matches!(verify_config(&old, config, marks), Ok(true) | Err(Distrust::Tampered))
+            {
+                eprintln!(
+                    "warning: dropping a passphrase wrap that nothing vouches for; the database stays in key-file mode"
+                );
+            }
             (old, None)
         }
     };
@@ -883,12 +898,32 @@ fn stage_key_file(path: &Path, key: &RootKey) -> anyhow::Result<PathBuf> {
     Ok(pending)
 }
 
-/// Removes the staged key when the database did not move to it.
+/// A root key change that reported an error but may still have been committed.
+#[derive(Debug)]
+struct OutcomeUnknown(String);
+
+impl std::fmt::Display for OutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OutcomeUnknown {}
+
+/// Removes the staged key when the database did not move to it. When that is not known, the
+/// staged key may be the only copy of the database's root key, so it stays.
 fn unstage_on_error<T>(result: anyhow::Result<T>, staged: Option<&Path>) -> anyhow::Result<T> {
-    if result.is_err()
-        && let Some(staged) = staged
-        && let Err(error) = remove_if_present(staged)
-    {
+    let (Err(error), Some(staged)) = (&result, staged) else {
+        return result;
+    };
+    if error.downcast_ref::<OutcomeUnknown>().is_some() {
+        bail!(
+            "{error}. The new root key is kept in {}; if the database took the change, that file is the only copy \
+             of its root key, so do not delete it",
+            staged.display()
+        );
+    }
+    if let Err(error) = remove_if_present(staged) {
         eprintln!("could not remove {}: {error}", staged.display());
     }
     result
@@ -934,7 +969,10 @@ async fn replace_root(
     };
     let report = sekret_server::admin::rotate_root_key(sql, old, new, seal, rotation)
         .await
-        .map_err(|e| anyhow::anyhow!(e.message))?;
+        .map_err(|e| match e.code {
+            sekret_server::admin::REKEY_OUTCOME_UNKNOWN => anyhow::Error::new(OutcomeUnknown(e.message)),
+            _ => anyhow::anyhow!(e.message),
+        })?;
     for row in &report.skipped {
         eprintln!("warning: left unreadable {row} as it was");
     }
@@ -1544,5 +1582,35 @@ async fn mark_restored(restored: &SqlStore, database_url: &str, root: &RootKey) 
     };
     if let Err(error) = sekret_server::seal::pin(root).and_then(|pin| record_config(&paths, &config, &pin)) {
         eprintln!("warning: could not write the epoch mark beside the restored database: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn staged(dir: &Path) -> anyhow::Result<PathBuf> {
+        let path = dir.join("root.key.new");
+        std::fs::write(&path, "key").context("stage")?;
+        Ok(path)
+    }
+
+    #[test]
+    fn a_staged_key_survives_a_change_that_may_have_been_committed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("dir")?;
+        let path = staged(dir.path())?;
+        let unknown: anyhow::Result<()> = Err(anyhow::Error::new(OutcomeUnknown("connection reset".into())));
+        let error = unstage_on_error(unknown, Some(&path)).err().context("still an error")?;
+        assert!(path.exists(), "it may be the only copy of the database's root key");
+        assert!(error.to_string().contains("root.key.new"), "{error}");
+
+        let refused: anyhow::Result<()> = Err(anyhow::anyhow!("unreadable data"));
+        assert!(unstage_on_error(refused, Some(&path)).is_err());
+        assert!(!path.exists(), "a change that was not committed leaves nothing staged");
+
+        let path = staged(dir.path())?;
+        unstage_on_error(Ok(()), Some(&path))?;
+        assert!(path.exists());
+        Ok(())
     }
 }

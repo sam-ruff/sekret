@@ -102,7 +102,7 @@ function DefaultsForm({ project, policy, canEdit }: { project: string; policy: S
           <p className="text-sm text-muted-foreground" data-testid="defaults-summary">
             {initiallyOn && !on
               ? "Saving turns the defaults off. Secrets with their own policy keep it."
-              : "Off. Generate makes 32 letters and digits, and nothing rotates unless a secret sets its own policy."}
+              : "Off."}
           </p>
         )}
         {on && !problem && (

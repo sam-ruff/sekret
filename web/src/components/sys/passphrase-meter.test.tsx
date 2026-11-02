@@ -37,8 +37,9 @@ describe("PassphraseMeter", () => {
 
   it("says when a passphrase is strong enough", () => {
     render(<PassphraseMeter strength={{ score: 4, acceptable: true, warning: null, suggestions: [] }} />);
-    expect(screen.getByTestId("passphrase-meter-label")).toHaveTextContent("Strong");
-    expect(screen.getByTestId("passphrase-meter")).toHaveTextContent("Strong enough");
+    // One verdict, not "Strong" beside "Strong enough".
+    expect(screen.getByTestId("passphrase-meter-label")).toHaveTextContent(/^Strong enough$/);
+    expect(screen.getByTestId("passphrase-meter").textContent?.match(/Strong/g)).toHaveLength(1);
     expect(screen.queryByTestId("passphrase-meter-feedback")).toBeNull();
   });
 });

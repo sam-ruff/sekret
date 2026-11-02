@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Fragment, useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { onSealResponse, redirectToLogin } from "@/api/client";
 import type { Me } from "@/api/types";
@@ -8,7 +8,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { forgetAllButStatus, keys, useSysStatus } from "@/hooks/queries";
 import { clearCopiedSecret } from "@/lib/clipboard";
 import { browserNavigation, isLeaving, subscribeLeaving } from "@/lib/leaving";
-import { gateRedirect } from "@/lib/sys-gate";
+import { gateRedirect, UNLOCK_PATH, type UnlockState } from "@/lib/sys-gate";
 import { listen } from "@/lib/tab-sync";
 import { StandalonePage } from "./standalone-page";
 
@@ -37,12 +37,19 @@ export function StatusGate({ children }: { children: ReactNode }) {
   const [generation, setGeneration] = useState(0);
   const leaving = useSyncExternalStore(subscribeLeaving, isLeaving);
 
+  // Whether someone was signed in when the server was found locked, for the unlock page to say so.
+  const hadSession = useRef(false);
+  const forget = useCallback(() => {
+    if (queryClient.getQueryData(keys.me) !== undefined) hadSession.current = true;
+    forgetAllButStatus(queryClient);
+  }, [queryClient]);
+
   const recheck = useCallback(() => {
     setRechecking(true);
     setGeneration((value) => value + 1);
-    forgetAllButStatus(queryClient);
+    forget();
     void queryClient.invalidateQueries({ queryKey: keys.sysStatus }).finally(() => setRechecking(false));
-  }, [queryClient]);
+  }, [queryClient, forget]);
 
   useEffect(() => onSealResponse(recheck), [recheck]);
 
@@ -61,7 +68,7 @@ export function StatusGate({ children }: { children: ReactNode }) {
         }
         if (message === "signed-out") {
           forgetAllButStatus(queryClient);
-          redirectToLogin();
+          void redirectToLogin();
           return;
         }
         recheck();
@@ -71,13 +78,16 @@ export function StatusGate({ children }: { children: ReactNode }) {
 
   const locked = status.data !== undefined && status.data.state !== "unsealed";
   useEffect(() => {
-    if (locked) forgetAllButStatus(queryClient);
-  }, [locked, queryClient]);
+    if (locked) forget();
+  }, [locked, forget]);
 
   const target = status.data ? gateRedirect(status.data.state, location) : null;
 
   useEffect(() => {
-    if (target && !isLeaving()) void navigate(target, { replace: true });
+    if (!target || isLeaving()) return;
+    const state: UnlockState | undefined = target.startsWith(UNLOCK_PATH) && hadSession.current ? { interrupted: true } : undefined;
+    hadSession.current = false;
+    void navigate(target, { replace: true, state });
   }, [target, navigate]);
 
   if (leaving) return <GateSpinner />;

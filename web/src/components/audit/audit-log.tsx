@@ -1,7 +1,7 @@
 import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
 import { EyeOff, Info, ScrollText, SearchX, X } from "lucide-react";
 import { useCallback, useMemo } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { ApiError } from "@/api/client";
 import type { AuditQuery } from "@/api/endpoints";
 import type { AuditEntry, AuditPage, Environment } from "@/api/types";
@@ -193,9 +193,6 @@ export function AuditLog({ queryKey, fetchPage, scope, project, environments, se
                   >
                     {actionLabel(e.action)}
                   </Badge>
-                  <span className="max-w-full truncate font-mono text-[0.7rem] text-muted-foreground" data-testid="audit-action-code">
-                    {e.action}
-                  </span>
                 </div>
               ),
             },
@@ -216,11 +213,36 @@ export function AuditLog({ queryKey, fetchPage, scope, project, environments, se
             },
             {
               header: "Target",
-              cell: (e) => (
-                <span className="truncate font-mono text-xs text-muted-foreground" data-testid="audit-target">
-                  {target(e) || "-"}
-                </span>
-              ),
+              cell: (e) => {
+                const where = target(e);
+                const project = scope === "org" && e.project_id ? e.project_id : null;
+                const slug = project ? directory.projectSlugs.get(project) : undefined;
+                const projectName = project ? (names.project?.(project) ?? project) : null;
+                return (
+                  <div className="flex min-w-0 flex-col items-start gap-0.5">
+                    {projectName &&
+                      (slug ? (
+                        <Link
+                          to={`/projects/${encodeURIComponent(slug)}/audit`}
+                          className="-my-1 max-w-full truncate py-1 text-xs font-medium hover:text-primary hover:underline"
+                          title={`Open the audit log for ${projectName}`}
+                          data-testid="audit-project"
+                        >
+                          {projectName}
+                        </Link>
+                      ) : (
+                        <span className="max-w-full truncate text-xs font-medium" title={project ?? undefined} data-testid="audit-project">
+                          {projectName}
+                        </span>
+                      ))}
+                    {(where || !projectName) && (
+                      <span className="max-w-full truncate font-mono text-xs text-muted-foreground" data-testid="audit-target">
+                        {where || "-"}
+                      </span>
+                    )}
+                  </div>
+                );
+              },
             },
             {
               header: "Detail",

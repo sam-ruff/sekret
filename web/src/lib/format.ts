@@ -140,6 +140,11 @@ export function initials(name: string): string {
     .join("");
 }
 
+/** "org admin" as "Org admin", matching names shown with a capitalised first letter. */
+export function upperFirst(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 /** Turns free text such as "My App" into a valid slug like "my-app". */
 export function slugify(text: string): string {
   return text

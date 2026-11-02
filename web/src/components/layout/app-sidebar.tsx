@@ -2,6 +2,7 @@ import {
   BookOpen,
   Bot,
   Camera,
+  Check,
   ChevronsUpDown,
   ExternalLink,
   FolderKey,
@@ -18,6 +19,7 @@ import {
 import { Link, useLocation, useParams } from "react-router";
 import { Logo } from "@/components/logo";
 import { ProjectLogo } from "@/components/project-logo";
+import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -118,14 +120,23 @@ function ProjectSwitcher({ current }: { current?: string }) {
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-(--radix-dropdown-menu-trigger-width) min-w-56">
         <DropdownMenuLabel className="text-xs text-muted-foreground">Projects</DropdownMenuLabel>
-        {(projects ?? []).map((p) => (
-          <DropdownMenuItem key={p.id} asChild>
-            <Link to={`/projects/${p.slug}/secrets`} onClick={() => setOpenMobile(false)} data-testid={`switcher-project-${p.slug}`}>
-              <ProjectLogo url={p.logo_url} className="size-4 rounded-sm" fallback={<FolderKey />} />
-              <span className="truncate">{p.name}</span>
-            </Link>
-          </DropdownMenuItem>
-        ))}
+        {(projects ?? []).map((p) => {
+          const selected = p.id === project?.id;
+          return (
+            <DropdownMenuItem key={p.id} asChild className={cn(selected && "font-medium")}>
+              <Link
+                to={`/projects/${p.slug}/secrets`}
+                onClick={() => setOpenMobile(false)}
+                aria-current={selected ? "page" : undefined}
+                data-testid={`switcher-project-${p.slug}`}
+              >
+                <ProjectLogo url={p.logo_url} className="size-4 rounded-sm" fallback={<FolderKey />} />
+                <span className="truncate">{p.name}</span>
+                {selected && <Check className="ml-auto text-primary" aria-hidden data-testid="switcher-current" />}
+              </Link>
+            </DropdownMenuItem>
+          );
+        })}
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
           <Link to="/projects" onClick={() => setOpenMobile(false)}>

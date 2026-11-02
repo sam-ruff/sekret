@@ -131,7 +131,8 @@ test("organisation access shows role names and describes what org roles can do",
   await page.goto("/org/access");
   const binding = page.getByTestId("binding-row-user-sam@example.com-org-admin");
   await expect(binding.getByTestId("role-label-name")).toHaveText("org admin");
-  await expect(binding.getByTestId("role-label-id")).toHaveText("org-admin");
+  // The ID is in the tooltip, so built-in and custom roles line up alike.
+  await expect(binding.getByTestId("role-label")).toHaveAttribute("title", "Role ID: org-admin");
 
   await page.getByTestId("access-tab-roles").click();
   await expect(page.getByTestId("roles-intro")).toContainText("organisation areas");
@@ -154,11 +155,18 @@ test("the only org admin binding cannot be removed, and removing your own admin 
   // With a second admin, removing your own is allowed but worded for you.
   await page.getByTestId("binding-add").click();
   const add = page.getByTestId("add-binding-dialog");
+  // The disabled button says why, and machines go by one name everywhere.
+  await expect(add.getByTestId("binding-blocker")).toHaveText("Choose a user to continue.");
+  await expect(add.getByTestId("binding-kind-identity")).toHaveText("Machine identity");
   await add.getByTestId("binding-principal").click();
   await page.getByTestId("binding-principal-search").fill("priya");
   await page.getByTestId("principal-option-Priya Shah").click();
+  await expect(add.getByTestId("binding-blocker")).toHaveText("Choose a role to continue.");
+  await expect(add.getByTestId("binding-submit")).toBeDisabled();
   await add.getByTestId("binding-role").click();
-  await page.getByRole("option", { name: /org admin/i }).click();
+  // Role names read as they do in the table.
+  await page.getByRole("option", { name: "Org admin", exact: true }).click();
+  await expect(add.getByTestId("binding-blocker")).toHaveCount(0);
   await add.getByTestId("binding-submit").click();
   await expect(page.getByTestId("binding-row-user-priya@example.com-org-admin")).toBeVisible();
 

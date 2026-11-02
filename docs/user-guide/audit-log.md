@@ -8,7 +8,7 @@ The project log only shows what the reader could see in the secrets view. If a r
 
 People are shown by their email when the identity provider says it verified it, and otherwise by their display name. A display name that looks like an email address is shown with "(unverified)" after it, so nobody can pass for someone else's address in the log, in a secret's history or in member lists. The `actor_id` the API returns with each entry is what tells two people apart for certain.
 
-In the web interface each entry says what happened in plain words, such as "Viewed history values" or "2 values read", with the action's code, such as `secret.history-read`, underneath. The codes are what the action filter, the API and the CLI use. Entries store people, machine identities and roles by ID; the web interface shows their names where it can look them up with what you may already see, and the ID otherwise.
+In the web interface each entry says what happened in plain words, such as "Viewed history values" or "2 values read"; hovering over it shows the action's code, such as `secret.history-read`. The codes are what the action filter, the API and the CLI use. Entries store people, machine identities, roles and projects by ID; the web interface shows their names where it can look them up with what you may already see, and the ID otherwise. In the organisation log, each entry about a project names that project above its environment and key, and the name links to the project's own log, which is the place to narrow things down to one project. Opening the organisation log without permission to read it says which roles can, rather than showing filters that cannot work.
 
 ![The audit log, filtered to secret actions](../assets/screenshots/audit-light.png)
 

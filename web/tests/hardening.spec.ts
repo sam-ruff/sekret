@@ -66,14 +66,35 @@ test.describe("clipboard clearing in a background tab", () => {
     expect(await clipboardText(page)).toBe(DEV_DATABASE_URL);
   });
 
-  test("waits for the tab to come back, then clears when it may check the clipboard", async ({ page }) => {
+  test("still clears the clipboard on sign-out after the window lost focus", async ({ page }) => {
+    // As when pasting into a terminal and coming back.
     await leaveTab(page);
-    await page.clock.fastForward(46_000);
-    expect(await clipboardText(page)).toBe(DEV_DATABASE_URL);
+    await returnToTab(page, false);
+    // The fake clipboard goes with the page, so read it just before the page goes.
+    await page.evaluate(() => {
+      window.addEventListener("pagehide", () => {
+        sessionStorage.setItem("clipboard-at-exit", (window as unknown as TestWindow).readClipboard());
+      });
+    });
+    await page.getByTestId("user-menu").click();
+    await page.getByTestId("logout").click();
+    await expect(page).toHaveURL(/\/login/);
+    expect(await page.evaluate(() => sessionStorage.getItem("clipboard-at-exit"))).toBe("");
+    await expect(page.getByTestId("clipboard-not-cleared")).toHaveCount(0);
+  });
 
-    await returnToTab(page, true);
-    await expect.poll(() => clipboardText(page)).toBe("");
-    await expect(page.locator("[data-sonner-toast]").filter({ hasText: "Clipboard not cleared" })).toHaveCount(0);
+  test("says so on the sign-in page when the browser refuses to clear on sign-out", async ({ page }) => {
+    await page.evaluate(() => {
+      navigator.clipboard.writeText = () => Promise.reject(new DOMException("refused", "NotAllowedError"));
+    });
+    await page.getByTestId("user-menu").click();
+    await page.getByTestId("logout").click();
+    await expect(page).toHaveURL(/\/login/);
+    await expect(page.getByTestId("clipboard-not-cleared")).toContainText("may still be on the clipboard");
+    // Said once, not on every later visit.
+    await page.reload();
+    await expect(page.getByTestId("sign-in")).toBeVisible();
+    await expect(page.getByTestId("clipboard-not-cleared")).toHaveCount(0);
   });
 
   test("says so when it comes back but cannot tell whether the clipboard still holds the secret", async ({ page }) => {

@@ -87,7 +87,7 @@ class TestSettings:
     def test_defaults(self):
         result = settings()
         assert result.validate_certs is True
-        assert result.kubernetes_token_file == DEFAULT_KUBERNETES_TOKEN_FILE
+        assert result.kubernetes_token_file is None
         assert result.auth_method == "auto"
 
     def test_url_required(self):
@@ -126,13 +126,22 @@ class TestAuthResolution:
         with pytest.raises(ConfigError, match="no sekret credentials"):
             resolve_auth(settings(identity_id="i"), read_file=lambda path: "sa-jwt")
 
-    def test_kubernetes_uses_default_token_file(self):
+    def test_kubernetes_never_sends_the_pods_default_token(self):
+        read = []
+        with pytest.raises(ConfigError, match=DEFAULT_KUBERNETES_TOKEN_FILE):
+            resolve_auth(
+                settings(identity_id="i", auth_method="kubernetes"),
+                read_file=lambda path: read.append(path) or "sa-jwt",
+            )
+        assert read == []
+
+    def test_kubernetes_uses_the_named_token_file(self):
         read = []
         plan = resolve_auth(
-            settings(identity_id="i", auth_method="kubernetes"),
+            settings(identity_id="i", auth_method="kubernetes", kubernetes_token_file="/sa/sekret"),
             read_file=lambda path: read.append(path) or "sa-jwt",
         )
-        assert read == [DEFAULT_KUBERNETES_TOKEN_FILE]
+        assert read == ["/sa/sekret"]
         assert plan.path == "/api/v1/auth/kubernetes/login"
         assert plan.payload == {"identity_id": "i", "token": "sa-jwt"}
 

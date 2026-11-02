@@ -4,7 +4,7 @@ A machine identity is an account for software: a CI pipeline, a pod, an Ansible 
 
 Each identity has a token lifetime (`token_ttl`, default 3600 seconds) and a maximum lifetime (`token_max_ttl`, default 24 hours, at most a year). A token can be renewed with `POST /api/v1/auth/token/renew` until it reaches its maximum. Renewals follow the identity's lifetimes as they are now. Lowering either lifetime also shortens tokens already issued, straight away and whether or not they are ever renewed: each then lasts at most `token_ttl` from the change and at most `token_max_ttl` from when it was issued. Raising them again does not give back the time taken off. An identity can also have trusted CIDRs, shown as *Allowed networks* in the web interface, which limit where it can log in from and where its tokens can be used.
 
-Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Lifetime fields there take a number of seconds or a unit, such as `30m`, `1h`, `7d` or `1h 30m`. The identity's *Usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. It also has example snippets, led by the ones for auth methods the identity has set up. Disabling an identity revokes its tokens straight away.
+Create identities under *Organisation > Machine identities* in the web interface, then give them project roles under each project's *Members* tab. Lifetime fields there take a number of seconds or a unit, such as `30m`, `1h`, `7d` or `1h 30m`. The identity's *Access and usage* tab lists the projects it belongs to, with its roles there, and links to each project's *Members* tab to add it or change its role. It also has example snippets, led by the ones for auth methods the identity has set up. Disabling an identity revokes its tokens straight away.
 
 There are three auth methods, and an identity can have any of them. On the identity's *Auth methods* tab, methods that are not set up stay folded away behind a *Set up* button.
 
@@ -34,7 +34,7 @@ Claim names may be JSON pointers (`/realm_access/roles`) for nested claims. See 
 
 ## Kubernetes
 
-For pods. The pod presents a service account token with the audience `sekret`, and sekret checks it one of two ways.
+For pods. The pod presents a service account token with the audience `sekret`, and sekret checks it one of two ways. Project such a token into the pod and pass it with `sekret login --kubernetes --kubernetes-token-file F --identity-id ID`; the CLI never falls back to the pod's standard token, whose audience is the Kubernetes API.
 
 In JWKS mode, sekret checks the token's signature against the cluster's service account signing keys. Give it the cluster's issuer and either the keys themselves (from `kubectl get --raw /openid/v1/jwks`) or a URL to fetch them. It needs no network path to the cluster, but a deleted service account's tokens keep working until they expire, ten minutes for tokens minted by the operator.
 

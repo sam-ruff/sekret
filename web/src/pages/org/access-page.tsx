@@ -8,6 +8,7 @@ import type { OrgBinding, PrincipalKind } from "@/api/types";
 import { ORG_SUBJECTS } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { FormBlocker } from "@/components/form-blocker";
 import { LinkTabs } from "@/components/link-tabs";
 import { PageHeader } from "@/components/page-header";
 import { PrincipalPicker, type PrincipalOption } from "@/components/principal-picker";
@@ -34,6 +35,7 @@ import { keys, useApiMutation, useMe, useOrgRoles } from "@/hooks/queries";
 import { describeRemoval } from "@/lib/org-bindings";
 import { useOrgPermissions } from "@/hooks/use-permissions";
 import { errorMessage, isEscalation } from "@/lib/errors";
+import { upperFirst } from "@/lib/format";
 
 const KIND_ICONS: Record<PrincipalKind, typeof UserIcon> = { user: UserIcon, group: Users, identity: Bot };
 const KIND_LABELS: Record<PrincipalKind, string> = { user: "User", group: "Group", identity: "Machine identity" };
@@ -47,6 +49,13 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
   const [escalation, setEscalation] = useState<string>();
   const roles = useOrgRoles(open);
   const principal = kind === "group" ? group : (chosen?.id ?? "");
+  const blocker = !principal.trim()
+    ? kind === "group"
+      ? "Enter a group name to continue."
+      : `Choose a ${kind === "user" ? "user" : "machine identity"} to continue.`
+    : !role
+      ? "Choose a role to continue."
+      : null;
 
   const reset = () => {
     setGroup("");
@@ -72,7 +81,7 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (principal.trim() && role) add.mutate();
+    if (!blocker) add.mutate();
   };
 
   return (
@@ -104,8 +113,8 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
               className="w-full"
             >
               {(["user", "identity", "group"] as const).map((k) => (
-                <ToggleGroupItem key={k} value={k} className="flex-1" data-testid={`binding-kind-${k}`}>
-                  {k === "identity" ? "Identity" : KIND_LABELS[k]}
+                <ToggleGroupItem key={k} value={k} className="flex-auto" data-testid={`binding-kind-${k}`}>
+                  {KIND_LABELS[k]}
                 </ToggleGroupItem>
               ))}
             </ToggleGroup>
@@ -145,7 +154,7 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
               <SelectContent>
                 {(roles.data ?? []).map((r) => (
                   <SelectItem key={r.slug} value={r.slug}>
-                    {r.name}
+                    {upperFirst(r.name)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -158,11 +167,22 @@ function AddBindingDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
               <AlertDescription>{escalation}. Choose a role with no more access than your own.</AlertDescription>
             </Alert>
           )}
-          <DialogFooter>
+          <DialogFooter className="sm:items-center">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!principal.trim() || !role || add.isPending} data-testid="binding-submit">
+            {/* Under the submit button on phones, at the left on wider screens. */}
+            {blocker && (
+              <FormBlocker id="binding-blocker" testId="binding-blocker" className="sm:order-first sm:mr-auto">
+                {blocker}
+              </FormBlocker>
+            )}
+            <Button
+              type="submit"
+              disabled={!!blocker || add.isPending}
+              aria-describedby={blocker ? "binding-blocker" : undefined}
+              data-testid="binding-submit"
+            >
               {add.isPending && <Spinner />}
               Grant role
             </Button>
@@ -214,7 +234,7 @@ function BindingsTab() {
           rowTestId={(b) => `binding-row-${b.principal_kind}-${b.principal_name}-${b.role}`}
           columns={[
             {
-              header: "Person, group or machine",
+              header: "Name",
               primary: true,
               cell: (b) => {
                 const Icon = KIND_ICONS[b.principal_kind];

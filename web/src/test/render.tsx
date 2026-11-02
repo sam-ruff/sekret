@@ -21,14 +21,16 @@ export function testQueryClient(): QueryClient {
 /** Renders `ui` with the providers every page expects. */
 export function renderWithProviders(
   ui: ReactNode,
-  { client = testQueryClient(), path = "/" }: { client?: QueryClient; path?: string } = {},
+  { client = testQueryClient(), path = "/", state }: { client?: QueryClient; path?: string; state?: unknown } = {},
 ): RenderResult & { client: QueryClient } {
+  const url = new URL(path, "http://localhost");
+  const entry = { pathname: url.pathname, search: url.search, state };
   // A wrapper rather than inline providers, so `rerender` keeps them.
   const wrapper = ({ children }: { children: ReactNode }) => (
     <ThemeProvider>
       <QueryClientProvider client={client}>
         <TooltipProvider>
-          <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
+          <MemoryRouter initialEntries={[entry]}>{children}</MemoryRouter>
         </TooltipProvider>
       </QueryClientProvider>
     </ThemeProvider>

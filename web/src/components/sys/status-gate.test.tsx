@@ -27,7 +27,8 @@ const status = (state: SealState): SysStatus => ({
 
 function Where() {
   const location = useLocation();
-  return <p data-testid="where">{`${location.pathname}${location.search}`}</p>;
+  const interrupted = (location.state as { interrupted?: boolean } | null)?.interrupted === true;
+  return <p data-testid="where" data-interrupted={interrupted}>{`${location.pathname}${location.search}`}</p>;
 }
 
 function renderGate(path: string): QueryClient {
@@ -225,5 +226,24 @@ describe("StatusGate", () => {
     await hitSealedGate();
     expect(await screen.findByText("/unlock?return_to=%2Fprojects%2Fapp%2Fsecrets")).toBeInTheDocument();
     expect(sysStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("tells the unlock page a session was interrupted only when someone was signed in", async () => {
+    sysStatus.mockResolvedValue(status("unsealed"));
+    const client = renderGate("/projects/app/secrets");
+    expect(await screen.findByTestId("where")).toHaveTextContent("/projects/app/secrets");
+    client.setQueryData(keys.me, { id: "u1" });
+
+    sysStatus.mockResolvedValue(status("sealed"));
+    await hitSealedGate();
+    await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/unlock?return_to="));
+    expect(screen.getByTestId("where")).toHaveAttribute("data-interrupted", "true");
+  });
+
+  it("does not call a deep link opened while locked an interrupted session", async () => {
+    sysStatus.mockResolvedValue(status("sealed"));
+    renderGate("/projects/app/secrets");
+    await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/unlock?return_to="));
+    expect(screen.getByTestId("where")).toHaveAttribute("data-interrupted", "false");
   });
 });

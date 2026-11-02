@@ -13,6 +13,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { upperFirst } from "@/lib/format";
 import { focusInstead } from "@/lib/return-focus";
 import { RoleEditor } from "./role-editor";
 
@@ -117,7 +118,7 @@ export function RolesPanel({
                       }}
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={`Actions for ${r.name}`}
+                      aria-label={`Actions for ${upperFirst(r.name)}`}
                       data-testid={`role-actions-${r.slug}`}
                     >
                       <MoreHorizontal />

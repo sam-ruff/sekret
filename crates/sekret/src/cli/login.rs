@@ -6,8 +6,6 @@ use async_trait::async_trait;
 use sekret_api::TokenResponse;
 use sekret_client::SekretApi;
 
-pub const DEFAULT_SA_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
-
 /// Fetches a workload identity token, e.g. from GitHub Actions.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

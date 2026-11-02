@@ -173,7 +173,7 @@ export function AuditToolbar({ filters, onChange, scope, environments, searchesS
           </SelectContent>
         </Select>
         <Select value={filters.actorKind || ALL} onValueChange={(v) => set({ actorKind: v === ALL ? "" : (v as ActorKind) })}>
-          <SelectTrigger className="w-full sm:w-36" aria-label="Actor" data-testid="audit-actor-kind">
+          <SelectTrigger className="w-full sm:w-44" aria-label="Actor" data-testid="audit-actor-kind">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -182,7 +182,7 @@ export function AuditToolbar({ filters, onChange, scope, environments, searchesS
               People
             </SelectItem>
             <SelectItem value="identity" data-testid="audit-actor-kind-identity">
-              Machines
+              Machine identities
             </SelectItem>
           </SelectContent>
         </Select>

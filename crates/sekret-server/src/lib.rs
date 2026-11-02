@@ -7,6 +7,7 @@ pub mod authz;
 pub mod body;
 pub mod clock;
 pub mod config;
+pub mod dumps;
 pub mod error;
 pub mod files;
 pub mod host_socket;
@@ -151,16 +152,32 @@ fn carries_credential(state: &AppState, request: &Request) -> bool {
         || auth::cookie_value(headers, auth::session_cookie_name(&state.config)).is_some()
 }
 
+/// The routes that sign someone in, which take no token, so a stale cookie sent along never
+/// blocks signing in again.
+const SIGN_IN_ROUTES: [&str; 6] = [
+    "/api/v1/auth/config",
+    "/api/v1/auth/cli/start",
+    "/api/v1/auth/cli/poll",
+    "/api/v1/auth/oidc/login",
+    "/api/v1/auth/kubernetes/login",
+    "/api/v1/auth/universal/login",
+];
+
+/// Whether a request to `path` that carries a credential counts towards the failed-auth limit:
+/// every API route and signing out, except the sign-in routes.
+fn auth_checked(path: &str) -> bool {
+    (path.starts_with("/api/v1/") || path == "/auth/logout") && !SIGN_IN_ROUTES.contains(&path)
+}
+
 /// Answers 429 without a lookup once a client has failed authentication too often, and counts
-/// each failure. Sign-in routes are left alone, so a stale cookie never blocks signing in again.
+/// each failure.
 async fn failed_auth_gate(
     State(state): State<AppState>,
     auth::ClientIp(ip): auth::ClientIp,
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path();
-    let checked = path.starts_with("/api/v1/") && !path.starts_with("/api/v1/auth/");
+    let checked = auth_checked(request.uri().path());
     if !checked || !carries_credential(&state, &request) {
         return next.run(request).await;
     }
@@ -516,6 +533,29 @@ mod tests {
         assert_eq!(time_limit("/api/v1/sys/backup"), Some(BACKUP_TIMEOUT));
         assert_eq!(time_limit("/api/v1/projects"), Some(REQUEST_TIMEOUT));
         assert_eq!(time_limit("/api/v1/sys/passphrase/"), Some(REQUEST_TIMEOUT));
+    }
+
+    #[test]
+    fn only_sign_in_routes_skip_the_failed_auth_limit() {
+        for checked in [
+            "/api/v1/projects",
+            "/api/v1/auth/token/renew",
+            "/api/v1/auth/token/revoke",
+            "/api/v1/auth/cli/pending",
+            "/api/v1/auth/cli/approve",
+            "/api/v1/auth/cli/deny",
+            "/api/v1/sys/status/detail",
+            "/auth/logout",
+        ] {
+            assert!(auth_checked(checked), "{checked}");
+        }
+        for open in SIGN_IN_ROUTES
+            .iter()
+            .copied()
+            .chain(["/auth/login", "/auth/callback", "/"])
+        {
+            assert!(!auth_checked(open), "{open}");
+        }
     }
 
     #[test]

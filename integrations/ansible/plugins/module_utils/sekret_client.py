@@ -106,7 +106,7 @@ class Settings:
     identity_id: str | None = None
     oidc_token: str | None = field(default=None, repr=False)
     oidc_token_file: str | None = None
-    kubernetes_token_file: str = DEFAULT_KUBERNETES_TOKEN_FILE
+    kubernetes_token_file: str | None = None
     validate_certs: bool = True
     ca_path: str | None = None
     client_cert: str | None = None
@@ -144,7 +144,7 @@ class Settings:
             identity_id=pick("identity_id"),
             oidc_token=pick("oidc_token"),
             oidc_token_file=pick("oidc_token_file"),
-            kubernetes_token_file=pick("kubernetes_token_file") or DEFAULT_KUBERNETES_TOKEN_FILE,
+            kubernetes_token_file=pick("kubernetes_token_file"),
             validate_certs=True if validate_certs is None else _to_bool(validate_certs),
             ca_path=pick("ca_path"),
             client_cert=client_cert,
@@ -211,6 +211,12 @@ def _oidc(settings: Settings, read_file: Callable[[str], str]) -> Login:
 
 def _kubernetes(settings: Settings, read_file: Callable[[str], str]) -> Login:
     identity_id = _require_identity(settings, "kubernetes")
+    # The pod's default token reaches the Kubernetes API, so it is never sent unless named.
+    if not settings.kubernetes_token_file:
+        raise ConfigError(
+            "kubernetes auth needs kubernetes_token_file: a projected token with the sekret audience, "
+            f"not the pod's default {DEFAULT_KUBERNETES_TOKEN_FILE}"
+        )
     token = read_file(settings.kubernetes_token_file)
     return Login(
         "kubernetes",

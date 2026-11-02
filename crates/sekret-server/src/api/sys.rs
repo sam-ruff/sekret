@@ -68,6 +68,87 @@ pub fn host_router(state: AppState) -> axum::Router {
         .with_state(state)
 }
 
+/// A JSON body that carries a passphrase or setup code. It is read into one buffer, sized up
+/// front so it never moves, and wiped once parsed, rather than left in memory as it arrived.
+pub struct SecretJson<T>(pub T);
+
+fn json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let essence = value.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    essence == "application/json" || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Wipes a chunk of the body once copied, when nothing else holds it.
+fn wipe(chunk: axum::body::Bytes) {
+    if let Ok(mut owned) = chunk.try_into_mut() {
+        zeroize::Zeroize::zeroize(&mut owned[..]);
+    }
+}
+
+/// The body, at most `limit` bytes, in a buffer that is wiped when dropped.
+pub async fn read_wiped(mut body: axum::body::Body, limit: usize) -> ApiResult<Zeroizing<Vec<u8>>> {
+    use axum::body::HttpBody;
+    let mut out = Zeroizing::new(Vec::with_capacity(limit));
+    while let Some(frame) = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await {
+        let frame = frame.map_err(|_| crate::body::too_large())?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if out.len() + chunk.len() > limit {
+            wipe(chunk);
+            return Err(crate::body::too_large());
+        }
+        out.extend_from_slice(&chunk);
+        wipe(chunk);
+    }
+    Ok(out)
+}
+
+impl<T, S> axum::extract::FromRequest<S> for SecretJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: axum::extract::Request, _state: &S) -> Result<Self, ApiError> {
+        if !json_content_type(request.headers()) {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "the request body must be JSON, sent with content-type application/json",
+            ));
+        }
+        let declared = request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        if declared.is_some_and(|len| len > SYS_BODY_LIMIT) {
+            return Err(crate::body::too_large());
+        }
+        let bytes = read_wiped(request.into_body(), SYS_BODY_LIMIT).await?;
+        // The parser's message can quote the body, so it is not passed on.
+        serde_json::from_slice(&bytes).map(SecretJson).map_err(|error| {
+            let status = match error.classify() {
+                serde_json::error::Category::Data => StatusCode::UNPROCESSABLE_ENTITY,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            ApiError::new(
+                status,
+                "invalid_body",
+                format!(
+                    "the request body does not match what this route takes (line {}, column {})",
+                    error.line(),
+                    error.column()
+                ),
+            )
+        })
+    }
+}
+
 /// Every passphrase source drops a leading byte order mark and one trailing line ending the same way.
 fn normalised(passphrase: Zeroizing<String>) -> Zeroizing<String> {
     let trimmed = trim_input(&passphrase);
@@ -87,7 +168,7 @@ async fn check_passphrase(
     ClientIp(ip): ClientIp,
     method: Method,
     headers: HeaderMap,
-    Json(request): Json<PassphraseCheck>,
+    SecretJson(request): SecretJson<PassphraseCheck>,
 ) -> ApiResult<Json<PassphraseStrength>> {
     rate_limit(&state, ip)?;
     match state.keyring.state() {
@@ -158,7 +239,7 @@ async fn status_detail(
 async fn init(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(request): Json<InitRequest>,
+    SecretJson(request): SecretJson<InitRequest>,
 ) -> ApiResult<Json<InitResponse>> {
     rate_limit(&state, ip)?;
     let request = ops::InitRequest {
@@ -185,7 +266,7 @@ async fn unseal(
     State(state): State<AppState>,
     host: Option<Extension<HostSocket>>,
     ClientIp(ip): ClientIp,
-    Json(request): Json<UnsealRequest>,
+    SecretJson(request): SecretJson<UnsealRequest>,
 ) -> ApiResult<Json<SysStatus>> {
     let source = match host {
         Some(_) => Source::HostSocket,
@@ -232,7 +313,7 @@ async fn change_passphrase(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     principal: Principal,
-    Json(request): Json<ChangePassphrase>,
+    SecretJson(request): SecretJson<ChangePassphrase>,
 ) -> ApiResult<StatusCode> {
     require_org_admin(&state, &principal, ip).await?;
     rate_limit(&state, ip)?;
@@ -254,7 +335,7 @@ async fn set_unlock_policy(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     principal: Principal,
-    Json(request): Json<SetUnlockPolicy>,
+    SecretJson(request): SecretJson<SetUnlockPolicy>,
 ) -> ApiResult<Json<SysStatus>> {
     require_org_admin(&state, &principal, ip).await?;
     rate_limit(&state, ip)?;

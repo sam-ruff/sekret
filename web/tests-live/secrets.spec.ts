@@ -58,6 +58,14 @@ test("creates a project, adds and updates a secret, then rolls it back", async (
   await expect(drawer.getByTestId("diff-output").locator('[data-kind="removed"]')).toHaveText(/first/);
   await expect(drawer.getByTestId("diff-output").locator('[data-kind="added"]')).toHaveText(/second/);
 
+  // Escape closes only the confirm, leaving the drawer open with focus back on the button.
+  await drawer.getByTestId("rollback-1").click();
+  await expect(page.getByTestId("rollback-confirm")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("rollback-confirm")).toBeHidden();
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByTestId("rollback-1")).toBeFocused();
+
   await drawer.getByTestId("rollback-1").click();
   await page.getByTestId("rollback-confirm").getByTestId("confirm-action").click();
   await expect(drawer.getByTestId("version-3")).toContainText("Current");

@@ -9,6 +9,11 @@ interface Place {
   search: string;
 }
 
+/** Navigation state for the unlock page; `interrupted` when someone was signed in as the server locked. */
+export interface UnlockState {
+  interrupted?: boolean;
+}
+
 export function unlockPath(returnTo: string): string {
   if (returnTo === "/" || returnTo === "") return UNLOCK_PATH;
   return `${UNLOCK_PATH}?return_to=${encodeURIComponent(returnTo)}`;
