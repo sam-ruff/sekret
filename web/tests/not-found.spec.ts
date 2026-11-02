@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { isMobile } from "./helpers";
 
 test("an unknown address has a page heading and a way back", async ({ page }) => {

@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, isMobile, navigate, openProject, secretRow } from "./helpers";
 
 const SETUP_CODE = "MOCK-SETUP-CODE";
@@ -331,8 +332,11 @@ test.describe("unlocking", () => {
   test("explains a lock that interrupted a session and lets them sign out instead", async ({ page }) => {
     await page.clock.install();
     await openProject(page);
+    // Only a page showing a value watches for a lock, so reveal one before sealing.
+    const row = secretRow(page, "LOG_LEVEL");
+    await row.getByTestId("secret-reveal").click();
+    await expect(row.getByTestId("secret-value")).toHaveText("warn");
     await sealBehindTheScenes(page);
-    // The status check notices the lock by itself.
     await page.clock.fastForward(16_000);
     await expect(page).toHaveURL(/\/unlock\?return_to=/);
     await expect(page.getByTestId("unlock-description")).toHaveText(

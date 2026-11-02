@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, failNext, isMobile, openProject, secretAction, secretRow } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
@@ -77,7 +77,11 @@ test("search reaches into subfolders and opens a match in its own folder", async
 
   // A search that finds nothing anywhere says it looked below too.
   await page.getByTestId("crumb-root").click();
+  // Moving folder resets the search, so type only once the top folder is showing.
+  await expect(page).not.toHaveURL(/path=/);
+  await expect(secretRow(page, "WEBHOOK_SECRET")).toHaveCount(0);
   await page.getByTestId("secret-search").fill("zzz-nothing");
+  await expect(page.getByTestId("secret-search")).toHaveValue("zzz-nothing");
   await expect(page.getByTestId("no-search-results")).toContainText("this folder and the folders inside it");
 });
 

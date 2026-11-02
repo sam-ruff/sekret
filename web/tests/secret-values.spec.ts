@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, openProject, secretAction, secretRow } from "./helpers";
 
 const DEV_DATABASE_URL = "postgres://shop:devpass@localhost:5432/shop";

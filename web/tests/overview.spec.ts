@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { isMobile, navigate, openProject } from "./helpers";
 
 test("highlights keys missing from some environments", async ({ page }) => {

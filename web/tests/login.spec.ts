@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 
 test("login page offers a generic sign-in on the shared standalone layout", async ({ page }) => {
   await page.goto("/login");

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { isMobile } from "./helpers";
 
 test("settings tabs that do not fit show an arrow that scrolls to them", async ({ page }) => {

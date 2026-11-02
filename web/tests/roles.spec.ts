@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, failNext } from "./helpers";
 
 test("creates a custom project role with a conditional deny", async ({ page }) => {

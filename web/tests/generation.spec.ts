@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, openProject, secretAction, secretRow } from "./helpers";
 
 async function reveal(page: Page, key: string): Promise<string> {

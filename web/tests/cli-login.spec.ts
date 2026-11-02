@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { isMobile } from "./helpers";
 
 /** What every pending login in the fake says about where it came from. */

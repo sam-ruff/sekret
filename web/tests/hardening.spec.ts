@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, openProject, secretRow } from "./helpers";
 
 const DEV_DATABASE_URL = "postgres://shop:devpass@localhost:5432/shop";
@@ -338,12 +339,23 @@ test.describe("revealed values", () => {
     await row.getByTestId("secret-reveal").click();
     await expect(row.getByTestId("secret-value")).toHaveText(DEV_DATABASE_URL);
 
+    // Resolves once the message has reached a listener in this page, so the app's own listener has
+    // had it too, then waits a frame for anything it changed to render.
     const signInElsewhere = (user: string) =>
-      page.evaluate((id) => {
-        const channel = new BroadcastChannel("sekret-tabs");
-        channel.postMessage({ kind: "signed-in", user: id });
-        channel.close();
-      }, user);
+      page.evaluate(
+        (id) =>
+          new Promise<void>((resolve) => {
+            const listener = new BroadcastChannel("sekret-tabs");
+            listener.onmessage = () => {
+              listener.close();
+              requestAnimationFrame(() => resolve());
+            };
+            const channel = new BroadcastChannel("sekret-tabs");
+            channel.postMessage({ kind: "signed-in", user: id });
+            channel.close();
+          }),
+        user,
+      );
 
     // The same person signing in elsewhere changes nothing here.
     const myId = await page.evaluate(async () => {
@@ -353,11 +365,15 @@ test.describe("revealed values", () => {
       return me.id;
     });
     await signInElsewhere(myId);
-    await page.waitForTimeout(300);
     await expect(row.getByTestId("secret-value")).toHaveText(DEV_DATABASE_URL);
 
+    // Someone else's sign-in reloads this page, so post without waiting inside it, then wait for the load.
     const reloaded = page.waitForEvent("load");
-    await signInElsewhere("someone-else-entirely");
+    await page.evaluate(() => {
+      const channel = new BroadcastChannel("sekret-tabs");
+      channel.postMessage({ kind: "signed-in", user: "someone-else-entirely" });
+      channel.close();
+    });
     await reloaded;
     await expect(secretRow(page, "DATABASE_URL")).toBeVisible();
     await expect(page.locator("body")).not.toContainText(DEV_DATABASE_URL);
