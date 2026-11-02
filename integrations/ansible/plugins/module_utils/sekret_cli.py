@@ -300,6 +300,10 @@ class CliTokens:
         return self._saved() or self._log_in(None)
 
     def refresh(self, rejected: str | None) -> str:
+        # A login saved since, by another worker or by hand, needs no new one, whatever may log in.
+        token = self._saved()
+        if token and token != rejected:
+            return token
         return self._log_in(rejected)
 
     def _fail(self, marker: Path, message: str) -> AuthenticationError:
@@ -416,8 +420,14 @@ def distrust_reason(owners: list[int], directory: os.stat_result, file: os.stat_
     return None
 
 
+def _unreadable(candidate: Path, why: str) -> ConfigError:
+    return ConfigError(f"{candidate} {why}, so the settings `sekret-env` left cannot be checked against it")
+
+
 def _read_trusted(candidate: Path, me: Me) -> str | None:
-    """The text of a project file the CLI would trust, read from the handle that was checked."""
+    """The text of a project file the CLI would trust, read from the handle that was checked, or
+    None for one the CLI would pass over. One it would trust but cannot read is an error, as it is
+    for the CLI, not a reason to look further up."""
     try:
         link = os.lstat(candidate)
         fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -430,17 +440,20 @@ def _read_trusted(candidate: Path, me: Me) -> str | None:
         directory = os.stat(candidate.parent)
         if distrust_reason([link.st_uid, info.st_uid], directory, info, me):
             return None
-        data = os.read(fd, PROJECT_FILE_LIMIT + 1)
+        try:
+            data = os.read(fd, PROJECT_FILE_LIMIT + 1)
+        except OSError as e:
+            raise _unreadable(candidate, f"cannot be read ({e.strerror})") from None
     except OSError:
         return None
     finally:
         os.close(fd)
     if len(data) > PROJECT_FILE_LIMIT:
-        return None
+        raise _unreadable(candidate, f"is larger than {PROJECT_FILE_LIMIT} bytes")
     try:
         return data.decode()
     except UnicodeDecodeError:
-        return None
+        raise _unreadable(candidate, "is not UTF-8") from None
 
 
 def nearest_project_file(start: str, me: Me | None = None) -> tuple[Path, str] | None:

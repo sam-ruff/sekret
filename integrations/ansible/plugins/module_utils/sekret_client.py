@@ -355,12 +355,18 @@ def _verifying_context(validate_certs: bool, ca_path: str | None) -> ssl.SSLCont
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         return context
+    # The system's CAs, with the given one added to them rather than in their place, as the CLI does.
+    context = ssl.create_default_context()
+    if not ca_path:
+        return context
     try:
-        if ca_path and os.path.isdir(ca_path):
-            return ssl.create_default_context(capath=ca_path)
-        return ssl.create_default_context(cafile=ca_path)
+        if os.path.isdir(ca_path):
+            context.load_verify_locations(capath=ca_path)
+        else:
+            context.load_verify_locations(cafile=ca_path)
     except (OSError, ssl.SSLError) as e:
         raise ConfigError(f"could not load CA bundle {ca_path}: {e}") from None
+    return context
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

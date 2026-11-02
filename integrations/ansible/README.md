@@ -81,6 +81,10 @@ Like any module it runs on the target host, so `delegate_to: localhost` is usual
 
 `examples/playbook.yml` shows both together: it stores a setting and renders a config file from a couple of lookups.
 
+## Upgrading
+
+The lookup now reads `sekret_url`, `sekret_project`, `sekret_environment`, `sekret_path` and `sekret_ca_path` variables, above the `SEKRET_*` environment variables. Inventories that already use those names, for instance to feed the module, change what the lookup reads, and a token or machine identity is refused for a server a `sekret_url` variable names. The lookup warns once in each worker process when such a variable overrides a different `SEKRET_*` value. Rename the variables or pass the values to the lookup to keep the old behaviour. A CA file is now added to the system's CAs instead of replacing them. See `docs/integrations/ansible.md` for the details.
+
 ## Development
 
 ```sh

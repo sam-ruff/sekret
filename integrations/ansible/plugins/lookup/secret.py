@@ -294,12 +294,15 @@ def cached_context(cli_path: str, known: dict, read_context=cli_context) -> dict
     return _CONTEXTS[key]
 
 
-def project_file_values(text: str) -> dict:
-    """The project, environment and folder a .sekret.toml names."""
+def project_file_values(path: Path, text: str) -> dict:
+    """The project, environment and folder a .sekret.toml names. One that is not valid TOML is an
+    error, as it is for the CLI, rather than a file naming nothing."""
     try:
         data = tomllib.loads(text)
-    except ValueError:
-        return {}
+    except ValueError as e:
+        raise ConfigError(
+            f"{path} is not valid TOML ({e}), so the settings `sekret-env` left cannot be checked against it"
+        ) from None
     return {name: data[name] for name in SHELL_NAMES if isinstance(data.get(name), str)}
 
 
@@ -359,7 +362,7 @@ def check_shell(
         return
     sources = [("ansible.cfg", read_cfg())]
     if found is not None and tomllib is not None:
-        sources.append((str(here), project_file_values(found[1])))
+        sources.append((str(here), project_file_values(here, found[1])))
     elif found is not None:
         _ask_cli_about_the_shell(here, loaded, place, cli_path, read_context)
     clashes = [
@@ -438,6 +441,24 @@ def check_destination(plan, place_origins: dict, ca_vouched: bool = False) -> No
         )
 
 
+_WARNED: set[str] = set()
+
+
+def warn_overridden(name: str, from_inventory, from_environment) -> None:
+    """Warns once a worker process when an inventory variable outranks a different SEKRET_* value,
+    which before sekret_* variables were read was the one used. Names only, never values."""
+    if from_environment in ("", None) or from_inventory == from_environment or name in _WARNED:
+        return
+    _WARNED.add(name)
+    display.warning(
+        terminal_safe(
+            f"the inventory variable sekret_{name} overrides {PLACE_ENV[name]}, which is set to something "
+            f"else; the sekret lookup ranks sekret_* variables above SEKRET_* ones. Remove or rename "
+            f"sekret_{name} if the environment variable was meant"
+        )
+    )
+
+
 def announce(place: dict, origins: dict) -> None:
     """Says once a process, at -v, where the lookup reads from and why."""
     key = tuple((name, place.get(name), origins.get(name)) for name in PLACE_OPTIONS)
@@ -510,6 +531,8 @@ class LookupModule(LookupBase):
         if position is None:
             return value or None, origin
         if ranked[position][1] not in ("", None) and value not in ("", None):
+            if origin.startswith("var:"):
+                warn_overridden(name, ranked[1][1], ranked[2][1])
             return value, origin
         for _, candidate, label in ranked[position + 1 :]:
             if candidate not in ("", None):

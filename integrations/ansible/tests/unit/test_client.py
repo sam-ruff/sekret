@@ -1,11 +1,20 @@
+import contextlib
+import datetime
 import http.server
 import io
 import json
+import socket
 import ssl
 import threading
 import urllib.error
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from fake_server import FakeServer, error, respond
 
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (
@@ -28,6 +37,87 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
 )
 
 URL = "https://sekret.test"
+
+
+@dataclass
+class LocalCa:
+    ca_file: Path
+    server_context: ssl.SSLContext
+
+
+def make_ca(directory: Path, name: str) -> LocalCa:
+    """A CA and a localhost server certificate it signed, as files and a server context."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{name} CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, True, True, False, False), critical=True
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(ca_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False
+        )
+        .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_file = directory / f"{name}-ca.pem"
+    ca_file.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    chain = directory / f"{name}-server.pem"
+    chain.write_bytes(
+        leaf.public_bytes(serialization.Encoding.PEM)
+        + key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(chain)
+    return LocalCa(ca_file, server_context)
+
+
+def handshake(client: ssl.SSLContext, ca: LocalCa) -> bool:
+    """Whether `client` accepts a localhost server whose certificate `ca` signed."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def serve():
+        connection, _ = listener.accept()
+        with contextlib.suppress(OSError), ca.server_context.wrap_socket(connection, server_side=True):
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=15) as raw,
+            client.wrap_socket(raw, server_hostname="localhost"),
+        ):
+            return True
+    except ssl.SSLCertVerificationError:
+        return False
+    finally:
+        thread.join(timeout=15)
+        listener.close()
 
 
 class FakeClock:
@@ -356,6 +446,18 @@ class TestTls:
 
     def test_ca_directory(self, tmp_path):
         assert ssl_context(True, str(tmp_path)).verify_mode == ssl.CERT_REQUIRED
+
+    def test_a_ca_file_is_added_to_the_system_cas_not_in_their_place(self, tmp_path, monkeypatch):
+        private = make_ca(tmp_path, "private")
+        system = make_ca(tmp_path, "system")
+        unknown = make_ca(tmp_path, "unknown")
+        # OpenSSL's default paths honour SSL_CERT_FILE, which stands in for the system store here.
+        monkeypatch.setenv("SSL_CERT_FILE", str(system.ca_file))
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        context = ssl_context(True, str(private.ca_file))
+        assert handshake(context, private)
+        assert handshake(context, system)
+        assert not handshake(context, unknown)
 
     def test_client_certificate_is_loaded(self, monkeypatch):
         loaded = []

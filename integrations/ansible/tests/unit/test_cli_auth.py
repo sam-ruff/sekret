@@ -376,9 +376,13 @@ class FakeDisplay:
     def __init__(self):
         self.verbose = []
         self.shown = []
+        self.warnings = []
 
     def v(self, message):
         self.verbose.append(message)
+
+    def warning(self, message, *args, **kwargs):
+        self.warnings.append(message)
 
     def display(self, message, *args, **kwargs):
         self.shown.append(message)
@@ -393,7 +397,7 @@ def lookup(state, monkeypatch):
         settings, transport=server, cache=TokenCache(), token_source=token_source
     )
     module = sys.modules[type(plugin).__module__]
-    for cache in (module._FOLDERS, module._CONTEXTS, module._ANNOUNCED):
+    for cache in (module._FOLDERS, module._CONTEXTS, module._ANNOUNCED, module._WARNED):
         cache.clear()
     shown = FakeDisplay()
     monkeypatch.setattr(module, "display", shown)
@@ -855,6 +859,68 @@ class TestEmptyValuesFallThrough:
         assert lookup.server.asked()[0] == "var-p"
 
 
+class TestInventoryOverridesEnvironmentWarning:
+    """sekret_* variables now outrank SEKRET_*, which a playbook written before may not expect."""
+
+    def run(self, lookup, variables):
+        return lookup.run([], variables, url=URL, token="static-token", environment="e")
+
+    def test_an_inventory_variable_beating_a_different_environment_value_warns_once(
+        self, lookup, monkeypatch
+    ):
+        monkeypatch.setenv("SEKRET_PROJECT", "env-secret-project")
+        self.run(lookup, {"sekret_project": "var-secret-project"})
+        self.run(lookup, {"sekret_project": "var-secret-project"})
+        (warning,) = lookup.shown.warnings
+        assert "sekret_project" in warning and "SEKRET_PROJECT" in warning
+        assert "env-secret-project" not in warning and "var-secret-project" not in warning
+        assert lookup.server.asked()[0] == "var-secret-project"
+
+    def test_the_same_value_or_no_environment_value_does_not_warn(self, lookup, monkeypatch):
+        self.run(lookup, {"sekret_project": "p"})
+        monkeypatch.setenv("SEKRET_PROJECT", "p")
+        self.run(lookup, {"sekret_project": "p"})
+        assert lookup.shown.warnings == []
+
+
+class TestUnreadableProjectFile:
+    """A .sekret.toml the CLI would trust but cannot read or parse stops the env use check, as it
+    stops the CLI, rather than being passed over for a parent's or counted as naming nothing."""
+
+    @pytest.fixture(autouse=True)
+    def shell(self, tmp_path, monkeypatch, lookup):
+        tmp_path.chmod(0o700)
+        parent = tmp_path / ".sekret.toml"
+        parent.write_text('project = "a-project"\n')
+        parent.chmod(0o600)
+        folder = tmp_path / "repo"
+        folder.mkdir(mode=0o700)
+        monkeypatch.chdir(folder)
+        lookup.read_ansible_cfg = staticmethod(dict)
+        monkeypatch.setenv("SEKRET_PROJECT", "a-project")
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", "prod")
+        monkeypatch.setenv("SEKRET_LOADED_FILE", str(parent))
+        return folder
+
+    def write(self, folder, data: bytes):
+        project_file = folder / ".sekret.toml"
+        project_file.write_bytes(data)
+        project_file.chmod(0o600)
+
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="reading .sekret.toml needs tomllib")
+    def test_invalid_toml_is_refused(self, lookup, shell):
+        self.write(shell, b"project = [unterminated\n")
+        with pytest.raises(AnsibleError, match="is not valid TOML"):
+            lookup.run([], {}, url=URL, token="static-token")
+        assert lookup.server.calls == []
+
+    def test_a_file_that_is_not_utf8_is_refused(self, lookup, shell):
+        self.write(shell, b'project = "\xff\xfe"\n')
+        with pytest.raises(AnsibleError, match="is not UTF-8"):
+            lookup.run([], {}, url=URL, token="static-token")
+        assert lookup.server.calls == []
+
+
 class TestProjectFileTrust:
     """The lookup reads .sekret.toml only where the CLI would, so a file planted in a shared folder
     cannot make it refuse or choose anything."""
@@ -1048,6 +1114,30 @@ class TestCliEnvironment:
     def test_the_environment_given_to_the_cli_keeps_everything_else(self):
         environ = {"PATH": "/bin", "SEKRET_CLIENT_SECRET": "s", "SEKRET_PATH": "/x", "SEKRET_URL": "u"}
         assert sekret_cli.cli_environment(environ) == {"PATH": "/bin", "SEKRET_PATH": "/x"}
+
+
+class TestRefreshReadsTheSavedLoginFirst:
+    """After a 401, a login saved since by another worker or by hand is used before any thought of
+    logging in, even where the lookup could not log in itself."""
+
+    @pytest.mark.parametrize("blocked", ["cli_login off", "inventory server"])
+    def test_a_newer_saved_login_is_used(self, state, blocked):
+        (state / "token").write_text("newer\n")
+        source = CliTokens(
+            state.cli,
+            URL,
+            lock_dir=state.dir,
+            login=blocked != "cli_login off",
+            no_login_reason="the inventory chose it" if blocked == "inventory server" else None,
+        )
+        assert source.refresh("older") == "newer"
+        assert logins(state) == []
+
+    def test_the_same_rejected_login_still_needs_a_new_one(self, state):
+        (state / "token").write_text("older\n")
+        source = CliTokens(state.cli, URL, lock_dir=state.dir, login=False)
+        with pytest.raises(AuthenticationError, match="cli_login is off"):
+            source.refresh("older")
 
 
 class TestProducedTokensAcrossRuns:
