@@ -84,6 +84,19 @@ options:
     choices: [auto, token, universal, oidc, kubernetes, cli]
     env:
       - name: SEKRET_AUTH_METHOD
+  validate_certs:
+    description:
+      - Whether to check the server's TLS certificate. Off, anyone on the network path can read your token
+        and secrets, and the lookup warns once in each worker process.
+      - With your C(sekret login), off passes C(--insecure-skip-verify) to the CLI.
+      - There is deliberately no C(sekret_validate_certs) variable, so an inventory cannot turn checking off.
+    type: bool
+    default: true
+    env:
+      - name: SEKRET_VALIDATE_CERTS
+    ini:
+      - section: sekret
+        key: validate_certs
   cli_path:
     description:
       - The sekret CLI to run for the saved login and the project file's settings.
@@ -189,6 +202,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     SekretError,
     Settings,
     resolve_auth,
+    skip_verify_warning,
     terminal_safe,
 )
 
@@ -446,6 +460,14 @@ def check_destination(plan, place_origins: dict, ca_vouched: bool = False) -> No
 _WARNED: set[str] = set()
 
 
+def warn_skip_verify(url: str) -> None:
+    """Warns once a worker process that a server's certificate is not being checked."""
+    if "validate_certs" in _WARNED:
+        return
+    _WARNED.add("validate_certs")
+    display.warning(skip_verify_warning(url))
+
+
 def warn_overridden(name: str, from_inventory, from_environment) -> None:
     """Warns once a worker process when an inventory variable outranks a different SEKRET_* value,
     which before sekret_* variables were read was the one used. Names only, never values."""
@@ -489,7 +511,18 @@ class LookupModule(LookupBase):
             login=settings.cli_login,
             notify=lambda message: display.display(terminal_safe(message)),
             no_login_reason=no_login_reason,
+            insecure_skip_verify=not settings.validate_certs,
         )
+
+    def _validate_certs(self) -> bool:
+        """validate_certs from the lookup's arguments, SEKRET_VALIDATE_CERTS or ansible.cfg, never an
+        inventory variable, which must not be able to turn checking off."""
+        value, origin = self.get_option_and_origin("validate_certs")
+        if origin.startswith("var:"):
+            value, _ = C.config.get_config_value_and_origin(
+                "validate_certs", plugin_type="lookup", plugin_name=self._load_name, variables={}
+            )
+        return value is not False
 
     def _ca_vouched(self, place: dict, origins: dict) -> str | None:
         """The trusted setting naming the same file as a CA path an inventory variable gave: the
@@ -555,6 +588,7 @@ class LookupModule(LookupBase):
     def run(self, terms, variables=None, **kwargs):
         self.set_options(var_options=variables, direct=kwargs)
         options = {name: self.get_option(name) for name in CONNECTION_OPTIONS}
+        options["validate_certs"] = self._validate_certs()
         try:
             place, origins = self._place(variables, kwargs)
             options.update(place)
@@ -577,12 +611,14 @@ class LookupModule(LookupBase):
                     origins["ca_path"] = CLI_ORIGIN
                     settings = Settings.from_options(options)
                     plan = resolve_auth(settings, allow_cli=True)
-            if isinstance(plan, CliLogin) and not settings.validate_certs:
-                raise ConfigError(
-                    "validate_certs is off, but your sekret login is never sent without checking the "
-                    "server's certificate; turn it back on, or use a token or machine identity"
-                )
-            if isinstance(plan, CliLogin) and settings.ca_path and os.path.isdir(settings.ca_path):
+            if not settings.validate_certs:
+                warn_skip_verify(settings.url)
+            if (
+                isinstance(plan, CliLogin)
+                and settings.validate_certs
+                and settings.ca_path
+                and os.path.isdir(settings.ca_path)
+            ):
                 raise ConfigError(
                     f"ca_path {settings.ca_path} is a directory, but the sekret CLI that holds your login "
                     "needs a CA file; name the file instead"

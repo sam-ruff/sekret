@@ -106,6 +106,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     SekretError,
     Settings,
     option_or_env,
+    skip_verify_warning,
 )
 
 HIDDEN = "(hidden)"
@@ -251,10 +252,13 @@ def main():
         supports_check_mode=True,
     )
     try:
-        client = SekretClient(Settings.from_options(module.params))
+        settings = Settings.from_options(module.params)
+        client = SekretClient(settings)
         result, warnings = ensure(client, module.params, module.check_mode)
     except SekretError as e:
         module.fail_json(msg=e.message)
+    if not settings.validate_certs:
+        warnings.insert(0, skip_verify_warning(settings.url))
     for warning in warnings:
         module.warn(warning)
     if not module._diff:

@@ -84,6 +84,13 @@ class HttpResponse(NamedTuple):
 Transport = Callable[[str, str, Mapping[str, str], "bytes | None", float], HttpResponse]
 
 
+def skip_verify_warning(url: str) -> str:
+    return terminal_safe(
+        f"validate_certs is off, so the server's certificate is not checked for {url}; anyone on the network "
+        "path can read your token and secrets"
+    )
+
+
 def terminal_safe(value: Any) -> str:
     """The text with anything that is not printable, such as escape sequences, C1 controls and
     direction overrides, written as an escape, for messages that reach a terminal."""

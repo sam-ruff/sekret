@@ -31,7 +31,7 @@ The lookup also takes `url`, `project`, `environment`, `path` and `ca_path` from
 
 A machine login is cached for the rest of the process, so a template full of lookups only logs in once.
 
-If the server uses a certificate from your own CA, set `ca_path` (or `SEKRET_CA_PATH`) to the CA bundle. `validate_certs: false` turns checking off entirely, which is fine for a quick test and not much else.
+If the server uses a certificate from your own CA, set `ca_path` (or `SEKRET_CA_PATH`) to the CA bundle. `validate_certs: false` turns checking off entirely, which is fine for a quick test and not much else: the lookup and the module warn when it is off, and the lookup takes it only from its own argument, `SEKRET_VALIDATE_CERTS` or `[sekret] validate_certs` in `ansible.cfg`, never from an inventory variable. With your `sekret login` it runs the CLI with `--insecure-skip-verify`.
 
 `project` and `environment` can also come from `SEKRET_PROJECT` and `SEKRET_ENVIRONMENT`.
 

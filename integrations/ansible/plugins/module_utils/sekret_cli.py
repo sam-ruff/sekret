@@ -267,7 +267,9 @@ class CliTokens:
         no_login_reason: str | None = None,
         lock_wait: float = LOCK_WAIT,
         clock: Callable[[], float] = time.time,
+        insecure_skip_verify: bool = False,
     ):
+        self._insecure_skip_verify = insecure_skip_verify
         self._cli_path = cli_path
         self._url = url
         self._ca_path = ca_path
@@ -284,7 +286,10 @@ class CliTokens:
     def _argv(self, *args: str) -> list[str]:
         # `--flag=value`, so a value starting with a dash is never read as a flag.
         argv = [self._cli_path, *args, f"--server={self._url}"]
-        if self._ca_path:
+        if self._insecure_skip_verify:
+            # The CLI would ignore a CA file then, and say so, so none is passed.
+            argv.append("--insecure-skip-verify")
+        elif self._ca_path:
             argv.append(f"--ca-file={self._ca_path}")
         return argv
 

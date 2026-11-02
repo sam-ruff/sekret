@@ -1007,13 +1007,51 @@ class TestContextOnlyWhenNeeded:
             lookup.run([], {}, url=URL, token="static-token", environment="e")
 
 
-class TestCliLoginChecksCertificates:
-    def test_the_cli_login_with_certificate_checks_off_is_refused(self, lookup, state):
+class TestSkippingCertificateChecks:
+    def recording(self, lookup):
+        used = []
+        factory = lookup.client_factory
+        lookup.client_factory = lambda settings, token_source=None: (
+            used.append(settings.validate_certs) or factory(settings, token_source=token_source)
+        )
+        return used
+
+    def test_the_cli_login_passes_the_flag_and_no_ca_file_and_warns_once(self, lookup, state, tmp_path):
         (state / "token").write_text("cli-token-saved\n")
-        with pytest.raises(AnsibleError, match="validate_certs is off"):
-            lookup.run([], {}, url=URL, project="p", environment="e", validate_certs=False)
-        assert lookup.server.calls == []
-        assert not [c for c in calls(state) if c[:1] == ["token"] and "--context" not in c]
+        lookup.server.tokens = {"cli-token-saved"}
+        ca = tmp_path / "ca.pem"
+        ca.write_text("ca")
+        for _ in range(2):
+            lookup.run([], {}, url=URL, project="p", environment="e", validate_certs=False, ca_path=str(ca))
+        token_calls = [c for c in calls(state) if c[:1] == ["token"] and "--context" not in c]
+        assert token_calls and all("--insecure-skip-verify" in c for c in token_calls)
+        assert not any(a.startswith("--ca-file") for c in token_calls for a in c)
+        (warning,) = lookup.shown.warnings
+        assert "validate_certs is off" in warning and "can read your token" in warning
+
+    def test_checking_stays_on_by_default_with_no_warning(self, lookup, state):
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        used = self.recording(lookup)
+        lookup.run([], {}, url=URL, project="p", environment="e")
+        assert used == [True]
+        assert all("--insecure-skip-verify" not in c for c in calls(state))
+        assert lookup.shown.warnings == []
+
+    def test_an_inventory_variable_cannot_turn_checking_off(self, lookup):
+        used = self.recording(lookup)
+        lookup.run(
+            [], {"sekret_validate_certs": False}, url=URL, token="static-token", project="p", environment="e"
+        )
+        assert used == [True]
+        assert lookup.shown.warnings == []
+
+    def test_the_environment_can(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_VALIDATE_CERTS", "false")
+        used = self.recording(lookup)
+        lookup.run([], {}, url=URL, token="static-token", project="p", environment="e")
+        assert used == [False]
+        assert len(lookup.shown.warnings) == 1
 
 
 class TestCachedTokensAreRedacted:
@@ -1299,7 +1337,9 @@ def http_echo():
     server.server_close()
 
 
-def ansible_run(tmp_path, state, server, ini, env=None, extra=(), lookup_args="", refused=False):
+def ansible_run(
+    tmp_path, state, server, ini, env=None, extra=(), lookup_args="", refused=False, output=False
+):
     config = tmp_path / "ansible.cfg"
     config.write_text(f"[defaults]\ncollections_path = {COLLECTIONS_ROOT}\n\n[sekret]\n{ini}")
     environment = {
@@ -1339,6 +1379,8 @@ def ansible_run(tmp_path, state, server, ini, env=None, extra=(), lookup_args=""
         assert result.returncode != 0, result.stdout
         return result.stdout + result.stderr
     assert result.returncode == 0, result.stdout + result.stderr
+    if output:
+        return result.stdout + result.stderr
     return server.fake.asked()
 
 
@@ -1379,3 +1421,9 @@ class TestAnsibleCfg:
             json.dumps({"project": "file-p", "project_source": "project_file"})
         )
         assert ansible_run(tmp_path, state, http_echo, INI)[0] == "ini-p"
+
+    def test_ansible_cfg_can_turn_certificate_checks_off_with_a_warning(self, tmp_path, state, http_echo):
+        output = ansible_run(
+            tmp_path, state, http_echo, INI + "validate_certs = false\n", refused=False, output=True
+        )
+        assert "validate_certs is off" in output
