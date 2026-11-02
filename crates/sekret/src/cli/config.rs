@@ -780,7 +780,9 @@ pub struct Overrides {
     pub env_environment: Option<String>,
     /// [`LOADED_FILE_VAR`]: set by `env use` to the project file it loaded under, empty for none.
     pub loaded_file: Option<String>,
+    /// From `--path` or `SEKRET_PATH`; `env_path` holds `SEKRET_PATH` when no flag gave it.
     pub path: Option<String>,
+    pub env_path: Option<String>,
     /// From `--ca-file` or `SEKRET_CA_FILE`.
     pub ca_file: Option<PathBuf>,
     /// The user config, the lowest priority of all.
@@ -829,6 +831,12 @@ fn stale_shell_choice(overrides: &Overrides, file: &ProjectFile) -> Option<Strin
             &file.environment,
             "SEKRET_ENVIRONMENT",
         ),
+        clash(
+            &overrides.env_path.is_none().then(|| overrides.path.clone()).flatten(),
+            &overrides.env_path,
+            &file.path,
+            "SEKRET_PATH",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -864,8 +872,8 @@ Settings are taken from the first of these that sets them:
      (server, ca_file)
 An empty value for the server, token, project, environment or path, as a flag or a variable, counts
 as unset; an empty CA file is an error. The token, when neither --token nor SEKRET_TOKEN is set, is
-the one `sekret login` saved for the chosen server. SEKRET_PROJECT and SEKRET_ENVIRONMENT left by
-`sekret-env` under a different .sekret.toml are refused rather than used.";
+the one `sekret login` saved for the chosen server. SEKRET_PROJECT, SEKRET_ENVIRONMENT and
+SEKRET_PATH left by `sekret-env` under a different .sekret.toml are refused rather than used.";
 
 /// Flags (which already include environment variables via clap) win over the project file, which
 /// wins over the user config. The stored login is used when no token was given.
@@ -2160,6 +2168,28 @@ mod tests {
             0,
         )?;
         assert_eq!(outside.stale_shell, None, "no project file here to override");
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_loaded_for_another_project_file_is_refused_too() -> anyhow::Result<()> {
+        let mut file: ProjectFile =
+            toml::from_str("server = \"https://s\"\nproject = \"a\"\nenvironment = \"prod\"\npath = \"/b\"\n")?;
+        file.location = Some("/repo-b/.sekret.toml".into());
+        let mut shell = shell_from_a("/repo-a/.sekret.toml");
+        shell.path = Some("/a".into());
+        shell.env_path = Some("/a".into());
+        let stale = resolve(shell.clone(), file.clone(), &Credentials::default(), 0)?;
+        let reason = stale.stale_shell.context("the folder clash is reported")?;
+        assert!(
+            reason.contains("SEKRET_PATH is /a") && reason.contains("says /b"),
+            "{reason}"
+        );
+
+        shell.env_path = None;
+        let flagged = resolve(shell, file, &Credentials::default(), 0)?;
+        assert_eq!(flagged.stale_shell, None, "--path is a deliberate choice");
+        assert_eq!(flagged.path, "/a");
         Ok(())
     }
 

@@ -391,6 +391,13 @@ pub fn resolve_with_token(args: &ClientArgs, token: Option<String>) -> anyhow::R
             env_environment: var("SEKRET_ENVIRONMENT"),
             loaded_file: std::env::var(config::LOADED_FILE_VAR).ok(),
             path: set(&args.path, "SEKRET_PATH"),
+            // clap merges --path with SEKRET_PATH; the stale-shell check needs to know which it was.
+            env_path: (!argv
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--path" || arg.starts_with("--path=")))
+            .then(|| var("SEKRET_PATH"))
+            .flatten(),
             ca_file: args.ca_file.clone(),
             user,
         },
