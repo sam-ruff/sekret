@@ -57,5 +57,9 @@ curl -fsS "$url/api/v1/auth/config" >/dev/null
 
 token=$(sekret admin bootstrap --database-url "$database_url" --root-key-file "$key_file")
 
+target_dir=$(cd "$repo_root" && cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+
 cd "$collection_dir"
-SEKRET_TEST_URL="$url" SEKRET_TEST_TOKEN="$token" uv run pytest -m integration -v "$@"
+SEKRET_TEST_URL="$url" SEKRET_TEST_TOKEN="$token" SEKRET_TEST_CLI="$target_dir/debug/sekret" \
+  uv run pytest -m integration -v "$@"

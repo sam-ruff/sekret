@@ -13,22 +13,49 @@ ansible-galaxy collection install sekret-secrets-*.tar.gz
 
 ## Connect
 
-Set `SEKRET_URL` and one way to log in. Universal auth suits a controller or a host:
+When you run Ansible yourself, the lookup can use your own `sekret login`. Set the server and the project once, in `ansible.cfg`:
 
-```sh
-export SEKRET_URL=https://sekret.example.com
-export SEKRET_CLIENT_ID=0192d4a8-0000-7000-8000-000000000000
-export SEKRET_CLIENT_SECRET=$(cat ~/.config/sekret/ansible-client-secret)
+```ini
+[sekret]
+url = https://sekret.example.com
+ca_path = trust/root.pem
+project = app
+environment = prod
 ```
+
+With nothing else set, the lookup asks the CLI (`sekret token`) for the login it saved. When there is none, or it has expired, it runs `sekret login` itself: the browser opens on the approval page, the link and code also appear in Ansible's output, and the run carries on once you approve. Of several Ansible workers, only one logs in; the others wait for it and use the same login. If the server rejects a saved login part way through a run, the lookup logs in again once and retries. The `sekret` CLI must be on the `PATH`, or named with `cli_path` or `SEKRET_CLI`.
+
+The lookup tries these in order and uses the first that is set:
 
 | Method | Options | Environment |
 |---|---|---|
 | Token | `token` | `SEKRET_TOKEN` |
 | Universal auth | `client_id`, `client_secret` | `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET` |
 | OIDC | `identity_id` with `oidc_token` or `oidc_token_file` | `SEKRET_IDENTITY_ID`, `SEKRET_OIDC_TOKEN`, `SEKRET_OIDC_TOKEN_FILE` |
-| Kubernetes | `identity_id`, `auth_method: kubernetes` | `SEKRET_IDENTITY_ID`, `SEKRET_AUTH_METHOD` |
+| Your `sekret login` (lookup only) | `auth_method: cli` to use nothing else | `SEKRET_AUTH_METHOD` |
+| Kubernetes, only when asked for | `identity_id`, `auth_method: kubernetes` | `SEKRET_IDENTITY_ID`, `SEKRET_AUTH_METHOD` |
+
+The module runs on the target host, so it never uses a CLI login; give it a token or a machine identity.
 
 A login is cached for the rest of the run, so a template full of lookups logs in once. For a private CA, set `ca_path` or `SEKRET_CA_PATH`.
+
+### Runs nobody is watching
+
+A scheduled or CI run has nobody to approve a browser login. Set `cli_login = false` in `[sekret]`, or `SEKRET_CLI_LOGIN=false`, so a missing login fails at once instead of waiting, and better still give the run a machine identity of its own with universal, OIDC or Kubernetes auth.
+
+### Where the lookup reads from
+
+The server, project, environment, folder and CA file are each taken from the first of these that sets them:
+
+| | Source | For example |
+|---|---|---|
+| 1 | The lookup's own arguments | `lookup('sekret.secrets.secret', 'KEY', environment='staging')` |
+| 2 | Ansible variables | `sekret_url`, `sekret_project`, `sekret_environment`, `sekret_path`, `sekret_ca_path` in group_vars, host_vars or a play |
+| 3 | Environment variables | `SEKRET_URL`, `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT`, `SEKRET_PATH`, `SEKRET_CA_PATH`, which `sekret env use` sets |
+| 4 | `ansible.cfg` | `url`, `project`, `environment`, `path`, `ca_path` in `[sekret]` |
+| 5 | The sekret CLI's own settings | the nearest `.sekret.toml`, then the CLI's user config, read through `sekret token --context` |
+
+The folder is `/` when nothing sets it. So `sekret env use staging` switches a run that relies on `ansible.cfg`, but not a play or group that names its environment in a variable: a group pinned to `prod` keeps reading `prod` whatever your shell has loaded. A `.sekret.toml` counts only once you have confirmed it, as for `sekret export`; until then a lookup that needs it fails and says so. Run with `-v` to see, once a run, where the project and environment came from.
 
 ## Read
 
@@ -49,6 +76,8 @@ A login is cached for the rest of the run, so a template full of lookups logs in
 ```
 
 A missing key fails the task unless you pass `default=`.
+
+A whole folder is fetched once a run and kept for the rest of it, for each server, login, project, environment and folder. So a variable set to a folder lookup in group_vars, which Ansible works out again every time it is used, costs one request a run.
 
 ## Write
 

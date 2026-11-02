@@ -25,10 +25,14 @@ def server():
 
 @pytest.fixture
 def lookup(server, monkeypatch):
-    for name in ("SEKRET_URL", "SEKRET_TOKEN", "SEKRET_PROJECT", "SEKRET_ENVIRONMENT"):
+    for name in ("SEKRET_URL", "SEKRET_TOKEN", "SEKRET_PROJECT", "SEKRET_ENVIRONMENT", "SEKRET_PATH"):
         monkeypatch.delenv(name, raising=False)
     plugin = lookup_loader.get("sekret.secrets.secret")
-    plugin.client_factory = lambda settings: SekretClient(settings, transport=server, cache=TokenCache())
+    plugin.client_factory = lambda settings, token_source=None: SekretClient(
+        settings, transport=server, cache=TokenCache(), token_source=token_source
+    )
+    # No sekret CLI here: these tests name everything themselves.
+    plugin.read_context = staticmethod(lambda cli_path, known: None)
     return plugin
 
 

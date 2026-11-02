@@ -9,9 +9,99 @@ description:
   - Returns the value of each secret key given as a term.
   - With no terms, or O(all=true), returns a single dictionary of every readable secret under O(path).
   - Every option falls back to the matching C(SEKRET_*) environment variable.
+  - O(url), O(project), O(environment), O(path) and O(ca_path) are taken from the first of the lookup's own
+    arguments, a C(sekret_*) variable, a C(SEKRET_*) environment variable (which C(sekret env use) sets) and
+    the C([sekret]) section of C(ansible.cfg). Any still unset come from the sekret CLI's own settings,
+    above all the nearest C(.sekret.toml), when the CLI is installed.
+  - With no token, machine identity or OIDC token, it uses the login C(sekret login) saved, running
+    C(sekret login) once when there is none or it has expired.
 extends_documentation_fragment:
   - sekret.secrets.connection
 options:
+  url:
+    description:
+      - Base URL of the sekret server, for example C(https://sekret.example.com).
+    type: str
+    env:
+      - name: SEKRET_URL
+    vars:
+      - name: sekret_url
+    ini:
+      - section: sekret
+        key: url
+  project:
+    description:
+      - Project slug or ID.
+    type: str
+    env:
+      - name: SEKRET_PROJECT
+    vars:
+      - name: sekret_project
+    ini:
+      - section: sekret
+        key: project
+  environment:
+    description:
+      - Environment slug within the project, for example C(prod).
+    type: str
+    env:
+      - name: SEKRET_ENVIRONMENT
+    vars:
+      - name: sekret_environment
+    ini:
+      - section: sekret
+        key: environment
+  path:
+    description:
+      - Folder path holding the secrets. C(/) when nothing sets it.
+    type: str
+    default: null
+    env:
+      - name: SEKRET_PATH
+    vars:
+      - name: sekret_path
+    ini:
+      - section: sekret
+        key: path
+  ca_path:
+    description:
+      - CA bundle file, or directory of hashed certificates, used to verify the server.
+    type: path
+    env:
+      - name: SEKRET_CA_PATH
+    vars:
+      - name: sekret_ca_path
+    ini:
+      - section: sekret
+        key: ca_path
+  auth_method:
+    description:
+      - How to authenticate.
+      - V(auto) uses the first of O(token), O(client_id) and O(client_secret), O(identity_id) with an OIDC
+        token, and then the login C(sekret login) saved.
+      - V(cli) uses only the saved login. V(kubernetes) is never picked automatically.
+    type: str
+    choices: [auto, token, universal, oidc, kubernetes, cli]
+    env:
+      - name: SEKRET_AUTH_METHOD
+  cli_path:
+    description:
+      - The sekret CLI to run for the saved login and the project file's settings.
+    type: str
+    default: sekret
+    env:
+      - name: SEKRET_CLI
+  cli_login:
+    description:
+      - Whether to run C(sekret login), which opens the browser, when there is no usable saved login.
+      - Turn it off for runs nobody is watching, so they fail at once instead of waiting for an approval.
+    type: bool
+    default: true
+    env:
+      - name: SEKRET_CLI_LOGIN
+    ini:
+      - section: sekret
+        key: cli_login
   _terms:
     description:
       - Secret keys to read from O(path).
@@ -72,11 +162,17 @@ _raw:
   elements: raw
 """
 
+import os  # noqa: E402
 from typing import Any  # noqa: E402
 
 from ansible.errors import AnsibleError  # noqa: E402
 from ansible.plugins.lookup import LookupBase  # noqa: E402
+from ansible.utils.display import Display  # noqa: E402
 
+from ansible_collections.sekret.secrets.plugins.module_utils.sekret_cli import (  # noqa: E402
+    CliTokens,
+    cli_context,
+)
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (  # noqa: E402
     ConfigError,
     SekretClient,
@@ -84,10 +180,19 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     Settings,
 )
 
+display = Display()
+
+# Where to read from: each can come from the lookup, a variable, the environment or ansible.cfg,
+# and failing those from the CLI's own settings.
+PLACE_OPTIONS = ("url", "project", "environment", "path", "ca_path")
+CONTEXT_KEYS = {"url": "server", "project": "project", "environment": "environment", "path": "path"}
+
 CONNECTION_OPTIONS = (
     "url",
     "project",
     "environment",
+    "cli_path",
+    "cli_login",
     "auth_method",
     "token",
     "client_id",
@@ -146,29 +251,109 @@ def read_secrets(
     return values
 
 
+# Per process, so a variable Ansible templates on every use costs one request a run.
+_FOLDERS: dict[tuple, dict] = {}
+_CONTEXTS: dict[tuple, dict | None] = {}
+_ANNOUNCED: set[tuple] = set()
+
+
+def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_context) -> None:
+    """Takes whatever is still unset from the CLI's settings, above all the nearest .sekret.toml."""
+    if all(place.get(name) for name in CONTEXT_KEYS):
+        return
+    known = {name: place.get(name) for name in PLACE_OPTIONS}
+    key = (cli_path, os.getcwd(), tuple(sorted((k, v or "") for k, v in known.items())))
+    if key not in _CONTEXTS:
+        _CONTEXTS[key] = read_context(cli_path, known)
+    context = _CONTEXTS[key]
+    if not context:
+        return
+    for name, field in CONTEXT_KEYS.items():
+        if not place.get(name) and context.get(field):
+            place[name] = context[field]
+            origins[name] = f"the sekret CLI ({context.get(field + '_source') or 'its settings'})"
+    if not place.get("ca_path") and context.get("ca_file"):
+        place["ca_path"] = context["ca_file"]
+        origins["ca_path"] = "the sekret CLI"
+
+
+def announce(place: dict, origins: dict) -> None:
+    """Says once a process, at -v, where the lookup reads from and why."""
+    key = tuple((name, place.get(name), origins.get(name)) for name in PLACE_OPTIONS)
+    if key in _ANNOUNCED:
+        return
+    _ANNOUNCED.add(key)
+    display.v(
+        f"sekret: {place['project']}/{place['environment']} at {place['path']} on {place['url']} "
+        f"(project from {origins['project']}, environment from {origins['environment']})"
+    )
+
+
 class LookupModule(LookupBase):
     client_factory = SekretClient
+    cli_tokens = CliTokens
+    read_context = staticmethod(cli_context)
+
+    def _token_source(self, settings: Settings) -> CliTokens:
+        return self.cli_tokens(
+            settings.cli_path,
+            settings.url,
+            ca_path=settings.ca_path,
+            login=settings.cli_login,
+            notify=display.display,
+        )
+
+    def _place(self) -> tuple[dict, dict]:
+        place, origins = {}, {}
+        for name in PLACE_OPTIONS:
+            value, origin = self.get_option_and_origin(name)
+            place[name] = value or None
+            origins[name] = origin
+        fill_from_cli(place, origins, self.get_option("cli_path") or "sekret", self.read_context)
+        if not place.get("path"):
+            place["path"], origins["path"] = "/", "default"
+        return place, origins
 
     def run(self, terms, variables=None, **kwargs):
         self.set_options(var_options=variables, direct=kwargs)
         options = {name: self.get_option(name) for name in CONNECTION_OPTIONS}
-        project = options.get("project")
-        environment = options.get("environment")
-        if not project or not environment:
-            raise AnsibleError(
-                "sekret lookup needs project and environment (or SEKRET_PROJECT and SEKRET_ENVIRONMENT)"
-            )
         try:
-            client = self.client_factory(Settings.from_options(options))
-            return read_secrets(
-                client,
-                list(terms or []),
-                project,
-                environment,
-                path=self.get_option("path") or "/",
-                all_keys=self.get_option("all"),
-                recursive=self.get_option("recursive"),
-                default=kwargs.get("default", _MISSING),
+            place, origins = self._place()
+            options.update(place)
+            if not place.get("project") or not place.get("environment"):
+                raise AnsibleError(
+                    "sekret lookup needs project and environment: pass them, set sekret_project and "
+                    "sekret_environment, SEKRET_PROJECT and SEKRET_ENVIRONMENT, the [sekret] section of "
+                    "ansible.cfg, or a .sekret.toml"
+                )
+            settings = Settings.from_options(options)
+            client = self.client_factory(settings, token_source=self._token_source)
+            announce(place, origins)
+            terms = list(terms or [])
+            if terms:
+                return read_secrets(
+                    client,
+                    terms,
+                    place["project"],
+                    place["environment"],
+                    path=place["path"],
+                    all_keys=self.get_option("all"),
+                    recursive=self.get_option("recursive"),
+                    default=kwargs.get("default", _MISSING),
+                )
+            recursive = bool(self.get_option("recursive"))
+            key = (
+                settings.url,
+                client.identity(),
+                place["project"],
+                place["environment"],
+                place["path"],
+                recursive,
             )
+            if key not in _FOLDERS:
+                (_FOLDERS[key],) = read_secrets(
+                    client, [], place["project"], place["environment"], place["path"], True, recursive
+                )
+            return [dict(_FOLDERS[key])]
         except SekretError as e:
             raise AnsibleError(e.message) from None

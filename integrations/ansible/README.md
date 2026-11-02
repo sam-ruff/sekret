@@ -22,9 +22,12 @@ Set `url` (or `SEKRET_URL`) to the server, plus one way of logging in. Every opt
 | Token | `token` | `SEKRET_TOKEN` |
 | Universal auth | `client_id`, `client_secret` | `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET` |
 | OIDC | `identity_id` with `oidc_token` or `oidc_token_file` | `SEKRET_IDENTITY_ID`, `SEKRET_OIDC_TOKEN`, `SEKRET_OIDC_TOKEN_FILE` |
-| Kubernetes | `identity_id`, `auth_method: kubernetes` | `SEKRET_IDENTITY_ID`, `SEKRET_AUTH_METHOD` |
+| Your `sekret login` (lookup only) | `auth_method: cli`, `cli_path`, `cli_login` | `SEKRET_AUTH_METHOD`, `SEKRET_CLI`, `SEKRET_CLI_LOGIN` |
+| Kubernetes | `identity_id`, `auth_method: kubernetes`, `kubernetes_token_file` | `SEKRET_IDENTITY_ID`, `SEKRET_AUTH_METHOD`, `SEKRET_KUBERNETES_TOKEN_FILE` |
 
-When `auth_method` is left alone it tries them in that order, skipping Kubernetes, which you have to ask for. Kubernetes reads the pod's service account token from the usual path unless you set `kubernetes_token_file`.
+When `auth_method` is left alone it tries them in that order, skipping Kubernetes, which you have to ask for. Kubernetes needs `kubernetes_token_file`: a projected token with the `sekret` audience, never the pod's default token. With none of the others set, the lookup uses the login the `sekret` CLI saved, and runs `sekret login` (which opens the browser) when there is none; set `cli_login: false` for runs nobody is watching.
+
+The lookup also takes `url`, `project`, `environment`, `path` and `ca_path` from `sekret_*` variables and from a `[sekret]` section in `ansible.cfg`, below its own arguments and the environment, and failing all of those from the CLI's own settings such as a `.sekret.toml`. See `docs/integrations/ansible.md` for the order.
 
 A machine login is cached for the rest of the process, so a template full of lookups only logs in once.
 

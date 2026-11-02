@@ -13,11 +13,13 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 DEFAULT_KUBERNETES_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 DEFAULT_TIMEOUT = 30
-AUTH_METHODS = ("auto", "token", "universal", "oidc", "kubernetes")
+AUTH_METHODS = ("auto", "token", "universal", "oidc", "kubernetes", "cli")
+# A CLI login can be days old; a rejected one is replaced on the first 401 whatever this says.
+CLI_TOKEN_TTL = 3600
 REDACTED = "********"
 
 # Refresh tokens a little before they expire so in-flight requests do not race expiry.
@@ -40,6 +42,8 @@ ENV_VARS = {
     "timeout": "SEKRET_TIMEOUT",
     "project": "SEKRET_PROJECT",
     "environment": "SEKRET_ENVIRONMENT",
+    "cli_path": "SEKRET_CLI",
+    "cli_login": "SEKRET_CLI_LOGIN",
 }
 
 
@@ -112,6 +116,8 @@ class Settings:
     client_cert: str | None = None
     client_key: str | None = None
     timeout: float = DEFAULT_TIMEOUT
+    cli_path: str = "sekret"
+    cli_login: bool = True
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> Settings:
@@ -135,6 +141,7 @@ class Settings:
         client_cert, client_key = pick("client_cert"), pick("client_key")
         if bool(client_cert) != bool(client_key):
             raise ConfigError("client_cert and client_key must be set together")
+        cli_login = pick("cli_login")
         return cls(
             url=str(url).rstrip("/"),
             auth_method=auth_method,
@@ -150,6 +157,8 @@ class Settings:
             client_cert=client_cert,
             client_key=client_key,
             timeout=timeout,
+            cli_path=pick("cli_path") or "sekret",
+            cli_login=True if cli_login is None else _to_bool(cli_login),
         )
 
     def sensitive_values(self) -> list[str]:
@@ -159,6 +168,19 @@ class Settings:
 @dataclass(frozen=True)
 class StaticToken:
     token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class CliLogin:
+    """The login `sekret login` saved, read through the CLI on the controller."""
+
+    def cache_key(self, url: str) -> str:
+        return hashlib.sha256(json.dumps(["cli", url]).encode()).hexdigest()
+
+
+class TokenSource(Protocol):
+    def token(self) -> str: ...
+    def refresh(self, rejected: str | None) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -226,10 +248,15 @@ def _kubernetes(settings: Settings, read_file: Callable[[str], str]) -> Login:
 
 
 def resolve_auth(
-    settings: Settings, read_file: Callable[[str], str] = read_token_file
-) -> StaticToken | Login:
-    """Picks how to authenticate: an explicit auth_method, otherwise token, universal then OIDC."""
+    settings: Settings, read_file: Callable[[str], str] = read_token_file, allow_cli: bool = False
+) -> StaticToken | Login | CliLogin:
+    """Picks how to authenticate: an explicit auth_method, otherwise token, universal, OIDC, then
+    the CLI's saved login where the caller can run the CLI (the lookup, on the controller)."""
     method = settings.auth_method
+    if method == "cli":
+        if not allow_cli:
+            raise ConfigError("cli auth only works in the lookup, which runs where `sekret login` was run")
+        return CliLogin()
     if method == "token":
         if not settings.token:
             raise ConfigError("token auth needs token (or SEKRET_TOKEN)")
@@ -247,6 +274,8 @@ def resolve_auth(
         return _universal(settings)
     if settings.identity_id and (settings.oidc_token or settings.oidc_token_file):
         return _oidc(settings, read_file)
+    if allow_cli:
+        return CliLogin()
     raise ConfigError(
         "no sekret credentials found: set token, client_id and client_secret, "
         "identity_id with oidc_token or oidc_token_file, or auth_method=kubernetes"
@@ -384,12 +413,16 @@ class SekretClient:
         transport: Transport | None = None,
         cache: TokenCache = TOKEN_CACHE,
         read_file: Callable[[str], str] = read_token_file,
+        token_source: Callable[[Settings], TokenSource] | None = None,
     ):
         self._settings = settings
         self._transport = transport if transport is not None else default_transport(settings)
         self._cache = cache
         self._read_file = read_file
-        self._auth: StaticToken | Login | None = None
+        self._token_source_factory = token_source
+        self._token_source: TokenSource | None = None
+        self._auth: StaticToken | Login | CliLogin | None = None
+        self._rejected: str | None = None
         self._sensitive = settings.sensitive_values()
 
     def _redacted(self, message: str, extra: list[str] | None = None) -> str:
@@ -436,17 +469,45 @@ class SekretClient:
         except ValueError:
             raise SekretError("sekret returned a response that is not JSON", response.status) from None
 
-    def _auth_plan(self) -> StaticToken | Login:
+    def _auth_plan(self) -> StaticToken | Login | CliLogin:
         if self._auth is None:
-            self._auth = resolve_auth(self._settings, self._read_file)
+            allow_cli = self._token_source_factory is not None
+            self._auth = resolve_auth(self._settings, self._read_file, allow_cli=allow_cli)
             if isinstance(self._auth, Login):
                 self._sensitive.append(self._auth.payload.get("token") or "")
         return self._auth
+
+    def identity(self) -> str:
+        """Stands for whoever the requests run as, without holding a credential."""
+        plan = self._auth_plan()
+        if isinstance(plan, StaticToken):
+            return hashlib.sha256(plan.token.encode()).hexdigest()
+        return plan.cache_key(self._settings.url)
+
+    def _cli_token(self, plan: CliLogin) -> str:
+        if self._token_source is None and self._token_source_factory is not None:
+            self._token_source = self._token_source_factory(self._settings)
+        if self._token_source is None:
+            raise ConfigError("cli auth needs the sekret CLI, which only the lookup runs")
+        key = plan.cache_key(self._settings.url)
+        if self._rejected is not None:
+            rejected, self._rejected = self._rejected, None
+            token = self._token_source.refresh(rejected)
+        else:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached
+            token = self._token_source.token()
+        self._sensitive.append(token)
+        self._cache.put(key, token, CLI_TOKEN_TTL)
+        return token
 
     def access_token(self) -> str:
         plan = self._auth_plan()
         if isinstance(plan, StaticToken):
             return plan.token
+        if isinstance(plan, CliLogin):
+            return self._cli_token(plan)
         key = plan.cache_key(self._settings.url)
         cached = self._cache.get(key)
         if cached is not None:
@@ -462,17 +523,20 @@ class SekretClient:
         self._cache.put(key, token, float(payload.get("expires_in") or 0))
         return token
 
-    def _invalidate(self) -> bool:
+    def _invalidate(self, rejected: str) -> bool:
         plan = self._auth_plan()
         if isinstance(plan, StaticToken):
             return False
         self._cache.discard(plan.cache_key(self._settings.url))
+        if isinstance(plan, CliLogin):
+            self._rejected = rejected
         return True
 
     def request(self, method: str, path: str, body: Any = None, sensitive: list[str] | None = None) -> Any:
         """Sends an authenticated request, logging in again once if a cached token was rejected."""
-        response = self._send(method, path, body, self.access_token())
-        if response.status == 401 and self._invalidate():
+        token = self.access_token()
+        response = self._send(method, path, body, token)
+        if response.status == 401 and self._invalidate(token):
             response = self._send(method, path, body, self.access_token())
         if not 200 <= response.status < 300:
             raise self._error(response, sensitive)
