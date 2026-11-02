@@ -165,6 +165,7 @@ _raw:
 import os  # noqa: E402
 from typing import Any  # noqa: E402
 
+from ansible import constants as C  # noqa: E402
 from ansible.errors import AnsibleError  # noqa: E402
 from ansible.plugins.lookup import LookupBase  # noqa: E402
 from ansible.utils.display import Display  # noqa: E402
@@ -181,6 +182,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     Settings,
     StaticToken,
     resolve_auth,
+    terminal_safe,
 )
 
 display = Display()
@@ -267,15 +269,19 @@ _CONTEXTS: dict[tuple, dict | None] = {}
 _ANNOUNCED: set[tuple] = set()
 
 
+def cached_context(cli_path: str, known: dict, read_context=cli_context) -> dict | None:
+    key = (cli_path, os.getcwd(), tuple(sorted((k, v or "") for k, v in known.items())))
+    if key not in _CONTEXTS:
+        _CONTEXTS[key] = read_context(cli_path, known)
+    return _CONTEXTS[key]
+
+
 def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_context) -> None:
     """Takes whatever is still unset from the CLI's settings, above all the nearest .sekret.toml."""
     if all(place.get(name) for name in CONTEXT_KEYS):
         return
     known = {name: place.get(name) for name in PLACE_OPTIONS}
-    key = (cli_path, os.getcwd(), tuple(sorted((k, v or "") for k, v in known.items())))
-    if key not in _CONTEXTS:
-        _CONTEXTS[key] = read_context(cli_path, known)
-    context = _CONTEXTS[key]
+    context = cached_context(cli_path, known, read_context)
     if not context:
         return
     if not place.get("url") and context.get("server") and context.get("server_confirmed") is not True:
@@ -297,10 +303,26 @@ def _from_inventory(origin: str | None) -> bool:
     return (origin or "").startswith("var:")
 
 
-def check_destination(plan, place_origins: dict, credential_origins: dict) -> None:
+def same_path(first: str | None, second: str | None) -> bool:
+    if not first or not second:
+        return False
+    norm = lambda p: os.path.realpath(os.path.expanduser(p))  # noqa: E731
+    return norm(first) == norm(second)
+
+
+def check_destination(plan, place_origins: dict, credential_origins: dict, ca_vouched: bool = False) -> None:
     """Refuses to send a token or machine identity to a server, or through a CA, that the inventory
-    or a project file chose, unless the same playbook passed the credential to the lookup itself."""
+    or a project file chose, unless the same playbook passed the credential to the lookup itself.
+    A CA the inventory chose replaces every other CA the server is checked against, so even the
+    saved login is not sent through it unless a trusted setting names the same file."""
+    ca_from_inventory = _from_inventory(place_origins.get("ca_path")) and not ca_vouched
     if isinstance(plan, CliLogin):
+        if ca_from_inventory:
+            raise ConfigError(
+                "sekret_ca_path comes from an inventory variable, so your sekret login is not sent through "
+                "it: it replaces the CAs the server is checked against. Set ca_path in SEKRET_CA_PATH, "
+                "ansible.cfg or the lookup's own arguments; naming the same file there is enough"
+            )
         return
     if (place_origins.get("url") or "").startswith(CLI_ORIGIN):
         raise ConfigError(
@@ -308,7 +330,9 @@ def check_destination(plan, place_origins: dict, credential_origins: dict) -> No
             "never a token or machine identity; set url, SEKRET_URL or url in the [sekret] section of "
             "ansible.cfg to send those"
         )
-    steered = [f"sekret_{name}" for name in ("url", "ca_path") if _from_inventory(place_origins.get(name))]
+    steered = ["sekret_url"] if _from_inventory(place_origins.get("url")) else []
+    if ca_from_inventory:
+        steered.append("sekret_ca_path")
     outside = {name: origin for name, origin in credential_origins.items() if origin != "Direct"}
     if steered and outside:
         sources = ", ".join(f"{name} ({origin})" for name, origin in sorted(outside.items()))
@@ -333,9 +357,11 @@ def announce(place: dict, origins: dict) -> None:
     if key in _ANNOUNCED:
         return
     _ANNOUNCED.add(key)
+    safe = {name: terminal_safe(place.get(name)) for name in PLACE_OPTIONS}
     display.v(
-        f"sekret: {place['project']}/{place['environment']} at {place['path']} on {place['url']} "
-        f"(project from {origins['project']}, environment from {origins['environment']})"
+        f"sekret: {safe['project']}/{safe['environment']} at {safe['path']} on {safe['url']} "
+        f"(project from {terminal_safe(origins['project'])}, environment from "
+        f"{terminal_safe(origins['environment'])})"
     )
 
 
@@ -350,9 +376,26 @@ class LookupModule(LookupBase):
             settings.url,
             ca_path=settings.ca_path,
             login=settings.cli_login,
-            notify=display.display,
+            notify=lambda message: display.display(terminal_safe(message)),
             no_login_reason=no_login_reason,
         )
+
+    def _ca_vouched(self, place: dict, origins: dict) -> bool:
+        """Whether a CA path an inventory variable gave is also what a trusted setting names: the
+        lookup's own argument, SEKRET_CA_PATH, ansible.cfg, or the CLI's own CA file."""
+        if not _from_inventory(origins.get("ca_path")):
+            return False
+        trusted, _ = C.config.get_config_value_and_origin(
+            "ca_path", plugin_type="lookup", plugin_name=self._load_name, variables={}
+        )
+        if same_path(trusted, place.get("ca_path")):
+            return True
+        known = {name: place.get(name) for name in ("url", "project", "environment")}
+        try:
+            context = cached_context(self.get_option("cli_path") or "sekret", known, self.read_context)
+        except ConfigError:
+            return False
+        return bool(context) and same_path(context.get("ca_file"), place.get("ca_path"))
 
     def _credential_origins(self, plan) -> dict:
         origins = {}
@@ -387,10 +430,10 @@ class LookupModule(LookupBase):
                 )
             settings = Settings.from_options(options)
             plan = resolve_auth(settings, allow_cli=True)
-            check_destination(plan, origins, self._credential_origins(plan))
+            check_destination(plan, origins, self._credential_origins(plan), self._ca_vouched(place, origins))
             # A browser login only to a server the person named, never one an inventory chose.
             no_login_reason = None
-            if _from_inventory(origins.get("url")) or _from_inventory(origins.get("ca_path")):
+            if _from_inventory(origins.get("url")):
                 no_login_reason = (
                     "the server or CA comes from an inventory variable, so the lookup will not open a "
                     f"browser login for it; run `sekret login --server={settings.url}` yourself if you "
@@ -427,4 +470,5 @@ class LookupModule(LookupBase):
                 )
             return [dict(_FOLDERS[key])]
         except SekretError as e:
-            raise AnsibleError(e.message) from None
+            # Messages carry values a project file or an inventory chose.
+            raise AnsibleError(terminal_safe(e.message)) from None

@@ -37,6 +37,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     Settings,
     TokenCache,
     resolve_auth,
+    terminal_safe,
 )
 
 URL = "https://sekret.test"
@@ -567,6 +568,81 @@ class TestWhereCredentialsGo:
         assert logins(state) == []
         (state / "token").write_text("cli-token-saved\n")
         assert self.run(lookup, {"sekret_url": URL}) == [{"WHERE": "here"}]
+
+
+class TestInventoryCa:
+    """A CA file replaces every other CA the server is checked against, so one an inventory chose
+    must not carry even the saved login unless a trusted setting names the same file."""
+
+    def run(self, lookup, **direct):
+        return lookup.run(
+            [], {"sekret_ca_path": "/repo/certs/ca.pem"}, project="p", environment="e", **direct
+        )
+
+    def test_an_inventory_ca_never_carries_the_saved_login(self, lookup, state, monkeypatch):
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        monkeypatch.setenv("SEKRET_URL", URL)
+        with pytest.raises(AnsibleError, match="not sent through it"):
+            self.run(lookup)
+        assert lookup.server.calls == []
+        assert not [c for c in calls(state) if c[:1] == ["token"] and "--context" not in c]
+
+    def test_the_same_ca_in_the_environment_vouches_for_it(self, lookup, state, monkeypatch):
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        monkeypatch.setenv("SEKRET_URL", URL)
+        monkeypatch.setenv("SEKRET_CA_PATH", "/repo/certs/../certs/ca.pem")
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+    def test_the_same_ca_in_the_clis_own_settings_vouches_for_it(self, lookup, state, monkeypatch):
+        (state / "token").write_text("cli-token-saved\n")
+        (state / "context.json").write_text(json.dumps({"ca_file": "/repo/certs/ca.pem"}))
+        lookup.server.tokens = {"cli-token-saved"}
+        monkeypatch.setenv("SEKRET_URL", URL)
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+    def test_another_ca_in_the_environment_does_not(self, lookup, state, monkeypatch):
+        (state / "token").write_text("cli-token-saved\n")
+        monkeypatch.setenv("SEKRET_URL", URL)
+        monkeypatch.setenv("SEKRET_CA_PATH", "/etc/ssl/real-ca.pem")
+        with pytest.raises(AnsibleError, match="not sent through it"):
+            self.run(lookup)
+
+
+class TestTerminalSafety:
+    def test_a_project_file_path_cannot_reach_the_terminal_raw(self, lookup, state):
+        (state / "context.json").write_text(json.dumps({"path": "/a\x1b[2J‮b", "path_source": "project_file"}))
+        lookup.server.put("KEY", "value", path="/elsewhere")
+        with pytest.raises(AnsibleError) as caught:
+            lookup.run(["KEY"], {}, url=URL, token="static-token", project="p", environment="e")
+        message = str(caught.value)
+        assert "\x1b" not in message and "‮" not in message
+        assert "\\u001b" in message and "\\u202e" in message
+        (note,) = lookup.shown.verbose
+        assert "\x1b" not in note and "‮" not in note
+
+    def test_an_unconfirmed_server_with_controls_is_shown_escaped(self, lookup, state):
+        (state / "context.json").write_text(
+            json.dumps({"server": "https://x.test/\x9b31m", "server_confirmed": False})
+        )
+        with pytest.raises(AnsibleError) as caught:
+            lookup.run([], {}, project="p", environment="e")
+        assert "\x9b" not in str(caught.value) and "\\u009b" in str(caught.value)
+
+    def test_login_lines_are_shown_escaped(self, lookup, state):
+        lookup.server.tokens = {"cli-token-1"}
+        # The login, and what it prints, comes before the request, which the odd URL fails.
+        with pytest.raises(AnsibleError):
+            lookup.run([], {}, url=URL + "/‮", project="p", environment="e")
+        assert logins(state)
+        assert lookup.shown.shown
+        assert all("‮" not in line for line in lookup.shown.shown)
+        assert any("\\u202e" in line for line in lookup.shown.shown)
+
+    def test_terminal_safe_keeps_printable_text(self):
+        assert terminal_safe("café /a b") == "café /a b"
+        assert terminal_safe("a\nb\U0001f600") == "a\\u000ab\U0001f600"
 
 
 class TestContextCommand:

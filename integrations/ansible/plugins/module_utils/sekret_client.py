@@ -83,6 +83,20 @@ class HttpResponse(NamedTuple):
 Transport = Callable[[str, str, Mapping[str, str], "bytes | None", float], HttpResponse]
 
 
+def terminal_safe(value: Any) -> str:
+    """The text with anything that is not printable, such as escape sequences, C1 controls and
+    direction overrides, written as an escape, for messages that reach a terminal."""
+    out = []
+    for c in str(value):
+        if c.isprintable():
+            out.append(c)
+        elif ord(c) > 0xFFFF:
+            out.append(f"\\U{ord(c):08x}")
+        else:
+            out.append(f"\\u{ord(c):04x}")
+    return "".join(out)
+
+
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
