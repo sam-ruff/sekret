@@ -55,7 +55,7 @@ The server, project, environment, folder and CA file are each taken from the fir
 | 4 | `ansible.cfg` | `url`, `project`, `environment`, `path`, `ca_path` in `[sekret]` |
 | 5 | The sekret CLI's own settings | the nearest `.sekret.toml`, then the CLI's user config, read through `sekret token --context` |
 
-The folder is `/` when nothing sets it. So `sekret env use staging` switches a run that relies on `ansible.cfg`, but not a play or group that names its environment in a variable: a group pinned to `prod` keeps reading `prod` whatever your shell has loaded. A `.sekret.toml` counts only once you have confirmed it, as for `sekret export`; until then a lookup that needs it fails and says so. Run with `-v` to see, once a run, where the project and environment came from.
+The folder is `/` when nothing sets it. So `sekret env use staging` switches a run that relies on `ansible.cfg`, but not a play or group that names its environment in a variable: a group pinned to `prod` keeps reading `prod` whatever your shell has loaded. Like the CLI, the lookup refuses a `SEKRET_PROJECT` or `SEKRET_ENVIRONMENT` that `sekret env use` loaded under a different `.sekret.toml` from the one in the folder you run Ansible in, when that file names something else, rather than read another repository's secrets; run `sekret-env off`, or name the project and environment another way. Values you exported by hand are not checked. A `.sekret.toml` counts only once you have confirmed it, as for `sekret export`; until then a lookup that needs it fails and says so. Run with `-v` to see, once a run, where the project and environment came from.
 
 ### What may choose the server
 
