@@ -37,7 +37,9 @@ The lookup tries these in order and uses the first that is set:
 
 The module runs on the target host, so it never uses a CLI login; give it a token or a machine identity.
 
-A login is cached for the rest of the run, so a template full of lookups logs in once. For a private CA, set `ca_path` or `SEKRET_CA_PATH`.
+A login is cached for the rest of the run, so a template full of lookups logs in once. For a private CA, set `ca_path` or `SEKRET_CA_PATH`. Without one, a lookup using a token or machine identity trusts the system's CAs. With your `sekret login`, the lookup checks the server against the same CA file as the CLI does: `ca_path` when it is set, otherwise the CLI's own `SEKRET_CA_FILE` or the `ca_file` in its user config. `ca_path` must then be a file, not a directory of certificates, since the CLI reads it too.
+
+The lookup runs the CLI without `SEKRET_TOKEN`, `SEKRET_CLIENT_ID`, `SEKRET_CLIENT_SECRET`, `SEKRET_IDENTITY_ID`, the OIDC and Kubernetes token variables, the GitHub Actions token variables or `SEKRET_URL`, so `sekret login` is always your own browser login, never a machine login, and a machine credential on the controller never reaches the CLI.
 
 ### Runs nobody is watching
 
