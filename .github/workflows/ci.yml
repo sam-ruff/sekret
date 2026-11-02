@@ -56,6 +56,8 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest
+      - name: Build the collection as a release would
+        run: ../../scripts/build-collection.sh 0.0.1 "$RUNNER_TEMP/collection" && test -s "$RUNNER_TEMP/collection/sekret-secrets-0.0.1.tar.gz"
 
   helm:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -148,6 +150,29 @@ jobs:
       pre-build-command: cd web && npm ci --no-audit --no-fund && npm run build && test -f dist/index.html
       verify-command: '"$BINARY" admin web-check'
       asset-label: sekret (linux amd64, static)
+
+  collection:
+    needs: release
+    if: needs.release.outputs.new-release-published == 'true'
+    runs-on: [self-hosted, sophie-small]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: scripts/build-collection.sh "$VERSION" dist
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+      - name: Attach the collection to the release
+        run: gh release upload "$TAG" dist/sekret-secrets-*.tar.gz dist/sekret-secrets-*.tar.gz.sha256 --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
 
   image:
     needs: [release, binary]
