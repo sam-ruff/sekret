@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "sekret",
     version = sekret_core::VERSION,
-    about = "Secrets management server, CLI and Kubernetes operator"
+    about = "Secrets management server, CLI and Kubernetes operator",
+    after_help = cli::config::SETTINGS_ORDER
 )]
 struct Cli {
     #[command(flatten)]

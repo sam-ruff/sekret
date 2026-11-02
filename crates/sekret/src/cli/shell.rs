@@ -413,9 +413,11 @@ pub fn blocked_reason(key: &str) -> Option<SkipReason> {
     None
 }
 
-/// sekret's own settings are never loaded from secrets, even when allowed.
+/// sekret's own settings, and the variables that locate its user config and so decide which
+/// server it trusts, are never loaded from secrets, even when allowed.
 fn is_sekret_setting(key: &str) -> bool {
-    key.to_ascii_uppercase().starts_with("SEKRET_")
+    let key = key.to_ascii_uppercase();
+    key.starts_with("SEKRET_") || key == "HOME" || key == "XDG_CONFIG_HOME"
 }
 
 /// Why a key was not loaded.
@@ -431,7 +433,9 @@ impl SkipReason {
     fn explain(self) -> &'static str {
         match self {
             SkipReason::InvalidName => "they are not valid variable names",
-            SkipReason::SekretSetting => "SEKRET_* names are sekret's own settings",
+            SkipReason::SekretSetting => {
+                "SEKRET_* names are sekret's own settings, and HOME and XDG_CONFIG_HOME locate its user config"
+            }
             SkipReason::Blocked => {
                 "they can change what programs run or where they connect; pass --allow NAME, or add the name to \
                  `allow` in .sekret.toml, to load one anyway"
@@ -466,7 +470,9 @@ impl LoadPolicy {
                 anyhow::bail!("cannot allow {name:?}: it is not a valid variable name");
             }
             if is_sekret_setting(&name) {
-                anyhow::bail!("cannot allow {name}: sekret's own SEKRET_* settings are never loaded from secrets");
+                anyhow::bail!(
+                    "cannot allow {name}: SEKRET_* settings, HOME and XDG_CONFIG_HOME are never loaded from secrets"
+                );
             }
             set.insert(name);
         }
@@ -1339,6 +1345,13 @@ mod tests {
             assert_eq!(strict().check(name), Err(SkipReason::Blocked), "{name}");
         }
         assert_eq!(strict().check("SEKRET_URL"), Err(SkipReason::SekretSetting));
+        for locates_config in ["HOME", "XDG_CONFIG_HOME"] {
+            assert_eq!(strict().check(locates_config), Err(SkipReason::SekretSetting));
+            assert!(
+                LoadPolicy::new([locates_config.to_string()]).is_err(),
+                "{locates_config} cannot be allowed"
+            );
+        }
         assert_eq!(strict().check("bad.key"), Err(SkipReason::InvalidName));
         let (kept, skipped) = strict().split(vars(&[("DB_URL", "1"), ("SEKRET_TOKEN", "x"), ("HTTPS_PROXY", "p")]));
         assert_eq!(kept.keys().collect::<Vec<_>>(), ["DB_URL"]);

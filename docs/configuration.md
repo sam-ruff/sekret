@@ -260,7 +260,24 @@ sekret whoami \
 
 ## CLI configuration
 
-The CLI reads its server, project, environment and folder from, in order of priority: command-line flags, `SEKRET_URL`, `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT` and `SEKRET_PATH`, then the nearest `.sekret.toml` in the current directory or a parent. The exception is a project or environment that `sekret env use` left in the shell for a different `.sekret.toml`: where the nearer file names another one, the CLI refuses to guess and asks you to run `sekret-env off` or pass `-p` and `-e` (see [Shells and AI agents](integrations/shells-and-agents.md)). There is no fallback to the last server you logged in to: with none of these, the command asks for `--server`.
+The CLI takes each setting from the first of these that sets it:
+
+1. Command-line flags.
+2. Environment variables: `SEKRET_URL`, `SEKRET_CA_FILE`, `SEKRET_PROJECT`, `SEKRET_ENVIRONMENT` and `SEKRET_PATH`.
+3. The nearest `.sekret.toml` in the current directory or a parent: server, project, environment and folder.
+4. The user config, `~/.config/sekret/config.toml` (under `$XDG_CONFIG_HOME` when that is an absolute path): server and CA file only.
+
+The exception is a project or environment that `sekret env use` left in the shell for a different `.sekret.toml`: where the nearer file names another one, the CLI refuses to guess and asks you to run `sekret-env off` or pass `-p` and `-e` (see [Shells and AI agents](integrations/shells-and-agents.md)). There is no fallback to the last server you logged in to: with none of these, the command asks for `--server`.
+
+To use one server everywhere without exporting anything, put it in the user config:
+
+```toml
+# ~/.config/sekret/config.toml
+server = "https://sekret.example.com"
+ca_file = "/etc/ssl/private-root.pem"
+```
+
+It takes only `server` and `ca_file`, refuses any other key, and must not be writable by anyone else. See the [CLI reference](cli.md#where-settings-come-from).
 
 ```toml
 # .sekret.toml
@@ -272,4 +289,4 @@ path = "/"
 
 A `.sekret.toml` may also list `allow = ["NAME", ...]`, blocked variable names that `sekret run`, `sekret env use` and export load anyway; see [Shells and AI agents](integrations/shells-and-agents.md). A project or environment that only the file picks is confirmed once at a terminal before anything loads from it or a command changes secrets, policies or snapshots there; see the [CLI reference](cli.md). A server that only the project file names is not sent tokens from `SEKRET_TOKEN`, machine login secrets, passphrases or setup codes; see the [CLI reference](cli.md#options-shared-by-every-command).
 
-`sekret login` saves its token in `$XDG_CONFIG_HOME/sekret/credentials.toml` (usually `~/.config/sekret/`, which is also used when `XDG_CONFIG_HOME` is not an absolute path) with mode 0600, in a 0700 directory, keyed by server. It writes a new file under a random name and renames it into place, and refuses to read one that another user owns or can change. `SEKRET_TOKEN` overrides it. For a server with a certificate from a private CA, pass `--ca-file` or set `SEKRET_CA_FILE`.
+`sekret login` saves its token in `$XDG_CONFIG_HOME/sekret/credentials.toml` (usually `~/.config/sekret/`, which is also used when `XDG_CONFIG_HOME` is not an absolute path) with mode 0600, in a 0700 directory, keyed by server. It writes a new file under a random name and renames it into place, and refuses to read one that another user owns or can change. `SEKRET_TOKEN` overrides it. For a server with a certificate from a private CA, pass `--ca-file`, set `SEKRET_CA_FILE` or set `ca_file` in the user config.

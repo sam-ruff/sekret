@@ -421,6 +421,11 @@ impl HttpClient {
         if let Some(pem) = options.ca_pem {
             let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| ClientError::Config(format!("CA bundle: {e}")))?;
+            // A file of something else yields no certificates and would quietly trust only the
+            // system roots, so a wrong path is refused rather than ignored.
+            if certs.is_empty() {
+                return Err(ClientError::Config("CA bundle holds no PEM certificates".into()));
+            }
             builder = builder.tls_certs_merge(certs);
         }
         if let Some(pem) = options.identity_pem {
@@ -828,6 +833,19 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn a_ca_bundle_without_certificates_is_refused_without_quoting_it() {
+        let options = ClientOptions {
+            ca_pem: Some(b"token = \"skt_SECRET\"\n".to_vec()),
+            identity_pem: None,
+            timeout: None,
+        };
+        let refused = HttpClient::new("https://sekret.test", None, options).err();
+        let message = refused.map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("holds no PEM certificates"), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+    }
 
     #[cfg(unix)]
     #[test]

@@ -6,14 +6,48 @@ Every command is part of the single `sekret` binary. `sekret <command> --help` p
 
 | Flag | Environment | Meaning |
 |---|---|---|
-| `--server` | `SEKRET_URL` | Server URL. Falls back to the nearest `.sekret.toml`; there is no other default. |
+| `--server` | `SEKRET_URL` | Server URL. Falls back to the nearest `.sekret.toml`, then the [user config](#where-settings-come-from); there is no other default. |
 | `--token` | `SEKRET_TOKEN` | Access token. Defaults to the one `sekret login` saved for the server. Any local user can read a flag in the process list, so `--token` prints a warning; prefer the variable. |
 | `--allow-insecure-http` | `SEKRET_CLIENT_ALLOW_INSECURE_HTTP` | Allow a plain `http://` server that is not on this machine. Without it, only `localhost` and loopback addresses may use `http://`. |
 | `-p`, `--project` | `SEKRET_PROJECT` | Project slug. |
 | `-e`, `--env` | `SEKRET_ENVIRONMENT` | Environment slug. |
 | `--path` | `SEKRET_PATH` | Folder, default `/`. |
-| `--ca-file` | `SEKRET_CA_FILE` | Extra PEM CA certificates to trust. |
+| `--ca-file` | `SEKRET_CA_FILE` | Extra PEM CA certificates to trust. Falls back to the [user config](#where-settings-come-from). A file holding no PEM certificate is an error rather than ignored. |
 | `--client-cert`, `--client-key` | `SEKRET_CLIENT_CERT`, `SEKRET_CLIENT_KEY` | PEM client certificate and key, for servers or proxies that require mTLS. |
+
+### Where settings come from
+
+Each setting is taken from the first of these that sets it:
+
+1. Command-line flags.
+2. Environment variables.
+3. The nearest `.sekret.toml` in the current directory or a parent: `server`, `project`, `environment`, `path` and `allow`.
+4. The user config, `$XDG_CONFIG_HOME/sekret/config.toml`, or `~/.config/sekret/config.toml` when that variable is unset or not an absolute path: `server` and `ca_file`. If `HOME` is needed and is not an absolute path, the command stops rather than read a config from the current directory.
+
+The token is `--token` or `SEKRET_TOKEN` if set, and otherwise the one `sekret login` saved for whichever server was chosen. An empty server, token, project, environment or path counts as unset, whether it comes from a flag or a variable, so `--server ""` falls back to `SEKRET_URL` and then to the sources below it; an empty CA file is an error. `sekret --help` prints the same order.
+
+The user config holds your own defaults, so a machine that always talks to one server needs no flags or variables:
+
+```toml
+# ~/.config/sekret/config.toml
+server = "https://sekret.example.com"
+ca_file = "/etc/ssl/private-root.pem"
+```
+
+A relative `ca_file` is read from the config file's real directory, after following any symlinks. Any other key, or a value that is not a quoted string, is an error, so a typo does not go unnoticed. A parse error gives the line and a fixed explanation, never the file's text, in case a secret was typed into the wrong file. A `server` that parses is shown in later messages, as one from `SEKRET_URL` is.
+
+A server named here counts as one you chose, the same as `SEKRET_URL`, so it receives `SEKRET_TOKEN` and `sekret sys` passphrases. On Unix, both the config and the CA file it names are checked when they are read:
+
+- The file must be a regular file, yours or root's (as for a config copied from `/etc/skel`), and not writable by others. This is checked on the open file, so nothing can be swapped in between the check and the read, and nothing that is not a regular file is ever opened.
+- The path is followed one name at a time, and every directory holding a name on the way, through any symlink to a file or a directory, must be yours or root's, and not writable by others unless it has the sticky bit, as `/tmp` does.
+- A symlink on the way is followed only if you, root or the owner of its directory made it, so a link someone else planted in `/tmp` is refused, as the kernel's `protected_symlinks` setting does for ordinary opens.
+- On Linux, a file or directory with a POSIX access ACL counts as writable by others whenever its group bits allow writing, because an ACL can grant that to named users. Other kinds of ACL, such as NFSv4 ACLs or macOS's, are not detected.
+
+A config that fails these checks, cannot be read, or cannot be parsed stops every command that looks up a server, even one given `--server`, unless both `--server` (or `SEKRET_URL`) and `--ca-file` (or `SEKRET_CA_FILE`) are given, when the config could not apply and is not read. `sekret server`, `sekret admin`, `sekret operator` and `sekret sys` over a host socket never read it. Only a config that does not exist counts as absent: one that cannot be looked for, such as under a `HOME` you cannot enter after `sudo -u`, is an error. To run as another user without the caller's config, for example under `sudo` keeping `HOME`, set `XDG_CONFIG_HOME` to that user's own config directory. Other systems read both files without these checks.
+
+A relative or empty `HOME` stops every client command, because both this config and the saved logins in `credentials.toml` would otherwise be read from the current directory, which may be a repository you cloned.
+
+A repository's `.sekret.toml` still overrides the server under the rules below, unless it names the same server as your config, which stays trusted.
 
 The CLI and the operator honour `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` only for an `https://` server on another machine, where TLS still protects the traffic inside the proxy's tunnel. A plain `http://` server, and any server on `localhost` or a loopback address, is always reached directly: a proxy would see tokens, passphrases and secret values in the clear, and would connect to its own loopback rather than yours. If a plain `http://` server is only reachable through a proxy, switch it to `https://`.
 

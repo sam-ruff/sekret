@@ -22,7 +22,9 @@ use crate::prompt::Prompter;
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
-    /// Server URL, e.g. https://sekret.example.com.
+    /// Server URL, e.g. https://sekret.example.com. Taken from this flag, then SEKRET_URL, then
+    /// `server` in the nearest .sekret.toml, then `server` in the user config
+    /// ($XDG_CONFIG_HOME/sekret/config.toml or ~/.config/sekret/config.toml).
     #[arg(long, global = true, env = "SEKRET_URL")]
     pub server: Option<String>,
     /// Access token; defaults to the one saved by `sekret login`. As a flag it is visible to
@@ -38,7 +40,9 @@ pub struct ClientArgs {
     /// Folder path within the environment.
     #[arg(long, global = true, env = "SEKRET_PATH")]
     pub path: Option<String>,
-    /// Extra PEM CA bundle to trust, such as a private root.
+    /// Extra PEM CA bundle to trust, such as a private root. Taken from this flag, then
+    /// SEKRET_CA_FILE, then `ca_file` in the user config ($XDG_CONFIG_HOME/sekret/config.toml or
+    /// ~/.config/sekret/config.toml). The file must hold at least one PEM certificate.
     #[arg(long, global = true, env = "SEKRET_CA_FILE")]
     pub ca_file: Option<PathBuf>,
     /// PEM client certificate, for servers or proxies that require mutual TLS.
@@ -355,17 +359,28 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
         eprintln!("sekret: {warning}");
     }
     let credentials = read_credentials(&config::credentials_path()?)?;
-    let var = |name: &str| std::env::var(name).ok();
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    // clap lets an empty flag hide its variable, so an empty flag falls back to the variable.
+    let set = |value: &Option<String>, env: &str| value.clone().filter(|v| !v.is_empty()).or_else(|| var(env));
+    let server = set(&args.server, "SEKRET_URL");
+    // With both named explicitly, nothing in the user config could apply.
+    let user = if server.is_some() && args.ca_file.is_some() {
+        config::UserConfig::default()
+    } else {
+        config::load_user_config(&config::user_config_path()?)?
+    };
     config::resolve(
         Overrides {
-            server: args.server.clone(),
-            token: args.token.clone(),
-            project: args.project.clone(),
-            environment: args.environment.clone(),
-            env_project: var("SEKRET_PROJECT").filter(|v| !v.is_empty()),
-            env_environment: var("SEKRET_ENVIRONMENT").filter(|v| !v.is_empty()),
-            loaded_file: var(config::LOADED_FILE_VAR),
-            path: args.path.clone(),
+            server,
+            token: set(&args.token, "SEKRET_TOKEN"),
+            project: args.project.clone().filter(|v| !v.is_empty()),
+            environment: args.environment.clone().filter(|v| !v.is_empty()),
+            env_project: var("SEKRET_PROJECT"),
+            env_environment: var("SEKRET_ENVIRONMENT"),
+            loaded_file: std::env::var(config::LOADED_FILE_VAR).ok(),
+            path: set(&args.path, "SEKRET_PATH"),
+            ca_file: args.ca_file.clone(),
+            user,
         },
         file,
         &credentials,
@@ -375,10 +390,10 @@ pub fn resolve(args: &ClientArgs) -> anyhow::Result<Resolved> {
 
 pub fn client(args: &ClientArgs, resolved: &Resolved, token: Option<String>) -> anyhow::Result<HttpClient> {
     config::check_transport(&resolved.server, args.allow_insecure_http.unwrap_or(false))?;
-    let ca_pem = args
+    let ca_pem = resolved
         .ca_file
-        .as_deref()
-        .map(config::read_text)
+        .as_ref()
+        .map(config::CaFile::read)
         .transpose()
         .context("reading CA file")?
         .map(String::into_bytes);
@@ -482,7 +497,8 @@ pub async fn machine_credential(
 
 fn unconfirmed(server: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "{} comes only from {}, so no credential is sent to it; pass --server or set SEKRET_URL to confirm the server",
+        "{} comes only from {}, so no credential is sent to it; pass --server, set SEKRET_URL or set `server` in \
+         the user config to confirm the server",
         format::one_line(server),
         config::PROJECT_FILE
     )
@@ -1755,6 +1771,7 @@ mod tests {
         Resolved {
             server: "https://evil.test".into(),
             token: None,
+            ca_file: None,
             project: None,
             environment: None,
             path: "/".into(),
