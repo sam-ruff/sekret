@@ -162,8 +162,15 @@ _raw:
   elements: raw
 """
 
+import configparser  # noqa: E402
 import os  # noqa: E402
+from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10: the CLI's own check still covers .sekret.toml there.
+    tomllib = None
 
 from ansible import constants as C  # noqa: E402
 from ansible.errors import AnsibleError  # noqa: E402
@@ -271,32 +278,90 @@ _CONTEXTS: dict[tuple, dict | None] = {}
 _ANNOUNCED: set[tuple] = set()
 
 
-SHELL_VARS = ("SEKRET_PROJECT", "SEKRET_ENVIRONMENT", LOADED_FILE_VAR)
+# What `sekret env use` exports, by the option each sets.
+SHELL_NAMES = {"project": "SEKRET_PROJECT", "environment": "SEKRET_ENVIRONMENT", "path": "SEKRET_PATH"}
+PROJECT_FILE = ".sekret.toml"
 
 
 def cached_context(cli_path: str, known: dict, read_context=cli_context) -> dict | None:
-    shell = tuple(os.environ.get(name) for name in SHELL_VARS)
+    shell = tuple(os.environ.get(name) for name in (*SHELL_NAMES.values(), LOADED_FILE_VAR))
     key = (cli_path, os.getcwd(), shell, tuple(sorted((k, v or "") for k, v in known.items())))
     if key not in _CONTEXTS:
         _CONTEXTS[key] = read_context(cli_path, known)
     return _CONTEXTS[key]
 
 
-def _from_shell(origins: dict) -> set[str]:
-    """The project and environment `sekret env use` left in the environment, if it did."""
-    if os.environ.get(LOADED_FILE_VAR) is None:
-        return set()
-    return {name for name in ("project", "environment") if (origins.get(name) or "").startswith("env:")}
+def nearest_project_file(start: str) -> Path | None:
+    directory = Path(start).resolve()
+    for folder in (directory, *directory.parents):
+        candidate = folder / PROJECT_FILE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def project_file_values(path: Path | None) -> dict:
+    """The project, environment and folder a .sekret.toml names, as far as Python can read it."""
+    if path is None or tomllib is None:
+        return {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {name: data[name] for name in SHELL_NAMES if isinstance(data.get(name), str)}
+
+
+def ansible_cfg_values() -> dict:
+    """The [sekret] project, environment and folder in the ansible.cfg in use, and nothing else."""
+    config_file = C.CONFIG_FILE
+    if not config_file:
+        return {}
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(config_file)
+    except configparser.Error:
+        return {}
+    if not parser.has_section("sekret"):
+        return {}
+    return {name: parser.get("sekret", name) for name in SHELL_NAMES if parser.has_option("sekret", name)}
+
+
+def check_shell(place: dict, origins: dict, read_cfg=ansible_cfg_values, cwd: str | None = None) -> None:
+    """Refuses a project, environment or folder `sekret env use` left in the environment under
+    another project file, when what this folder is set up for names something else, as the CLI
+    does. Values exported by hand, without SEKRET_LOADED_FILE, are not checked."""
+    loaded = os.environ.get(LOADED_FILE_VAR)
+    if loaded is None:
+        return
+    from_shell = [name for name in SHELL_NAMES if (origins.get(name) or "").startswith("env:")]
+    if not from_shell:
+        return
+    here = nearest_project_file(cwd or os.getcwd())
+    if (not loaded and here is None) or (loaded and here is not None and same_path(loaded, str(here))):
+        return
+    sources = [("ansible.cfg", read_cfg())]
+    if here is not None:
+        sources.append((str(here), project_file_values(here)))
+    clashes = [
+        f"{SHELL_NAMES[name]} is {place[name]} in this shell but {source} says {values[name]}"
+        for name in from_shell
+        for source, values in sources
+        if values.get(name) and values[name] != place[name]
+    ]
+    if clashes:
+        raise ConfigError(
+            f"{'; '.join(clashes)}; these were loaded by `sekret-env` under {loaded or 'no project file'}, "
+            "so not using them here. Run `sekret-env off`, or pass project and environment to the lookup"
+        )
 
 
 def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_context) -> None:
-    """Takes whatever is still unset from the CLI's settings, above all the nearest .sekret.toml.
-    A project or environment `sekret env use` set is left in the environment rather than passed as
-    a flag, so the CLI's own check that it was meant for this folder's project file runs."""
-    from_shell = _from_shell(origins)
-    if all(place.get(name) for name in CONTEXT_KEYS) and not from_shell:
+    """Takes the server, project or environment, when still unset, from the CLI's settings, above
+    all the nearest .sekret.toml, and the folder with them. The folder alone never calls the CLI:
+    it is / when nothing sets it."""
+    if all(place.get(name) for name in ("url", "project", "environment")):
         return
-    known = {name: place.get(name) for name in PLACE_OPTIONS if name not in from_shell}
+    known = {name: place.get(name) for name in PLACE_OPTIONS}
     context = cached_context(cli_path, known, read_context)
     if not context:
         return
@@ -382,6 +447,7 @@ class LookupModule(LookupBase):
     client_factory = SekretClient
     cli_tokens = CliTokens
     read_context = staticmethod(cli_context)
+    read_ansible_cfg = staticmethod(ansible_cfg_values)
 
     def _token_source(self, settings: Settings, no_login_reason: str | None = None) -> CliTokens:
         return self.cli_tokens(
@@ -434,6 +500,7 @@ class LookupModule(LookupBase):
             value, origin = self.get_option_and_origin(name)
             place[name] = value or None
             origins[name] = origin
+        check_shell(place, origins, self.read_ansible_cfg)
         fill_from_cli(place, origins, self.get_option("cli_path") or "sekret", self.read_context)
         if not place.get("path"):
             place["path"], origins["path"] = "/", "default"
@@ -464,6 +531,11 @@ class LookupModule(LookupBase):
                     origins["ca_path"] = CLI_ORIGIN
                     settings = Settings.from_options(options)
                     plan = resolve_auth(settings, allow_cli=True)
+            if isinstance(plan, CliLogin) and not settings.validate_certs:
+                raise ConfigError(
+                    "validate_certs is off, but your sekret login is never sent without checking the "
+                    "server's certificate; turn it back on, or use a token or machine identity"
+                )
             if isinstance(plan, CliLogin) and settings.ca_path and os.path.isdir(settings.ca_path):
                 raise ConfigError(
                     f"ca_path {settings.ca_path} is a directory, but the sekret CLI that holds your login "

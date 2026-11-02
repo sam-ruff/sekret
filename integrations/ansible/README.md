@@ -27,7 +27,7 @@ Set `url` (or `SEKRET_URL`) to the server, plus one way of logging in. Every opt
 
 When `auth_method` is left alone it tries them in that order, skipping Kubernetes, which you have to ask for. Kubernetes needs `kubernetes_token_file`: a projected token with the `sekret` audience, never the pod's default token. With none of the others set, the lookup uses the login the `sekret` CLI saved, and runs `sekret login` (which opens the browser) when there is none; set `cli_login: false` for runs nobody is watching.
 
-The lookup also takes `url`, `project`, `environment`, `path` and `ca_path` from `sekret_*` variables and from a `[sekret]` section in `ansible.cfg`, below its own arguments and the environment, and failing all of those from the CLI's own settings such as a `.sekret.toml`. See `docs/integrations/ansible.md` for the order.
+The lookup also takes `url`, `project`, `environment`, `path` and `ca_path` from `sekret_*` variables, which come below its own arguments and above the environment, and from a `[sekret]` section in `ansible.cfg`, below the environment. Failing all of those, it takes the server, project and environment from the CLI's own settings, such as a `.sekret.toml`. See `docs/integrations/ansible.md` for the order.
 
 A machine login is cached for the rest of the process, so a template full of lookups only logs in once.
 

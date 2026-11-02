@@ -615,10 +615,13 @@ class TestInventoryCa:
 
 class TestTerminalSafety:
     def test_a_project_file_path_cannot_reach_the_terminal_raw(self, lookup, state):
-        (state / "context.json").write_text(json.dumps({"path": "/a\x1b[2J‮b", "path_source": "project_file"}))
+        # The project comes from the CLI too, since the folder alone never calls it.
+        (state / "context.json").write_text(
+            json.dumps({"project": "p", "path": "/a\x1b[2J‮b", "path_source": "project_file"})
+        )
         lookup.server.put("KEY", "value", path="/elsewhere")
         with pytest.raises(AnsibleError) as caught:
-            lookup.run(["KEY"], {}, url=URL, token="static-token", project="p", environment="e")
+            lookup.run(["KEY"], {}, url=URL, token="static-token", environment="e")
         message = str(caught.value)
         assert "\x1b" not in message and "‮" not in message
         assert "\\u001b" in message and "\\u202e" in message
@@ -697,40 +700,103 @@ class TestRejectedFreshTokens:
 
 class TestShellLoadedElsewhere:
     """`sekret env use` records the project file it loaded under; a lookup in another project's
-    folder must not quietly use what it left behind."""
+    folder, set up by ansible.cfg or a .sekret.toml, must not quietly use what it left behind.
+    The check is the lookup's own, so it holds with no CLI at all."""
+
+    @pytest.fixture(autouse=True)
+    def repo_b(self, tmp_path, monkeypatch, lookup, state):
+        folder = tmp_path / "repo-b"
+        folder.mkdir()
+        monkeypatch.chdir(folder)
+        # No CLI: whatever is refused here is refused by the lookup itself.
+        monkeypatch.setenv("SEKRET_CLI", str(tmp_path / "no-such-sekret"))
+        lookup.read_ansible_cfg = staticmethod(lambda: {"project": "b-project", "environment": "prod"})
+        return folder
 
     def run(self, lookup):
-        return lookup.run([], {}, url=URL, token="static-token", path="/")
+        return lookup.run([], {}, url=URL, token="static-token")
 
-    def shell(self, monkeypatch, loaded=None):
-        monkeypatch.setenv("SEKRET_PROJECT", "shell-p")
-        monkeypatch.setenv("SEKRET_ENVIRONMENT", "shell-e")
+    def shell(self, monkeypatch, loaded=None, project="a-project", environment="prod", path=None):
+        monkeypatch.setenv("SEKRET_PROJECT", project)
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", environment)
+        if path is not None:
+            monkeypatch.setenv("SEKRET_PATH", path)
         if loaded is not None:
             monkeypatch.setenv("SEKRET_LOADED_FILE", loaded)
 
-    def test_the_cli_checks_a_shell_choice_without_it_being_passed_as_a_flag(
-        self, lookup, state, monkeypatch
-    ):
-        self.shell(monkeypatch, "/a/.sekret.toml")
-        assert self.run(lookup) == [{"WHERE": "here"}]
-        (argv,) = [c for c in calls(state) if "--context" in c]
-        assert not any(a.startswith(("--project=", "--env=")) for a in argv)
-        assert lookup.server.asked()[:2] == ("shell-p", "shell-e")
-
-    def test_the_clis_refusal_stops_the_lookup(self, lookup, state, monkeypatch):
-        self.shell(monkeypatch, "/a/.sekret.toml")
-        (state / "context_error").write_text(
-            "sekret: SEKRET_PROJECT is shell-p in this shell but /b/.sekret.toml says b; these were loaded "
-            "by `sekret-env` under /a/.sekret.toml, so not using them here\n"
-        )
-        with pytest.raises(AnsibleError, match="loaded by `sekret-env`"):
+    def test_a_shell_loaded_under_another_file_is_refused_against_ansible_cfg(self, lookup, monkeypatch):
+        self.shell(monkeypatch, "/repo-a/.sekret.toml")
+        with pytest.raises(
+            AnsibleError, match=r"SEKRET_PROJECT is a-project in this shell but ansible\.cfg"
+        ) as caught:
             self.run(lookup)
+        assert "sekret-env off" in str(caught.value)
         assert lookup.server.calls == []
 
-    def test_values_set_by_hand_are_not_checked(self, lookup, state, monkeypatch):
+    def test_the_same_values_are_used(self, lookup, monkeypatch):
+        self.shell(monkeypatch, "/repo-a/.sekret.toml", project="b-project")
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+    def test_values_set_by_hand_are_used(self, lookup, monkeypatch):
         self.shell(monkeypatch)
         assert self.run(lookup) == [{"WHERE": "here"}]
+        assert lookup.server.asked()[0] == "a-project"
+
+    def test_a_stale_folder_is_refused(self, lookup, monkeypatch):
+        lookup.read_ansible_cfg = staticmethod(lambda: {"path": "/b"})
+        self.shell(monkeypatch, "/repo-a/.sekret.toml", path="/a")
+        with pytest.raises(AnsibleError, match="SEKRET_PATH is /a"):
+            self.run(lookup)
+
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="reading .sekret.toml needs tomllib")
+    def test_a_shell_loaded_under_another_file_is_refused_against_this_folders_file(
+        self, lookup, monkeypatch, repo_b
+    ):
+        lookup.read_ansible_cfg = staticmethod(dict)
+        (repo_b / ".sekret.toml").write_text('project = "b-project"\n')
+        self.shell(monkeypatch, "/repo-a/.sekret.toml")
+        with pytest.raises(AnsibleError, match=r"\.sekret\.toml says b-project"):
+            self.run(lookup)
+        monkeypatch.setenv("SEKRET_LOADED_FILE", str(repo_b / ".sekret.toml"))
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+    def test_loaded_with_no_project_file_and_none_here_is_the_same_place(self, lookup, monkeypatch):
+        self.shell(monkeypatch, "")
+        assert self.run(lookup) == [{"WHERE": "here"}]
+
+
+class TestContextOnlyWhenNeeded:
+    """The CLI's settings are read only for a missing server, project or environment, so a token
+    or machine identity lookup works whatever the CLI is, or thinks of the server."""
+
+    @pytest.mark.parametrize("cli", ["missing", "old", "refuses"])
+    def test_a_folder_alone_never_calls_the_cli(self, lookup, state, monkeypatch, tmp_path, cli):
+        if cli == "missing":
+            monkeypatch.setenv("SEKRET_CLI", str(tmp_path / "no-such-sekret"))
+        elif cli == "old":
+            monkeypatch.setenv("SEKRET_CLI", "false")
+        else:
+            (state / "context_error").write_text("sekret: http://remote.test is plain http\n")
+        result = lookup.run(
+            [], {}, url="http://remote.test", token="static-token", project="p", environment="e"
+        )
+        assert result == [{"WHERE": "here"}]
+        assert lookup.server.asked() == ("p", "e", "/")
         assert calls(state) == []
+
+    def test_a_missing_project_still_asks_and_a_refusal_is_fatal(self, lookup, state):
+        (state / "context_error").write_text("sekret: no\n")
+        with pytest.raises(AnsibleError, match="could not read the sekret CLI's settings"):
+            lookup.run([], {}, url=URL, token="static-token", environment="e")
+
+
+class TestCliLoginChecksCertificates:
+    def test_the_cli_login_with_certificate_checks_off_is_refused(self, lookup, state):
+        (state / "token").write_text("cli-token-saved\n")
+        with pytest.raises(AnsibleError, match="validate_certs is off"):
+            lookup.run([], {}, url=URL, project="p", environment="e", validate_certs=False)
+        assert lookup.server.calls == []
+        assert not [c for c in calls(state) if c[:1] == ["token"] and "--context" not in c]
 
 
 class TestCachedTokensAreRedacted:
@@ -960,7 +1026,7 @@ def http_echo():
     server.server_close()
 
 
-def ansible_run(tmp_path, state, server, ini, env=None, extra=(), lookup_args=""):
+def ansible_run(tmp_path, state, server, ini, env=None, extra=(), lookup_args="", refused=False):
     config = tmp_path / "ansible.cfg"
     config.write_text(f"[defaults]\ncollections_path = {COLLECTIONS_ROOT}\n\n[sekret]\n{ini}")
     environment = {
@@ -990,11 +1056,15 @@ def ansible_run(tmp_path, state, server, ini, env=None, extra=(), lookup_args=""
             *extra,
         ],
         env=environment,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
     )
+    if refused:
+        assert result.returncode != 0, result.stdout
+        return result.stdout + result.stderr
     assert result.returncode == 0, result.stdout + result.stderr
     return server.fake.asked()
 
@@ -1009,6 +1079,16 @@ class TestAnsibleCfg:
     def test_sekret_env_use_beats_ansible_cfg(self, tmp_path, state, http_echo):
         env = {"SEKRET_PROJECT": "env-p", "SEKRET_ENVIRONMENT": "env-e"}
         assert ansible_run(tmp_path, state, http_echo, INI, env)[:2] == ("env-p", "env-e")
+
+    def test_but_not_when_it_loaded_them_for_another_repository(self, tmp_path, state, http_echo):
+        env = {
+            "SEKRET_PROJECT": "env-p",
+            "SEKRET_ENVIRONMENT": "env-e",
+            "SEKRET_LOADED_FILE": "/elsewhere/repo-a/.sekret.toml",
+        }
+        output = ansible_run(tmp_path, state, http_echo, INI, env, refused=True)
+        assert "SEKRET_PROJECT is env-p in this shell but ansible.cfg says ini-p" in output
+        assert http_echo.fake.calls == []
 
     def test_a_variable_beats_sekret_env_use(self, tmp_path, state, http_echo):
         env = {"SEKRET_ENVIRONMENT": "env-e"}
