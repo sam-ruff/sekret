@@ -169,7 +169,7 @@ from typing import Any  # noqa: E402
 
 try:
     import tomllib
-except ImportError:  # Python 3.10: the CLI's own check still covers .sekret.toml there.
+except ImportError:  # Python 3.10; check_shell asks the CLI instead.
     tomllib = None
 
 from ansible import constants as C  # noqa: E402
@@ -180,6 +180,7 @@ from ansible.utils.display import Display  # noqa: E402
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_cli import (  # noqa: E402
     CliTokens,
     cli_context,
+    nearest_project_file,
 )
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (  # noqa: E402
     CliLogin,
@@ -187,7 +188,6 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     SekretClient,
     SekretError,
     Settings,
-    StaticToken,
     resolve_auth,
     terminal_safe,
 )
@@ -196,11 +196,13 @@ display = Display()
 CLI_ORIGIN = "the sekret CLI"
 # Set by `sekret env use` to the project file it loaded under.
 LOADED_FILE_VAR = "SEKRET_LOADED_FILE"
-# The options each way of logging in sends to the server.
-CREDENTIALS = {
-    "universal": ("client_id", "client_secret"),
-    "oidc": ("identity_id", "oidc_token", "oidc_token_file"),
-    "kubernetes": ("identity_id", "kubernetes_token_file"),
+# Each place option's environment variable, for falling through an empty value.
+PLACE_ENV = {
+    "url": "SEKRET_URL",
+    "project": "SEKRET_PROJECT",
+    "environment": "SEKRET_ENVIRONMENT",
+    "path": "SEKRET_PATH",
+    "ca_path": "SEKRET_CA_PATH",
 }
 
 # Where to read from: each can come from the lookup, a variable, the environment or ansible.cfg,
@@ -272,7 +274,8 @@ def read_secrets(
     return values
 
 
-# Per process, so a variable Ansible templates on every use costs one request a run.
+# Per Ansible worker process, so a variable Ansible templates on every use costs one request in
+# each worker rather than one per use.
 _FOLDERS: dict[tuple, dict] = {}
 _CONTEXTS: dict[tuple, dict | None] = {}
 _ANNOUNCED: set[tuple] = set()
@@ -291,28 +294,18 @@ def cached_context(cli_path: str, known: dict, read_context=cli_context) -> dict
     return _CONTEXTS[key]
 
 
-def nearest_project_file(start: str) -> Path | None:
-    directory = Path(start).resolve()
-    for folder in (directory, *directory.parents):
-        candidate = folder / PROJECT_FILE
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def project_file_values(path: Path | None) -> dict:
-    """The project, environment and folder a .sekret.toml names, as far as Python can read it."""
-    if path is None or tomllib is None:
-        return {}
+def project_file_values(text: str) -> dict:
+    """The project, environment and folder a .sekret.toml names."""
     try:
-        data = tomllib.loads(path.read_text())
-    except (OSError, ValueError):
+        data = tomllib.loads(text)
+    except ValueError:
         return {}
     return {name: data[name] for name in SHELL_NAMES if isinstance(data.get(name), str)}
 
 
 def ansible_cfg_values() -> dict:
-    """The [sekret] project, environment and folder in the ansible.cfg in use, and nothing else."""
+    """The [sekret] settings in the ansible.cfg in use, with a relative ca_path taken from the
+    config file's own folder, as Ansible does."""
     config_file = C.CONFIG_FILE
     if not config_file:
         return {}
@@ -323,10 +316,34 @@ def ansible_cfg_values() -> dict:
         return {}
     if not parser.has_section("sekret"):
         return {}
-    return {name: parser.get("sekret", name) for name in SHELL_NAMES if parser.has_option("sekret", name)}
+    values = {name: parser.get("sekret", name) for name in PLACE_OPTIONS if parser.has_option("sekret", name)}
+    if values.get("ca_path"):
+        ca_path = os.path.expanduser(values["ca_path"])
+        values["ca_path"] = os.path.join(os.path.dirname(os.path.abspath(config_file)), ca_path)
+    return values
 
 
-def check_shell(place: dict, origins: dict, read_cfg=ansible_cfg_values, cwd: str | None = None) -> None:
+def _ask_cli_about_the_shell(here: Path, loaded: str, place: dict, cli_path: str, read_context) -> None:
+    """Without tomllib, lets the CLI compare the shell's values with the project file: they stay
+    in the environment, not flags, so its own check runs."""
+    known = {name: place.get(name) for name in ("url", "ca_path")}
+    if cached_context(cli_path, known, read_context) is None:
+        raise ConfigError(
+            f"these settings were loaded by `sekret-env` under {loaded or 'no project file'}, and this "
+            f"Python cannot read {here} to check they are meant for this folder, nor is the sekret CLI "
+            "installed to check it instead. Install the CLI or Python 3.11, run `sekret-env off`, or pass "
+            "project and environment to the lookup"
+        )
+
+
+def check_shell(
+    place: dict,
+    origins: dict,
+    read_cfg=ansible_cfg_values,
+    cwd: str | None = None,
+    cli_path: str = "sekret",
+    read_context=cli_context,
+) -> None:
     """Refuses a project, environment or folder `sekret env use` left in the environment under
     another project file, when what this folder is set up for names something else, as the CLI
     does. Values exported by hand, without SEKRET_LOADED_FILE, are not checked."""
@@ -336,12 +353,15 @@ def check_shell(place: dict, origins: dict, read_cfg=ansible_cfg_values, cwd: st
     from_shell = [name for name in SHELL_NAMES if (origins.get(name) or "").startswith("env:")]
     if not from_shell:
         return
-    here = nearest_project_file(cwd or os.getcwd())
+    found = nearest_project_file(cwd or os.getcwd())
+    here = found[0] if found else None
     if (not loaded and here is None) or (loaded and here is not None and same_path(loaded, str(here))):
         return
     sources = [("ansible.cfg", read_cfg())]
-    if here is not None:
-        sources.append((str(here), project_file_values(here)))
+    if found is not None and tomllib is not None:
+        sources.append((str(here), project_file_values(found[1])))
+    elif found is not None:
+        _ask_cli_about_the_shell(here, loaded, place, cli_path, read_context)
     clashes = [
         f"{SHELL_NAMES[name]} is {place[name]} in this shell but {source} says {values[name]}"
         for name in from_shell
@@ -388,45 +408,34 @@ def same_path(first: str | None, second: str | None) -> bool:
     return norm(first) == norm(second)
 
 
-def check_destination(plan, place_origins: dict, credential_origins: dict, ca_vouched: bool = False) -> None:
-    """Refuses to send a token or machine identity to a server, or through a CA, that the inventory
-    or a project file chose, unless the same playbook passed the credential to the lookup itself.
-    A CA the inventory chose replaces every other CA the server is checked against, so even the
-    saved login is not sent through it unless a trusted setting names the same file."""
-    ca_from_inventory = _from_inventory(place_origins.get("ca_path")) and not ca_vouched
+def check_destination(plan, place_origins: dict, ca_vouched: bool = False) -> None:
+    """Refuses to send anything through a CA the inventory chose, which replaces every other CA
+    the server is checked against, unless a trusted setting names the same file. Refuses to send a
+    token or machine identity, however it was given, to a server the inventory or a project file
+    chose: only the login `sekret login` saved for that server may go there."""
+    if _from_inventory(place_origins.get("ca_path")) and not ca_vouched:
+        raise ConfigError(
+            "sekret_ca_path comes from an inventory variable, so nothing is sent through it, neither your "
+            "sekret login nor a credential passed to the lookup: it replaces the CAs the server is checked "
+            "against. Set ca_path in SEKRET_CA_PATH, ansible.cfg or the lookup's own arguments; naming "
+            "the same file there is enough"
+        )
     if isinstance(plan, CliLogin):
-        if ca_from_inventory:
-            raise ConfigError(
-                "sekret_ca_path comes from an inventory variable, so your sekret login is not sent through "
-                "it: it replaces the CAs the server is checked against. Set ca_path in SEKRET_CA_PATH, "
-                "ansible.cfg or the lookup's own arguments; naming the same file there is enough"
-            )
         return
-    if (place_origins.get("url") or "").startswith(CLI_ORIGIN):
+    url_origin = place_origins.get("url") or ""
+    if url_origin.startswith(CLI_ORIGIN):
         raise ConfigError(
             "the server came from the sekret CLI's settings, so only your own `sekret login` is sent to it, "
             "never a token or machine identity; set url, SEKRET_URL or url in the [sekret] section of "
             "ansible.cfg to send those"
         )
-    steered = ["sekret_url"] if _from_inventory(place_origins.get("url")) else []
-    if ca_from_inventory:
-        steered.append("sekret_ca_path")
-    outside = {name: origin for name, origin in credential_origins.items() if origin != "Direct"}
-    if steered and outside:
-        sources = ", ".join(f"{name} ({origin})" for name, origin in sorted(outside.items()))
+    if _from_inventory(url_origin):
         raise ConfigError(
-            f"{' and '.join(steered)} come from inventory variables, so {sources} is not sent there: an "
-            "inventory could point it at any server. Pass the credential to the lookup itself, or set the "
-            "server in SEKRET_URL or ansible.cfg"
+            "sekret_url comes from an inventory variable, so no token or machine identity is sent to it, "
+            "not even one passed to the lookup: an inventory could point it at any server. Set the server "
+            "in SEKRET_URL, ansible.cfg or the lookup's own url, or use your own sekret login, which only "
+            "ever works for the server it was saved for"
         )
-
-
-def credential_options(plan) -> tuple[str, ...]:
-    if isinstance(plan, CliLogin):
-        return ()
-    if isinstance(plan, StaticToken):
-        return ("token",)
-    return CREDENTIALS.get(plan.method, ())
 
 
 def announce(place: dict, origins: dict) -> None:
@@ -486,22 +495,34 @@ class LookupModule(LookupBase):
         context = cached_context(self.get_option("cli_path") or "sekret", known, self.read_context)
         return (context or {}).get("ca_file") or None
 
-    def _credential_origins(self, plan) -> dict:
-        origins = {}
-        for name in credential_options(plan):
-            value, origin = self.get_option_and_origin(name)
-            if value:
-                origins[name] = origin
-        return origins
+    def _option(self, name: str, variables: dict, direct: dict) -> tuple:
+        """The option and where it came from, an empty value from any source counting as unset,
+        so the next source is used, with its own origin. The raw value each source gave is what is
+        checked, since Ansible turns an empty path into the current directory."""
+        value, origin = self.get_option_and_origin(name)
+        ranked = [
+            ("Direct", direct.get(name), "Direct"),
+            ("var:", (variables or {}).get(f"sekret_{name}"), f"var: sekret_{name}"),
+            ("env:", os.environ.get(PLACE_ENV[name]), f"env: {PLACE_ENV[name]}"),
+            ("ini:", self.read_ansible_cfg().get(name), f"ini: {C.CONFIG_FILE}"),
+        ]
+        position = next((i for i, (prefix, _, _) in enumerate(ranked) if origin.startswith(prefix)), None)
+        if position is None:
+            return value or None, origin
+        if ranked[position][1] not in ("", None) and value not in ("", None):
+            return value, origin
+        for _, candidate, label in ranked[position + 1 :]:
+            if candidate not in ("", None):
+                return candidate, label
+        return None, "default"
 
-    def _place(self) -> tuple[dict, dict]:
+    def _place(self, variables: dict, direct: dict) -> tuple[dict, dict]:
         place, origins = {}, {}
         for name in PLACE_OPTIONS:
-            value, origin = self.get_option_and_origin(name)
-            place[name] = value or None
-            origins[name] = origin
-        check_shell(place, origins, self.read_ansible_cfg)
-        fill_from_cli(place, origins, self.get_option("cli_path") or "sekret", self.read_context)
+            place[name], origins[name] = self._option(name, variables, direct)
+        cli_path = self.get_option("cli_path") or "sekret"
+        check_shell(place, origins, self.read_ansible_cfg, cli_path=cli_path, read_context=self.read_context)
+        fill_from_cli(place, origins, cli_path, self.read_context)
         if not place.get("path"):
             place["path"], origins["path"] = "/", "default"
         return place, origins
@@ -510,7 +531,7 @@ class LookupModule(LookupBase):
         self.set_options(var_options=variables, direct=kwargs)
         options = {name: self.get_option(name) for name in CONNECTION_OPTIONS}
         try:
-            place, origins = self._place()
+            place, origins = self._place(variables, kwargs)
             options.update(place)
             if not place.get("project") or not place.get("environment"):
                 raise AnsibleError(
@@ -541,7 +562,7 @@ class LookupModule(LookupBase):
                     f"ca_path {settings.ca_path} is a directory, but the sekret CLI that holds your login "
                     "needs a CA file; name the file instead"
                 )
-            check_destination(plan, origins, self._credential_origins(plan), vouched_ca is not None)
+            check_destination(plan, origins, vouched_ca is not None)
             # A browser login only to a server the person named, never one an inventory chose.
             no_login_reason = None
             if _from_inventory(origins.get("url")):

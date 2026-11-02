@@ -296,7 +296,7 @@ class TestStuckAndFailedLogins:
         (state / "login_fails").write_text("")
         with pytest.raises(AuthenticationError, match="did not finish"):
             tokens(state).token()
-        with pytest.raises(AuthenticationError, match="already failed in this run"):
+        with pytest.raises(AuthenticationError, match="already failed in this Ansible worker process"):
             tokens(state).token()
         assert logins(state) == [URL]
 
@@ -545,9 +545,8 @@ class TestWhereCredentialsGo:
 
     def test_an_inventory_server_never_gets_the_environments_token(self, lookup, monkeypatch):
         monkeypatch.setenv("SEKRET_TOKEN", "static-token")
-        with pytest.raises(AnsibleError, match="sekret_url come from inventory") as caught:
+        with pytest.raises(AnsibleError, match="sekret_url comes from an inventory variable"):
             self.run(lookup, {"sekret_url": URL})
-        assert "SEKRET_TOKEN" in str(caught.value)
         assert lookup.server.calls == []
 
     def test_an_inventory_ca_never_gets_the_environments_machine_identity(self, lookup, monkeypatch):
@@ -556,8 +555,15 @@ class TestWhereCredentialsGo:
         with pytest.raises(AnsibleError, match="sekret_ca_path"):
             self.run(lookup, {"sekret_ca_path": "/attacker-ca.pem"}, url=URL)
 
-    def test_an_inventory_server_with_a_credential_the_playbook_passed_is_fine(self, lookup):
-        assert self.run(lookup, {"sekret_url": URL}, token="static-token") == [{"WHERE": "here"}]
+    def test_an_inventory_server_never_gets_a_credential_the_playbook_passed_either(self, lookup):
+        with pytest.raises(AnsibleError, match="not even one passed to the lookup"):
+            self.run(lookup, {"sekret_url": URL}, token="static-token")
+        with pytest.raises(AnsibleError, match="not even one passed to the lookup"):
+            self.run(lookup, {"sekret_url": URL}, client_id="client-1", client_secret="client-secret-1")
+        assert lookup.server.calls == []
+
+    def test_a_server_passed_to_the_lookup_with_a_token_passed_too_is_fine(self, lookup):
+        assert self.run(lookup, url=URL, token="static-token") == [{"WHERE": "here"}]
 
     def test_the_environments_server_and_token_together_are_fine(self, lookup, monkeypatch):
         monkeypatch.setenv("SEKRET_URL", URL)
@@ -586,10 +592,16 @@ class TestInventoryCa:
         (state / "token").write_text("cli-token-saved\n")
         lookup.server.tokens = {"cli-token-saved"}
         monkeypatch.setenv("SEKRET_URL", URL)
-        with pytest.raises(AnsibleError, match="not sent through it"):
+        with pytest.raises(AnsibleError, match="nothing is sent through it"):
             self.run(lookup)
         assert lookup.server.calls == []
         assert not [c for c in calls(state) if c[:1] == ["token"] and "--context" not in c]
+
+    def test_an_inventory_ca_never_carries_a_token_the_playbook_passed(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_URL", URL)
+        with pytest.raises(AnsibleError, match="nor a credential passed to the lookup"):
+            self.run(lookup, token="static-token")
+        assert lookup.server.calls == []
 
     def test_the_same_ca_in_the_environment_vouches_for_it(self, lookup, state, monkeypatch):
         (state / "token").write_text("cli-token-saved\n")
@@ -609,7 +621,7 @@ class TestInventoryCa:
         (state / "token").write_text("cli-token-saved\n")
         monkeypatch.setenv("SEKRET_URL", URL)
         monkeypatch.setenv("SEKRET_CA_PATH", "/etc/ssl/real-ca.pem")
-        with pytest.raises(AnsibleError, match="not sent through it"):
+        with pytest.raises(AnsibleError, match="nothing is sent through it"):
             self.run(lookup)
 
 
@@ -671,7 +683,7 @@ class TestRejectedFreshTokens:
         base = {"url": URL, "project": "p", "environment": "e"}
         with pytest.raises(AnsibleError, match="just produced"):
             lookup.run([], {}, **base)
-        with pytest.raises(AnsibleError, match="already failed in this run"):
+        with pytest.raises(AnsibleError, match="already failed in this Ansible worker process"):
             lookup.run([], {}, path="/other", **base)
         assert logins(state) == [URL]
 
@@ -763,6 +775,141 @@ class TestShellLoadedElsewhere:
     def test_loaded_with_no_project_file_and_none_here_is_the_same_place(self, lookup, monkeypatch):
         self.shell(monkeypatch, "")
         assert self.run(lookup) == [{"WHERE": "here"}]
+
+
+class TestShellCheckWithoutTomllib:
+    """Python 3.10 cannot read .sekret.toml, so the CLI compares the shell's values with it, which
+    only works if they reach it through the environment; with no CLI the lookup refuses."""
+
+    @pytest.fixture(autouse=True)
+    def python_310(self, tmp_path, monkeypatch, lookup):
+        folder = tmp_path / "repo-b"
+        folder.mkdir()
+        (folder / ".sekret.toml").write_text('project = "b-project"\n')
+        monkeypatch.chdir(folder)
+        monkeypatch.setattr(sys.modules[type(lookup).__module__], "tomllib", None)
+        lookup.read_ansible_cfg = staticmethod(dict)
+        monkeypatch.setenv("SEKRET_PROJECT", "a-project")
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", "prod")
+        monkeypatch.setenv("SEKRET_LOADED_FILE", "/repo-a/.sekret.toml")
+
+    def run(self, lookup):
+        return lookup.run([], {}, url=URL, token="static-token")
+
+    def test_with_no_cli_it_refuses_rather_than_guess(self, lookup, monkeypatch, tmp_path):
+        monkeypatch.setenv("SEKRET_CLI", str(tmp_path / "no-such-sekret"))
+        with pytest.raises(AnsibleError, match=r"cannot read .*\.sekret\.toml"):
+            self.run(lookup)
+        assert lookup.server.calls == []
+
+    def test_the_clis_own_check_runs_with_the_values_left_in_the_environment(self, lookup, state):
+        (state / "context_error").write_text(
+            "sekret: SEKRET_PROJECT is a-project in this shell but .sekret.toml says b-project; these were "
+            "loaded by `sekret-env` under /repo-a/.sekret.toml, so not using them here\n"
+        )
+        with pytest.raises(AnsibleError, match="loaded by `sekret-env`"):
+            self.run(lookup)
+        (argv,) = [c for c in calls(state) if "--context" in c]
+        assert not any(a.startswith(("--project=", "--env=", "--path=")) for a in argv)
+        assert lookup.server.calls == []
+
+    def test_when_the_cli_agrees_the_lookup_goes_ahead(self, lookup, state):
+        assert self.run(lookup) == [{"WHERE": "here"}]
+        assert lookup.server.asked()[0] == "a-project"
+
+
+class TestEmptyValuesFallThrough:
+    def run(self, lookup, variables, **direct):
+        return lookup.run([], variables, **{"environment": "e", **direct})
+
+    def test_an_empty_inventory_url_falls_through_to_the_environment(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_URL", URL)
+        monkeypatch.setenv("SEKRET_TOKEN", "static-token")
+        assert self.run(lookup, {"sekret_url": ""}, project="p") == [{"WHERE": "here"}]
+
+    def test_an_empty_inventory_ca_falls_through_to_the_environment(self, lookup, monkeypatch, tmp_path):
+        monkeypatch.setenv("SEKRET_CA_PATH", str(tmp_path / "env-ca.pem"))
+        used = []
+        factory = lookup.client_factory
+        lookup.client_factory = lambda settings, token_source=None: (
+            used.append(settings.ca_path) or factory(settings, token_source=token_source)
+        )
+        self.run(lookup, {"sekret_ca_path": ""}, url=URL, token="static-token", project="p")
+        assert used == [str(tmp_path / "env-ca.pem")]
+
+    def test_an_empty_project_falls_through_to_the_environment_with_its_origin(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_PROJECT", "env-p")
+        self.run(lookup, {"sekret_project": ""}, url=URL, token="static-token")
+        assert lookup.server.asked()[0] == "env-p"
+        (note,) = lookup.shown.verbose
+        assert "project from env: SEKRET_PROJECT" in note
+
+    def test_an_empty_environment_variable_falls_through_to_ansible_cfg(self, lookup, monkeypatch):
+        monkeypatch.setenv("SEKRET_PROJECT", "")
+        lookup.read_ansible_cfg = staticmethod(lambda: {"project": "ini-p"})
+        self.run(lookup, {}, url=URL, token="static-token")
+        assert lookup.server.asked()[0] == "ini-p"
+
+    def test_an_empty_argument_falls_through_to_the_inventory(self, lookup):
+        self.run(lookup, {"sekret_project": "var-p"}, project="", url=URL, token="static-token")
+        assert lookup.server.asked()[0] == "var-p"
+
+
+class TestProjectFileTrust:
+    """The lookup reads .sekret.toml only where the CLI would, so a file planted in a shared folder
+    cannot make it refuse or choose anything."""
+
+    def me(self, private_group=False):
+        return sekret_cli.Me(os.geteuid(), os.getegid(), private_group)
+
+    def test_a_file_in_a_folder_everyone_can_write_is_skipped(self, tmp_path):
+        tmp_path.chmod(0o700)
+        (tmp_path / ".sekret.toml").write_text('project = "trusted"\n')
+        (tmp_path / ".sekret.toml").chmod(0o600)
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        shared.chmod(0o777)
+        (shared / ".sekret.toml").write_text('project = "planted"\n')
+        found = sekret_cli.nearest_project_file(str(shared), self.me())
+        assert found is not None and found[0] == tmp_path / ".sekret.toml"
+
+    def test_a_file_its_group_can_write_is_skipped_unless_the_group_is_private(self, tmp_path):
+        tmp_path.chmod(0o700)
+        project_file = tmp_path / ".sekret.toml"
+        project_file.write_text('project = "x"\n')
+        project_file.chmod(0o660)
+        assert sekret_cli.nearest_project_file(str(tmp_path), self.me()) is None
+        assert sekret_cli.nearest_project_file(str(tmp_path), self.me(private_group=True)) is not None
+
+    def test_another_users_file_or_folder_is_distrusted(self):
+        me = self.me()
+        mine = os.stat_result((0o100600, 0, 0, 1, me.uid, me.gid, 0, 0, 0, 0))
+        folder = os.stat_result((0o040755, 0, 0, 1, me.uid, me.gid, 0, 0, 0, 0))
+        assert sekret_cli.distrust_reason([me.uid], folder, mine, me) is None
+        assert "another user" in sekret_cli.distrust_reason([me.uid + 1], folder, mine, me)
+        others = os.stat_result((0o040755, 0, 0, 1, me.uid + 1, me.gid, 0, 0, 0, 0))
+        assert "directory belongs to another user" in sekret_cli.distrust_reason([me.uid], others, mine, me)
+        roots = os.stat_result((0o040755, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        assert sekret_cli.distrust_reason([me.uid], roots, mine, me) is None
+
+    def test_a_private_group_is_one_nobody_else_is_in(self):
+        passwd = "me:x:1000:1000::/home/me:/bin/sh\nother:x:1001:1001::/home/other:/bin/sh\n"
+        assert sekret_cli.group_holds_only("me:x:1000:\n", passwd, 1000, 1000)
+        assert not sekret_cli.group_holds_only("me:x:1000:other\n", passwd, 1000, 1000)
+        assert not sekret_cli.group_holds_only("staff:x:1001:\n", passwd, 1001, 1000)
+        assert not sekret_cli.group_holds_only("", passwd, 1000, 1000)
+
+    def test_a_planted_file_cannot_make_the_lookup_refuse(self, lookup, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        shared.chmod(0o777)
+        (shared / ".sekret.toml").write_text('project = "planted"\n')
+        monkeypatch.chdir(shared)
+        lookup.read_ansible_cfg = staticmethod(dict)
+        monkeypatch.setenv("SEKRET_PROJECT", "mine")
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", "prod")
+        monkeypatch.setenv("SEKRET_LOADED_FILE", "")
+        assert lookup.run([], {}, url=URL, token="static-token") == [{"WHERE": "here"}]
 
 
 class TestContextOnlyWhenNeeded:

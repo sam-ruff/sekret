@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import (
@@ -309,7 +310,7 @@ class CliTokens:
     def _log_in(self, rejected: str | None) -> str:
         yourself = f"run `sekret login --server={self._url}` yourself, then run again"
         rejected_fresh = (
-            f"sekret rejected the token a login in this run just produced, so logging in again will not "
+            f"sekret rejected the token a recent login just produced, so logging in again will not "
             f"help; something between here and {self._url}, such as a proxy dropping the Authorization "
             "header or a clock far out, needs fixing"
         )
@@ -321,7 +322,9 @@ class CliTokens:
         if self._no_login_reason:
             raise AuthenticationError(f"no usable sekret login for {self._url}; {self._no_login_reason}")
         if self._key in _FAILED:
-            raise AuthenticationError(f"`sekret login` to {self._url} already failed in this run; {yourself}")
+            raise AuthenticationError(
+                f"`sekret login` to {self._url} already failed in this Ansible worker process; {yourself}"
+            )
         # One lock per server, CLI and CA, so a login waiting on one server holds up no other.
         lock_name = _beside_lock(self._lock_dir, self._key, "lock").name
         with login_lock(self._lock_dir, self._lock_wait, name=lock_name):
@@ -352,6 +355,107 @@ class CliTokens:
             _write_own(produced, _digest(token))
             _remove(marker)
             return token
+
+
+PROJECT_FILE = ".sekret.toml"
+PROJECT_FILE_LIMIT = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Me:
+    uid: int
+    gid: int
+    # Nobody else is listed in the primary group or has it as their own.
+    private_group: bool
+
+
+def group_holds_only(group: str, passwd: str, gid: int, uid: int) -> bool:
+    """Whether `gid` is a group of `uid` alone, read from /etc/group and /etc/passwd text."""
+    gid_text, uid_text = str(gid), str(uid)
+    users = [line.split(":") for line in passwd.splitlines()]
+    me = next((fields[0] for fields in users if len(fields) > 2 and fields[2] == uid_text), None)
+    entries = [line.split(":") for line in group.splitlines()]
+    entries = [fields for fields in entries if len(fields) > 2 and fields[2] == gid_text]
+    if not entries:
+        return False
+    listed = {
+        name.strip() for fields in entries for name in (fields[3] if len(fields) > 3 else "").split(",")
+    }
+    primary = {fields[0] for fields in users if len(fields) > 3 and fields[3] == gid_text}
+    return not ((listed | primary) - {"", me})
+
+
+def current_user() -> Me:
+    uid, gid = os.geteuid(), os.getegid()
+    try:
+        group, passwd = Path("/etc/group").read_text(), Path("/etc/passwd").read_text()
+    except OSError:
+        return Me(uid, gid, False)
+    return Me(uid, gid, group_holds_only(group, passwd, gid, uid))
+
+
+def _group_can_write(me: Me, gid: int, mode: int) -> bool:
+    return bool(mode & 0o020) and not (me.private_group and gid == me.gid)
+
+
+def distrust_reason(owners: list[int], directory: os.stat_result, file: os.stat_result, me: Me) -> str | None:
+    """Why the CLI would skip a project file, or None when it would use it (config.rs
+    distrust_reason and file_writers)."""
+    if any(owner != me.uid for owner in owners):
+        return "it belongs to another user"
+    if directory.st_uid not in (me.uid, 0):
+        return "its directory belongs to another user"
+    if directory.st_mode & 0o002:
+        return "its directory is writable by every user"
+    if _group_can_write(me, directory.st_gid, directory.st_mode):
+        return "its directory is writable by its group"
+    if file.st_mode & 0o002:
+        return "it is writable by every user"
+    if _group_can_write(me, file.st_gid, file.st_mode):
+        return "it is writable by its group"
+    return None
+
+
+def _read_trusted(candidate: Path, me: Me) -> str | None:
+    """The text of a project file the CLI would trust, read from the handle that was checked."""
+    try:
+        link = os.lstat(candidate)
+        fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        directory = os.stat(candidate.parent)
+        if distrust_reason([link.st_uid, info.st_uid], directory, info, me):
+            return None
+        data = os.read(fd, PROJECT_FILE_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > PROJECT_FILE_LIMIT:
+        return None
+    try:
+        return data.decode()
+    except UnicodeDecodeError:
+        return None
+
+
+def nearest_project_file(start: str, me: Me | None = None) -> tuple[Path, str] | None:
+    """The nearest .sekret.toml the CLI would use, and its text, skipping the ones it skips:
+    another user's, or one others could change."""
+    me = me or current_user()
+    directory = Path(start)
+    for folder in (directory, *directory.parents):
+        candidate = folder / PROJECT_FILE
+        if not os.path.lexists(candidate):
+            continue
+        text = _read_trusted(candidate, me)
+        if text is not None:
+            return candidate, text
+    return None
 
 
 CONTEXT_FLAGS = {
