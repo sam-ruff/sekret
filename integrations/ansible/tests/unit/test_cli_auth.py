@@ -34,6 +34,7 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
     CliLogin,
     ConfigError,
     SekretClient,
+    SekretError,
     Settings,
     TokenCache,
     resolve_auth,
@@ -57,6 +58,7 @@ ENV_NAMES = (
     "SEKRET_AUTH_METHOD",
     "SEKRET_CLI",
     "SEKRET_CLI_LOGIN",
+    "SEKRET_LOADED_FILE",
 )
 
 
@@ -102,6 +104,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_SEKRET_STATE", str(directory))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     sekret_cli._FAILED.clear()
+    sekret_cli._PRODUCED.clear()
     return State(directory, str(cli))
 
 
@@ -643,6 +646,162 @@ class TestTerminalSafety:
     def test_terminal_safe_keeps_printable_text(self):
         assert terminal_safe("café /a b") == "café /a b"
         assert terminal_safe("a\nb\U0001f600") == "a\\u000ab\U0001f600"
+
+
+def _log_in_then_be_rejected(cli, lock_dir, barrier, results):
+    barrier.wait()
+    source = CliTokens(cli, URL, lock_dir=Path(lock_dir))
+    token = source.token()
+    try:
+        source.refresh(token)
+        results.put("logged in again")
+    except AuthenticationError as e:
+        results.put(e.message)
+
+
+class TestRejectedFreshTokens:
+    """A server that rejects the token a login just produced, behind a proxy dropping the
+    Authorization header say, gets one browser login, not one per lookup or worker."""
+
+    def test_lookups_in_one_process_log_in_once(self, lookup, state):
+        lookup.server.tokens = set()
+        base = {"url": URL, "project": "p", "environment": "e"}
+        with pytest.raises(AnsibleError, match="just produced"):
+            lookup.run([], {}, **base)
+        with pytest.raises(AnsibleError, match="already failed in this run"):
+            lookup.run([], {}, path="/other", **base)
+        assert logins(state) == [URL]
+
+    def test_workers_in_several_processes_log_in_once(self, state):
+        context = multiprocessing.get_context("fork")
+        workers = 4
+        barrier = context.Barrier(workers)
+        results = context.Queue()
+        lock_dir = str(state.parent / "cache" / "sekret")
+        processes = [
+            context.Process(target=_log_in_then_be_rejected, args=(state.cli, lock_dir, barrier, results))
+            for _ in range(workers)
+        ]
+        for process in processes:
+            process.start()
+        got = [results.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(timeout=15)
+        assert all("just produced" in message for message in got), got
+        assert logins(state) == [URL]
+
+    def test_a_revoked_older_token_still_gets_a_new_login(self, state):
+        (state / "token").write_text("revoked\n")
+        assert tokens(state).refresh("revoked") == "cli-token-1"
+
+
+class TestShellLoadedElsewhere:
+    """`sekret env use` records the project file it loaded under; a lookup in another project's
+    folder must not quietly use what it left behind."""
+
+    def run(self, lookup):
+        return lookup.run([], {}, url=URL, token="static-token", path="/")
+
+    def shell(self, monkeypatch, loaded=None):
+        monkeypatch.setenv("SEKRET_PROJECT", "shell-p")
+        monkeypatch.setenv("SEKRET_ENVIRONMENT", "shell-e")
+        if loaded is not None:
+            monkeypatch.setenv("SEKRET_LOADED_FILE", loaded)
+
+    def test_the_cli_checks_a_shell_choice_without_it_being_passed_as_a_flag(
+        self, lookup, state, monkeypatch
+    ):
+        self.shell(monkeypatch, "/a/.sekret.toml")
+        assert self.run(lookup) == [{"WHERE": "here"}]
+        (argv,) = [c for c in calls(state) if "--context" in c]
+        assert not any(a.startswith(("--project=", "--env=")) for a in argv)
+        assert lookup.server.asked()[:2] == ("shell-p", "shell-e")
+
+    def test_the_clis_refusal_stops_the_lookup(self, lookup, state, monkeypatch):
+        self.shell(monkeypatch, "/a/.sekret.toml")
+        (state / "context_error").write_text(
+            "sekret: SEKRET_PROJECT is shell-p in this shell but /b/.sekret.toml says b; these were loaded "
+            "by `sekret-env` under /a/.sekret.toml, so not using them here\n"
+        )
+        with pytest.raises(AnsibleError, match="loaded by `sekret-env`"):
+            self.run(lookup)
+        assert lookup.server.calls == []
+
+    def test_values_set_by_hand_are_not_checked(self, lookup, state, monkeypatch):
+        self.shell(monkeypatch)
+        assert self.run(lookup) == [{"WHERE": "here"}]
+        assert calls(state) == []
+
+
+class TestCachedTokensAreRedacted:
+    def test_a_token_another_client_logged_in_for_is_still_redacted(self):
+        server = FakeServer()
+        cache = TokenCache()
+        settings = Settings.from_options(
+            {"url": URL, "client_id": "client-1", "client_secret": "client-secret-1"}, environ={}
+        )
+        SekretClient(settings, transport=server, cache=cache).list_raw("app", "prod")
+        server.override = lambda call: (
+            error(500, "boom", "your token issued-1 is odd") if call.path == "/api/v1/secrets/raw" else None
+        )
+        with pytest.raises(Exception) as caught:
+            SekretClient(settings, transport=server, cache=cache).list_raw("app", "prod")
+        assert "issued-1" not in str(caught.value)
+
+    def test_a_cached_cli_token_is_still_redacted(self, state):
+        (state / "token").write_text("cli-cached-token\n")
+        server = FakeServer()
+        server.tokens = {"cli-cached-token"}
+        cache = TokenCache()
+        settings = Settings.from_options({"url": URL}, environ={})
+
+        def client():
+            return SekretClient(settings, transport=server, cache=cache, token_source=lambda s: tokens(state))
+
+        client().list_raw("app", "prod")
+        server.override = lambda call: error(500, "boom", "bad cli-cached-token")
+        with pytest.raises(Exception) as caught:
+            client().list_raw("app", "prod")
+        assert "cli-cached-token" not in str(caught.value)
+
+
+class TestApprovedCaPath:
+    def test_the_trusted_settings_path_is_loaded_not_the_inventorys(
+        self, lookup, state, tmp_path, monkeypatch
+    ):
+        real = tmp_path / "real-ca.pem"
+        real.write_text("ca")
+        link = tmp_path / "inventory-ca.pem"
+        link.symlink_to(real)
+        monkeypatch.setenv("SEKRET_CA_PATH", str(real))
+        (state / "token").write_text("cli-token-saved\n")
+        lookup.server.tokens = {"cli-token-saved"}
+        used = []
+        factory = lookup.client_factory
+        lookup.client_factory = lambda settings, token_source=None: (
+            used.append(settings.ca_path) or factory(settings, token_source=token_source)
+        )
+        lookup.run([], {"sekret_ca_path": str(link)}, url=URL, project="p", environment="e")
+        assert used == [str(real)]
+
+
+class TestOddSettings:
+    def test_the_lock_outlasts_a_login(self):
+        assert sekret_cli.LOCK_WAIT > sekret_cli.LOGIN_WAIT
+
+    def test_a_nul_in_a_setting_is_a_clear_error(self, state):
+        with pytest.raises(ConfigError, match="NUL"):
+            CliTokens(state.cli, URL + "\x00", lock_dir=state.dir).token()
+        with pytest.raises(ConfigError, match="NUL"):
+            cli_context(state.cli, {"url": URL, "project": "p\x00"})
+
+    def test_a_file_error_beside_the_lock_is_a_sekret_error(self, state):
+        lock_dir = state.parent / "cache" / "sekret"
+        lock_dir.mkdir(parents=True, mode=0o700)
+        sekret_cli._beside_lock(lock_dir, (state.cli, URL, None), "produced").mkdir()
+        with pytest.raises(SekretError, match="could not") as caught:
+            tokens(state).token()
+        assert not isinstance(caught.value, OSError)
 
 
 class TestContextCommand:

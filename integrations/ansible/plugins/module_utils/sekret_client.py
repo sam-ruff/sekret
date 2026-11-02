@@ -513,6 +513,7 @@ class SekretClient:
         else:
             cached = self._cache.get(key)
             if cached is not None:
+                self._sensitive.append(cached)
                 return cached
             token = self._token_source.token()
         self._sensitive.append(token)
@@ -528,6 +529,8 @@ class SekretClient:
         key = plan.cache_key(self._settings.url)
         cached = self._cache.get(key)
         if cached is not None:
+            # Another client in this process logged in; this one must still keep it out of errors.
+            self._sensitive.append(cached)
             return cached
         response = self._send("POST", plan.path, plan.payload)
         if response.status != 200:

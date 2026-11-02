@@ -187,6 +187,8 @@ from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client impor
 
 display = Display()
 CLI_ORIGIN = "the sekret CLI"
+# Set by `sekret env use` to the project file it loaded under.
+LOADED_FILE_VAR = "SEKRET_LOADED_FILE"
 # The options each way of logging in sends to the server.
 CREDENTIALS = {
     "universal": ("client_id", "client_secret"),
@@ -269,18 +271,32 @@ _CONTEXTS: dict[tuple, dict | None] = {}
 _ANNOUNCED: set[tuple] = set()
 
 
+SHELL_VARS = ("SEKRET_PROJECT", "SEKRET_ENVIRONMENT", LOADED_FILE_VAR)
+
+
 def cached_context(cli_path: str, known: dict, read_context=cli_context) -> dict | None:
-    key = (cli_path, os.getcwd(), tuple(sorted((k, v or "") for k, v in known.items())))
+    shell = tuple(os.environ.get(name) for name in SHELL_VARS)
+    key = (cli_path, os.getcwd(), shell, tuple(sorted((k, v or "") for k, v in known.items())))
     if key not in _CONTEXTS:
         _CONTEXTS[key] = read_context(cli_path, known)
     return _CONTEXTS[key]
 
 
+def _from_shell(origins: dict) -> set[str]:
+    """The project and environment `sekret env use` left in the environment, if it did."""
+    if os.environ.get(LOADED_FILE_VAR) is None:
+        return set()
+    return {name for name in ("project", "environment") if (origins.get(name) or "").startswith("env:")}
+
+
 def fill_from_cli(place: dict, origins: dict, cli_path: str, read_context=cli_context) -> None:
-    """Takes whatever is still unset from the CLI's settings, above all the nearest .sekret.toml."""
-    if all(place.get(name) for name in CONTEXT_KEYS):
+    """Takes whatever is still unset from the CLI's settings, above all the nearest .sekret.toml.
+    A project or environment `sekret env use` set is left in the environment rather than passed as
+    a flag, so the CLI's own check that it was meant for this folder's project file runs."""
+    from_shell = _from_shell(origins)
+    if all(place.get(name) for name in CONTEXT_KEYS) and not from_shell:
         return
-    known = {name: place.get(name) for name in PLACE_OPTIONS}
+    known = {name: place.get(name) for name in PLACE_OPTIONS if name not in from_shell}
     context = cached_context(cli_path, known, read_context)
     if not context:
         return
@@ -380,22 +396,25 @@ class LookupModule(LookupBase):
             no_login_reason=no_login_reason,
         )
 
-    def _ca_vouched(self, place: dict, origins: dict) -> bool:
-        """Whether a CA path an inventory variable gave is also what a trusted setting names: the
-        lookup's own argument, SEKRET_CA_PATH, ansible.cfg, or the CLI's own CA file."""
+    def _ca_vouched(self, place: dict, origins: dict) -> str | None:
+        """The trusted setting naming the same file as a CA path an inventory variable gave: the
+        lookup's own argument, SEKRET_CA_PATH, ansible.cfg, or the CLI's own CA file. That path,
+        not the inventory's, is the one loaded, so a link swapped afterwards changes nothing."""
         if not _from_inventory(origins.get("ca_path")):
-            return False
+            return None
         trusted, _ = C.config.get_config_value_and_origin(
             "ca_path", plugin_type="lookup", plugin_name=self._load_name, variables={}
         )
         if same_path(trusted, place.get("ca_path")):
-            return True
+            return trusted
         known = {name: place.get(name) for name in ("url", "project", "environment")}
         try:
             context = cached_context(self.get_option("cli_path") or "sekret", known, self.read_context)
         except ConfigError:
-            return False
-        return bool(context) and same_path(context.get("ca_file"), place.get("ca_path"))
+            return None
+        if context and same_path(context.get("ca_file"), place.get("ca_path")):
+            return context["ca_file"]
+        return None
 
     def _credential_origins(self, plan) -> dict:
         origins = {}
@@ -428,9 +447,12 @@ class LookupModule(LookupBase):
                     "sekret_environment, SEKRET_PROJECT and SEKRET_ENVIRONMENT, the [sekret] section of "
                     "ansible.cfg, or a .sekret.toml"
                 )
+            vouched_ca = self._ca_vouched(place, origins)
+            if vouched_ca:
+                place["ca_path"] = options["ca_path"] = vouched_ca
             settings = Settings.from_options(options)
             plan = resolve_auth(settings, allow_cli=True)
-            check_destination(plan, origins, self._credential_origins(plan), self._ca_vouched(place, origins))
+            check_destination(plan, origins, self._credential_origins(plan), vouched_ca is not None)
             # A browser login only to a server the person named, never one an inventory chose.
             no_login_reason = None
             if _from_inventory(origins.get("url")):
