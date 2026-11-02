@@ -1,5 +1,9 @@
-use sekret_core::permissions::{Action, BuiltinRole, Decision, Effect, Resource, Rule, Subject, authorise};
-use sekret_store::{Membership, PrincipalKind, Role, User};
+use std::collections::HashMap;
+
+use sekret_core::permissions::{
+    Access, Action, BuiltinRole, Decision, Effect, LISTABLE_ACTIONS, Resource, Rule, Subject, authorise,
+};
+use sekret_store::{Membership, PrincipalKind, Project, Role, Secret, SecretGrant, User};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
@@ -105,6 +109,97 @@ pub fn is_project_admin(memberships: &[Membership], principal: &Principal) -> bo
         m.role_slug == BuiltinRole::ProjectAdmin.slug()
             && principal_matches(m.principal_kind, &m.principal_id, principal)
     })
+}
+
+/// Whether `principal` manages per-secret access in the project and is exempt from access lists:
+/// a project admin or an organisation admin.
+pub async fn manages_secret_access(state: &AppState, principal: &Principal, project_id: &str) -> ApiResult<bool> {
+    if is_org_admin(state, principal).await? {
+        return Ok(true);
+    }
+    Ok(is_project_admin(
+        &state.store.list_memberships(project_id).await?,
+        principal,
+    ))
+}
+
+/// How per-secret access lists bear on one caller in one environment.
+#[derive(Debug, Clone, Default)]
+pub struct SecretAccess {
+    exempt: bool,
+    /// Secret id to the actions its list grants the caller, through any entry that reaches them.
+    granted: HashMap<String, Vec<Action>>,
+}
+
+impl SecretAccess {
+    /// For callers no list binds: admins and the server's own jobs.
+    pub fn exempt() -> Self {
+        Self {
+            exempt: true,
+            granted: HashMap::new(),
+        }
+    }
+
+    /// The caller's share of `grants`, which may cover other principals too.
+    pub fn listed(principal: &Principal, grants: Vec<SecretGrant>) -> Self {
+        let mut granted: HashMap<String, Vec<Action>> = HashMap::new();
+        for grant in grants {
+            if !principal_matches(grant.principal_kind, &grant.principal_id, principal) {
+                continue;
+            }
+            let actions = granted.entry(grant.secret_id).or_default();
+            for action in grant.actions {
+                if LISTABLE_ACTIONS.contains(&action) && !actions.contains(&action) {
+                    actions.push(action);
+                }
+            }
+        }
+        Self { exempt: false, granted }
+    }
+
+    pub fn is_exempt(&self) -> bool {
+        self.exempt
+    }
+
+    /// How lists bear on a check that spans every secret in the project, such as "may this
+    /// caller read them all": open only when the caller is exempt or nothing there can be
+    /// restricted, since the store refuses turning the setting off while any secret is.
+    pub fn spanning(&self, project: &Project) -> Access<'static> {
+        if self.exempt || !project.secret_access {
+            return Access::Open;
+        }
+        Access::Unknown
+    }
+
+    /// How the secret's list bears on the caller.
+    pub fn of(&self, secret: &Secret) -> Access<'_> {
+        if self.exempt || !secret.restricted {
+            return Access::Open;
+        }
+        Access::Listed(self.granted.get(&secret.id).map_or(&[], Vec::as_slice))
+    }
+}
+
+/// The caller's access to secrets in `environment_id` of the project.
+pub async fn secret_access(
+    state: &AppState,
+    principal: &Principal,
+    project_id: &str,
+    environment_id: &str,
+) -> ApiResult<SecretAccess> {
+    if manages_secret_access(state, principal, project_id).await? {
+        return Ok(SecretAccess::exempt());
+    }
+    let grants = state.store.list_environment_grants(environment_id).await?;
+    Ok(SecretAccess::listed(principal, grants))
+}
+
+/// A caller's role rules and their access lists, which together decide what they may do with
+/// a secret.
+#[derive(Clone, Copy)]
+pub struct Caller<'a> {
+    pub rules: &'a [Rule],
+    pub access: &'a SecretAccess,
 }
 
 pub type Key<'k> = (PrincipalKind, &'k str);

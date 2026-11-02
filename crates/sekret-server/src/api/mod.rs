@@ -1,3 +1,4 @@
+pub mod access;
 pub mod listing;
 pub mod logo;
 mod org;
@@ -158,6 +159,7 @@ pub fn api_project(p: &Project) -> sekret_api::Project {
         logo_url: p
             .logo_updated_at
             .map(|v| format!("/api/v1/projects/{}/logo?v={v}", p.id)),
+        secret_access: p.secret_access,
     }
 }
 
@@ -241,6 +243,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .merge(auth_router())
         .merge(org::router())
         .merge(projects::router())
+        .merge(access::router())
         .merge(logo::router())
         .merge(secrets::router())
         .merge(sys::router())

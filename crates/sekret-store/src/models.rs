@@ -1,4 +1,4 @@
-use sekret_core::permissions::Rule;
+use sekret_core::permissions::{Action, Rule};
 use sekret_core::seal::{SealFlags, SealMode, UnlockPolicy, WrappedRootKey};
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +187,8 @@ pub struct Project {
     pub logo_updated_at: Option<i64>,
     /// Default generation and rotation policy as JSON; `None` is off.
     pub secret_policy: Option<String>,
+    /// Secrets in this project may be restricted to their own access lists.
+    pub secret_access: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +239,29 @@ pub struct Secret {
     pub updated_at: i64,
     /// This secret's own policy override as JSON; `None` follows the project.
     pub policy: Option<String>,
+    /// Only the principals on its access list, and admins, may reach it.
+    pub restricted: bool,
+}
+
+/// One entry on a secret's access list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretGrant {
+    pub secret_id: String,
+    pub principal_kind: PrincipalKind,
+    pub principal_id: String,
+    pub actions: Vec<Action>,
+    pub created_at: i64,
+}
+
+/// Changes to one secret's access, applied together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessChange {
+    pub secret_id: String,
+    /// Restricting needs the project setting on, checked in the same transaction.
+    pub restricted: Option<bool>,
+    /// Added, or replacing the actions of an existing entry for the same principal.
+    pub grant: Vec<SecretGrant>,
+    pub revoke: Vec<(PrincipalKind, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +294,9 @@ pub struct SecretChange {
     pub key: String,
     pub previous_version: i64,
     pub version: SecretVersion,
+    /// For a new secret, whether it starts restricted, which needs the project setting on.
+    /// Ignored for existing secrets.
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

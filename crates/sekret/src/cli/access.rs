@@ -1,0 +1,486 @@
+//! `sekret secrets access` and `sekret projects secret-access`: per-secret access lists.
+
+use std::io::Write;
+
+use anyhow::bail;
+use clap::{Args, Subcommand, ValueEnum};
+use sekret_api::{
+    Action, GrantRequest, Identity, PrincipalKind, PrincipalRef, SecretAccess, SecretAccessChange, SecretAccessSetting,
+    User,
+};
+use sekret_client::{Location, SekretApi};
+
+use super::format::{one_line, table};
+
+#[derive(Debug, Subcommand)]
+pub enum AccessCommand {
+    /// Show whether a secret is restricted and who is on its access list.
+    List { key: String },
+    /// Add principals to a secret's access list, or change what they may do. Admins only.
+    Grant {
+        key: String,
+        #[command(flatten)]
+        who: Principals,
+        /// What they may do. Read is always included. A list narrows what roles allow and
+        /// never widens it.
+        #[arg(long, value_enum, value_delimiter = ',', default_value = "read,read-value")]
+        allow: Vec<AccessAction>,
+    },
+    /// Take principals off a secret's access list. Admins only.
+    Revoke {
+        key: String,
+        #[command(flatten)]
+        who: Principals,
+    },
+    /// Restrict a secret to its access list, project admins and organisation admins. Needs
+    /// per-secret access on for the project.
+    Restrict { key: String },
+    /// Open a restricted secret to everyone its role rules allow again. The list is kept but has
+    /// no effect until the secret is restricted again.
+    Unrestrict { key: String },
+}
+
+impl AccessCommand {
+    /// Whether it writes to the server rather than only reading.
+    pub fn changes(&self) -> bool {
+        !matches!(self, AccessCommand::List { .. })
+    }
+}
+
+/// Principals named on the command line. Each flag can be repeated.
+#[derive(Debug, Clone, Default, Args)]
+#[group(required = true, multiple = true)]
+pub struct Principals {
+    /// A machine identity, by id or name.
+    #[arg(long = "identity", value_name = "ID_OR_NAME")]
+    pub identities: Vec<String>,
+    /// A user, by id or email.
+    #[arg(long = "user", value_name = "ID_OR_EMAIL")]
+    pub users: Vec<String>,
+    /// A group from the identity provider, by name.
+    #[arg(long = "group", value_name = "NAME")]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AccessAction {
+    Read,
+    ReadValue,
+    Edit,
+    Delete,
+}
+
+impl From<AccessAction> for Action {
+    fn from(value: AccessAction) -> Self {
+        match value {
+            AccessAction::Read => Action::Read,
+            AccessAction::ReadValue => Action::ReadValue,
+            AccessAction::Edit => Action::Edit,
+            AccessAction::Delete => Action::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
+}
+
+/// The identity `wanted` names: an exact id, else the one identity with that name.
+pub fn pick_identity(wanted: &str, candidates: &[Identity]) -> anyhow::Result<String> {
+    if let Some(found) = candidates.iter().find(|i| i.id == wanted) {
+        return Ok(found.id.clone());
+    }
+    let named: Vec<&Identity> = candidates.iter().filter(|i| i.name == wanted).collect();
+    match named.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => bail!("no machine identity has the id or name {}", one_line(wanted)),
+        _ => bail!(
+            "more than one machine identity is called {}; give its id instead",
+            one_line(wanted)
+        ),
+    }
+}
+
+/// The user `wanted` names: an exact id, else the one user with that email.
+pub fn pick_user(wanted: &str, candidates: &[User]) -> anyhow::Result<String> {
+    if let Some(found) = candidates.iter().find(|u| u.id == wanted) {
+        return Ok(found.id.clone());
+    }
+    let named: Vec<&User> = candidates
+        .iter()
+        .filter(|u| !u.email.is_empty() && u.email.eq_ignore_ascii_case(wanted))
+        .collect();
+    match named.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => bail!(
+            "no user has the id or email {}; they must have signed in once",
+            one_line(wanted)
+        ),
+        _ => bail!(
+            "more than one user has the email {}; give their id instead",
+            one_line(wanted)
+        ),
+    }
+}
+
+async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<PrincipalRef>> {
+    let mut resolved = Vec::new();
+    for wanted in &who.identities {
+        let page = api.find_identities(wanted.clone()).await?;
+        resolved.push(PrincipalRef {
+            principal_kind: PrincipalKind::Identity,
+            principal_id: pick_identity(wanted, &page.items)?,
+        });
+    }
+    for wanted in &who.users {
+        let page = api.find_users(wanted.clone()).await?;
+        resolved.push(PrincipalRef {
+            principal_kind: PrincipalKind::User,
+            principal_id: pick_user(wanted, &page.items)?,
+        });
+    }
+    for group in &who.groups {
+        resolved.push(PrincipalRef {
+            principal_kind: PrincipalKind::Group,
+            principal_id: group.clone(),
+        });
+    }
+    Ok(resolved)
+}
+
+fn kind_label(kind: PrincipalKind) -> &'static str {
+    match kind {
+        PrincipalKind::User => "user",
+        PrincipalKind::Group => "group",
+        PrincipalKind::Identity => "identity",
+    }
+}
+
+fn action_label(action: Action) -> &'static str {
+    match action {
+        Action::Read => "read",
+        Action::ReadValue => "read-value",
+        Action::Create => "create",
+        Action::Edit => "edit",
+        Action::Delete => "delete",
+    }
+}
+
+pub fn describe_access(access: &SecretAccess) -> String {
+    let state = if access.restricted {
+        "restricted: yes, only the principals below and admins can reach it\n"
+    } else {
+        "restricted: no, role rules alone decide who can reach it\n"
+    };
+    if access.grants.is_empty() {
+        return format!("{state}no one is on the access list\n");
+    }
+    let rows: Vec<Vec<String>> = access
+        .grants
+        .iter()
+        .map(|g| {
+            vec![
+                kind_label(g.principal_kind).to_string(),
+                g.principal_name.clone(),
+                g.principal_id.clone(),
+                g.actions
+                    .iter()
+                    .map(|a| action_label(*a))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]
+        })
+        .collect();
+    format!("{state}{}", table(&["KIND", "NAME", "ID", "ALLOWED"], &rows))
+}
+
+pub async fn run(api: &dyn SekretApi, at: Location, command: AccessCommand, out: &mut dyn Write) -> anyhow::Result<()> {
+    let access = match command {
+        AccessCommand::List { key } => api.secret_access(at, key).await?,
+        AccessCommand::Grant { key, who, allow } => {
+            let actions: Vec<Action> = allow.into_iter().map(Action::from).collect();
+            let grant = resolve(api, &who)
+                .await?
+                .into_iter()
+                .map(|p| GrantRequest {
+                    principal_kind: p.principal_kind,
+                    principal_id: p.principal_id,
+                    actions: actions.clone(),
+                })
+                .collect();
+            let change = SecretAccessChange {
+                grant,
+                ..Default::default()
+            };
+            api.change_secret_access(at, key, change).await?
+        }
+        AccessCommand::Revoke { key, who } => {
+            let change = SecretAccessChange {
+                revoke: resolve(api, &who).await?,
+                ..Default::default()
+            };
+            api.change_secret_access(at, key, change).await?
+        }
+        AccessCommand::Restrict { key } => {
+            let change = SecretAccessChange {
+                restricted: Some(true),
+                ..Default::default()
+            };
+            api.change_secret_access(at, key, change).await?
+        }
+        AccessCommand::Unrestrict { key } => {
+            let change = SecretAccessChange {
+                restricted: Some(false),
+                ..Default::default()
+            };
+            api.change_secret_access(at, key, change).await?
+        }
+    };
+    write!(out, "{}", describe_access(&access))?;
+    Ok(())
+}
+
+pub fn describe_setting(setting: &SecretAccessSetting) -> String {
+    let mut text = format!("per-secret access: {}\n", if setting.enabled { "on" } else { "off" });
+    let hidden = setting.restricted_count - i64::try_from(setting.restricted.len()).unwrap_or(i64::MAX);
+    if setting.restricted_count == 0 {
+        text.push_str("no secrets are restricted\n");
+        return text;
+    }
+    text.push_str(&format!("restricted secrets: {}\n", setting.restricted_count));
+    let rows: Vec<Vec<String>> = setting
+        .restricted
+        .iter()
+        .map(|s| {
+            let place = if s.path == "/" {
+                s.key.clone()
+            } else {
+                format!("{}/{}", s.path, s.key)
+            };
+            vec![
+                s.environment.clone(),
+                place,
+                if s.deleted { "yes".into() } else { "no".into() },
+                s.grants.to_string(),
+            ]
+        })
+        .collect();
+    text.push_str(&table(&["ENVIRONMENT", "KEY", "DELETED", "ENTRIES"], &rows));
+    if hidden > 0 {
+        text.push_str(&format!("{hidden} more are in places your roles hide from you\n"));
+    }
+    text
+}
+
+pub async fn project_setting(api: &dyn SekretApi, project: String, state: Option<OnOff>) -> anyhow::Result<String> {
+    let setting = match state {
+        None => api.secret_access_setting(project).await?,
+        Some(state) => api.set_secret_access_setting(project, state == OnOff::On).await?,
+    };
+    Ok(describe_setting(&setting))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sekret_api::{RestrictedSecret, SecretGrant};
+
+    fn identity(id: &str, name: &str) -> Identity {
+        Identity {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            token_ttl: 0,
+            token_max_ttl: 0,
+            trusted_cidrs: vec![],
+            disabled: false,
+            created_at: 0,
+            auth_methods: vec![],
+        }
+    }
+
+    fn user(id: &str, email: &str) -> User {
+        User {
+            id: id.into(),
+            email: email.into(),
+            name: String::new(),
+            groups: vec![],
+            disabled: false,
+            created_at: 0,
+            last_login_at: 0,
+        }
+    }
+
+    #[test]
+    fn identities_are_found_by_id_then_by_a_unique_name() -> anyhow::Result<()> {
+        let all = [
+            identity("i1", "web"),
+            identity("i2", "worker"),
+            identity("i3", "worker"),
+        ];
+        assert_eq!(pick_identity("i2", &all)?, "i2");
+        assert_eq!(pick_identity("web", &all)?, "i1");
+        assert!(
+            pick_identity("worker", &all)
+                .err()
+                .is_some_and(|e| e.to_string().contains("more than one"))
+        );
+        assert!(pick_identity("missing", &all).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn users_are_found_by_id_then_by_email() -> anyhow::Result<()> {
+        let all = [user("u1", "ann@example.com"), user("u2", "")];
+        assert_eq!(pick_user("u2", &all)?, "u2");
+        assert_eq!(pick_user("ANN@example.com", &all)?, "u1");
+        assert!(pick_user("", &all).is_err(), "an empty email never matches");
+        assert!(pick_user("bob@example.com", &all).is_err());
+        Ok(())
+    }
+
+    fn at() -> Location {
+        Location {
+            project: "app".into(),
+            environment: "prod".into(),
+            path: "/".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn grants_resolve_names_and_send_one_change() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut api = sekret_client::MockSekretApi::new();
+        api.expect_find_identities().times(1).returning(|_| {
+            Ok(sekret_api::IdentityPage {
+                items: vec![identity("i1", "web")],
+                total: 1,
+            })
+        });
+        api.expect_find_users().times(1).returning(|_| {
+            Ok(sekret_api::UserPage {
+                items: vec![user("u1", "ann@example.com")],
+                total: 1,
+            })
+        });
+        api.expect_change_secret_access()
+            .withf(|at, key, change| {
+                let wanted = [
+                    (PrincipalKind::Identity, "i1"),
+                    (PrincipalKind::User, "u1"),
+                    (PrincipalKind::Group, "ops"),
+                ];
+                at.environment == "prod"
+                    && key == "DB"
+                    && change.restricted.is_none()
+                    && change.revoke.is_empty()
+                    && change.grant.len() == 3
+                    && change.grant.iter().zip(wanted).all(|(g, (kind, id))| {
+                        g.principal_kind == kind && g.principal_id == id && g.actions == [Action::Read, Action::Edit]
+                    })
+            })
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(SecretAccess {
+                    restricted: true,
+                    grants: vec![],
+                })
+            });
+        let command = AccessCommand::Grant {
+            key: "DB".into(),
+            who: Principals {
+                identities: vec!["web".into()],
+                users: vec!["ann@example.com".into()],
+                groups: vec!["ops".into()],
+            },
+            allow: vec![AccessAction::Read, AccessAction::Edit],
+        };
+        let mut out = Vec::new();
+        run(&api, at(), command, &mut out).await.context("grant")?;
+        assert!(String::from_utf8(out).context("utf8")?.starts_with("restricted: yes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restricting_and_unrestricting_send_only_the_flag() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut api = sekret_client::MockSekretApi::new();
+        for wanted in [true, false] {
+            api.expect_change_secret_access()
+                .withf(move |_, _, change| {
+                    change.restricted == Some(wanted) && change.grant.is_empty() && change.revoke.is_empty()
+                })
+                .times(1)
+                .returning(move |_, _, _| {
+                    Ok(SecretAccess {
+                        restricted: wanted,
+                        grants: vec![],
+                    })
+                });
+        }
+        let mut out = Vec::new();
+        run(&api, at(), AccessCommand::Restrict { key: "DB".into() }, &mut out)
+            .await
+            .context("restrict")?;
+        run(&api, at(), AccessCommand::Unrestrict { key: "DB".into() }, &mut out)
+            .await
+            .context("unrestrict")?;
+        Ok(())
+    }
+
+    #[test]
+    fn access_lists_are_described_plainly() {
+        let empty = SecretAccess {
+            restricted: false,
+            grants: vec![],
+        };
+        assert_eq!(
+            describe_access(&empty),
+            "restricted: no, role rules alone decide who can reach it\nno one is on the access list\n"
+        );
+        let listed = SecretAccess {
+            restricted: true,
+            grants: vec![SecretGrant {
+                principal_kind: PrincipalKind::Identity,
+                principal_id: "i1".into(),
+                principal_name: "web\u{1b}[31m".into(),
+                actions: vec![Action::Read, Action::ReadValue],
+                created_at: 0,
+            }],
+        };
+        let text = describe_access(&listed);
+        assert!(text.starts_with("restricted: yes"));
+        assert!(text.contains("read, read-value"));
+        assert!(!text.contains('\u{1b}'), "names cannot drive the terminal");
+    }
+
+    #[test]
+    fn the_setting_lists_restricted_secrets_and_says_how_many_are_hidden() {
+        let setting = SecretAccessSetting {
+            enabled: true,
+            restricted: vec![RestrictedSecret {
+                environment: "prod".into(),
+                path: "/payments".into(),
+                key: "STRIPE".into(),
+                deleted: false,
+                grants: 2,
+            }],
+            restricted_count: 3,
+        };
+        let text = describe_setting(&setting);
+        assert!(text.starts_with("per-secret access: on\nrestricted secrets: 3\n"));
+        assert!(text.contains("/payments/STRIPE"));
+        assert!(text.contains("2 more are in places your roles hide from you"));
+        let off = SecretAccessSetting {
+            enabled: false,
+            restricted: vec![],
+            restricted_count: 0,
+        };
+        assert_eq!(
+            describe_setting(&off),
+            "per-secret access: off\nno secrets are restricted\n"
+        );
+    }
+}

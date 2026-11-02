@@ -665,6 +665,7 @@ async fn a_missing_fingerprint_is_only_adopted_by_a_key_that_opens_the_data(db: 
         created_at: 1,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     store.create_project(project, vec![]).await?;
     let stranger = RootKey::generate().context("stranger")?;

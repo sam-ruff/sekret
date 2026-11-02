@@ -108,6 +108,7 @@ async fn a_planted_project_does_not_let_a_forged_root_in(db: String) -> anyhow::
         created_at: 1,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     h.state.store.create_project(planted, vec![]).await?;
 

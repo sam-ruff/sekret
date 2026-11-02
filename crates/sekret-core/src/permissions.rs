@@ -134,6 +134,47 @@ pub struct Resource<'a> {
     pub key: Option<&'a str>,
     /// `None` when the tags are unknown, so a deny scoped by tag still applies.
     pub tags: Option<&'a [String]>,
+    /// How the secret's own access list bears on the caller, for checks on secrets and their
+    /// versions.
+    pub access: Access<'a>,
+}
+
+/// A secret's access list as it applies to one caller. It narrows what the caller's roles
+/// allow on that secret and never widens it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Access<'a> {
+    /// The secret is not restricted, or the caller is exempt from access lists.
+    Open,
+    /// The secret is restricted; these are the actions its list grants the caller, empty when
+    /// they are not on it.
+    Listed(&'a [Action]),
+    /// Not known, which allows nothing on secrets, so a check that forgets the list fails closed.
+    #[default]
+    Unknown,
+}
+
+/// The actions an access list entry can grant.
+pub const LISTABLE_ACTIONS: [Action; 4] = [Action::Read, Action::ReadValue, Action::Edit, Action::Delete];
+
+impl Access<'_> {
+    /// Whether the list lets `action` through. Creating over a restricted secret, which brings a
+    /// deleted one back, counts as editing it.
+    pub fn permits(self, action: Action) -> bool {
+        let wanted = match action {
+            Action::Create => Action::Edit,
+            other => other,
+        };
+        match self {
+            Access::Open => true,
+            Access::Listed(granted) => granted.contains(&wanted),
+            Access::Unknown => false,
+        }
+    }
+}
+
+/// Subjects that are about one secret, and so answer to its access list.
+fn follows_access_lists(subject: Subject) -> bool {
+    matches!(subject, Subject::Secrets | Subject::SecretVersions)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +244,9 @@ pub fn authorise(rules: &[Rule], subject: Subject, action: Action, resource: &Re
             .filter(|r| r.subject == subject && r.actions.contains(&action))
     };
     if relevant().any(|r| r.effect == Effect::Deny && deny_applies(&r.conditions, resource)) {
+        return Decision::Deny;
+    }
+    if follows_access_lists(subject) && !resource.access.permits(action) {
         return Decision::Deny;
     }
     if relevant().any(|r| r.effect == Effect::Allow && allow_applies(&r.conditions, resource)) {
@@ -378,6 +422,80 @@ mod tests {
             path: Some(path),
             key: Some(key),
             tags: Some(&[]),
+            access: Access::Open,
+        }
+    }
+
+    #[test]
+    fn an_access_list_narrows_but_never_widens() {
+        let developer = BuiltinRole::Developer.rules();
+        let viewer = BuiltinRole::Viewer.rules();
+        let granted = [Action::Read, Action::ReadValue, Action::Edit];
+        let listed = |granted: &'static [Action]| Resource {
+            access: Access::Listed(granted),
+            ..secret("prod", "/", "DB")
+        };
+        let check = |rules: &[Rule], action, r: &Resource| authorise(rules, Subject::Secrets, action, r);
+        let with_grant = Resource {
+            access: Access::Listed(&granted),
+            ..secret("prod", "/", "DB")
+        };
+        assert_eq!(check(&developer, Action::ReadValue, &with_grant), Decision::Allow);
+        assert_eq!(check(&developer, Action::Edit, &with_grant), Decision::Allow);
+        assert_eq!(
+            check(&developer, Action::Create, &with_grant),
+            Decision::Allow,
+            "bringing a restricted secret back counts as editing it"
+        );
+        assert_eq!(check(&developer, Action::Delete, &with_grant), Decision::Deny);
+        assert_eq!(
+            check(&viewer, Action::Edit, &with_grant),
+            Decision::Deny,
+            "the list cannot grant what the role does not"
+        );
+        for action in Action::ALL {
+            assert_eq!(check(&developer, action, &listed(&[])), Decision::Deny, "{action:?}");
+            assert_eq!(
+                authorise(&developer, Subject::SecretVersions, action, &listed(&[])),
+                Decision::Deny,
+                "{action:?} on versions"
+            );
+        }
+        assert_eq!(
+            check(&developer, Action::ReadValue, &listed(&[Action::Read])),
+            Decision::Deny
+        );
+        assert_eq!(
+            check(&developer, Action::Read, &listed(&[Action::Read])),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn an_unknown_list_fails_closed_on_secrets_only() {
+        let admin = BuiltinRole::ProjectAdmin.rules();
+        let unknown = Resource {
+            access: Access::Unknown,
+            ..secret("prod", "/", "DB")
+        };
+        assert_eq!(
+            authorise(&admin, Subject::Secrets, Action::Read, &unknown),
+            Decision::Deny
+        );
+        assert_eq!(
+            authorise(&admin, Subject::SecretVersions, Action::Read, &unknown),
+            Decision::Deny
+        );
+        let environment = Resource {
+            environment: Some("prod"),
+            ..Default::default()
+        };
+        for subject in [Subject::Snapshots, Subject::Folders, Subject::Environments] {
+            assert_eq!(
+                authorise(&admin, subject, Action::Read, &environment),
+                Decision::Allow,
+                "{subject:?} has no access list"
+            );
         }
     }
 
@@ -772,6 +890,7 @@ mod tests {
             path: Some("/app/x"),
             key: Some("DB_URL"),
             tags: Some(&tags),
+            access: Access::Open,
         };
         assert!(allow_applies(&conditions, &full));
         assert!(deny_applies(&conditions, &full));
@@ -851,6 +970,15 @@ mod tests {
             }).collect();
             if authorise(&narrowed, Subject::Secrets, action, &resource) == Decision::Allow {
                 prop_assert_eq!(authorise(&rules, Subject::Secrets, action, &resource), Decision::Allow);
+            }
+        }
+
+        #[test]
+        fn an_access_list_never_widens_access(rules in prop::collection::vec(arb_rule(), 0..6), granted in prop::collection::vec(arb_action(), 0..4), action in arb_action(), (env, path) in arb_resource()) {
+            let open = secret(&env, &path, "K");
+            let listed = Resource { access: Access::Listed(&granted), ..open.clone() };
+            if authorise(&rules, Subject::Secrets, action, &listed) == Decision::Allow {
+                prop_assert_eq!(authorise(&rules, Subject::Secrets, action, &open), Decision::Allow);
             }
         }
 

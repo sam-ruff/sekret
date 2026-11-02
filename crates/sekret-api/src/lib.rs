@@ -133,6 +133,83 @@ pub struct Project {
     /// Versioned URL of the project's logo, absent when it has none.
     #[serde(default)]
     pub logo_url: Option<String>,
+    /// Secrets here may be restricted to their own access lists.
+    #[serde(default)]
+    pub secret_access: bool,
+}
+
+/// The project's per-secret access setting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretAccessSetting {
+    pub enabled: bool,
+    /// Every restricted secret in the project the caller's roles let them see, deleted ones
+    /// included. The setting cannot be turned off while any secret is restricted.
+    pub restricted: Vec<RestrictedSecret>,
+    /// Restricted secrets in the project, including any the caller's roles hide.
+    pub restricted_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RestrictedSecret {
+    pub environment: String,
+    pub path: String,
+    pub key: String,
+    pub deleted: bool,
+    /// Entries on its access list.
+    pub grants: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SetSecretAccessSetting {
+    pub enabled: bool,
+}
+
+/// One entry on a secret's access list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretGrant {
+    pub principal_kind: PrincipalKind,
+    pub principal_id: String,
+    /// Display name for users and identities; the group name for groups.
+    pub principal_name: String,
+    /// Always includes `read`; at most `read`, `read-value`, `edit` and `delete`.
+    pub actions: Vec<Action>,
+    pub created_at: i64,
+}
+
+/// Who may reach a secret beyond its role rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretAccess {
+    /// Only principals on `grants`, project admins and organisation admins may reach it, and
+    /// only as far as their roles also allow. Off, the list has no effect.
+    pub restricted: bool,
+    pub grants: Vec<SecretGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct GrantRequest {
+    pub principal_kind: PrincipalKind,
+    pub principal_id: String,
+    /// Any of `read`, `read-value`, `edit` and `delete`; `read` is always added.
+    pub actions: Vec<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PrincipalRef {
+    pub principal_kind: PrincipalKind,
+    pub principal_id: String,
+}
+
+/// Changes to one secret's access, applied together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SecretAccessChange {
+    /// Restricting needs the project setting on.
+    #[serde(default)]
+    pub restricted: Option<bool>,
+    /// Entries to add, or to replace the actions of for a principal already listed.
+    #[serde(default)]
+    pub grant: Vec<GrantRequest>,
+    #[serde(default)]
+    pub revoke: Vec<PrincipalRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -206,6 +283,9 @@ pub struct Secret {
     /// When automatic rotation will next replace the value; absent when rotation does not apply.
     #[serde(default)]
     pub next_rotation_at: Option<i64>,
+    /// Only principals on its access list, and admins, may reach it.
+    #[serde(default)]
+    pub restricted: bool,
 }
 
 /// Request to fill a secret with a newly generated value, creating it if needed.
@@ -240,6 +320,9 @@ pub struct SetSecret {
     pub comment: String,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// See [`SecretUpsert::restricted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restricted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -250,6 +333,12 @@ pub struct SecretUpsert {
     pub comment: String,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// `true` creates the secret restricted, with an empty access list, so it is never open
+    /// even for a moment; that needs a project admin and the project setting on. For a secret
+    /// that already exists it must match whether it is restricted, which only the access
+    /// route changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restricted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -397,6 +486,10 @@ pub struct PutRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ProjectPermissions {
     pub rules: Vec<Rule>,
+    /// The caller is a project or organisation admin, so manages per-secret access and is
+    /// exempt from access lists, though not from their own rules.
+    #[serde(default)]
+    pub manages_secret_access: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

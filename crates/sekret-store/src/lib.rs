@@ -105,6 +105,17 @@ pub trait Store: Send + Sync {
     async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>>;
     async fn set_project_policy(&self, project_id: &str, policy: Option<String>) -> StoreResult<()>;
     async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
+    /// Turns per-secret access on or off. Turning it off is a `Conflict` while any secret in the
+    /// project is restricted, so no restriction is ever dropped silently.
+    async fn set_project_secret_access(&self, project_id: &str, enabled: bool) -> StoreResult<()>;
+    /// Restricted secrets in the project, deleted ones included.
+    async fn count_restricted_secrets(&self, project_id: &str) -> StoreResult<i64>;
+    /// Every access list entry on secrets in the environment.
+    async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    /// Applies one secret's access changes atomically. Restricting is a `Conflict` when the
+    /// project setting is off.
+    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<()>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
     async fn delete_project(&self, id: &str) -> StoreResult<()>;
     /// Every stored secret value in the project, history included.

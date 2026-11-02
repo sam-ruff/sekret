@@ -19,12 +19,14 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use super::access::{HiddenSecrets, audit_resource, hidden_secrets};
 use super::listing::{AuditParams, audit_page};
 use super::{AuditTarget, api_env, api_project, audit, find_env, from_api_kind, load_project, to_api_kind};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{
     Key, added_denies, admin_bindings, allowed, can_see_project, deny_needs_admin, has_denies, holders, is_org_admin,
-    is_project_admin, org_rules, project_management_rules, project_rules, reaches_admin, require, require_any,
+    is_project_admin, manages_secret_access, org_rules, project_management_rules, project_rules, reaches_admin,
+    require, require_any,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::rotation::project_policy;
@@ -114,6 +116,7 @@ async fn create_project(
         created_at: now,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     state.store.create_project(project.clone(), environments).await?;
     state
@@ -267,6 +270,7 @@ async fn delete_project(
             "deleting a project needs unrestricted delete on its secrets, folders and environments",
         ));
     }
+    refuse_destroying_restricted(&state, &principal, &project.id, None).await?;
     state.store.delete_project(&project.id).await?;
     audit(
         &state,
@@ -290,8 +294,11 @@ async fn permissions(
     principal: Principal,
     Path(project): Path<String>,
 ) -> ApiResult<Json<ProjectPermissions>> {
-    let (_, rules) = load_project(&state, &principal, &project).await?;
-    Ok(Json(ProjectPermissions { rules }))
+    let (project, rules) = load_project(&state, &principal, &project).await?;
+    Ok(Json(ProjectPermissions {
+        rules,
+        manages_secret_access: manages_secret_access(&state, &principal, &project.id).await?,
+    }))
 }
 
 #[utoipa::path(get, path = "/api/v1/projects/{project}/environments", tag = "projects", params(("project" = String, Path)),
@@ -411,6 +418,7 @@ async fn delete_environment(
     let (project, rules) = load_project(&state, &principal, &project).await?;
     let env = find_env(&state, &project, &rules, &env).await?;
     require(&rules, Subject::Environments, Action::Delete, &env_resource(&env.slug))?;
+    refuse_destroying_restricted(&state, &principal, &project.id, Some(&env.id)).await?;
     // Deleting an environment destroys its history, so it must be emptied through the secret routes first.
     state.store.delete_environment(&env.id).await.map_err(|e| match e {
         sekret_store::StoreError::Conflict => ApiError::new(
@@ -434,6 +442,33 @@ async fn delete_environment(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Destroying a restricted secret's history, with its project or environment, is for admins only,
+/// since anyone else may be kept off it by its list.
+async fn refuse_destroying_restricted(
+    state: &AppState,
+    principal: &Principal,
+    project_id: &str,
+    environment_id: Option<&str>,
+) -> ApiResult<()> {
+    let restricted = match environment_id {
+        None => state.store.count_restricted_secrets(project_id).await? > 0,
+        Some(env) => state
+            .store
+            .list_secrets(env, "/", true, true)
+            .await?
+            .iter()
+            .any(|s| s.secret.restricted),
+    };
+    if !restricted || manages_secret_access(state, principal, project_id).await? {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "only a project admin can delete this, because it holds restricted secrets",
+    ))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -616,7 +651,9 @@ async fn delete_folder(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn principal_names(state: &AppState) -> ApiResult<std::collections::HashMap<(PrincipalKind, String), String>> {
+pub(super) async fn principal_names(
+    state: &AppState,
+) -> ApiResult<std::collections::HashMap<(PrincipalKind, String), String>> {
     let mut names = std::collections::HashMap::new();
     for user in state.store.list_users().await? {
         let label = if user.email.is_empty() { user.name } else { user.email };
@@ -1108,19 +1145,21 @@ async fn project_audit(
 ) -> ApiResult<Json<AuditPage>> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::AuditLog, Action::Read)?;
-    let search_actors_only = audit_filter_scope(&rules, &params)?;
+    let hidden = hidden_secrets(&state, &principal, &project).await?;
+    let search_actors_only = audit_filter_scope(&rules, &hidden, &params)?;
     let mut page = audit_page(&state, Some(project.id), params, search_actors_only).await?;
     for entry in &mut page.entries {
-        redact_audit_entry(&rules, entry);
+        redact_audit_entry(&rules, &hidden, entry);
     }
     Ok(Json(page))
 }
 
 /// Whether the reader sees every environment, folder and key in the entries a filter covers:
 /// all of them, or those of the environment filtered on.
-fn sees_unredacted(rules: &[Rule], environment: Option<&str>) -> bool {
+fn sees_unredacted(rules: &[Rule], hidden: &HiddenSecrets, environment: Option<&str>) -> bool {
     let scope = Resource {
         environment,
+        access: hidden.spanning(environment),
         ..Default::default()
     };
     allowed(rules, Subject::Secrets, Action::Read, &scope)
@@ -1130,7 +1169,7 @@ fn sees_unredacted(rules: &[Rule], environment: Option<&str>) -> bool {
 /// Refuses filters that would reveal what redaction hides, since a match or a count is an
 /// answer even when the matching entries are redacted. Returns whether `q` must be limited
 /// to actions, actors and addresses.
-pub fn audit_filter_scope(rules: &[Rule], params: &AuditParams) -> ApiResult<bool> {
+pub fn audit_filter_scope(rules: &[Rule], hidden: &HiddenSecrets, params: &AuditParams) -> ApiResult<bool> {
     let given = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
@@ -1147,7 +1186,7 @@ pub fn audit_filter_scope(rules: &[Rule], params: &AuditParams) -> ApiResult<boo
             return Err(ApiError::forbidden());
         }
     }
-    if sees_unredacted(rules, environment.as_deref()) {
+    if sees_unredacted(rules, hidden, environment.as_deref()) {
         return Ok(false);
     }
     if given(&params.key).is_some() || given(&params.path).is_some() {
@@ -1163,12 +1202,13 @@ pub fn audit_filter_scope(rules: &[Rule], params: &AuditParams) -> ApiResult<boo
 
 /// Hides key names, folders, environments and change lists the reader could not see in the
 /// secrets view.
-pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
+pub fn redact_audit_entry(rules: &[Rule], hidden: &HiddenSecrets, entry: &mut AuditEntry) {
     let Some(environment) = entry.environment.clone() else {
         return;
     };
     let whole_environment = Resource {
         environment: Some(&environment),
+        access: hidden.spanning(Some(&environment)),
         ..Default::default()
     };
     if !allowed(rules, Subject::Environments, Action::Read, &whole_environment) {
@@ -1183,18 +1223,13 @@ pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
         return;
     }
     let path = entry.path.as_deref();
+    // An entry does not record the secret's tags, so a deny by tag hides the key.
     let key_visible = entry.secret_key.as_deref().is_some_and(|key| {
         allowed(
             rules,
             Subject::Secrets,
             Action::Read,
-            &Resource {
-                environment: Some(environment),
-                path,
-                key: Some(key),
-                // An entry does not record the secret's tags, so a deny by tag hides the key.
-                tags: None,
-            },
+            &audit_resource(hidden, environment, path, key),
         )
     });
     if !key_visible {

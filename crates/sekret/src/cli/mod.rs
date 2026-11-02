@@ -1,3 +1,4 @@
+pub mod access;
 pub mod config;
 pub mod format;
 pub mod login;
@@ -143,6 +144,10 @@ pub enum SecretsCommand {
         from_dotenv: Option<PathBuf>,
         #[arg(long, default_value = "")]
         comment: String,
+        /// Create the secrets restricted, so only admins reach them until someone is granted
+        /// access. Needs a project admin and per-secret access on for the project.
+        #[arg(long)]
+        restricted: bool,
     },
     /// Delete secrets.
     Delete {
@@ -180,6 +185,9 @@ pub enum SecretsCommand {
         #[command(flatten)]
         policy: PolicyFlags,
     },
+    /// Show or change who may reach a secret, when per-secret access is on for the project.
+    #[command(subcommand)]
+    Access(access::AccessCommand),
 }
 
 impl SecretsCommand {
@@ -192,6 +200,7 @@ impl SecretsCommand {
             | SecretsCommand::Rollback { .. }
             | SecretsCommand::Generate { .. } => true,
             SecretsCommand::Policy { inherit, policy, .. } => *inherit || !policy.is_empty(),
+            SecretsCommand::Access(command) => command.changes(),
         }
     }
 }
@@ -734,6 +743,7 @@ pub fn collect_upserts(
             value,
             comment: comment.to_string(),
             tags: None,
+            restricted: None,
         })
         .collect())
 }
@@ -816,6 +826,7 @@ pub async fn secrets(
             pairs,
             from_dotenv,
             comment,
+            restricted,
         } => {
             if let Some(warning) = shell_history_warning(&pairs, std::io::IsTerminal::is_terminal(&std::io::stdin())) {
                 eprintln!("{warning}");
@@ -825,7 +836,12 @@ pub async fn secrets(
                 .map(config::read_text)
                 .transpose()
                 .context("reading .env file")?;
-            let upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
+            let mut upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
+            if restricted {
+                for upsert in &mut upserts {
+                    upsert.restricted = Some(true);
+                }
+            }
             let result = api
                 .write(
                     at,
@@ -952,6 +968,7 @@ pub async fn secrets(
                 None => {}
             }
         }
+        SecretsCommand::Access(command) => access::run(api, at, command, out).await?,
     }
     Ok(())
 }
@@ -1352,6 +1369,7 @@ mod tests {
             updated_by: "user:sam".into(),
             generated: false,
             next_rotation_at: None,
+            restricted: false,
         }
     }
 
@@ -1499,8 +1517,16 @@ mod tests {
         let mut api = MockSekretApi::new();
         api.expect_write()
             .withf(|at, b| {
-                at.project == "app" && b.upserts.len() == 1 && b.upserts[0].key == "A" && b.deletes.is_empty()
+                at.project == "app"
+                    && b.upserts.len() == 1
+                    && b.upserts[0].key == "A"
+                    && b.upserts[0].restricted.is_none()
+                    && b.deletes.is_empty()
             })
+            .times(1)
+            .returning(|_, _| Ok(result()));
+        api.expect_write()
+            .withf(|_, b| b.upserts.len() == 2 && b.upserts.iter().all(|u| u.restricted == Some(true)))
             .times(1)
             .returning(|_, _| Ok(result()));
         api.expect_write()
@@ -1512,10 +1538,20 @@ mod tests {
             pairs: vec!["A=1".into()],
             from_dotenv: None,
             comment: String::new(),
+            restricted: false,
         };
         secrets(&api, at(), set, &mut out, &mut "".as_bytes())
             .await
             .context("set")?;
+        let restricted = SecretsCommand::Set {
+            pairs: vec!["B=1".into(), "C=2".into()],
+            from_dotenv: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        secrets(&api, at(), restricted, &mut out, &mut "".as_bytes())
+            .await
+            .context("set restricted")?;
         secrets(
             &api,
             at(),

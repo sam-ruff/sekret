@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv6Addr};
 
 use sekret_api::SecretUpsert;
-use sekret_core::permissions::{BuiltinRole, Rule};
+use sekret_core::permissions::BuiltinRole;
 use sekret_core::rotation::{Generator, PolicyOverride, SecretPolicy, effective, generate, is_due};
 use sekret_core::seal::SealState;
 use sekret_store::{Environment, PrincipalKind, Project, Secret};
@@ -11,6 +11,7 @@ use serde_json::json;
 
 use crate::api::{AuditTarget, audit, secret_ctx};
 use crate::auth::Principal;
+use crate::authz::{Caller, SecretAccess};
 use crate::error::{ApiError, ApiResult};
 use crate::secrets::{PlannedWrite, SecretCtx, apply, plan_batch};
 use crate::state::AppState;
@@ -45,7 +46,7 @@ pub struct Target<'a> {
 /// exist. The caller's rules are checked exactly as for a normal write.
 pub async fn plan_generated(
     ctx: &SecretCtx<'_>,
-    rules: &[Rule],
+    caller: Caller<'_>,
     target: Target<'_>,
     generator: Option<Generator>,
     comment: String,
@@ -64,10 +65,16 @@ pub async fn plan_generated(
             // A hidden secret's own policy must not change the answer; the write refuses it anyway.
             let existing = ctx.store.get_secret(&env.id, path, key).await?.filter(|s| {
                 crate::authz::allowed(
-                    rules,
+                    caller.rules,
                     sekret_core::permissions::Subject::Secrets,
                     sekret_core::permissions::Action::Read,
-                    &crate::secrets::secret_resource(&env.slug, path, key, &s.version.tags),
+                    &crate::secrets::secret_resource(
+                        &env.slug,
+                        path,
+                        key,
+                        &s.version.tags,
+                        caller.access.of(&s.secret),
+                    ),
                 )
             });
             let policy = match existing {
@@ -89,8 +96,9 @@ pub async fn plan_generated(
         value: value.to_string(),
         comment,
         tags: None,
+        restricted: None,
     };
-    plan_batch(ctx, rules, project, env, path, vec![upsert], vec![]).await
+    plan_batch(ctx, caller, project, env, path, vec![upsert], vec![]).await
 }
 
 /// The actor recorded on automatic rotations.
@@ -126,6 +134,12 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
     let principal = rotation_principal();
     let now = state.clock.now();
     let rules = BuiltinRole::ProjectAdmin.rules();
+    // Rotation keeps a restricted secret's list as it is, and is bound by none of them.
+    let access = SecretAccess::exempt();
+    let caller = Caller {
+        rules: &rules,
+        access: &access,
+    };
     let mut rotated = Vec::new();
     for project in state.store.list_projects().await? {
         for env in state.store.list_environments(&project.id).await? {
@@ -157,7 +171,7 @@ pub async fn rotate_due(state: &AppState) -> ApiResult<Vec<String>> {
                         key: &s.secret.key,
                     };
                     let comment = rotation_comment(&s.version.comment);
-                    let planned = plan_generated(&ctx, &rules, target, None, comment).await?;
+                    let planned = plan_generated(&ctx, caller, target, None, comment).await?;
                     apply(&ctx, planned).await
                 }
                 .await;

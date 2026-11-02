@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sekret_api::{BatchResult, SecretUpsert, SnapshotChange, SnapshotChangeKind};
 use sekret_core::crypto::{DataKey, RootKey, ValueContext, decrypt_value, encrypt_value, unwrap_data_key};
-use sekret_core::permissions::{Action, Resource, Rule, Subject};
+use sekret_core::permissions::{Access, Action, Resource, Rule, Subject};
 use sekret_core::rotation::next_rotation;
 use sekret_core::validate;
 use sekret_store::{
@@ -12,7 +12,7 @@ use sekret_store::{
 };
 use zeroize::Zeroizing;
 
-use crate::authz::{allowed, require};
+use crate::authz::{Caller, allowed, require};
 use crate::error::{ApiError, ApiResult};
 
 /// Everything a secret operation needs, injected so the logic is testable with a mock store.
@@ -42,12 +42,19 @@ pub fn decrypt(key: &DataKey, project_id: &str, version: &SecretVersion) -> ApiR
     Ok(Some(decrypt_value(key, blob, ctx)?))
 }
 
-pub fn secret_resource<'a>(env: &'a str, path: &'a str, key: &'a str, tags: &'a [String]) -> Resource<'a> {
+pub fn secret_resource<'a>(
+    env: &'a str,
+    path: &'a str,
+    key: &'a str,
+    tags: &'a [String],
+    access: Access<'a>,
+) -> Resource<'a> {
     Resource {
         environment: Some(env),
         path: Some(path),
         key: Some(key),
         tags: Some(tags),
+        access,
     }
 }
 
@@ -139,12 +146,55 @@ fn normalise_tags(tags: Vec<String>) -> ApiResult<Vec<String>> {
 }
 
 /// Whether the caller may see a secret at this place carrying `tags`.
-fn readable(rules: &[Rule], env: &Environment, path: &str, key: &str, tags: &[String]) -> bool {
+fn readable(rules: &[Rule], env: &Environment, path: &str, key: &str, tags: &[String], access: Access<'_>) -> bool {
     allowed(
         rules,
         Subject::Secrets,
         Action::Read,
-        &secret_resource(&env.slug, path, key, tags),
+        &secret_resource(&env.slug, path, key, tags, access),
+    )
+}
+
+/// Checks a request to create a secret restricted, or to write one whose restriction it states.
+fn check_restricted(
+    caller: Caller<'_>,
+    project: &Project,
+    existing: Option<&SecretWithVersion>,
+    key: &str,
+    wanted: Option<bool>,
+) -> ApiResult<bool> {
+    let Some(wanted) = wanted else {
+        return Ok(false);
+    };
+    if let Some(current) = existing {
+        if current.secret.restricted != wanted {
+            return Err(ApiError::bad_request(format!(
+                "{key} already exists; change whether it is restricted through its access settings"
+            )));
+        }
+        return Ok(false);
+    }
+    if !wanted {
+        return Ok(false);
+    }
+    if !caller.access.is_exempt() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "forbidden",
+            "only a project admin can create a restricted secret",
+        ));
+    }
+    if !project.secret_access {
+        return Err(secret_access_off());
+    }
+    Ok(true)
+}
+
+pub fn secret_access_off() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::CONFLICT,
+        "secret_access_off",
+        "per-secret access is off for this project; a project admin can turn it on in the project settings",
     )
 }
 
@@ -158,7 +208,7 @@ fn not_found(key: &str) -> ApiError {
 /// one that does not exist.
 pub async fn plan_batch(
     ctx: &SecretCtx<'_>,
-    rules: &[Rule],
+    caller: Caller<'_>,
     project: &Project,
     env: &Environment,
     path: &str,
@@ -184,18 +234,22 @@ pub async fn plan_batch(
         snapshot_id: None,
     };
     let mut changes = Vec::new();
+    let rules = caller.rules;
 
     for upsert in upserts {
         validate::secret_value(&upsert.value)?;
         validate::comment(&upsert.comment)?;
         let existing = ctx.store.get_secret(&env.id, &path, &upsert.key).await?;
+        // A new secret has no list until it exists.
+        let access = existing.as_ref().map_or(Access::Open, |s| caller.access.of(&s.secret));
         // A deleted secret is judged by the tags it was deleted with, so writing over it cannot
         // continue the history of one the caller cannot see.
         if let Some(current) = &existing
-            && !readable(rules, env, &path, &upsert.key, &current.version.tags)
+            && !readable(rules, env, &path, &upsert.key, &current.version.tags, access)
         {
             return Err(not_found(&upsert.key));
         }
+        let restricted = check_restricted(caller, project, existing.as_ref(), &upsert.key, upsert.restricted)?;
         let live = existing.as_ref().filter(|s| !s.secret.deleted);
         let tags = match (upsert.tags, live) {
             (Some(tags), _) => normalise_tags(tags)?,
@@ -209,20 +263,20 @@ pub async fn plan_batch(
                     rules,
                     Subject::Secrets,
                     Action::Edit,
-                    &secret_resource(&env.slug, &path, &upsert.key, &current.version.tags),
+                    &secret_resource(&env.slug, &path, &upsert.key, &current.version.tags, access),
                 )?;
                 require(
                     rules,
                     Subject::Secrets,
                     Action::Edit,
-                    &secret_resource(&env.slug, &path, &upsert.key, &tags),
+                    &secret_resource(&env.slug, &path, &upsert.key, &tags, access),
                 )?;
                 // Comparing values would tell a caller who cannot read them whether a guess was right.
                 let may_compare = allowed(
                     rules,
                     Subject::Secrets,
                     Action::ReadValue,
-                    &secret_resource(&env.slug, &path, &upsert.key, &current.version.tags),
+                    &secret_resource(&env.slug, &path, &upsert.key, &current.version.tags, access),
                 );
                 let old = if may_compare {
                     decrypt(&key, &project.id, &current.version)?
@@ -243,14 +297,14 @@ pub async fn plan_batch(
             }
             None => {
                 // Refused like a hidden secret, so a folder the caller cannot read stays silent.
-                if !readable(rules, env, &path, &upsert.key, &tags) {
+                if !readable(rules, env, &path, &upsert.key, &tags, access) {
                     return Err(not_found(&upsert.key));
                 }
                 require(
                     rules,
                     Subject::Secrets,
                     Action::Create,
-                    &secret_resource(&env.slug, &path, &upsert.key, &tags),
+                    &secret_resource(&env.slug, &path, &upsert.key, &tags, access),
                 )?;
                 result.created.push(upsert.key.clone());
             }
@@ -278,21 +332,36 @@ pub async fn plan_batch(
                 generated: ctx.generated || keeps_generated,
                 ..new_version(&secret_id, version, Some(blob), upsert.comment, tags, ctx)
             },
+            restricted,
         });
     }
 
     for key_name in deletes {
         let existing = ctx.store.get_secret(&env.id, &path, &key_name).await?;
-        let Some(current) =
-            existing.filter(|s| !s.secret.deleted && readable(rules, env, &path, &key_name, &s.version.tags))
-        else {
+        let Some(current) = existing.filter(|s| {
+            !s.secret.deleted
+                && readable(
+                    rules,
+                    env,
+                    &path,
+                    &key_name,
+                    &s.version.tags,
+                    caller.access.of(&s.secret),
+                )
+        }) else {
             return Err(not_found(&key_name));
         };
         require(
             rules,
             Subject::Secrets,
             Action::Delete,
-            &secret_resource(&env.slug, &path, &key_name, &current.version.tags),
+            &secret_resource(
+                &env.slug,
+                &path,
+                &key_name,
+                &current.version.tags,
+                caller.access.of(&current.secret),
+            ),
         )?;
         let version = current.secret.current_version + 1;
         changes.push(SecretChange {
@@ -308,6 +377,7 @@ pub async fn plan_batch(
                 current.version.tags.clone(),
                 ctx,
             ),
+            restricted: false,
         });
         result.deleted.push(key_name);
     }
@@ -348,14 +418,14 @@ pub async fn apply(ctx: &SecretCtx<'_>, planned: PlannedWrite) -> ApiResult<Batc
 /// Tags for a restored version. A caller who cannot read the current value keeps the current
 /// tags as well, so restoring an older, less restricted version cannot strip a restriction.
 fn restored_tags(
-    rules: &[Rule],
+    caller: Caller<'_>,
     env: &Environment,
     current: &SecretWithVersion,
     target: &SecretVersion,
 ) -> Vec<String> {
     let s = &current.secret;
-    let resource = secret_resource(&env.slug, &s.path, &s.key, &current.version.tags);
-    if allowed(rules, Subject::Secrets, Action::ReadValue, &resource) {
+    let resource = secret_resource(&env.slug, &s.path, &s.key, &current.version.tags, caller.access.of(s));
+    if allowed(caller.rules, Subject::Secrets, Action::ReadValue, &resource) {
         return target.tags.clone();
     }
     let mut tags: Vec<String> = target.tags.iter().chain(&current.version.tags).cloned().collect();
@@ -404,24 +474,26 @@ fn restore_change(
             generated: target.generated,
             ..new_version(&current.secret.id, version, Some(blob), comment, tags, ctx)
         },
+        restricted: false,
     })
 }
 
 pub async fn plan_rollback(
     ctx: &SecretCtx<'_>,
-    rules: &[Rule],
+    caller: Caller<'_>,
     project: &Project,
     env: &Environment,
     current: &SecretWithVersion,
     version: i64,
 ) -> ApiResult<PlannedWrite> {
     let s = &current.secret;
+    let access = caller.access.of(s);
     let action = if s.deleted { Action::Create } else { Action::Edit };
     require(
-        rules,
+        caller.rules,
         Subject::Secrets,
         action,
-        &secret_resource(&env.slug, &s.path, &s.key, &current.version.tags),
+        &secret_resource(&env.slug, &s.path, &s.key, &current.version.tags, access),
     )?;
     let target = ctx
         .store
@@ -429,10 +501,10 @@ pub async fn plan_rollback(
         .await?
         .ok_or_else(|| ApiError::not_found(&format!("version {version}")))?;
     require(
-        rules,
+        caller.rules,
         Subject::Secrets,
         action,
-        &secret_resource(&env.slug, &s.path, &s.key, &target.tags),
+        &secret_resource(&env.slug, &s.path, &s.key, &target.tags, access),
     )?;
     let key = data_key(&ctx.root_key, project)?;
     let change = restore_change(
@@ -440,7 +512,7 @@ pub async fn plan_rollback(
         project,
         current,
         &target,
-        restored_tags(rules, env, current, &target),
+        restored_tags(caller, env, current, &target),
         rollback_comment(version, &target.comment),
         ctx,
     )?;
@@ -500,7 +572,7 @@ pub fn snapshot_changes(current: &[SecretWithVersion], snapshot: &Snapshot, path
 /// may read, deleted ones included, so a restore never touches or names a hidden secret.
 pub async fn plan_restore(
     ctx: &SecretCtx<'_>,
-    rules: &[Rule],
+    caller: Caller<'_>,
     project: &Project,
     env: &Environment,
     snapshot: &Snapshot,
@@ -522,14 +594,16 @@ pub async fn plan_restore(
         snapshot_id: None,
     };
     let mut changes = Vec::new();
+    let rules = caller.rules;
     for change in &plan {
         let Some(s) = by_key.get(&(change.path.as_str(), change.key.as_str())) else {
             continue;
         };
-        if !readable(rules, env, &s.secret.path, &s.secret.key, &s.version.tags) {
+        let access = caller.access.of(&s.secret);
+        if !readable(rules, env, &s.secret.path, &s.secret.key, &s.version.tags, access) {
             continue;
         }
-        let resource = secret_resource(&env.slug, &s.secret.path, &s.secret.key, &s.version.tags);
+        let resource = secret_resource(&env.slug, &s.secret.path, &s.secret.key, &s.version.tags, access);
         // Snapshot conditions apply to every secret touched, not only the folder named in the request.
         require(rules, Subject::Snapshots, Action::Edit, &resource)?;
         let label = format!("{}/{}", s.secret.path.trim_end_matches('/'), s.secret.key);
@@ -550,6 +624,7 @@ pub async fn plan_restore(
                         s.version.tags.clone(),
                         ctx,
                     ),
+                    restricted: false,
                 });
                 result.deleted.push(label);
             }
@@ -569,14 +644,14 @@ pub async fn plan_restore(
                     rules,
                     Subject::Secrets,
                     action,
-                    &secret_resource(&env.slug, &s.secret.path, &s.secret.key, &target.tags),
+                    &secret_resource(&env.slug, &s.secret.path, &s.secret.key, &target.tags, access),
                 )?;
                 changes.push(restore_change(
                     &key,
                     project,
                     s,
                     &target,
-                    restored_tags(rules, env, s, &target),
+                    restored_tags(caller, env, s, &target),
                     format!("snapshot {} restore", snapshot.id),
                     ctx,
                 )?);
@@ -612,11 +687,17 @@ pub fn to_api(
     project: &Project,
     env_slug: &str,
     s: &SecretWithVersion,
-    rules: &[Rule],
+    caller: Caller<'_>,
     want_value: bool,
 ) -> ApiResult<sekret_api::Secret> {
-    let resource = secret_resource(env_slug, &s.secret.path, &s.secret.key, &s.version.tags);
-    let may_read = allowed(rules, Subject::Secrets, Action::ReadValue, &resource);
+    let resource = secret_resource(
+        env_slug,
+        &s.secret.path,
+        &s.secret.key,
+        &s.version.tags,
+        caller.access.of(&s.secret),
+    );
+    let may_read = allowed(caller.rules, Subject::Secrets, Action::ReadValue, &resource);
     let value = match key {
         Some(key) if want_value && may_read => decrypt(key, &project.id, &s.version)?.map(|v| v.to_string()),
         _ => None,
@@ -638,6 +719,7 @@ pub fn to_api(
         updated_by: s.version.actor.clone(),
         generated: s.version.generated,
         next_rotation_at,
+        restricted: s.secret.restricted,
     })
 }
 
@@ -675,6 +757,7 @@ mod tests {
             created_at: 0,
             logo_updated_at: None,
             secret_policy: None,
+            secret_access: true,
         };
         let env = Environment {
             id: "e1".into(),
@@ -719,6 +802,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 policy: None,
+                restricted: false,
             },
             version: SecretVersion {
                 secret_id: id,
@@ -751,6 +835,18 @@ mod tests {
             value: value.into(),
             comment: String::new(),
             tags: None,
+            restricted: None,
+        }
+    }
+
+    static NO_LISTS: std::sync::LazyLock<crate::authz::SecretAccess> =
+        std::sync::LazyLock::new(crate::authz::SecretAccess::default);
+
+    /// The rules alone, as for an unrestricted secret.
+    fn open(rules: &[Rule]) -> Caller<'_> {
+        Caller {
+            rules,
+            access: &NO_LISTS,
         }
     }
 
@@ -766,7 +862,7 @@ mod tests {
         let planned = api(
             plan_batch(
                 &ctx(&store, &root),
-                &BuiltinRole::Developer.rules(),
+                open(&BuiltinRole::Developer.rules()),
                 &project,
                 &env,
                 "/",
@@ -797,7 +893,7 @@ mod tests {
             ..upsert("A", "same")
         };
         let planned = api(
-            plan_batch(&c, &rules, &project, &env, "/", vec![same], vec![]).await,
+            plan_batch(&c, open(&rules), &project, &env, "/", vec![same], vec![]).await,
             "plan",
         )?;
         assert!(planned.batch.is_none());
@@ -806,7 +902,7 @@ mod tests {
             ..upsert("A", "same")
         };
         let planned = api(
-            plan_batch(&c, &rules, &project, &env, "/", vec![new_comment], vec![]).await,
+            plan_batch(&c, open(&rules), &project, &env, "/", vec![new_comment], vec![]).await,
             "plan",
         )?;
         assert!(planned.batch.is_some());
@@ -824,7 +920,7 @@ mod tests {
         let planned = api(
             plan_batch(
                 &ctx(&store, &root),
-                &BuiltinRole::Developer.rules(),
+                open(&BuiltinRole::Developer.rules()),
                 &project,
                 &env,
                 "/",
@@ -856,7 +952,7 @@ mod tests {
         store.expect_write_secrets().never();
         let denied = plan_batch(
             &ctx(&store, &root),
-            &BuiltinRole::Viewer.rules(),
+            open(&BuiltinRole::Viewer.rules()),
             &project,
             &env,
             "/",
@@ -884,14 +980,30 @@ mod tests {
         }];
         let c = ctx(&store, &root);
         assert!(
-            plan_batch(&c, &rules, &project, &env, "/app/db", vec![upsert("A", "x")], vec![])
-                .await
-                .is_ok()
+            plan_batch(
+                &c,
+                open(&rules),
+                &project,
+                &env,
+                "/app/db",
+                vec![upsert("A", "x")],
+                vec![]
+            )
+            .await
+            .is_ok()
         );
         assert!(
-            plan_batch(&c, &rules, &project, &env, "/other", vec![upsert("A", "x")], vec![])
-                .await
-                .is_err()
+            plan_batch(
+                &c,
+                open(&rules),
+                &project,
+                &env,
+                "/other",
+                vec![upsert("A", "x")],
+                vec![]
+            )
+            .await
+            .is_err()
         );
         Ok(())
     }
@@ -922,7 +1034,7 @@ mod tests {
         store.expect_write_secrets().never();
         let planned = plan_batch(
             &ctx(&store, &root),
-            &payments_hidden(),
+            open(&payments_hidden()),
             &project,
             &env,
             "/payments",
@@ -976,7 +1088,7 @@ mod tests {
             .returning(move |_, _, _| Ok(Some(hidden.clone())));
         let refused = plan_batch(
             &ctx(&store, &root),
-            &rules,
+            open(&rules),
             &project,
             &env,
             "/",
@@ -989,7 +1101,7 @@ mod tests {
         let planned = api(
             plan_batch(
                 &ctx(&store, &root),
-                &BuiltinRole::Developer.rules(),
+                open(&BuiltinRole::Developer.rules()),
                 &project,
                 &env,
                 "/",
@@ -1007,10 +1119,10 @@ mod tests {
     #[tokio::test]
     async fn restores_leave_out_secrets_the_caller_cannot_read() -> anyhow::Result<()> {
         let (root, project, env) = fixture()?;
-        let mut open = stored(&project, &root, "OPEN", "x", 2, false)?;
+        let mut visible = stored(&project, &root, "OPEN", "x", 2, false)?;
         let mut hidden = stored(&project, &root, "STRIPE_KEY", "x", 2, false)?;
         hidden.secret.path = "/payments".into();
-        open.secret.path = "/".into();
+        visible.secret.path = "/".into();
         let snapshot = Snapshot {
             id: "s".into(),
             environment_id: "e1".into(),
@@ -1023,12 +1135,12 @@ mod tests {
         let planned = api(
             plan_restore(
                 &ctx(&store, &root),
-                &payments_hidden(),
+                open(&payments_hidden()),
                 &project,
                 &env,
                 &snapshot,
                 "/",
-                &[open, hidden],
+                &[visible, hidden],
             )
             .await,
             "plan",
@@ -1042,6 +1154,256 @@ mod tests {
         Ok(())
     }
 
+    fn listed_for(id: &str, actions: &[Action]) -> crate::authz::SecretAccess {
+        let principal = crate::auth::Principal {
+            kind: sekret_store::PrincipalKind::Identity,
+            id: "pod".into(),
+            name: "pod".into(),
+            email: String::new(),
+            groups: Vec::new(),
+            token_id: "t".into(),
+            token_kind: "machine".into(),
+        };
+        crate::authz::SecretAccess::listed(
+            &principal,
+            vec![sekret_store::SecretGrant {
+                secret_id: id.into(),
+                principal_kind: sekret_store::PrincipalKind::Identity,
+                principal_id: "pod".into(),
+                actions: actions.to_vec(),
+                created_at: 0,
+            }],
+        )
+    }
+
+    /// A restricted secret answers writes from someone off its list exactly as a missing one,
+    /// and a listed caller gets only the actions their entry grants.
+    #[tokio::test]
+    async fn restricted_secrets_follow_their_list_on_writes() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut restricted = stored(&project, &root, "STRIPE_KEY", "live", 2, false)?;
+        restricted.secret.restricted = true;
+        let mut store = MockStore::new();
+        store
+            .expect_get_secret()
+            .returning(move |_, _, _| Ok(Some(restricted.clone())));
+        store.expect_write_secrets().never();
+        let rules = BuiltinRole::Developer.rules();
+        let status = |access: crate::authz::SecretAccess, upserts: Vec<SecretUpsert>, deletes: Vec<String>| {
+            let rules = rules.clone();
+            let store = &store;
+            let root = root.clone();
+            let project = project.clone();
+            let env = env.clone();
+            async move {
+                let caller = Caller {
+                    rules: &rules,
+                    access: &access,
+                };
+                plan_batch(&ctx(store, &root), caller, &project, &env, "/", upserts, deletes)
+                    .await
+                    .err()
+                    .map(|e| e.status)
+            }
+        };
+        let unlisted = listed_for("someone-else", &[Action::Read, Action::Edit, Action::Delete]);
+        let not_found = Some(axum::http::StatusCode::NOT_FOUND);
+        let forbidden = Some(axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(unlisted.clone(), vec![upsert("STRIPE_KEY", "x")], vec![]).await,
+            not_found
+        );
+        assert_eq!(status(unlisted, vec![], vec!["STRIPE_KEY".into()]).await, not_found);
+        let read_only = listed_for("id-STRIPE_KEY", &[Action::Read]);
+        assert_eq!(
+            status(read_only.clone(), vec![upsert("STRIPE_KEY", "x")], vec![]).await,
+            forbidden
+        );
+        assert_eq!(status(read_only, vec![], vec!["STRIPE_KEY".into()]).await, forbidden);
+        let editor = listed_for("id-STRIPE_KEY", &[Action::Read, Action::Edit]);
+        assert_eq!(
+            status(editor.clone(), vec![], vec!["STRIPE_KEY".into()]).await,
+            forbidden
+        );
+        let rules = BuiltinRole::Developer.rules();
+        let caller = Caller {
+            rules: &rules,
+            access: &editor,
+        };
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                caller,
+                &project,
+                &env,
+                "/",
+                vec![upsert("STRIPE_KEY", "x")],
+                vec![],
+            )
+            .await,
+            "listed editor",
+        )?;
+        assert_eq!(planned.result.updated, vec!["STRIPE_KEY".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_admins_create_restricted_secrets_and_only_with_the_setting_on() -> anyhow::Result<()> {
+        let (root, mut project, env) = fixture()?;
+        let mut store = MockStore::new();
+        store.expect_get_secret().returning(|_, _, _| Ok(None));
+        let rules = BuiltinRole::Developer.rules();
+        let exempt = crate::authz::SecretAccess::exempt();
+        let restricted = SecretUpsert {
+            restricted: Some(true),
+            ..upsert("NEW", "x")
+        };
+        let refused = plan_batch(
+            &ctx(&store, &root),
+            open(&rules),
+            &project,
+            &env,
+            "/",
+            vec![restricted.clone()],
+            vec![],
+        )
+        .await;
+        assert_eq!(refused.err().map(|e| e.status), Some(axum::http::StatusCode::FORBIDDEN));
+        let admin = Caller {
+            rules: &rules,
+            access: &exempt,
+        };
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                admin,
+                &project,
+                &env,
+                "/",
+                vec![restricted.clone()],
+                vec![],
+            )
+            .await,
+            "admin",
+        )?;
+        assert!(planned.batch.context("batch")?.changes[0].restricted);
+        let unrestricted = SecretUpsert {
+            restricted: Some(false),
+            ..upsert("NEW", "x")
+        };
+        let planned = api(
+            plan_batch(
+                &ctx(&store, &root),
+                open(&rules),
+                &project,
+                &env,
+                "/",
+                vec![unrestricted],
+                vec![],
+            )
+            .await,
+            "explicitly open",
+        )?;
+        assert!(!planned.batch.context("batch")?.changes[0].restricted);
+        project.secret_access = false;
+        let off = plan_batch(
+            &ctx(&store, &root),
+            admin,
+            &project,
+            &env,
+            "/",
+            vec![restricted],
+            vec![],
+        )
+        .await;
+        assert_eq!(off.err().map(|e| e.code), Some("secret_access_off"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_write_cannot_change_whether_an_existing_secret_is_restricted() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let existing = stored(&project, &root, "A", "x", 1, false)?;
+        let mut store = MockStore::new();
+        store
+            .expect_get_secret()
+            .returning(move |_, _, _| Ok(Some(existing.clone())));
+        let rules = BuiltinRole::ProjectAdmin.rules();
+        let exempt = crate::authz::SecretAccess::exempt();
+        let admin = Caller {
+            rules: &rules,
+            access: &exempt,
+        };
+        let restrict = SecretUpsert {
+            restricted: Some(true),
+            ..upsert("A", "y")
+        };
+        let refused = plan_batch(&ctx(&store, &root), admin, &project, &env, "/", vec![restrict], vec![]).await;
+        assert_eq!(
+            refused.err().map(|e| e.status),
+            Some(axum::http::StatusCode::BAD_REQUEST)
+        );
+        let matching = SecretUpsert {
+            restricted: Some(false),
+            ..upsert("A", "y")
+        };
+        let planned = api(
+            plan_batch(&ctx(&store, &root), admin, &project, &env, "/", vec![matching], vec![]).await,
+            "matching",
+        )?;
+        assert_eq!(planned.result.updated, vec!["A".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollbacks_and_restores_follow_the_list() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut current = stored(&project, &root, "A", "v2", 2, false)?;
+        current.secret.restricted = true;
+        let old = stored(&project, &root, "A", "v1", 1, false)?.version;
+        let mut store = MockStore::new();
+        store.expect_get_version().returning(move |_, _| Ok(Some(old.clone())));
+        let rules = BuiltinRole::Developer.rules();
+        let read_only = listed_for("id-A", &[Action::Read, Action::ReadValue]);
+        let caller = Caller {
+            rules: &rules,
+            access: &read_only,
+        };
+        let refused = plan_rollback(&ctx(&store, &root), caller, &project, &env, &current, 1).await;
+        assert_eq!(refused.err().map(|e| e.status), Some(axum::http::StatusCode::FORBIDDEN));
+        let editor = listed_for("id-A", &[Action::Read, Action::Edit]);
+        let caller = Caller {
+            rules: &rules,
+            access: &editor,
+        };
+        api(
+            plan_rollback(&ctx(&store, &root), caller, &project, &env, &current, 1).await,
+            "listed editor",
+        )?;
+        let snapshot = Snapshot {
+            id: "s".into(),
+            environment_id: "e1".into(),
+            entries: vec![],
+            reason: String::new(),
+            actor: String::new(),
+            created_at: 0,
+        };
+        let unlisted = listed_for("other", &[Action::Read, Action::Delete]);
+        let caller = Caller {
+            rules: &rules,
+            access: &unlisted,
+        };
+        let planned = api(
+            plan_restore(&ctx(&store, &root), caller, &project, &env, &snapshot, "/", &[current]).await,
+            "restore",
+        )?;
+        assert!(
+            planned.batch.is_none(),
+            "a restore never touches a secret its list hides"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rejects_duplicate_and_invalid_keys() -> anyhow::Result<()> {
         let (root, project, env) = fixture()?;
@@ -1051,7 +1413,7 @@ mod tests {
         assert!(
             plan_batch(
                 &c,
-                &rules,
+                open(&rules),
                 &project,
                 &env,
                 "/",
@@ -1062,14 +1424,22 @@ mod tests {
             .is_err()
         );
         assert!(
-            plan_batch(&c, &rules, &project, &env, "/", vec![upsert("1BAD", "1")], vec![])
+            plan_batch(&c, open(&rules), &project, &env, "/", vec![upsert("1BAD", "1")], vec![])
                 .await
                 .is_err()
         );
         assert!(
-            plan_batch(&c, &rules, &project, &env, "/../x", vec![upsert("A", "1")], vec![])
-                .await
-                .is_err()
+            plan_batch(
+                &c,
+                open(&rules),
+                &project,
+                &env,
+                "/../x",
+                vec![upsert("A", "1")],
+                vec![]
+            )
+            .await
+            .is_err()
         );
         Ok(())
     }
@@ -1084,7 +1454,7 @@ mod tests {
         let planned = api(
             plan_rollback(
                 &ctx(&store, &root),
-                &BuiltinRole::Developer.rules(),
+                open(&BuiltinRole::Developer.rules()),
                 &project,
                 &env,
                 &current,
@@ -1148,12 +1518,12 @@ mod tests {
         let s = stored(&project, &root, "A", "secret", 1, false)?;
         let dk = api(data_key(&root, &project), "dk")?;
         let list_only = vec![Rule::allow(Subject::Secrets, &[Action::Read])];
-        let hidden = api(to_api(Some(&dk), &project, "dev", &s, &list_only, true), "api")?;
+        let hidden = api(to_api(Some(&dk), &project, "dev", &s, open(&list_only), true), "api")?;
         assert!(hidden.value.is_none() && hidden.value_hidden);
         let viewer = BuiltinRole::Viewer.rules();
-        let shown = api(to_api(Some(&dk), &project, "dev", &s, &viewer, true), "api")?;
+        let shown = api(to_api(Some(&dk), &project, "dev", &s, open(&viewer), true), "api")?;
         assert_eq!(shown.value.as_deref(), Some("secret"));
-        let not_requested = api(to_api(Some(&dk), &project, "dev", &s, &viewer, false), "api")?;
+        let not_requested = api(to_api(Some(&dk), &project, "dev", &s, open(&viewer), false), "api")?;
         assert!(not_requested.value.is_none() && !not_requested.value_hidden);
         assert_eq!(shown.next_rotation_at, None, "rotation is off by default");
         Ok(())
