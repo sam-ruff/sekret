@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, openProject, secretAction, secretRow } from "./helpers";
 
 test.describe("on a 390 pixel phone", () => {

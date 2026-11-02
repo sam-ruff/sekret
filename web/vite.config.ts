@@ -15,6 +15,11 @@ export default defineConfig({
     port: 5173,
     // Compiles the app and the mock up front, so the first pages a test opens do not time out.
     warmup: { clientFiles: ["./src/main.tsx", "./src/api/mock/*.ts"] },
+    // Test reports and traces are written while tests run; watching them reloads every open page,
+    // which drops the mock's state partway through a test.
+    watch: {
+      ignored: ["**/test-results/**", "**/playwright-report*/**", "**/dist/**", "**/tests-live/.auth/**"],
+    },
     proxy: {
       "/api": { target: backend, changeOrigin: false },
       "/auth": { target: backend, changeOrigin: false },

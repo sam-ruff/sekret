@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, navigate, openProject, secretRow } from "./helpers";
 
 test("a snapshot says what its own change did, apart from what restoring it would undo", async ({ page }) => {

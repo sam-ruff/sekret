@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 
 /** Waits until the results for the current filters have arrived. */
 async function settled(page: Page): Promise<void> {

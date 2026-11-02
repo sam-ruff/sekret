@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import {
   HOSTILE as X,
   HOSTILE_PROJECT,
@@ -19,8 +20,10 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function expectNoXss(page: Page): Promise<void> {
-  // Give any injected handler (such as onerror on a broken image) a chance to run.
-  await page.waitForTimeout(150);
+  // An injected onerror runs when its image settles, so wait until every image has loaded or failed.
+  await page.waitForFunction(() => Array.from(document.images).every((image) => image.complete), undefined, {
+    timeout: 15_000,
+  });
   expect(await page.evaluate(() => (window as unknown as { __xss?: unknown }).__xss)).toBeUndefined();
   expect(await page.locator("main script, main svg[onload], img[onerror]").count()).toBe(0);
 }

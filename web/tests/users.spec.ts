@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { expectToast, isMobile } from "./helpers";
 
 /** Waits until the list shows results for the query now in the URL. */

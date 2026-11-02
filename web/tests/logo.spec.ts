@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixture";
 import { LOGO_PNG, TRUNCATED_PNG } from "./fixtures/images";
 import { expectToast, failNext, isMobile } from "./helpers";
 

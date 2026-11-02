@@ -12,10 +12,12 @@ export async function navigate(page: Page, testId: string): Promise<void> {
   await page.getByTestId(testId).click();
 }
 
+/** Opens a project and waits until its secret list has loaded, not just the page around it. */
 export async function openProject(page: Page, slug = "storefront"): Promise<void> {
   await page.goto("/projects");
   await page.getByTestId(`project-card-${slug}`).click();
   await expect(page.getByTestId("env-tabs")).toBeVisible();
+  await expect(page.getByTestId("secrets-table").or(page.getByTestId("secrets-empty"))).toBeVisible();
 }
 
 export function secretRow(page: Page, key: string): Locator {

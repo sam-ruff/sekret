@@ -9,18 +9,20 @@ interface CliStart {
 /** The live server is shared by every test, so sign-ins elsewhere can use up this address's allowance. */
 const RATE_LIMIT_DEADLINE_MS = 45_000;
 
-/**
- * Sends a request, waiting and trying again while the server answers 429. Waits as long as
- * `Retry-After` says, or a few seconds when it says nothing, since the allowance refills steadily.
- */
+/** Sends a request until the server answers with anything but 429, as the allowance refills. */
 async function withinRateLimit(send: () => Promise<APIResponse>): Promise<APIResponse> {
-  const deadline = Date.now() + RATE_LIMIT_DEADLINE_MS;
-  for (;;) {
-    const response = await send();
-    if (response.status() !== 429 || Date.now() > deadline) return response;
-    const seconds = Number(response.headers()["retry-after"]);
-    await new Promise((resolve) => setTimeout(resolve, (Number.isFinite(seconds) && seconds > 0 ? seconds : 3) * 1000));
-  }
+  let last: APIResponse | undefined;
+  await expect
+    .poll(
+      async () => {
+        last = await send();
+        return last.status();
+      },
+      { message: "the server is still rate limiting", timeout: RATE_LIMIT_DEADLINE_MS, intervals: [1_000, 2_000, 5_000] },
+    )
+    .not.toBe(429);
+  if (!last) throw new Error("no request was sent");
+  return last;
 }
 
 /** Starts a CLI login the way `sekret login` does, without a session. */
@@ -50,31 +52,28 @@ function pathOf(url: string): string {
 /** Opens the approval page, pressing "Try again" while the page's own lookup is rate limited. */
 async function openApproval(page: Page, url: string): Promise<void> {
   await page.goto(pathOf(url));
-  const deadline = Date.now() + RATE_LIMIT_DEADLINE_MS;
   const shown = page.getByTestId("cli-request").or(page.getByTestId("cli-unknown")).or(page.getByTestId("error-state"));
-  for (;;) {
+  const limited = page.getByTestId("error-state").filter({ hasText: /too many|slow down/i });
+  // Passes once the page shows something other than a rate limit; until then it asks again.
+  await expect(async () => {
     await expect(shown.first()).toBeVisible();
-    const limited = page.getByTestId("error-state").filter({ hasText: /too many|slow down/i });
-    if ((await limited.count()) === 0 || Date.now() > deadline) return;
-    await page.waitForTimeout(3_000);
-    // The page may have retried on its own while we waited.
+    if ((await limited.count()) === 0) return;
     const retry = limited.getByRole("button", { name: "Try again" });
     if ((await retry.count()) > 0) await retry.click();
-  }
+    throw new Error("the approval page is still rate limited");
+  }).toPass({ timeout: RATE_LIMIT_DEADLINE_MS, intervals: [1_000, 2_000, 5_000] });
 }
 
 /** Clicks a button that posts to `path`, clicking again while the server answers 429. */
 async function clickWithinRateLimit(page: Page, testId: string, path: string): Promise<void> {
-  const deadline = Date.now() + RATE_LIMIT_DEADLINE_MS;
-  for (;;) {
+  // Passes once the server answers with anything but 429; until then it clicks again.
+  await expect(async () => {
     const [response] = await Promise.all([
       page.waitForResponse((r) => r.url().endsWith(path) && r.request().method() === "POST"),
       page.getByTestId(testId).click(),
     ]);
-    if (response.status() !== 429 || Date.now() > deadline) return;
-    const seconds = Number(response.headers()["retry-after"]);
-    await page.waitForTimeout((Number.isFinite(seconds) && seconds > 0 ? seconds : 3) * 1000);
-  }
+    expect(response.status(), "the server is still rate limiting").not.toBe(429);
+  }).toPass({ timeout: RATE_LIMIT_DEADLINE_MS, intervals: [1_000, 2_000, 5_000] });
 }
 
 test("shows where a CLI login came from and approves it only with the typed code", async ({ page, playwright, baseURL }) => {
