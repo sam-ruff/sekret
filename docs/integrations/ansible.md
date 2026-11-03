@@ -4,12 +4,17 @@ The `sekret.secrets` collection has a lookup plugin for reading secrets into tem
 
 ## Install
 
+Each sekret release carries the collection, built with the release's version, beside a `.sha256` file. Check it and install it:
+
 ```sh
-git clone https://github.com/sam-ruff/sekret
-cd sekret/integrations/ansible
-ansible-galaxy collection build
-ansible-galaxy collection install sekret-secrets-*.tar.gz
+v=1.4.0
+base=https://github.com/sam-ruff/sekret/releases/download/v$v
+curl -fLO "$base/sekret-secrets-$v.tar.gz" -fLO "$base/sekret-secrets-$v.tar.gz.sha256"
+sha256sum -c "sekret-secrets-$v.tar.gz.sha256"
+ansible-galaxy collection install "sekret-secrets-$v.tar.gz"
 ```
+
+Because the version changes with every release, installing a newer one upgrades the old without `--force`. From a checkout, `scripts/build-collection.sh VERSION DIR` builds the same file.
 
 ## Connect
 

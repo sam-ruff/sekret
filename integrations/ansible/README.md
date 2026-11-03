@@ -4,7 +4,7 @@ Ansible collection for reading and writing secrets in a sekret server. It has a 
 
 ## Install
 
-From this directory:
+Each sekret release attaches `sekret-secrets-VERSION.tar.gz`, stamped with the release's version, and its `.sha256`. Install that with `ansible-galaxy collection install`. To build from a checkout instead, run `scripts/build-collection.sh VERSION DIR` from the repository root, or from this directory (the version stays the 0.1.0 placeholder):
 
 ```sh
 ansible-galaxy collection build

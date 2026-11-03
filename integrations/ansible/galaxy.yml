@@ -1,5 +1,6 @@
 namespace: sekret
 name: secrets
+# A placeholder: scripts/build-collection.sh stamps each release's own version.
 version: 0.1.0
 readme: README.md
 authors:
