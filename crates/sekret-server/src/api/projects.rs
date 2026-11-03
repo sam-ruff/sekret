@@ -444,7 +444,8 @@ async fn delete_environment(
         .delete_environment(&env.id, spare_restricted)
         .await
         .map_err(|e| match e {
-            sekret_store::StoreError::Conflict => not_empty(),
+            // A restricted secret left behind answers as a live one would, so it is not given away.
+            sekret_store::StoreError::Conflict | sekret_store::StoreError::HoldsRestricted => not_empty(),
             other => other.into(),
         })?;
     audit(

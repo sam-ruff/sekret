@@ -638,7 +638,12 @@ async fn secrets_can_be_created_restricted(db: String) -> anyhow::Result<()> {
         .await?;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = h.delete("/api/v1/projects/app/environments/prod", &custodian).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "answered as for a live secret, so nothing hidden is given away: {body}"
+    );
+    assert_eq!(body["error"], "not_empty");
     let (status, body) = h.delete("/api/v1/projects/app/environments/prod", &h.admin).await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     Ok(())
@@ -948,6 +953,28 @@ async fn only_admins_grant_the_admin_roles(db: String) -> anyhow::Result<()> {
     let (status, body) = h.put("/api/v1/projects/app/secret-policy", &h.admin, policy).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // Backups hold every secret, so the backup role is an admin's to hand out too.
+    let (status, body) = h
+        .put(
+            "/api/v1/org/roles/backup-keeper",
+            &h.admin,
+            json!({"name": "Backup keeper", "rules": [
+                {"effect": "allow", "subject": "backups", "actions": ["read"]},
+                {"effect": "allow", "subject": "org-members", "actions": ["read", "create"]},
+            ]}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keeper = h.org_identity_as("keeper", "backup-keeper", &h.admin).await?;
+    let (status, body) = h
+        .post(
+            "/api/v1/org/bindings",
+            &keeper,
+            json!({"principal_kind": "identity", "principal_id": maintainer_id, "role": "backup-reader"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "escalation");
     // A real admin still can.
     let (status, body) = h
         .post(

@@ -52,7 +52,7 @@ A list holds at most 100 entries. Seeing a list and changing it are for project 
 
 Admin here means the built-in `org-admin` role, or the project's built-in `admin` role held directly or through a group. A custom role that allows everything is not enough, and since the built-in admin roles carry this exemption, only an admin can grant them; someone whose custom role merely matches them is refused. Admins are still held to their own deny rules, so a deny on `/payments/**` keeps an admin out of a restricted secret there as it would any other.
 
-Whoever can give an identity credentials can act as it, so in a project with the setting on, only an admin there can change, delete or give credentials to a user or identity that is on one of its lists or is an admin, whatever roles it holds at the time. That rule cannot reach credentials made before the identity was listed, so before you list an identity, look at its client secrets and auth methods on its page and revoke any you did not expect. Before turning the setting on, check who holds the built-in admin roles, since they are exempt from every list.
+Whoever can give an identity credentials can act as it, so in a project with the setting on, only an admin there can change, delete or give credentials to a user or identity that is on one of its lists or is an admin, whatever roles it holds at the time. That rule cannot reach credentials made before the identity was listed, so before you list an identity, look at its client secrets and auth methods on its page and revoke any you did not expect. Before turning the setting on, check who holds the built-in admin roles, since they are exempt from every list. That includes everyone in `oidc.admin_groups`, and everyone at all if `default_org_role` is set to `org-admin`. Only an organisation admin can give out `org-admin` or `backup-reader`.
 
 A write is planned against a secret as it stands. If its restriction or list changes before the write lands, the write is refused as a conflict and has to be tried again, so a change of access always takes effect at once.
 
@@ -81,7 +81,7 @@ The organisation audit log leaves the same entries out for everyone but organisa
 
 Deleting a project, or an environment, destroys the history of every secret in it. When any of those secrets is restricted, only a project admin or an organisation admin can do it.
 
-Downgrading to a release from before per-secret access is refused: an older server will not start on a database that has this release's schema, since it would ignore every restriction.
+Downgrading to a release from before per-secret access is refused: an older server will not start on a database that has this release's schema, since it would ignore every restriction. With several servers on one database, finish upgrading all of them before restricting anything, as one still running the older release ignores restrictions until it restarts.
 
 Backups hold the whole database, restricted secrets and their lists included. Anyone who can download and decrypt a backup can read everything in it, so treat `backup-reader` as access to every secret.
 

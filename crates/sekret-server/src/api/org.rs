@@ -738,7 +738,9 @@ async fn add_binding(
             "you cannot grant a role with more access than you have",
         ));
     }
-    if request.role == BuiltinRole::OrgAdmin.slug() && !is_org_admin(&state, &principal).await? {
+    // Backups hold every secret, so handing out the backup role is as strong as org admin.
+    let admin_only = [BuiltinRole::OrgAdmin.slug(), BuiltinRole::BackupReader.slug()];
+    if admin_only.contains(&request.role.as_str()) && !is_org_admin(&state, &principal).await? {
         return Err(admin_role_needs_admin(&request.role));
     }
     let kind = from_api_kind(request.principal_kind);
