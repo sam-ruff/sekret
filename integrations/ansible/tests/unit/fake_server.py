@@ -8,6 +8,8 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from ansible_collections.sekret.secrets.plugins.module_utils.sekret_client import HttpResponse
 
 SECRET_RE = re.compile(r"^/api/v1/projects/([^/]+)/environments/([^/]+)/secrets/([^/]+)$")
+ACCESS_RE = re.compile(r"^/api/v1/projects/([^/]+)/environments/([^/]+)/secrets/([^/]+)/access$")
+ACTIONS = ("read", "read-value", "edit", "delete")
 LOGIN_PATHS = {
     "/api/v1/auth/universal/login": "universal",
     "/api/v1/auth/oidc/login": "oidc",
@@ -32,6 +34,9 @@ class StoredSecret:
     comment: str = ""
     version: int = 1
     deleted: bool = False
+    restricted: bool = False
+    # (kind, id) to the actions granted.
+    grants: dict = field(default_factory=dict)
 
 
 def respond(status, payload=None):
@@ -55,6 +60,11 @@ class FakeServer:
         self.expires_in = 3600
         self.override = None
         self._issued = 0
+        # Per-secret access for the project, and whether callers are its admins.
+        self.secret_access = True
+        self.admin = True
+        # Behaves like a server from before per-secret access, which drops the field.
+        self.ignore_restricted = False
 
     def put(self, key, value, path="/", tags=None, comment=""):
         self.secrets[(path, key)] = StoredSecret(value, sorted(tags or []), comment)
@@ -69,6 +79,10 @@ class FakeServer:
     @property
     def writes(self):
         return [c for c in self.calls if c.path.endswith("/secrets/batch")]
+
+    @property
+    def access_changes(self):
+        return [c for c in self.calls if c.method == "PATCH" and c.path.endswith("/access")]
 
     def __call__(self, method, url, headers, body, timeout):
         parts = urlsplit(url)
@@ -110,6 +124,9 @@ class FakeServer:
             return self._raw(call)
         if call.path.endswith("/secrets/batch"):
             return self._batch(call)
+        match = ACCESS_RE.match(call.path)
+        if match:
+            return self._access(call, *(unquote(g) for g in match.groups()))
         match = SECRET_RE.match(call.path)
         if match and call.method == "GET":
             return self._get(call, *(unquote(g) for g in match.groups()))
@@ -157,8 +174,54 @@ class FakeServer:
                 "version": stored.version,
                 "tags": stored.tags,
                 "comment": stored.comment,
+                "restricted": stored.restricted,
             },
         )
+
+    @staticmethod
+    def _listing(stored):
+        grants = [
+            {
+                "principal_kind": kind,
+                "principal_id": principal_id,
+                "principal_name": principal_id,
+                "actions": actions,
+                "created_at": 1,
+            }
+            for (kind, principal_id), actions in sorted(stored.grants.items())
+        ]
+        return {"restricted": stored.restricted, "grants": grants}
+
+    def _access(self, call, project, environment, key):
+        failed = self._scope_error(project, environment)
+        if failed:
+            return failed
+        if not self.admin:
+            return error(
+                403, "forbidden", "only a project admin or an organisation admin can manage per-secret access"
+            )
+        stored = self.secrets.get((call.query.get("path", "/"), key))
+        if stored is None:
+            return error(404, "not_found", "secret not found")
+        if call.method == "GET":
+            return respond(200, self._listing(stored))
+        body = call.body or {}
+        if (body.get("restricted") is True or body.get("grant")) and not self.secret_access:
+            return error(409, "secret_access_off", "per-secret access is off for this project")
+        for actions in (g.get("actions") or [] for g in body.get("grant", [])):
+            if any(a not in ACTIONS for a in actions):
+                return error(400, "bad_request", "an access list cannot grant that")
+        if body.get("restricted") is False and stored.restricted:
+            # Unrestricting clears the list before the request's grants apply.
+            stored.grants = {}
+        if body.get("restricted") is not None:
+            stored.restricted = body["restricted"]
+        for revoked in body.get("revoke", []):
+            stored.grants.pop((revoked["principal_kind"], revoked["principal_id"]), None)
+        for granted in body.get("grant", []):
+            actions = [a for a in ACTIONS if a == "read" or a in granted["actions"]]
+            stored.grants[(granted["principal_kind"], granted["principal_id"])] = actions
+        return respond(200, self._listing(stored))
 
     def _batch(self, call):
         project, environment = call.path.split("/")[4], call.path.split("/")[6]
@@ -166,19 +229,40 @@ class FakeServer:
         if failed:
             return failed
         path = call.body.get("path", "/")
-        result = {"created": [], "updated": [], "deleted": [], "unchanged": [], "snapshot_id": None}
+        result = {
+            "created": [],
+            "updated": [],
+            "deleted": [],
+            "unchanged": [],
+            "restricted": [],
+            "snapshot_id": None,
+        }
         for upsert in call.body.get("upserts", []):
             key = upsert["key"]
             current = self.secrets.get((path, key))
             live = current if current and not current.deleted else None
             tags = sorted(upsert["tags"]) if upsert.get("tags") is not None else (live.tags if live else [])
             comment = upsert.get("comment", "")
+            wanted = upsert.get("restricted")
+            # A deleted secret can come back restricted; a live one changes only through its access route.
+            if live is not None and wanted is not None and wanted != live.restricted:
+                return error(400, "bad_request", f"{key} already exists")
+            if wanted and live is None and not self.secret_access:
+                return error(409, "secret_access_off", "per-secret access is off for this project")
+            if self.ignore_restricted:
+                wanted = None
             if live and live.value == upsert["value"] and live.tags == tags and not comment:
                 result["unchanged"].append(key)
                 continue
             result["updated" if live else "created"].append(key)
             version = current.version + 1 if current else 1
-            self.secrets[(path, key)] = StoredSecret(upsert["value"], tags, comment, version)
+            restricted = bool(wanted) or (current.restricted if current else False)
+            grants = current.grants if current else {}
+            self.secrets[(path, key)] = StoredSecret(
+                upsert["value"], tags, comment, version, restricted=restricted, grants=grants
+            )
+            if wanted and restricted:
+                result["restricted"].append(key)
         for key in call.body.get("deletes", []):
             current = self.secrets.get((path, key))
             if current is None or current.deleted:
@@ -188,4 +272,6 @@ class FakeServer:
             result["deleted"].append(key)
         if result["created"] or result["updated"] or result["deleted"]:
             result["snapshot_id"] = f"snap-{len(self.calls)}"
+        if self.ignore_restricted:
+            del result["restricted"]
         return respond(200, result)

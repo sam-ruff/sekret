@@ -77,6 +77,23 @@ A key that doesn't exist fails the task. Pass `default=` if you would rather get
 
 The module compares against what is stored before writing, so it only reports a change when there is one, and check mode works. It never returns the value, and `--diff` only tells you whether the value changed. The `comment` is attached to the new version when a write happens and isn't compared.
 
+When per-secret access is on for the project, `restricted: true` keeps a secret to its access list and admins, and `access` sets that list to exactly what you give, each entry a `kind` (`identity`, `user` or `group`), an `id` and what to `allow` (`read`, `read-value`, `edit`, `delete`; `read` and `read-value` by default). A new or deleted secret is restricted in the same write that creates it, and the task fails if the server writes it open. Leave either option out to keep what is there, except that `restricted: false` clears the list unless `access` is given with it. Managing access needs a project or organisation admin.
+
+```yaml
+- name: Only the payments workload reads the Stripe key
+  sekret.secrets.secret:
+    project: app
+    environment: prod
+    path: /payments
+    key: STRIPE_KEY
+    value: "{{ stripe_key }}"
+    restricted: true
+    access:
+      - kind: identity
+        id: "{{ payments_identity_id }}"
+  delegate_to: localhost
+```
+
 Like any module it runs on the target host, so `delegate_to: localhost` is usually what you want.
 
 `examples/playbook.yml` shows both together: it stores a setting and renders a config file from a couple of lookups.

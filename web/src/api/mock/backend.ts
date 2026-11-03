@@ -39,10 +39,16 @@ import type {
   PolicyOverride,
   PrincipalKind,
   Project,
+  ProjectPermissions,
   PutRole,
+  RestrictedSecret,
   Role,
   Rule,
   Secret,
+  SecretAccess,
+  SecretAccessChange,
+  SecretAccessSetting,
+  SecretGrant,
   SecretList,
   SecretPolicy,
   SecretPolicyView,
@@ -226,6 +232,15 @@ function checkOutboundUrl(raw: string): void {
 const notFound = (what: string) => new MockError(404, "not_found", `${what} not found`);
 const forbidden = () => new MockError(403, "forbidden", "you do not have permission to do that");
 const escalation = (message: string) => new MockError(403, "escalation", message);
+const secretAccessOff = () =>
+  new MockError(
+    409,
+    "secret_access_off",
+    "per-secret access is off for this project; a project admin can turn it on in the project settings",
+  );
+/** The server's `MAX_GRANTS`. */
+const MAX_GRANTS = 100;
+const LISTABLE: readonly Action[] = ["read", "read-value", "edit", "delete"];
 
 const SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const DEFAULT_ENVIRONMENTS: CreateEnvironment[] = [
@@ -416,6 +431,7 @@ export class MockBackend {
     if (controls.orgRole) this.setMyOrgRole(controls.orgRole);
     if (controls.idpLogout) this.state.idpLogoutUrl = MOCK_IDP_LOGOUT_URL;
     if (controls.oidc !== undefined) this.state.oidcDisabled = !controls.oidc;
+    if (controls.legacyWrites) this.state.legacyWrites = true;
   }
 
   // Projects
@@ -435,7 +451,11 @@ export class MockBackend {
 
   private apiProject(project: Project): Project {
     const logo = this.state.logos[project.id];
-    return { ...project, logo_url: logo ? `/api/v1/projects/${project.id}/logo?v=${logo.updated_at}` : null };
+    return {
+      ...project,
+      secret_access: project.secret_access === true,
+      logo_url: logo ? `/api/v1/projects/${project.id}/logo?v=${logo.updated_at}` : null,
+    };
   }
 
   listProjects(): Project[] {
@@ -469,6 +489,7 @@ export class MockBackend {
       name: request.name.trim(),
       description: request.description ?? "",
       created_at: this.now(),
+      secret_access: false,
     };
     const envs = request.environments ?? DEFAULT_ENVIRONMENTS;
     envs.forEach((e) => {
@@ -619,7 +640,12 @@ export class MockBackend {
       request.generator ?? this.effectivePolicy(project.id, existing && !isDeleted(existing) ? existing : undefined).generator ?? DEFAULT_GENERATOR;
     validatePolicy({ generator, rotation_days: null });
     const value = generateValue(generator);
-    const result = this.applyBatch(projectId, envSlug, { path, upserts: [{ key, value, comment: request.comment ?? "" }] }, true);
+    const result = this.applyBatch(
+      projectId,
+      envSlug,
+      { path, upserts: [{ key, value, comment: request.comment ?? "", restricted: request.restricted }] },
+      true,
+    );
     this.audit("secret.generate", { project_id: project.id, environment: env.slug, path, secret_key: key }, {
       created: result.created.length > 0,
     });
@@ -677,8 +703,9 @@ export class MockBackend {
     this.audit("project.delete", { project_id: project.id }, { slug: project.slug });
   }
 
-  permissions(id: string): { rules: Rule[] } {
-    return { rules: this.loadProject(id).rules };
+  permissions(id: string): ProjectPermissions {
+    const { project, rules } = this.loadProject(id);
+    return { rules, manages_secret_access: this.managesSecretAccess(project.id) };
   }
 
   // Environments
@@ -799,14 +826,39 @@ export class MockBackend {
 
   // Secrets
 
-  private resource(env: StoredEnvironment, s: Pick<StoredSecret, "path" | "key">, tags: string[]): Resource {
-    return { environment: env.slug, path: s.path, key: s.key, tags };
+  private resource(env: StoredEnvironment, s: StoredSecret, tags: string[]): Resource {
+    return { environment: env.slug, path: s.path, key: s.key, tags, granted: this.granted(env.projectId, s) };
+  }
+
+  /** A project admin or an organisation admin, who manages access lists and is exempt from them. */
+  private managesSecretAccess(projectId: string): boolean {
+    return (
+      this.isOrgAdmin() ||
+      this.state.memberships.some(
+        (m) => m.projectId === projectId && m.role === "admin" && this.principalIsMe(m.principal_kind, m.principal_id),
+      )
+    );
+  }
+
+  /** What a restricted secret's list grants the caller, or undefined when it does not bind them. */
+  private granted(projectId: string, s: StoredSecret): Action[] | undefined {
+    if (!s.restricted || this.managesSecretAccess(projectId)) return undefined;
+    const actions = new Set<Action>();
+    for (const g of this.state.grants ?? []) {
+      if (g.secretId === s.id && this.principalIsMe(g.principal_kind, g.principal_id)) {
+        g.actions.forEach((a) => actions.add(a));
+      }
+    }
+    return [...actions];
   }
 
   private toApi(env: StoredEnvironment, s: StoredSecret, rules: Rule[], values: boolean): Secret {
     const current = currentVersion(s);
     const mayRead = authorise(rules, "secrets", "read-value", this.resource(env, s, current.tags));
+    const granted = this.granted(env.projectId, s);
     return {
+      restricted: s.restricted === true,
+      ...(granted && { granted }),
       id: s.id,
       environment: env.slug,
       path: s.path,
@@ -907,6 +959,16 @@ export class MockBackend {
 
   /** Writes a batch with the caller's permissions; `generated` marks the new values as sekret's own. */
   private applyBatch(projectId: string, envSlug: string, request: BatchWrite, generated: boolean): BatchResult {
+    if (this.state.legacyWrites) {
+      const upserts = (request.upserts ?? []).map((u) => ({ ...u, restricted: undefined }));
+      this.state.legacyWrites = false;
+      try {
+        const { restricted: _ignored, ...result } = this.applyBatch(projectId, envSlug, { ...request, upserts }, generated);
+        return result;
+      } finally {
+        this.state.legacyWrites = true;
+      }
+    }
     const { project, rules } = this.loadProject(projectId);
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(request.path ?? "/");
@@ -922,11 +984,25 @@ export class MockBackend {
       seen.add(key);
     }
 
-    const result: BatchResult = { created: [], updated: [], deleted: [], unchanged: [], snapshot_id: null };
-    const planned: { existing?: StoredSecret; key: string; version: StoredVersion }[] = [];
+    const result: BatchResult = {
+      created: [],
+      updated: [],
+      deleted: [],
+      unchanged: [],
+      restricted: [],
+      snapshot_id: null,
+    };
+    const planned: { existing?: StoredSecret; key: string; version: StoredVersion; restricted?: boolean }[] = [];
 
     for (const upsert of upserts) {
       const existing = this.findSecret(env.id, path, upsert.key);
+      // As the server: one the caller's list hides answers exactly as a missing one.
+      if (existing && !authorise(rules, "secrets", "read", this.resource(env, existing, currentVersion(existing).tags))) {
+        throw notFound(`secret ${upsert.key}`);
+      }
+      const restricted = this.checkRestricted(project, existing, upsert.key, upsert.restricted);
+      // As the server: the keys that asked to be restricted and are restricted after the write.
+      if (upsert.restricted === true && (restricted || existing?.restricted === true)) result.restricted?.push(upsert.key);
       const live = existing && !isDeleted(existing) ? existing : undefined;
       const tags = upsert.tags ? normaliseTags(upsert.tags) : live ? currentVersion(live).tags : [];
       if (live) {
@@ -948,6 +1024,7 @@ export class MockBackend {
         existing,
         key: upsert.key,
         version: this.newVersion(existing, upsert.value, upsert.comment ?? "", tags, generated),
+        restricted,
       });
     }
 
@@ -955,6 +1032,7 @@ export class MockBackend {
       const existing = this.findSecret(env.id, path, key);
       if (!existing || isDeleted(existing)) throw notFound(`secret ${key}`);
       const tags = currentVersion(existing).tags;
+      if (!authorise(rules, "secrets", "read", this.resource(env, existing, tags))) throw notFound(`secret ${key}`);
       this.require(rules, "secrets", "delete", this.resource(env, existing, tags));
       planned.push({ existing, key, version: this.newVersion(existing, null, "", tags) });
       result.deleted.push(key);
@@ -965,8 +1043,16 @@ export class MockBackend {
     for (const change of planned) {
       if (change.existing) {
         change.existing.versions.push(change.version);
+        if (change.restricted) change.existing.restricted = true;
       } else {
-        this.state.secrets.push({ id: this.nextId("sec"), envId: env.id, path, key: change.key, versions: [change.version] });
+        this.state.secrets.push({
+          id: this.nextId("sec"),
+          envId: env.id,
+          path,
+          key: change.key,
+          versions: [change.version],
+          ...(change.restricted && { restricted: true }),
+        });
       }
     }
     const reason = `${result.created.length} created, ${result.updated.length} updated, ${result.deleted.length} deleted in ${path}`;
@@ -988,8 +1074,184 @@ export class MockBackend {
   setSecret(projectId: string, envSlug: string, key: string, rawPath: string, request: SetSecret): BatchResult {
     return this.batchWrite(projectId, envSlug, {
       path: rawPath,
-      upserts: [{ key, value: request.value, comment: request.comment ?? "", tags: request.tags }],
+      upserts: [
+        { key, value: request.value, comment: request.comment ?? "", tags: request.tags, restricted: request.restricted },
+      ],
     });
+  }
+
+  /** As the server: creating restricted needs an admin and the setting on; a write never flips the flag. */
+  private checkRestricted(
+    project: Project,
+    existing: StoredSecret | undefined,
+    key: string,
+    wanted: boolean | null | undefined,
+  ): boolean {
+    if (wanted == null) return false;
+    if (existing) {
+      const revivesRestricted = isDeleted(existing) && wanted && existing.restricted !== true;
+      if ((existing.restricted === true) !== wanted && !revivesRestricted) {
+        throw badRequest(`${key} already exists; change whether it is restricted through its access settings`);
+      }
+      if (!revivesRestricted) return false;
+    }
+    if (!wanted) return false;
+    if (!project.secret_access) throw secretAccessOff();
+    if (!this.managesSecretAccess(project.id)) {
+      throw new MockError(403, "forbidden", "only a project admin can create a restricted secret");
+    }
+    return true;
+  }
+
+  // Per-secret access
+
+  private loadForAccess(projectId: string, action: Action): { project: Project; rules: Rule[] } {
+    const loaded = this.loadProject(projectId);
+    if (!this.managesSecretAccess(loaded.project.id)) {
+      throw new MockError(403, "forbidden", "only a project admin or an organisation admin can manage per-secret access");
+    }
+    this.require(loaded.rules, "settings", action);
+    return loaded;
+  }
+
+  private accessSetting(project: Project, rules: Rule[]): SecretAccessSetting {
+    const envs = this.projectEnvs(project.id);
+    const restricted = this.state.secrets.filter((s) => s.restricted && envs.some((e) => e.id === s.envId));
+    const visible: RestrictedSecret[] = [];
+    for (const s of restricted) {
+      const env = envs.find((e) => e.id === s.envId);
+      if (!env) continue;
+      const open = { environment: env.slug, path: s.path, key: s.key, tags: currentVersion(s).tags };
+      if (!authorise(rules, "secrets", "read", open)) continue;
+      visible.push({
+        environment: env.slug,
+        path: s.path,
+        key: s.key,
+        deleted: isDeleted(s),
+        grants: (this.state.grants ?? []).filter((g) => g.secretId === s.id).length,
+      });
+    }
+    return { enabled: project.secret_access === true, restricted: visible, restricted_count: restricted.length };
+  }
+
+  getSecretAccessSetting(projectId: string): SecretAccessSetting {
+    const { project, rules } = this.loadForAccess(projectId, "read");
+    return this.accessSetting(project, rules);
+  }
+
+  putSecretAccessSetting(projectId: string, enabled: boolean): SecretAccessSetting {
+    const { project, rules } = this.loadForAccess(projectId, "edit");
+    if (!enabled) {
+      const envIds = new Set(this.projectEnvs(project.id).map((e) => e.id));
+      const count = this.state.secrets.filter((s) => s.restricted && envIds.has(s.envId)).length;
+      if (count > 0) {
+        const one = count === 1;
+        throw new MockError(
+          409,
+          "secrets_restricted",
+          `${count} secret${one ? "" : "s"} in this project ${one ? "is" : "are"} restricted; unrestrict ${one ? "it" : "them"} before turning per-secret access off`,
+        );
+      }
+    }
+    if (!enabled) {
+      // As the server: turning the setting off clears every list in the project.
+      const ids = new Set(
+        this.state.secrets.filter((s) => this.projectEnvs(project.id).some((e) => e.id === s.envId)).map((s) => s.id),
+      );
+      this.state.grants = (this.state.grants ?? []).filter((g) => !ids.has(g.secretId));
+    }
+    if ((project.secret_access === true) !== enabled) {
+      project.secret_access = enabled;
+      this.audit("project.secret-access", { project_id: project.id }, { enabled });
+    }
+    return this.accessSetting(project, rules);
+  }
+
+  private accessTarget(projectId: string, envSlug: string, key: string, rawPath: string, action: Action) {
+    const { project, rules } = this.loadForAccess(projectId, action);
+    const env = this.findEnv(project, envSlug);
+    const path = normaliseFolder(rawPath);
+    const secret = this.findSecret(env.id, path, key);
+    const open = secret && { environment: env.slug, path, key, tags: currentVersion(secret).tags };
+    if (!secret || !open || !authorise(rules, "secrets", "read", open)) throw notFound("secret");
+    return { project, env, secret };
+  }
+
+  private describeAccess(secret: StoredSecret): SecretAccess {
+    const names = this.principalNames();
+    const grants: SecretGrant[] = (this.state.grants ?? [])
+      .filter((g) => g.secretId === secret.id)
+      .sort((a, b) => a.principal_kind.localeCompare(b.principal_kind) || a.principal_id.localeCompare(b.principal_id))
+      .map((g) => ({
+        principal_kind: g.principal_kind,
+        principal_id: g.principal_id,
+        principal_name: names.get(`${g.principal_kind}:${g.principal_id}`) ?? g.principal_id,
+        actions: g.actions,
+        created_at: g.created_at,
+      }));
+    return { restricted: secret.restricted === true, grants };
+  }
+
+  getSecretAccess(projectId: string, envSlug: string, key: string, rawPath: string): SecretAccess {
+    return this.describeAccess(this.accessTarget(projectId, envSlug, key, rawPath, "read").secret);
+  }
+
+  changeSecretAccess(
+    projectId: string,
+    envSlug: string,
+    key: string,
+    rawPath: string,
+    request: SecretAccessChange,
+  ): SecretAccess {
+    const { project, env, secret } = this.accessTarget(projectId, envSlug, key, rawPath, "edit");
+    const grant = request.grant ?? [];
+    const revoke = request.revoke ?? [];
+    if ((request.restricted === true || grant.length > 0) && !project.secret_access) throw secretAccessOff();
+    if (grant.length + revoke.length > MAX_GRANTS) throw badRequest(`at most ${MAX_GRANTS} grants and revocations per request`);
+    const seen = new Set<string>();
+    for (const p of [...revoke, ...grant]) {
+      if (!p.principal_id.trim() || p.principal_id.length > 256 || /\p{Cc}/u.test(p.principal_id)) {
+        throw badRequest("principal ids must be 1 to 256 characters without control characters");
+      }
+      const id = `${p.principal_kind}:${p.principal_id}`;
+      if (seen.has(id)) throw badRequest(`${p.principal_kind} ${p.principal_id} appears more than once in the request`);
+      seen.add(id);
+    }
+    const planned = grant.map((g) => {
+      const bad = g.actions.find((a) => !LISTABLE.includes(a));
+      if (bad) throw badRequest(`an access list cannot grant ${bad}; use read, read-value, edit or delete`);
+      this.ensurePrincipal(g.principal_kind, g.principal_id);
+      const actions = LISTABLE.filter((a) => a === "read" || g.actions.includes(a));
+      return { secretId: secret.id, principal_kind: g.principal_kind, principal_id: g.principal_id, actions, created_at: this.now() };
+    });
+    const touched = (g: { principal_kind: PrincipalKind; principal_id: string }) =>
+      seen.has(`${g.principal_kind}:${g.principal_id}`);
+    // As the server: unrestricting clears the list first, then any grants in the same request apply.
+    const clears = request.restricted === false;
+    const kept = (this.state.grants ?? []).filter((g) => !(g.secretId === secret.id && (clears || touched(g))));
+    if (kept.filter((g) => g.secretId === secret.id).length + planned.length > MAX_GRANTS) {
+      throw badRequest(`a secret's access list holds at most ${MAX_GRANTS} entries`);
+    }
+    const cleared = clears
+      ? (this.state.grants ?? [])
+          .filter((g) => g.secretId === secret.id)
+          .map((g) => ({ principal_kind: g.principal_kind, principal_id: g.principal_id }))
+      : [];
+    const changes =
+      (request.restricted != null && request.restricted !== (secret.restricted === true)) ||
+      grant.length + revoke.length > 0 ||
+      cleared.length > 0;
+    this.state.grants = [...kept, ...planned];
+    if (request.restricted != null) secret.restricted = request.restricted;
+    if (changes) {
+      this.audit("secret.access", { project_id: project.id, environment: env.slug, path: secret.path, secret_key: key }, {
+        restricted: request.restricted ?? null,
+        cleared,
+        granted: planned.map((g) => ({ principal_kind: g.principal_kind, principal_id: g.principal_id, actions: g.actions })),
+        revoked: revoke,
+      });
+    }
+    return this.describeAccess(secret);
   }
 
   deleteSecret(projectId: string, envSlug: string, key: string, rawPath: string): BatchResult {
@@ -1018,6 +1280,7 @@ export class MockBackend {
     const s = this.findSecret(env.id, path, key);
     if (!s) throw notFound("secret");
     const resource = this.resource(env, s, currentVersion(s).tags);
+    if (!authorise(rules, "secrets", "read", resource)) throw notFound("secret");
     this.require(rules, "secret-versions", "read", resource);
     const reveal =
       values &&
@@ -1048,7 +1311,9 @@ export class MockBackend {
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(rawPath);
     const s = this.findSecret(env.id, path, key);
-    if (!s) throw notFound("secret");
+    if (!s || !authorise(rules, "secrets", "read", this.resource(env, s, currentVersion(s).tags))) {
+      throw notFound("secret");
+    }
     const action: Action = isDeleted(s) ? "create" : "edit";
     this.require(rules, "secrets", action, this.resource(env, s, currentVersion(s).tags));
     const target = s.versions.find((v) => v.version === version);
@@ -1220,6 +1485,8 @@ export class MockBackend {
     const administers =
       this.isOrgAdmin() ||
       this.state.memberships.some((m) => m.projectId === project.id && m.role === "admin" && this.principalIsMe(m.principal_kind, m.principal_id));
+    // As the server: the admin role also exempts from access lists, so only admins hand it out.
+    if (request.role === "admin" && !administers) throw escalation("only an admin can grant the built-in admin role");
     this.checkDenyForAdmin(granted, request.principal_kind, request.principal_id, administers, project.id);
     this.ensurePrincipal(request.principal_kind, request.principal_id);
     const duplicate = this.state.memberships.some(
@@ -1367,7 +1634,7 @@ export class MockBackend {
     const { project, rules } = this.loadProject(projectId);
     this.require(rules, "audit-log", "read");
     const actorsOnly = this.auditFilterScope(rules, query);
-    const entries = this.state.audit.filter((e) => e.project_id === project.id);
+    const entries = this.state.audit.filter((e) => e.project_id === project.id && this.auditVisible(project.id, e));
     if (!actorsOnly) return this.auditPage(entries, query);
     // `q` may only search what redaction leaves alone.
     const search = emptyToUndefined(query.q)?.toLowerCase();
@@ -1375,6 +1642,20 @@ export class MockBackend {
       ? entries.filter((e) => [e.action, e.actor_name, e.actor_id, e.ip].some((f) => f.toLowerCase().includes(search)))
       : entries;
     return this.auditPage(searched, { ...query, q: undefined });
+  }
+
+  /**
+   * As the server: entries about a restricted secret are left out for readers its list keeps off,
+   * and access list changes are for admins only.
+   */
+  private auditVisible(projectId: string, entry: AuditEntry): boolean {
+    if (this.managesSecretAccess(projectId)) return true;
+    if (entry.action === "secret.access") return false;
+    if (!entry.environment || !entry.secret_key) return true;
+    const env = this.projectEnvs(projectId).find((e) => e.slug === entry.environment);
+    const secret = env && this.state.secrets.find((s) => s.envId === env.id && s.path === entry.path && s.key === entry.secret_key);
+    if (!secret?.restricted) return true;
+    return this.granted(projectId, secret)?.includes("read") ?? true;
   }
 
   /** As the server: refuses filters that would reveal what redaction hides, and says whether `q` is limited. */
@@ -1519,6 +1800,7 @@ export class MockBackend {
     delete this.state.clientSecrets[id];
     this.state.memberships = this.state.memberships.filter((m) => !(m.principal_kind === "identity" && m.principal_id === id));
     this.state.orgBindings = this.state.orgBindings.filter((b) => !(b.principal_kind === "identity" && b.principal_id === id));
+    this.state.grants = (this.state.grants ?? []).filter((g) => !(g.principal_kind === "identity" && g.principal_id === id));
     this.audit("identity.delete", {}, { identity: id });
   }
 

@@ -1,3 +1,4 @@
+pub mod access;
 pub mod listing;
 pub mod logo;
 mod org;
@@ -30,6 +31,8 @@ pub struct AuditTarget<'a> {
     pub environment: Option<&'a str>,
     pub path: Option<&'a str>,
     pub key: Option<&'a str>,
+    /// About a restricted secret, so only readers who may see it get the entry.
+    pub restricted: bool,
 }
 
 /// Records an audit entry. Failures are logged rather than failing the request.
@@ -54,7 +57,20 @@ pub async fn audit_refusal(
     action: &str,
     detail: Value,
 ) {
-    let entry = audit_entry(state, principal, ip, action, AuditTarget::default(), detail);
+    audit_refusal_at(state, principal, subject, ip, action, AuditTarget::default(), detail).await;
+}
+
+/// As [`audit_refusal`], for a refusal about one place, which the entry names.
+pub async fn audit_refusal_at(
+    state: &AppState,
+    principal: &Principal,
+    subject: &str,
+    ip: IpAddr,
+    action: &str,
+    target: AuditTarget<'_>,
+    detail: Value,
+) {
+    let entry = audit_entry(state, principal, ip, action, target, detail);
     let key = format!("{action}|{subject}|{}", crate::ratelimit::limiter_key(ip));
     for entry in state.refusals.admit(key, entry) {
         insert_audit(state, entry).await;
@@ -96,6 +112,7 @@ fn audit_entry(
         secret_key: target.key.map(String::from),
         detail: crate::peer::annotate(detail, &ip.to_string()),
         ip: ip.to_string(),
+        restricted: target.restricted,
     }
 }
 
@@ -145,6 +162,7 @@ pub fn secret_ctx<'a>(state: &'a AppState, principal: &Principal) -> ApiResult<S
         actor: principal.actor(),
         snapshots_to_keep: state.config.snapshots_to_keep,
         generated: false,
+        hidden_collision: std::sync::Mutex::new(None),
     })
 }
 
@@ -158,6 +176,7 @@ pub fn api_project(p: &Project) -> sekret_api::Project {
         logo_url: p
             .logo_updated_at
             .map(|v| format!("/api/v1/projects/{}/logo?v={v}", p.id)),
+        secret_access: p.secret_access,
     }
 }
 
@@ -241,6 +260,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .merge(auth_router())
         .merge(org::router())
         .merge(projects::router())
+        .merge(access::router())
         .merge(logo::router())
         .merge(secrets::router())
         .merge(sys::router())

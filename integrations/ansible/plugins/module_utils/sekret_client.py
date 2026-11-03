@@ -444,6 +444,7 @@ class SecretRecord:
     version: int
     tags: list[str]
     comment: str = ""
+    restricted: bool = False
 
 
 def _redact(message: str, sensitive: list[str]) -> str:
@@ -636,7 +637,22 @@ class SekretClient:
             version=int(payload.get("version") or 0),
             tags=list(payload.get("tags") or []),
             comment=payload.get("comment") or "",
+            restricted=bool(payload.get("restricted")),
         )
+
+    def _access_url(self, project: str, environment: str, key: str, path: str) -> str:
+        return (
+            f"/api/v1/projects/{_quote(project)}/environments/{_quote(environment)}"
+            f"/secrets/{_quote(key)}/access?{urllib.parse.urlencode({'path': path})}"
+        )
+
+    def get_access(self, project: str, environment: str, key: str, path: str = "/") -> dict:
+        """The secret's restricted flag and access list. Needs a project or organisation admin."""
+        return self.request("GET", self._access_url(project, environment, key, path))
+
+    def change_access(self, project: str, environment: str, key: str, path: str, change: dict) -> dict:
+        """Applies a restricted flag, grants and revocations in one request, returning the new list."""
+        return self.request("PATCH", self._access_url(project, environment, key, path), change)
 
     def batch(
         self,

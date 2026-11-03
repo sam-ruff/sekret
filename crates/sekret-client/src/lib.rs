@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use sekret_api::{
     BatchResult, BatchWrite, ChangePassphrase, CliPollRequest, CliStartResponse, CreateProject, Environment, ErrorBody,
-    GenerateSecret, InitRequest, InitResponse, JwtLoginRequest, Me, PolicyOverride, Project, RawSecrets,
-    RestoreRequest, RollbackRequest, Secret, SecretList, SecretPolicy, SecretPolicyView, SecretVersion,
-    SetUnlockPolicy, Snapshot, SysStatus, TokenResponse, UniversalLoginRequest, UnsealRequest,
+    GenerateSecret, IdentityPage, InitRequest, InitResponse, JwtLoginRequest, Me, PolicyOverride, Project, RawSecrets,
+    RestoreRequest, RollbackRequest, Secret, SecretAccess, SecretAccessChange, SecretAccessSetting, SecretList,
+    SecretPolicy, SecretPolicyView, SecretVersion, SetSecretAccessSetting, SetUnlockPolicy, Snapshot, SysStatus,
+    TokenResponse, UniversalLoginRequest, UnsealRequest, UserPage,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -103,7 +104,7 @@ pub fn terminal_safe_json(json: &str) -> String {
 }
 
 fn is_unprintable(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    c.is_control() || sekret_api::is_invisible_format(c)
 }
 
 /// Drops the rest of an escape sequence: CSI up to its final byte, OSC, DCS and similar strings
@@ -169,6 +170,19 @@ pub trait SekretApi: Send + Sync {
     ) -> ClientResult<SecretPolicyView>;
     async fn project_policy(&self, project: String) -> ClientResult<SecretPolicy>;
     async fn set_project_policy(&self, project: String, policy: SecretPolicy) -> ClientResult<SecretPolicy>;
+    async fn secret_access(&self, at: Location, key: String) -> ClientResult<SecretAccess>;
+    async fn change_secret_access(
+        &self,
+        at: Location,
+        key: String,
+        change: SecretAccessChange,
+    ) -> ClientResult<SecretAccess>;
+    async fn secret_access_setting(&self, project: String) -> ClientResult<SecretAccessSetting>;
+    async fn set_secret_access_setting(&self, project: String, enabled: bool) -> ClientResult<SecretAccessSetting>;
+    /// Identities matching `q` by name, description or id.
+    async fn find_identities(&self, q: String) -> ClientResult<IdentityPage>;
+    /// Users matching `q` by name, email, group or id.
+    async fn find_users(&self, q: String) -> ClientResult<UserPage>;
     async fn raw(&self, at: Location, recursive: bool) -> ClientResult<RawSecrets>;
     async fn snapshots(&self, project: String, environment: String) -> ClientResult<Vec<Snapshot>>;
     async fn restore(&self, at: Location, snapshot: String) -> ClientResult<BatchResult>;
@@ -752,6 +766,42 @@ impl SekretApi for HttpClient {
         self.send(Method::PUT, url, Some(&policy)).await
     }
 
+    async fn secret_access(&self, at: Location, key: String) -> ClientResult<SecretAccess> {
+        let url = self.secrets_url(&at, &["secrets", &key, "access"], &[("path", at.path.clone())])?;
+        self.send(Method::GET, url, None).await
+    }
+
+    async fn change_secret_access(
+        &self,
+        at: Location,
+        key: String,
+        change: SecretAccessChange,
+    ) -> ClientResult<SecretAccess> {
+        let url = self.secrets_url(&at, &["secrets", &key, "access"], &[("path", at.path.clone())])?;
+        self.send(Method::PATCH, url, Some(&change)).await
+    }
+
+    async fn secret_access_setting(&self, project: String) -> ClientResult<SecretAccessSetting> {
+        let url = self.url(&["api", "v1", "projects", &project, "secret-access"], &[])?;
+        self.send(Method::GET, url, None).await
+    }
+
+    async fn set_secret_access_setting(&self, project: String, enabled: bool) -> ClientResult<SecretAccessSetting> {
+        let url = self.url(&["api", "v1", "projects", &project, "secret-access"], &[])?;
+        self.send(Method::PUT, url, Some(&SetSecretAccessSetting { enabled }))
+            .await
+    }
+
+    async fn find_identities(&self, q: String) -> ClientResult<IdentityPage> {
+        let url = self.url(&["api", "v1", "identities"], &[("q", q), ("limit", "100".into())])?;
+        self.send(Method::GET, url, None).await
+    }
+
+    async fn find_users(&self, q: String) -> ClientResult<UserPage> {
+        let url = self.url(&["api", "v1", "users"], &[("q", q), ("limit", "100".into())])?;
+        self.send(Method::GET, url, None).await
+    }
+
     async fn raw(&self, at: Location, recursive: bool) -> ClientResult<RawSecrets> {
         let query = [
             ("project", at.project.clone()),
@@ -987,11 +1037,65 @@ mod tests {
                 value: "1".into(),
                 comment: String::new(),
                 tags: None,
+                restricted: None,
             }],
             deletes: vec![],
         };
         let result = client(&server, None)?.write(at(), batch).await.context("write")?;
         assert_eq!(result.created, vec!["A".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_changes_name_the_secret_and_its_folder() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/projects/app/environments/prod/secrets/DB/access"))
+            .and(query_param("path", "/db"))
+            .and(body_json(json!({
+                "restricted": true,
+                "grant": [{"principal_kind": "identity", "principal_id": "pod", "actions": ["read", "read-value"]}],
+                "revoke": [{"principal_kind": "group", "principal_id": "ops"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "restricted": true,
+                "grants": [{"principal_kind": "identity", "principal_id": "pod", "principal_name": "web",
+                    "actions": ["read", "read-value"], "created_at": 1}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/projects/app/secret-access"))
+            .and(body_json(json!({"enabled": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "enabled": false, "restricted": [], "restricted_count": 0
+            })))
+            .mount(&server)
+            .await;
+        let api = client(&server, None)?;
+        let change = sekret_api::SecretAccessChange {
+            restricted: Some(true),
+            grant: vec![sekret_api::GrantRequest {
+                principal_kind: sekret_api::PrincipalKind::Identity,
+                principal_id: "pod".into(),
+                actions: vec![sekret_api::Action::Read, sekret_api::Action::ReadValue],
+            }],
+            revoke: vec![sekret_api::PrincipalRef {
+                principal_kind: sekret_api::PrincipalKind::Group,
+                principal_id: "ops".into(),
+            }],
+        };
+        let access = api
+            .change_secret_access(at(), "DB".into(), change)
+            .await
+            .context("change")?;
+        assert!(access.restricted);
+        assert_eq!(access.grants[0].principal_name, "web");
+        let setting = api
+            .set_secret_access_setting("app".into(), false)
+            .await
+            .context("setting")?;
+        assert!(!setting.enabled);
         Ok(())
     }
 
@@ -1096,6 +1200,11 @@ mod tests {
         assert_eq!(terminal_safe("a\rb\u{8}c\u{7}d\u{0}e\u{7f}f"), "abcdef");
         assert_eq!(terminal_safe("x\u{9b}31my"), "x31my", "C1 controls are removed");
         assert_eq!(terminal_safe("ab\u{202e}cd\u{2066}e"), "abcde");
+        assert_eq!(
+            terminal_safe("pod\u{200b}\u{2060}\u{feff}"),
+            "pod",
+            "invisible characters cannot make one name pass for another"
+        );
         assert_eq!(terminal_safe("trailing\u{1b}"), "trailing");
     }
 

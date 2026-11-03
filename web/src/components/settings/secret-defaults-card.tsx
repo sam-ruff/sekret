@@ -23,7 +23,16 @@ import {
 
 const OFF: SecretPolicy = { generator: null, rotation_days: null };
 
-export function SecretDefaultsCard({ project, canEdit }: { project: string; canEdit: boolean }) {
+export function SecretDefaultsCard({
+  project,
+  canEdit,
+  lockedReason,
+}: {
+  project: string;
+  canEdit: boolean;
+  /** Why the caller's settings rights are not enough here, shown when set. */
+  lockedReason?: string;
+}) {
   const policy = useQuery({ queryKey: keys.projectPolicy(project), queryFn: () => api.projectPolicy(project) });
   return (
     <Card className="max-w-3xl" data-testid="secret-defaults">
@@ -35,6 +44,13 @@ export function SecretDefaultsCard({ project, canEdit }: { project: string; canE
           only ever replaces values sekret generated, never ones that were typed or imported.
         </CardDescription>
       </CardHeader>
+      {lockedReason && (
+        <CardContent>
+          <p className="text-sm text-muted-foreground" data-testid="defaults-locked">
+            {lockedReason}
+          </p>
+        </CardContent>
+      )}
       {policy.isPending && (
         <CardContent>
           <Skeleton className="h-24 rounded-lg" />

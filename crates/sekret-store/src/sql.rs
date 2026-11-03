@@ -21,6 +21,8 @@ impl From<sqlx::Error> for StoreError {
             sqlx::Error::Database(db) if db.is_unique_violation() || db.is_foreign_key_violation() => {
                 StoreError::Conflict
             }
+            // SQLite refuses a write from a transaction whose snapshot another write has overtaken.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("517") => StoreError::Conflict,
             sqlx::Error::RowNotFound => StoreError::NotFound,
             _ => StoreError::Database(error.to_string()),
         }
@@ -140,6 +142,17 @@ fn project_from(row: &AnyRow) -> StoreResult<Project> {
         created_at: row.try_get("created_at")?,
         logo_updated_at: row.try_get("logo_updated_at")?,
         secret_policy: row.try_get("secret_policy")?,
+        secret_access: get_flag(row, "secret_access")?,
+    })
+}
+
+fn grant_from(row: &AnyRow) -> StoreResult<SecretGrant> {
+    Ok(SecretGrant {
+        secret_id: row.try_get("secret_id")?,
+        principal_kind: principal(row, "principal_kind")?,
+        principal_id: row.try_get("principal_id")?,
+        actions: from_json(&row.try_get::<String, _>("actions")?)?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -177,7 +190,7 @@ fn environment_from(row: &AnyRow) -> StoreResult<Environment> {
 }
 
 const SECRET_COLUMNS: &str = "s.id, s.project_id, s.environment_id, s.path, s.key, s.current_version, s.deleted, \
-     s.created_at, s.updated_at, s.policy, v.version, v.value, v.comment, v.tags, v.deleted AS v_deleted, v.actor, \
+     s.created_at, s.updated_at, s.policy, s.restricted, s.access_epoch, v.version, v.value, v.comment, v.tags, v.deleted AS v_deleted, v.actor, \
      v.created_at AS v_created_at, v.generated";
 
 const SECRET_JOIN: &str =
@@ -214,6 +227,8 @@ fn secret_with_version_from(row: &AnyRow) -> StoreResult<SecretWithVersion> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         policy: row.try_get("policy")?,
+        restricted: get_flag(row, "restricted")?,
+        access_epoch: row.try_get("access_epoch")?,
     };
     let version = version_from(row, secret.id.clone(), "v_deleted", "v_created_at")?;
     Ok(SecretWithVersion { secret, version })
@@ -244,6 +259,7 @@ fn audit_from(row: &AnyRow) -> StoreResult<AuditEntry> {
         secret_key: row.try_get("secret_key")?,
         detail: from_json(&row.try_get::<String, _>("detail")?)?,
         ip: row.try_get("ip")?,
+        restricted: get_flag(row, "restricted")?,
     })
 }
 
@@ -339,6 +355,28 @@ fn audit_filter(query: &AuditQuery) -> Filter {
     if let Some(until) = query.until {
         let p = filter.bind(SqlParam::Int(until));
         filter.clauses.push(format!("created_at <= {p}"));
+    }
+    if let Some(visible) = &query.restricted_visible {
+        let mut allowed = Vec::with_capacity(visible.len());
+        for (environment, path, key) in visible {
+            let (e, p, k) = (
+                filter.bind(SqlParam::Text(environment.clone())),
+                filter.bind(SqlParam::Text(path.clone())),
+                filter.bind(SqlParam::Text(key.clone())),
+            );
+            allowed.push(format!(
+                "(COALESCE(environment, '') = {e} AND COALESCE(path, '') = {p} AND COALESCE(secret_key, '') = {k})"
+            ));
+        }
+        let clause = if allowed.is_empty() {
+            "restricted = 0".to_string()
+        } else {
+            format!(
+                "(restricted = 0 OR (action NOT IN ('secret.access', 'secret.write-refused') AND ({})))",
+                allowed.join(" OR ")
+            )
+        };
+        filter.clauses.push(clause);
     }
     if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let p = filter.bind(SqlParam::Text(format!("%{}%", like_literal(&search.to_lowercase()))));
@@ -736,6 +774,15 @@ impl SqlStore {
         }
     }
 
+    /// `select` holding the rows it reads until the transaction ends. SQLite already runs one
+    /// writer at a time, and has no such clause.
+    fn locking(&self, select: &'static str) -> sqlx::AssertSqlSafe<String> {
+        if self.postgres {
+            return audited(format!("{select} FOR UPDATE"));
+        }
+        audited(select.to_string())
+    }
+
     pub async fn ping(&self) -> StoreResult<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
@@ -971,6 +1018,10 @@ impl Store for SqlStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM identity_auth_methods WHERE identity_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM secret_grants WHERE principal_kind = 'identity' AND principal_id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1391,16 +1442,261 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()> {
-        let result = sqlx::query("UPDATE secrets SET policy = $1 WHERE id = $2")
+    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>, access_epoch: i64) -> StoreResult<()> {
+        let result = sqlx::query("UPDATE secrets SET policy = $1 WHERE id = $2 AND access_epoch = $3")
             .bind(policy)
             .bind(secret_id)
+            .bind(access_epoch)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
+            let exists = sqlx::query("SELECT 1 FROM secrets WHERE id = $1")
+                .bind(secret_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
+            return Err(if exists {
+                StoreError::Conflict
+            } else {
+                StoreError::NotFound
+            });
         }
         Ok(())
+    }
+
+    async fn set_project_secret_access(&self, project_id: &str, enabled: bool) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        // Holding the project row orders this against restricting a secret in the same project.
+        sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        if !enabled {
+            let restricted: i64 =
+                sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE project_id = $1 AND restricted = 1")
+                    .bind(project_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("n")?;
+            if restricted > 0 {
+                return Err(StoreError::Conflict);
+            }
+            // Lists left on open secrets would come back to life if the setting returned.
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id IN (SELECT id FROM secrets WHERE project_id = $1)")
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE secrets SET access_epoch = access_epoch + 1 WHERE project_id = $1")
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE projects SET secret_access = $1 WHERE id = $2")
+            .bind(flag(enabled))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn count_restricted_secrets(&self, project_id: &str) -> StoreResult<i64> {
+        Ok(
+            sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE project_id = $1 AND restricted = 1")
+                .bind(project_id)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("n")?,
+        )
+    }
+
+    async fn list_restricted_secrets(&self, project_id: &str) -> StoreResult<Vec<RestrictedSecret>> {
+        let rows = sqlx::query(
+            "SELECT s.id, e.slug, s.path, s.key, s.deleted, v.tags FROM secrets s \
+             JOIN environments e ON e.id = s.environment_id \
+             JOIN secret_versions v ON v.secret_id = s.id AND v.version = s.current_version \
+             WHERE s.project_id = $1 AND s.restricted = 1 ORDER BY e.position, e.slug, s.path, s.key",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RestrictedSecret {
+                    secret_id: row.try_get("id")?,
+                    environment: row.try_get("slug")?,
+                    path: row.try_get("path")?,
+                    key: row.try_get("key")?,
+                    deleted: get_flag(row, "deleted")?,
+                    tags: from_json(&row.try_get::<String, _>("tags")?)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_project_grants(&self, project_id: &str) -> StoreResult<Vec<SecretGrant>> {
+        collect(
+            sqlx::query(
+                "SELECT g.* FROM secret_grants g JOIN secrets s ON s.id = g.secret_id WHERE s.project_id = $1 \
+                 ORDER BY g.secret_id, g.principal_kind, g.principal_id",
+            )
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?,
+            grant_from,
+        )
+    }
+
+    async fn environment_access(&self, environment_id: &str) -> StoreResult<EnvironmentAccess> {
+        // One statement, so the epochs and the entries come from the same moment.
+        let rows = sqlx::query(
+            "SELECT s.id AS sid, s.access_epoch, g.principal_kind, g.principal_id, g.actions, g.created_at \
+             FROM secrets s LEFT JOIN secret_grants g ON g.secret_id = s.id \
+             WHERE s.environment_id = $1 AND s.restricted = 1",
+        )
+        .bind(environment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut access = EnvironmentAccess::default();
+        for row in &rows {
+            let secret_id: String = row.try_get("sid")?;
+            access.epochs.insert(secret_id.clone(), row.try_get("access_epoch")?);
+            let Some(actions) = row.try_get::<Option<String>, _>("actions")? else {
+                continue;
+            };
+            let kind: String = row.try_get("principal_kind")?;
+            access.grants.push(SecretGrant {
+                secret_id,
+                principal_kind: PrincipalKind::parse(&kind)
+                    .ok_or_else(|| StoreError::Corrupt(format!("unknown principal kind {kind}")))?,
+                principal_id: row.try_get("principal_id")?,
+                actions: from_json(&actions)?,
+                created_at: row.try_get("created_at")?,
+            });
+        }
+        Ok(access)
+    }
+
+    async fn previous_snapshot(&self, snapshot: &Snapshot) -> StoreResult<Option<Snapshot>> {
+        let row = sqlx::query(
+            "SELECT * FROM snapshots WHERE environment_id = $1 AND (created_at < $2 OR (created_at = $3 AND id < $4)) \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&snapshot.environment_id)
+        .bind(snapshot.created_at)
+        .bind(snapshot.created_at)
+        .bind(&snapshot.id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(snapshot_from).transpose()
+    }
+
+    async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>> {
+        collect(
+            sqlx::query(
+                "SELECT g.* FROM secret_grants g JOIN secrets s ON s.id = g.secret_id WHERE s.environment_id = $1 \
+                 ORDER BY g.secret_id, g.principal_kind, g.principal_id",
+            )
+            .bind(environment_id)
+            .fetch_all(&self.pool)
+            .await?,
+            grant_from,
+        )
+    }
+
+    async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>> {
+        collect(
+            sqlx::query("SELECT * FROM secret_grants WHERE secret_id = $1 ORDER BY principal_kind, principal_id")
+                .bind(secret_id)
+                .fetch_all(&self.pool)
+                .await?,
+            grant_from,
+        )
+    }
+
+    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<Vec<SecretGrant>> {
+        let mut tx = self.pool.begin().await?;
+        let project_id: String = sqlx::query("SELECT project_id FROM secrets WHERE id = $1")
+            .bind(&change.secret_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?
+            .try_get("project_id")?;
+        let enabled = sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
+            .bind(&project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let widens = change.restricted == Some(true) || !change.grant.is_empty();
+        if widens && !get_flag(&enabled, "secret_access")? {
+            return Err(StoreError::Conflict);
+        }
+        if let Some(restricted) = change.restricted {
+            sqlx::query("UPDATE secrets SET restricted = $1 WHERE id = $2")
+                .bind(flag(restricted))
+                .bind(&change.secret_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Read under the project lock, so what is recorded as cleared is what was removed.
+        let mut cleared = Vec::new();
+        if change.restricted == Some(false) {
+            cleared = collect(
+                sqlx::query("SELECT * FROM secret_grants WHERE secret_id = $1 ORDER BY principal_kind, principal_id")
+                    .bind(&change.secret_id)
+                    .fetch_all(&mut *tx)
+                    .await?,
+                grant_from,
+            )?;
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1")
+                .bind(&change.secret_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE secrets SET access_epoch = access_epoch + 1 WHERE id = $1")
+            .bind(&change.secret_id)
+            .execute(&mut *tx)
+            .await?;
+        for (kind, id) in &change.revoke {
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1 AND principal_kind = $2 AND principal_id = $3")
+                .bind(&change.secret_id)
+                .bind(kind.as_str())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for grant in &change.grant {
+            if grant.secret_id != change.secret_id {
+                return Err(StoreError::Corrupt("a grant names another secret".into()));
+            }
+            sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1 AND principal_kind = $2 AND principal_id = $3")
+                .bind(&grant.secret_id)
+                .bind(grant.principal_kind.as_str())
+                .bind(&grant.principal_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO secret_grants (secret_id, principal_kind, principal_id, actions, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&grant.secret_id)
+            .bind(grant.principal_kind.as_str())
+            .bind(&grant.principal_id)
+            .bind(to_json(&grant.actions)?)
+            .bind(grant.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let entries: i64 = sqlx::query("SELECT COUNT(*) AS n FROM secret_grants WHERE secret_id = $1")
+            .bind(&change.secret_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?;
+        if usize::try_from(entries).map_or(true, |n| n > change.max_grants) {
+            return Err(StoreError::Conflict);
+        }
+        tx.commit().await?;
+        Ok(cleared)
     }
 
     async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>> {
@@ -1430,13 +1726,33 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn delete_project(&self, id: &str) -> StoreResult<()> {
+    async fn delete_project(&self, id: &str, spare_restricted: bool) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        if spare_restricted {
+            // Under the project lock, so nothing is restricted between this check and the delete.
+            sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let restricted: i64 =
+                sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE project_id = $1 AND restricted = 1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("n")?;
+            if restricted > 0 {
+                return Err(StoreError::HoldsRestricted);
+            }
+        }
         sqlx::query("DELETE FROM project_logos WHERE project_id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE project_id = $1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM secret_grants WHERE secret_id IN (SELECT id FROM secrets WHERE project_id = $1)")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1726,8 +2042,16 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn delete_environment(&self, id: &str) -> StoreResult<()> {
+    async fn delete_environment(&self, id: &str, spare_restricted: bool) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        if spare_restricted {
+            sqlx::query(self.locking(
+                "SELECT p.secret_access FROM projects p JOIN environments e ON e.project_id = p.id WHERE e.id = $1",
+            ))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
         // Checked inside the transaction so a secret written meanwhile is not lost with its history.
         let live: i64 = sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE environment_id = $1 AND deleted = 0")
             .bind(id)
@@ -1737,12 +2061,27 @@ impl Store for SqlStore {
         if live > 0 {
             return Err(StoreError::Conflict);
         }
+        if spare_restricted {
+            let restricted: i64 =
+                sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE environment_id = $1 AND restricted = 1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("n")?;
+            if restricted > 0 {
+                return Err(StoreError::HoldsRestricted);
+            }
+        }
         sqlx::query(
             "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE environment_id = $1)",
         )
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM secret_grants WHERE secret_id IN (SELECT id FROM secrets WHERE environment_id = $1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM secrets WHERE environment_id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -1913,12 +2252,22 @@ impl Store for SqlStore {
 
     async fn write_secrets(&self, batch: WriteBatch) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        if batch.changes.iter().any(|c| c.restricted) {
+            let project = sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
+                .bind(&batch.project_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+            if !get_flag(&project, "secret_access")? {
+                return Err(StoreError::Conflict);
+            }
+        }
         for change in &batch.changes {
             let v = &change.version;
             if change.previous_version == 0 {
                 sqlx::query(
                     "INSERT INTO secrets (id, project_id, environment_id, path, key, current_version, deleted, \
-                     created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                     created_at, updated_at, restricted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 )
                 .bind(&change.secret_id)
                 .bind(&batch.project_id)
@@ -1929,12 +2278,13 @@ impl Store for SqlStore {
                 .bind(flag(v.deleted))
                 .bind(batch.now)
                 .bind(batch.now)
+                .bind(flag(change.restricted))
                 .execute(&mut *tx)
                 .await?;
             } else {
                 let result = sqlx::query(
                     "UPDATE secrets SET current_version = $1, deleted = $2, updated_at = $3 \
-                     WHERE id = $4 AND current_version = $5 AND environment_id = $6",
+                     WHERE id = $4 AND current_version = $5 AND environment_id = $6 AND access_epoch = $7",
                 )
                 .bind(v.version)
                 .bind(flag(v.deleted))
@@ -1942,10 +2292,22 @@ impl Store for SqlStore {
                 .bind(&change.secret_id)
                 .bind(change.previous_version)
                 .bind(&batch.environment_id)
+                .bind(change.access_epoch)
                 .execute(&mut *tx)
                 .await?;
                 if result.rows_affected() != 1 {
                     return Err(StoreError::Conflict);
+                }
+                if change.restricted {
+                    // Brought back restricted with an empty list, as a new restricted secret starts.
+                    sqlx::query("UPDATE secrets SET restricted = 1, access_epoch = access_epoch + 1 WHERE id = $1")
+                        .bind(&change.secret_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1")
+                        .bind(&change.secret_id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
             }
             sqlx::query(
@@ -2028,7 +2390,7 @@ impl Store for SqlStore {
     async fn insert_audit(&self, entry: AuditEntry) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO audit_log (id, created_at, actor_kind, actor_id, actor_name, action, project_id, environment, \
-             path, secret_key, detail, ip) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             path, secret_key, detail, ip, restricted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&entry.id)
         .bind(entry.created_at)
@@ -2042,6 +2404,7 @@ impl Store for SqlStore {
         .bind(entry.secret_key.clone())
         .bind(to_json(&entry.detail)?)
         .bind(&entry.ip)
+        .bind(flag(entry.restricted))
         .execute(&self.pool)
         .await?;
         Ok(())

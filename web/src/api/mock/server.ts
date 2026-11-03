@@ -18,6 +18,7 @@ import type {
   PolicyOverride,
   PrincipalKind,
   PutRole,
+  SecretAccessChange,
   SecretPolicy,
   SetSecret,
   SetUnlockPolicy,
@@ -42,7 +43,7 @@ import { hasControls, takeControls } from "./controls";
 import { loadStrengthChecker } from "@/lib/passphrase";
 
 // Bumped whenever the stored shape changes, so an old session reseeds instead of breaking.
-const STORAGE_KEY = "sekret-mock-state-v4";
+const STORAGE_KEY = "sekret-mock-state-v5";
 const LATENCY_MS = 80;
 
 function loadState(): MockState {
@@ -238,6 +239,10 @@ route("PUT", `${P}/logo`, async (b, c) => b.putLogo(c.params[0], c.raw, await re
 route("DELETE", `${P}/logo`, (b, c) => b.deleteLogo(c.params[0]));
 route("GET", `${P}/secret-policy`, (b, c) => b.getProjectPolicy(c.params[0]));
 route("PUT", `${P}/secret-policy`, (b, c) => b.putProjectPolicy(c.params[0], body<SecretPolicy>(c)));
+route("GET", `${P}/secret-access`, (b, c) => b.getSecretAccessSetting(c.params[0]));
+route("PUT", `${P}/secret-access`, (b, c) =>
+  b.putSecretAccessSetting(c.params[0], body<{ enabled: boolean }>(c).enabled),
+);
 
 route("GET", `${P}/environments`, (b, c) => b.listEnvironments(c.params[0]));
 route("POST", `${P}/environments`, (b, c) => b.createEnvironment(c.params[0], body<CreateEnvironment>(c)), 201);
@@ -268,6 +273,10 @@ route("POST", `${E}/secrets/{key}/generate`, (b, c) =>
 route("GET", `${E}/secrets/{key}/policy`, (b, c) => b.getSecretPolicy(c.params[0], c.params[1], c.params[2], qs(c, "path")));
 route("PUT", `${E}/secrets/{key}/policy`, (b, c) =>
   b.putSecretPolicy(c.params[0], c.params[1], c.params[2], qs(c, "path"), body<PolicyOverride>(c)),
+);
+route("GET", `${E}/secrets/{key}/access`, (b, c) => b.getSecretAccess(c.params[0], c.params[1], c.params[2], qs(c, "path")));
+route("PATCH", `${E}/secrets/{key}/access`, (b, c) =>
+  b.changeSecretAccess(c.params[0], c.params[1], c.params[2], qs(c, "path"), body<SecretAccessChange>(c)),
 );
 
 route("GET", `${E}/snapshots`, (b, c) => b.listSnapshots(c.params[0], c.params[1]));

@@ -20,13 +20,14 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::{AuditTarget, api_env, audit, find_env, load_project, secret_ctx};
+use super::{AuditTarget, api_env, audit, audit_refusal_at, find_env, load_project, secret_ctx};
 use crate::auth::{ClientIp, Principal};
-use crate::authz::{allowed, require};
+use crate::authz::{Caller, SecretAccess, allowed, require, secret_access};
 use crate::error::{ApiError, ApiResult};
-use crate::rotation::{Target, effective_policy, plan_generated, secret_override};
+use crate::rotation::{Generation, Target, effective_policy, plan_generated, secret_override};
 use crate::secrets::{
-    apply, data_key, decrypt, plan_batch, plan_restore, plan_rollback, secret_resource, snapshot_changes, to_api,
+    SecretCtx, apply, data_key, decrypt, plan_batch, plan_restore, plan_rollback, secret_resource, snapshot_changes,
+    to_api,
 };
 use crate::state::AppState;
 
@@ -101,12 +102,32 @@ struct Scope {
     project: Project,
     env: Environment,
     rules: Vec<sekret_core::permissions::Rule>,
+    access: SecretAccess,
+}
+
+impl Scope {
+    fn caller(&self) -> Caller<'_> {
+        Caller {
+            rules: &self.rules,
+            access: &self.access,
+        }
+    }
+
+    fn resource<'a>(&'a self, s: &'a sekret_store::Secret, tags: &'a [String]) -> Resource<'a> {
+        secret_resource(&self.env.slug, &s.path, &s.key, tags, self.access.of(s))
+    }
 }
 
 async fn scope(state: &AppState, principal: &Principal, project: &str, env: &str) -> ApiResult<Scope> {
     let (project, rules) = load_project(state, principal, project).await?;
     let env = find_env(state, &project, &rules, env).await?;
-    Ok(Scope { project, env, rules })
+    let access = secret_access(state, principal, &project, &env.id).await?;
+    Ok(Scope {
+        project,
+        env,
+        rules,
+        access,
+    })
 }
 
 /// Pattern checks a listing may run on an async worker before it moves to the blocking pool.
@@ -121,21 +142,22 @@ static CHECK_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
 /// The secrets in `env` the rules allow every one of `actions` on. A long list checked against
 /// many patterns runs on the blocking pool, so it cannot stall the workers other requests need.
 async fn permitted(
-    rules: &[Rule],
+    caller: Caller<'_>,
     env: &str,
     secrets: Vec<SecretWithVersion>,
     actions: &'static [Action],
 ) -> ApiResult<Vec<SecretWithVersion>> {
-    permitted_with(&CHECK_SLOTS, rules, env, secrets, actions).await
+    permitted_with(&CHECK_SLOTS, caller, env, secrets, actions).await
 }
 
 async fn permitted_with(
     slots: &Arc<Semaphore>,
-    rules: &[Rule],
+    caller: Caller<'_>,
     env: &str,
     secrets: Vec<SecretWithVersion>,
     actions: &'static [Action],
 ) -> ApiResult<Vec<SecretWithVersion>> {
+    let rules = caller.rules;
     // Bindings are capped when made, but groups come from the identity provider at sign-in.
     let checked = rules
         .iter()
@@ -152,14 +174,23 @@ async fn permitted_with(
             ),
         ));
     }
-    let keep = |rules: &[Rule], env: &str, s: &SecretWithVersion| {
-        let resource = secret_resource(env, &s.secret.path, &s.secret.key, &s.version.tags);
+    let keep = |rules: &[Rule], access: &SecretAccess, env: &str, s: &SecretWithVersion| {
+        let resource = secret_resource(
+            env,
+            &s.secret.path,
+            &s.secret.key,
+            &s.version.tags,
+            access.of(&s.secret),
+        );
         actions
             .iter()
             .all(|action| allowed(rules, Subject::Secrets, *action, &resource))
     };
     if !runs_off_runtime(secrets.len(), rules) {
-        return Ok(secrets.into_iter().filter(|s| keep(rules, env, s)).collect());
+        return Ok(secrets
+            .into_iter()
+            .filter(|s| keep(rules, caller.access, env, s))
+            .collect());
     }
     let slot = slots
         .clone()
@@ -167,10 +198,11 @@ async fn permitted_with(
         .await
         .map_err(|e| ApiError::internal("permission check", e))?;
     let rules = rules.to_vec();
+    let access = caller.access.clone();
     let env = env.to_string();
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        secrets.into_iter().filter(|s| keep(&rules, &env, s)).collect()
+        secrets.into_iter().filter(|s| keep(&rules, &access, &env, s)).collect()
     })
     .await
     .map_err(|e| ApiError::internal("permission check", e))
@@ -189,7 +221,7 @@ async fn load_secret(state: &AppState, scope: &Scope, path: &str, key: &str) -> 
                 &scope.rules,
                 Subject::Secrets,
                 Action::Read,
-                &secret_resource(&scope.env.slug, &path, key, &s.version.tags),
+                &scope.resource(&s.secret, &s.version.tags),
             )
     });
     readable.map(|s| (path, s)).ok_or_else(|| ApiError::not_found("secret"))
@@ -210,7 +242,7 @@ async fn load_history(
             &scope.rules,
             Subject::Secrets,
             Action::Read,
-            &secret_resource(&scope.env.slug, &path, key, &s.version.tags),
+            &scope.resource(&s.secret, &s.version.tags),
         )
     });
     readable.map(|s| (path, s)).ok_or_else(|| ApiError::not_found("secret"))
@@ -237,7 +269,7 @@ async fn list_secrets(
     } else {
         None
     };
-    let readable = permitted(&scope.rules, &scope.env.slug, stored, &[Action::Read]).await?;
+    let readable = permitted(scope.caller(), &scope.env.slug, stored, &[Action::Read]).await?;
     let mut secrets = Vec::with_capacity(readable.len());
     for s in &readable {
         secrets.push(to_api(
@@ -245,7 +277,7 @@ async fn list_secrets(
             &scope.project,
             &scope.env.slug,
             s,
-            &scope.rules,
+            scope.caller(),
             params.values,
         )?);
     }
@@ -276,6 +308,7 @@ async fn list_secrets(
         .collect();
     if params.values {
         let revealed = secrets.iter().filter(|s| s.value.is_some()).count();
+        let restricted = secrets.iter().any(|s| s.value.is_some() && s.restricted);
         audit(
             &state,
             &principal,
@@ -286,6 +319,7 @@ async fn list_secrets(
                 environment: Some(&scope.env.slug),
                 path: Some(&path),
                 key: None,
+                restricted,
             },
             json!({"count": revealed, "recursive": params.recursive}),
         )
@@ -304,10 +338,29 @@ async fn write(
     deletes: Vec<String>,
 ) -> ApiResult<BatchResult> {
     let ctx = secret_ctx(state, principal)?;
-    let planned = plan_batch(&ctx, &scope.rules, &scope.project, &scope.env, path, upserts, deletes).await?;
+    let planned = plan_batch(&ctx, scope.caller(), &scope.project, &scope.env, path, upserts, deletes).await;
+    let planned = match planned {
+        Ok(planned) => planned,
+        Err(error) => {
+            refused_collision(state, principal, ip, scope, &ctx).await;
+            return Err(error);
+        }
+    };
+    let restricted: Vec<String> = planned
+        .batch
+        .iter()
+        .flat_map(|b| &b.changes)
+        .filter(|c| c.restricted)
+        .map(|c| c.key.clone())
+        .collect();
+    let touches_restricted = planned.touches_restricted;
     let result = apply(&ctx, planned).await?;
     let normalised = validate::folder_path(path)?;
     if result.snapshot_id.is_some() {
+        let mut detail = json!({"created": result.created, "updated": result.updated, "deleted": result.deleted});
+        if !restricted.is_empty() {
+            detail["restricted"] = json!(restricted);
+        }
         audit(
             state,
             principal,
@@ -318,12 +371,46 @@ async fn write(
                 environment: Some(&scope.env.slug),
                 path: Some(&normalised),
                 key: None,
+                restricted: touches_restricted,
             },
-            json!({"created": result.created, "updated": result.updated, "deleted": result.deleted}),
+            detail,
         )
         .await;
     }
     Ok(result)
+}
+
+/// Records a write refused because it landed on a secret hidden from the caller, so probing for
+/// hidden names leaves a trace that only admins see. Repeats within a minute fold into one entry.
+async fn refused_collision(
+    state: &AppState,
+    principal: &Principal,
+    ip: std::net::IpAddr,
+    scope: &Scope,
+    ctx: &SecretCtx<'_>,
+) {
+    let landed = ctx.hidden_collision.lock().ok().and_then(|mut slot| slot.take());
+    let Some((path, key)) = landed else {
+        return;
+    };
+    let (path, key) = (path.as_str(), key.as_str());
+    let subject = format!("{}/{}{path}/{key}", scope.project.id, scope.env.slug);
+    audit_refusal_at(
+        state,
+        principal,
+        &subject,
+        ip,
+        "secret.write-refused",
+        AuditTarget {
+            project_id: Some(&scope.project.id),
+            environment: Some(&scope.env.slug),
+            path: Some(path),
+            key: Some(key),
+            restricted: true,
+        },
+        json!({"reason": "hidden"}),
+    )
+    .await;
 }
 
 #[utoipa::path(post, path = "/api/v1/projects/{project}/environments/{env}/secrets/batch", tag = "secrets",
@@ -367,7 +454,7 @@ async fn get_secret(
     let scope = scope(&state, &principal, &project, &env).await?;
     let (path, s) = load_secret(&state, &scope, &params.path, &key).await?;
     let dk = data_key(state.keyring.root()?.as_ref(), &scope.project)?;
-    let secret = to_api(Some(&dk), &scope.project, &scope.env.slug, &s, &scope.rules, true)?;
+    let secret = to_api(Some(&dk), &scope.project, &scope.env.slug, &s, scope.caller(), true)?;
     if secret.value.is_some() {
         audit(
             &state,
@@ -379,6 +466,7 @@ async fn get_secret(
                 environment: Some(&scope.env.slug),
                 path: Some(&path),
                 key: Some(&key),
+                restricted: s.secret.restricted,
             },
             json!({}),
         )
@@ -404,6 +492,7 @@ async fn put_secret(
         value: request.value,
         comment: request.comment,
         tags: request.tags,
+        restricted: request.restricted,
     };
     Ok(Json(
         write(&state, &principal, ip, &scope, &params.path, vec![upsert], vec![]).await?,
@@ -442,7 +531,7 @@ async fn list_versions(
     let limit = params.page_size()?;
     let scope = scope(&state, &principal, &project, &env).await?;
     let (path, s) = load_history(&state, &scope, &params.path, &key).await?;
-    let resource = secret_resource(&scope.env.slug, &path, &key, &s.version.tags);
+    let resource = scope.resource(&s.secret, &s.version.tags);
     require(&scope.rules, Subject::SecretVersions, Action::Read, &resource)?;
     let may_reveal = |resource: &Resource<'_>| {
         allowed(&scope.rules, Subject::SecretVersions, Action::ReadValue, resource)
@@ -454,7 +543,7 @@ async fn list_versions(
     let mut revealed_any = false;
     for v in state.store.list_versions(&s.secret.id, params.before, limit).await? {
         // Each version is judged by its own tags as well, so retagging cannot expose old values.
-        let own = secret_resource(&scope.env.slug, &path, &key, &v.tags);
+        let own = scope.resource(&s.secret, &v.tags);
         let reveal = reveal_current && may_reveal(&own);
         revealed_any |= reveal;
         let value = if reveal {
@@ -492,6 +581,7 @@ async fn list_versions(
                 environment: Some(&scope.env.slug),
                 path: Some(&path),
                 key: Some(&key),
+                restricted: s.secret.restricted,
             },
             json!({}),
         )
@@ -516,13 +606,14 @@ async fn rollback(
     let ctx = secret_ctx(&state, &principal)?;
     let planned = plan_rollback(
         &ctx,
-        &scope.rules,
+        scope.caller(),
         &scope.project,
         &scope.env,
         &current,
         request.version,
     )
     .await?;
+    let restricted = planned.touches_restricted;
     let result = apply(&ctx, planned).await?;
     audit(
         &state,
@@ -534,6 +625,7 @@ async fn rollback(
             environment: Some(&scope.env.slug),
             path: Some(&path),
             key: Some(&key),
+            restricted,
         },
         json!({"to_version": request.version}),
     )
@@ -562,7 +654,19 @@ async fn generate_secret(
         path: &path,
         key: &key,
     };
-    let planned = plan_generated(&ctx, &scope.rules, target, request.generator, request.comment).await?;
+    let request = Generation {
+        generator: request.generator,
+        comment: request.comment,
+        restricted: request.restricted,
+    };
+    let planned = match plan_generated(&ctx, scope.caller(), target, request).await {
+        Ok(planned) => planned,
+        Err(error) => {
+            refused_collision(&state, &principal, ip, &scope, &ctx).await;
+            return Err(error);
+        }
+    };
+    let restricted = planned.touches_restricted;
     let result = apply(&ctx, planned).await?;
     audit(
         &state,
@@ -574,6 +678,7 @@ async fn generate_secret(
             environment: Some(&scope.env.slug),
             path: Some(&path),
             key: Some(&key),
+            restricted,
         },
         json!({"created": !result.created.is_empty()}),
     )
@@ -618,8 +723,12 @@ async fn put_secret_policy(
 ) -> ApiResult<Json<SecretPolicyView>> {
     let scope = scope(&state, &principal, &project, &env).await?;
     let (path, mut s) = load_secret(&state, &scope, &params.path, &key).await?;
-    let resource = secret_resource(&scope.env.slug, &path, &key, &s.version.tags);
-    require(&scope.rules, Subject::Secrets, Action::Edit, &resource)?;
+    require(
+        &scope.rules,
+        Subject::Secrets,
+        Action::Edit,
+        &scope.resource(&s.secret, &s.version.tags),
+    )?;
     if let PolicyOverride::Custom(policy) = &request {
         policy.validate().map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
@@ -627,7 +736,11 @@ async fn put_secret_policy(
         PolicyOverride::Inherit => None,
         custom => Some(serde_json::to_string(&custom).map_err(|e| ApiError::internal("secret policy", e))?),
     };
-    state.store.set_secret_policy(&s.secret.id, stored.clone()).await?;
+    let epoch = scope.access.planned_epoch(&s.secret);
+    state
+        .store
+        .set_secret_policy(&s.secret.id, stored.clone(), epoch)
+        .await?;
     s.secret.policy = stored;
     audit(
         &state,
@@ -639,6 +752,7 @@ async fn put_secret_policy(
             environment: Some(&scope.env.slug),
             path: Some(&path),
             key: Some(&key),
+            restricted: s.secret.restricted,
         },
         json!({"policy": request}),
     )
@@ -666,8 +780,13 @@ async fn overview(
         if !allowed(&rules, Subject::Environments, Action::Read, &env_resource) {
             continue;
         }
+        let access = secret_access(&state, &principal, &project, &env.id).await?;
+        let caller = Caller {
+            rules: &rules,
+            access: &access,
+        };
         let stored = state.store.list_secrets(&env.id, &path, false, false).await?;
-        for s in permitted(&rules, &env.slug, stored, &[Action::Read]).await? {
+        for s in permitted(caller, &env.slug, stored, &[Action::Read]).await? {
             rows.entry((s.secret.path, s.secret.key))
                 .or_default()
                 .insert(env.slug.clone(), s.secret.current_version);
@@ -715,18 +834,59 @@ fn without_counts(reason: &str) -> String {
     format!("secrets changed{}", &reason[end + END.len()..])
 }
 
+/// A rollback reason without the version number, which belongs to a secret the reader may not see.
+fn without_version(reason: &str) -> String {
+    const ROLLBACK: &str = "rolled back a secret to version ";
+    if reason.starts_with(ROLLBACK) {
+        return "rolled back a secret".to_string();
+    }
+    reason.to_string()
+}
+
+/// The secrets whose version differs between a snapshot and the one before it, or all of its
+/// secrets when there is none before it.
+fn changed_ids<'a>(
+    snapshot: &'a sekret_store::Snapshot,
+    previous: Option<&'a sekret_store::Snapshot>,
+) -> HashSet<&'a str> {
+    let versions = |s: &'a sekret_store::Snapshot| -> HashSet<(&'a str, i64)> {
+        s.entries.iter().map(|e| (e.secret_id.as_str(), e.version)).collect()
+    };
+    let now = versions(snapshot);
+    let Some(previous) = previous else {
+        return now.into_iter().map(|(id, _)| id).collect();
+    };
+    let before = versions(previous);
+    now.symmetric_difference(&before).map(|(id, _)| *id).collect()
+}
+
+/// Whether every change a snapshot records is to a secret the reader may not see, so the
+/// snapshot would only tell them that something hidden changed.
+fn only_hidden_changes(
+    snapshot: &sekret_store::Snapshot,
+    previous: Option<&sekret_store::Snapshot>,
+    readable: Option<&HashSet<String>>,
+) -> bool {
+    let Some(ids) = readable else {
+        return false;
+    };
+    let changed = changed_ids(snapshot, previous);
+    !changed.is_empty() && changed.iter().all(|id| !ids.contains(*id))
+}
+
 /// The ids of secrets in the scope's environment the reader may read, or `None` when they may
 /// read all of them.
 async fn readable_secret_ids(state: &AppState, scope: &Scope) -> ApiResult<Option<HashSet<String>>> {
     let whole = Resource {
         environment: Some(&scope.env.slug),
+        access: scope.access.spanning(&scope.project),
         ..Default::default()
     };
     if allowed(&scope.rules, Subject::Secrets, Action::Read, &whole) {
         return Ok(None);
     }
     let secrets = state.store.list_secrets(&scope.env.id, "/", true, true).await?;
-    let readable = permitted(&scope.rules, &scope.env.slug, secrets, &[Action::Read]).await?;
+    let readable = permitted(scope.caller(), &scope.env.slug, secrets, &[Action::Read]).await?;
     Ok(Some(readable.into_iter().map(|s| s.secret.id).collect()))
 }
 
@@ -745,7 +905,7 @@ fn api_snapshot(scope: &Scope, s: &sekret_store::Snapshot, readable: Option<&Has
     let (reason, secret_count) = match readable {
         None => (reason, s.entries.len()),
         Some(ids) => (
-            without_counts(&reason),
+            without_version(&without_counts(&reason)),
             s.entries.iter().filter(|e| ids.contains(&e.secret_id)).count(),
         ),
     };
@@ -771,15 +931,21 @@ async fn list_snapshots(
         ..Default::default()
     };
     require(&scope.rules, Subject::Snapshots, Action::Read, &env_resource)?;
-    let snapshots = state.store.list_snapshots(&scope.env.id, 200).await?;
+    // One more than is shown, so the oldest shown has the one before it to compare with.
+    let snapshots = state.store.list_snapshots(&scope.env.id, SNAPSHOTS_SHOWN + 1).await?;
     let readable = readable_secret_ids(&state, &scope).await?;
     Ok(Json(
         snapshots
             .iter()
-            .map(|s| api_snapshot(&scope, s, readable.as_ref()))
+            .enumerate()
+            .take(SNAPSHOTS_SHOWN as usize)
+            .filter(|(i, s)| !only_hidden_changes(s, snapshots.get(i + 1), readable.as_ref()))
+            .map(|(_, s)| api_snapshot(&scope, s, readable.as_ref()))
             .collect(),
     ))
 }
+
+const SNAPSHOTS_SHOWN: i64 = 200;
 
 async fn load_snapshot(state: &AppState, scope: &Scope, id: &str) -> ApiResult<sekret_store::Snapshot> {
     state
@@ -808,8 +974,14 @@ async fn get_snapshot(
     let snapshot = load_snapshot(&state, &scope, &id).await?;
     let path = validate::folder_path(&params.path)?;
     let current = state.store.list_secrets(&scope.env.id, &path, true, true).await?;
-    let readable = permitted(&scope.rules, &scope.env.slug, current, &[Action::Read]).await?;
+    let readable = permitted(scope.caller(), &scope.env.slug, current, &[Action::Read]).await?;
     let readable_ids = readable_secret_ids(&state, &scope).await?;
+    if readable_ids.is_some() {
+        let previous = state.store.previous_snapshot(&snapshot).await?;
+        if only_hidden_changes(&snapshot, previous.as_ref(), readable_ids.as_ref()) {
+            return Err(ApiError::not_found("snapshot"));
+        }
+    }
     Ok(Json(SnapshotDetail {
         snapshot: api_snapshot(&scope, &snapshot, readable_ids.as_ref()),
         changes: snapshot_changes(&readable, &snapshot, &path),
@@ -836,11 +1008,11 @@ async fn restore_snapshot(
     require(&scope.rules, Subject::Snapshots, Action::Edit, &env_resource)?;
     let snapshot = load_snapshot(&state, &scope, &id).await?;
     let current = state.store.list_secrets(&scope.env.id, &path, true, true).await?;
-    let readable = permitted(&scope.rules, &scope.env.slug, current, &[Action::Read]).await?;
+    let readable = permitted(scope.caller(), &scope.env.slug, current, &[Action::Read]).await?;
     let ctx = secret_ctx(&state, &principal)?;
     let planned = plan_restore(
         &ctx,
-        &scope.rules,
+        scope.caller(),
         &scope.project,
         &scope.env,
         &snapshot,
@@ -848,6 +1020,7 @@ async fn restore_snapshot(
         &readable,
     )
     .await?;
+    let restricted = planned.touches_restricted;
     let result = apply(&ctx, planned).await?;
     audit(
         &state,
@@ -859,6 +1032,7 @@ async fn restore_snapshot(
             environment: Some(&scope.env.slug),
             path: Some(&path),
             key: None,
+            restricted,
         },
         json!({"snapshot": id, "created": result.created, "updated": result.updated, "deleted": result.deleted}),
     )
@@ -893,13 +1067,14 @@ async fn raw_secrets(
         .list_secrets(&scope.env.id, &path, params.recursive, false)
         .await?;
     let readable = permitted(
-        &scope.rules,
+        scope.caller(),
         &scope.env.slug,
         stored,
         &[Action::Read, Action::ReadValue],
     )
     .await?;
     let mut secrets = Vec::new();
+    let restricted = readable.iter().any(|s| s.secret.restricted);
     for s in readable {
         if let Some(value) = decrypt(&dk, &scope.project.id, &s.version)? {
             secrets.push(RawSecret {
@@ -919,6 +1094,7 @@ async fn raw_secrets(
             environment: Some(&scope.env.slug),
             path: Some(&path),
             key: None,
+            restricted,
         },
         json!({"count": secrets.len(), "recursive": params.recursive, "raw": true}),
     )
@@ -948,6 +1124,8 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 policy: None,
+                restricted: false,
+                access_epoch: 0,
             },
             version: sekret_store::SecretVersion {
                 secret_id: format!("{path}/{key}"),
@@ -961,6 +1139,79 @@ mod tests {
                 generated: false,
             },
         }
+    }
+
+    static NO_LISTS: LazyLock<SecretAccess> = LazyLock::new(SecretAccess::default);
+
+    fn open(rules: &[Rule]) -> Caller<'_> {
+        Caller {
+            rules,
+            access: &NO_LISTS,
+        }
+    }
+
+    /// Restricted secrets are kept only for callers whose list lets every action through,
+    /// whichever thread the check runs on.
+    #[tokio::test]
+    async fn listings_keep_restricted_secrets_only_for_those_listed() -> anyhow::Result<()> {
+        let principal = Principal {
+            kind: sekret_store::PrincipalKind::Identity,
+            id: "pod".into(),
+            name: "pod".into(),
+            email: String::new(),
+            groups: Vec::new(),
+            token_id: "t".into(),
+            token_kind: "machine".into(),
+        };
+        let grant = |secret: &str, actions: &[Action]| sekret_store::SecretGrant {
+            secret_id: format!("/{secret}"),
+            principal_kind: sekret_store::PrincipalKind::Identity,
+            principal_id: "pod".into(),
+            actions: actions.to_vec(),
+            created_at: 0,
+        };
+        let access = SecretAccess::listed(
+            &principal,
+            vec![
+                grant("SHARED", &[Action::Read, Action::ReadValue]),
+                grant("LISTED", &[Action::Read]),
+            ],
+        );
+        for patterns in [1, 200] {
+            let rules = rules(patterns);
+            let mut secrets: Vec<SecretWithVersion> = ["OPEN", "SHARED", "LISTED", "HIDDEN"]
+                .iter()
+                .map(|key| stored("", key))
+                .collect();
+            for s in secrets.iter_mut().filter(|s| s.secret.key != "OPEN") {
+                s.secret.restricted = true;
+            }
+            secrets.extend((0..200).map(|i| stored("/hidden0", &format!("K{i}"))));
+            let caller = Caller {
+                rules: &rules,
+                access: &access,
+            };
+            let keys = |kept: Vec<SecretWithVersion>| kept.into_iter().map(|s| s.secret.key).collect::<Vec<_>>();
+            let readable = permitted(caller, "prod", secrets.clone(), &[Action::Read])
+                .await
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+            assert_eq!(keys(readable), ["OPEN", "SHARED", "LISTED"], "{patterns} patterns");
+            let mut values_rules = rules.clone();
+            values_rules.push(Rule::allow(Subject::Secrets, &[Action::ReadValue]));
+            let values = permitted(
+                Caller {
+                    rules: &values_rules,
+                    access: &access,
+                },
+                "prod",
+                secrets,
+                &[Action::Read, Action::ReadValue],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+            assert_eq!(keys(values), ["OPEN", "SHARED"], "{patterns} patterns");
+        }
+        Ok(())
     }
 
     fn rules(patterns: usize) -> Vec<Rule> {
@@ -988,7 +1239,7 @@ mod tests {
                 .collect();
             let off = runs_off_runtime(secrets.len(), &rules);
             assert_eq!(off, patterns > 1, "{patterns} patterns");
-            let kept = permitted(&rules, "prod", secrets, &[Action::Read])
+            let kept = permitted(open(&rules), "prod", secrets, &[Action::Read])
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
             assert_eq!(kept.len(), 100);
@@ -1004,12 +1255,12 @@ mod tests {
         let mut over = rules(MAX_ROLE_PATTERNS_FOR_TEST);
         over.extend(rules(MAX_ROLE_PATTERNS_FOR_TEST));
         over.extend(rules(1));
-        let refused = permitted(&over, "prod", vec![stored("/", "K")], &[Action::Read]).await;
+        let refused = permitted(open(&over), "prod", vec![stored("/", "K")], &[Action::Read]).await;
         assert_eq!(refused.err().map(|e| e.code), Some("too_many_patterns"));
         let mut at_cap = rules(MAX_ROLE_PATTERNS_FOR_TEST);
         at_cap.extend(rules(MAX_ROLE_PATTERNS_FOR_TEST));
         assert!(
-            permitted(&at_cap, "prod", vec![stored("/", "K")], &[Action::Read])
+            permitted(open(&at_cap), "prod", vec![stored("/", "K")], &[Action::Read])
                 .await
                 .is_ok()
         );
@@ -1024,7 +1275,7 @@ mod tests {
         let held = slots.clone().acquire_owned().await?;
         let secrets: Vec<_> = (0..200).map(|i| stored("/app", &format!("K{i}"))).collect();
         let rules = rules(200);
-        let check = permitted_with(&slots, &rules, "prod", secrets, &[Action::Read]);
+        let check = permitted_with(&slots, open(&rules), "prod", secrets, &[Action::Read]);
         tokio::pin!(check);
         let waited = tokio::time::timeout(std::time::Duration::from_millis(100), &mut check).await;
         assert!(waited.is_err(), "no slot, so the check has not run");
@@ -1039,7 +1290,7 @@ mod tests {
     async fn every_action_must_be_allowed() -> anyhow::Result<()> {
         let rules = vec![Rule::allow(Subject::Secrets, &[Action::Read])];
         let kept = permitted(
-            &rules,
+            open(&rules),
             "prod",
             vec![stored("/", "K")],
             &[Action::Read, Action::ReadValue],

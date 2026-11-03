@@ -8,7 +8,7 @@ use sekret_api::{
 use sekret_core::crypto::{DataKey, wrap_data_key};
 use sekret_core::glob::{key_pattern_can_match, path_pattern_can_match};
 use sekret_core::permissions::{
-    Action, BuiltinRole, MAX_PRINCIPAL_PATTERNS, MAX_ROLE_PATTERNS, Resource, Rule, Subject, covers, denied,
+    Access, Action, BuiltinRole, MAX_PRINCIPAL_PATTERNS, MAX_ROLE_PATTERNS, Resource, Rule, Subject, covers, denied,
     dropped_rules, may_remove, pattern_count,
 };
 use sekret_core::validate;
@@ -19,12 +19,14 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use super::access::restricted_visible;
 use super::listing::{AuditParams, audit_page};
 use super::{AuditTarget, api_env, api_project, audit, find_env, from_api_kind, load_project, to_api_kind};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{
-    Key, added_denies, admin_bindings, allowed, can_see_project, deny_needs_admin, has_denies, holders, is_org_admin,
-    is_project_admin, org_rules, project_management_rules, project_rules, reaches_admin, require, require_any,
+    Key, added_denies, admin_bindings, admin_role_needs_admin, allowed, can_see_project, deny_needs_admin, has_denies,
+    holders, is_org_admin, is_project_admin, manages_secret_access, org_rules, project_management_rules, project_rules,
+    reaches_admin, require, require_any,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::rotation::project_policy;
@@ -114,6 +116,7 @@ async fn create_project(
         created_at: now,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     state.store.create_project(project.clone(), environments).await?;
     state
@@ -185,6 +188,14 @@ async fn put_project_policy(
             StatusCode::FORBIDDEN,
             "escalation",
             "changing the project default needs unrestricted create and edit on secrets",
+        ));
+    }
+    // Rotation is bound by no list, so with lists in play only those exempt from them may steer it.
+    if project.secret_access && !manages_secret_access(&state, &principal, &project.id).await? {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "escalation",
+            "with per-secret access on, only a project admin can change the project default",
         ));
     }
     policy.validate().map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -267,7 +278,8 @@ async fn delete_project(
             "deleting a project needs unrestricted delete on its secrets, folders and environments",
         ));
     }
-    state.store.delete_project(&project.id).await?;
+    let spare_restricted = !manages_secret_access(&state, &principal, &project.id).await?;
+    state.store.delete_project(&project.id, spare_restricted).await?;
     audit(
         &state,
         &principal,
@@ -290,8 +302,11 @@ async fn permissions(
     principal: Principal,
     Path(project): Path<String>,
 ) -> ApiResult<Json<ProjectPermissions>> {
-    let (_, rules) = load_project(&state, &principal, &project).await?;
-    Ok(Json(ProjectPermissions { rules }))
+    let (project, rules) = load_project(&state, &principal, &project).await?;
+    Ok(Json(ProjectPermissions {
+        rules,
+        manages_secret_access: manages_secret_access(&state, &principal, &project.id).await?,
+    }))
 }
 
 #[utoipa::path(get, path = "/api/v1/projects/{project}/environments", tag = "projects", params(("project" = String, Path)),
@@ -411,15 +426,28 @@ async fn delete_environment(
     let (project, rules) = load_project(&state, &principal, &project).await?;
     let env = find_env(&state, &project, &rules, &env).await?;
     require(&rules, Subject::Environments, Action::Delete, &env_resource(&env.slug))?;
-    // Deleting an environment destroys its history, so it must be emptied through the secret routes first.
-    state.store.delete_environment(&env.id).await.map_err(|e| match e {
-        sekret_store::StoreError::Conflict => ApiError::new(
+    let not_empty = || {
+        ApiError::new(
             StatusCode::CONFLICT,
             "not_empty",
             "delete the secrets in this environment first",
-        ),
-        other => other.into(),
-    })?;
+        )
+    };
+    // Checked before the restricted secrets, so a refusal never tells hidden ones from live ones.
+    if !state.store.list_secrets(&env.id, "/", true, false).await?.is_empty() {
+        return Err(not_empty());
+    }
+    let spare_restricted = !manages_secret_access(&state, &principal, &project.id).await?;
+    // Deleting an environment destroys its history, so it must be emptied through the secret routes first.
+    state
+        .store
+        .delete_environment(&env.id, spare_restricted)
+        .await
+        .map_err(|e| match e {
+            // A restricted secret left behind answers as a live one would, so it is not given away.
+            sekret_store::StoreError::Conflict | sekret_store::StoreError::HoldsRestricted => not_empty(),
+            other => other.into(),
+        })?;
     audit(
         &state,
         &principal,
@@ -534,7 +562,7 @@ async fn create_folder(
             project_id: Some(&project.id),
             environment: Some(&env.slug),
             path: Some(&path),
-            key: None,
+            ..Default::default()
         },
         json!({}),
     )
@@ -608,7 +636,7 @@ async fn delete_folder(
             project_id: Some(&project.id),
             environment: Some(&env.slug),
             path: Some(&path),
-            key: None,
+            ..Default::default()
         },
         json!({}),
     )
@@ -616,7 +644,9 @@ async fn delete_folder(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn principal_names(state: &AppState) -> ApiResult<std::collections::HashMap<(PrincipalKind, String), String>> {
+pub(super) async fn principal_names(
+    state: &AppState,
+) -> ApiResult<std::collections::HashMap<(PrincipalKind, String), String>> {
     let mut names = std::collections::HashMap::new();
     for user in state.store.list_users().await? {
         let label = if user.email.is_empty() { user.name } else { user.email };
@@ -715,6 +745,9 @@ async fn add_member(
     }
     let kind = from_api_kind(request.principal_kind);
     let memberships = state.store.list_memberships(&project.id).await?;
+    if request.role == BuiltinRole::ProjectAdmin.slug() && !administers(&state, &principal, &memberships).await? {
+        return Err(admin_role_needs_admin(&request.role));
+    }
     let custom = state.store.list_roles(&project.id).await?;
     let users = state.store.list_users().await?;
     let bound = Bound {
@@ -1108,8 +1141,11 @@ async fn project_audit(
 ) -> ApiResult<Json<AuditPage>> {
     let (project, rules) = load_project(&state, &principal, &project).await?;
     require_any(&rules, Subject::AuditLog, Action::Read)?;
+    // Entries about restricted secrets the reader is not listed on are left out by the query,
+    // so totals and filters behave as if they were never written.
+    let visible = restricted_visible(&state, &principal, &project).await?;
     let search_actors_only = audit_filter_scope(&rules, &params)?;
-    let mut page = audit_page(&state, Some(project.id), params, search_actors_only).await?;
+    let mut page = audit_page(&state, Some(project.id), params, search_actors_only, visible).await?;
     for entry in &mut page.entries {
         redact_audit_entry(&rules, entry);
     }
@@ -1121,6 +1157,7 @@ async fn project_audit(
 fn sees_unredacted(rules: &[Rule], environment: Option<&str>) -> bool {
     let scope = Resource {
         environment,
+        access: Access::Open,
         ..Default::default()
     };
     allowed(rules, Subject::Secrets, Action::Read, &scope)
@@ -1169,6 +1206,7 @@ pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
     };
     let whole_environment = Resource {
         environment: Some(&environment),
+        access: Access::Open,
         ..Default::default()
     };
     if !allowed(rules, Subject::Environments, Action::Read, &whole_environment) {
@@ -1183,6 +1221,7 @@ pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
         return;
     }
     let path = entry.path.as_deref();
+    // An entry does not record the secret's tags, so a deny by tag hides the key.
     let key_visible = entry.secret_key.as_deref().is_some_and(|key| {
         allowed(
             rules,
@@ -1192,8 +1231,8 @@ pub fn redact_audit_entry(rules: &[Rule], entry: &mut AuditEntry) {
                 environment: Some(environment),
                 path,
                 key: Some(key),
-                // An entry does not record the secret's tags, so a deny by tag hides the key.
                 tags: None,
+                access: Access::Open,
             },
         )
     });

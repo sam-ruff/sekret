@@ -158,6 +158,177 @@ class TestAbsent:
         assert result["changed"] is False
 
 
+POD = {"kind": "identity", "id": "pod-1"}
+
+
+class TestAccess:
+    def test_create_restricted_in_one_write(self, client, server):
+        result, _ = ensure(client, params(key="NEW", value="v", restricted=True))
+        assert result["changed"] is True
+        assert result["restricted"] is True
+        assert result["access_changed"] is True
+        assert len(server.writes) == 1
+        assert server.writes[0].body["upserts"][0]["restricted"] is True
+        assert server.secrets[("/db", "NEW")].restricted
+        assert server.access_changes == [], "nothing else needed changing"
+
+    def test_create_with_a_list(self, client, server):
+        result, _ = ensure(client, params(key="NEW", value="v", restricted=True, access=[POD]))
+        assert result["changed"] is True
+        assert server.secrets[("/db", "NEW")].grants == {("identity", "pod-1"): ["read", "read-value"]}
+        assert server.access_changes[0].body == {
+            "grant": [
+                {"principal_kind": "identity", "principal_id": "pod-1", "actions": ["read", "read-value"]}
+            ]
+        }
+
+    def test_flag_is_left_alone_when_unset(self, client, server):
+        result, _ = ensure(client, params(key="NEW", value="v"))
+        assert "restricted" not in server.writes[0].body["upserts"][0]
+        assert result["restricted"] is False
+        assert result["access_changed"] is False
+        assert all(not c.path.endswith("/access") for c in server.calls)
+
+    def test_flip_the_flag_on_an_existing_secret(self, client, server):
+        result, _ = ensure(client, params(value="old-value", restricted=True))
+        assert result["changed"] is True
+        assert result["operation"] == "unchanged", "the value is untouched"
+        assert server.writes == []
+        assert server.access_changes[0].body == {"restricted": True}
+        assert result["diff"]["before"]["restricted"] is False
+        assert result["diff"]["after"]["restricted"] is True
+        again, _ = ensure(client, params(value="old-value", restricted=True))
+        assert again["changed"] is False
+        result, _ = ensure(client, params(value="old-value", restricted=False))
+        assert result["changed"] is True
+        assert not server.secrets[("/db", "DB_PASSWORD")].restricted
+
+    def test_unrestricting_clears_the_list(self, client, server):
+        stored = server.secrets[("/db", "DB_PASSWORD")]
+        stored.restricted = True
+        stored.grants = {("group", "ops"): ["read"]}
+        result, _ = ensure(client, params(value="old-value", restricted=False))
+        assert result["changed"] is True
+        assert result["access_changed"] is True
+        assert result["diff"]["before"]["access"] == [{"kind": "group", "id": "ops", "allow": ["read"]}]
+        assert result["diff"]["after"]["access"] == []
+        assert server.access_changes[0].body == {"restricted": False}
+        assert stored.grants == {}
+
+    def test_unrestricting_with_a_list_grants_it_again_in_the_same_request(self, client, server):
+        stored = server.secrets[("/db", "DB_PASSWORD")]
+        stored.restricted = True
+        stored.grants = {("identity", "pod-1"): ["read", "read-value"], ("group", "ops"): ["read"]}
+        result, _ = ensure(client, params(value="old-value", restricted=False, access=[POD]))
+        assert result["changed"] is True
+        assert result["diff"]["after"]["access"] == [
+            {"kind": "identity", "id": "pod-1", "allow": ["read", "read-value"]}
+        ]
+        assert server.access_changes[0].body == {
+            "restricted": False,
+            "grant": [
+                {"principal_kind": "identity", "principal_id": "pod-1", "actions": ["read", "read-value"]}
+            ],
+        }
+        assert len(server.access_changes) == 1
+        assert stored.grants == {("identity", "pod-1"): ["read", "read-value"]}
+        assert not stored.restricted
+
+    def test_a_deleted_open_secret_comes_back_restricted_in_one_write(self, client, server):
+        server.secrets[("/db", "DB_PASSWORD")].deleted = True
+        result, _ = ensure(client, params(value="again", restricted=True))
+        assert result["operation"] == "created"
+        assert result["restricted"] is True
+        assert server.writes[0].body["upserts"][0]["restricted"] is True
+        assert server.secrets[("/db", "DB_PASSWORD")].restricted
+        assert server.access_changes == []
+
+    def test_a_server_that_writes_it_open_fails_the_task(self, client, server):
+        server.ignore_restricted = True
+        with pytest.raises(SekretError, match="did not restrict it, so it is open"):
+            ensure(client, params(key="NEW", value="v", restricted=True))
+
+    def test_make_the_list_match(self, client, server):
+        stored = server.secrets[("/db", "DB_PASSWORD")]
+        stored.restricted = True
+        stored.grants = {
+            ("identity", "pod-1"): ["read"],
+            ("group", "ops"): ["read", "read-value"],
+            ("user", "u1"): ["read", "edit"],
+        }
+        access = [
+            {"kind": "identity", "id": "pod-1", "allow": ["read-value"]},
+            {"kind": "user", "id": "u1", "allow": ["edit", "read"]},
+            {"kind": "group", "id": "sre", "allow": None},
+        ]
+        result, _ = ensure(client, params(value="old-value", access=access))
+        assert result["changed"] is True
+        assert result["access_changed"] is True
+        assert server.access_changes[0].body == {
+            "grant": [
+                {"principal_kind": "group", "principal_id": "sre", "actions": ["read", "read-value"]},
+                {"principal_kind": "identity", "principal_id": "pod-1", "actions": ["read", "read-value"]},
+            ],
+            "revoke": [{"principal_kind": "group", "principal_id": "ops"}],
+        }
+        assert stored.grants == {
+            ("identity", "pod-1"): ["read", "read-value"],
+            ("user", "u1"): ["read", "edit"],
+            ("group", "sre"): ["read", "read-value"],
+        }
+        assert result["diff"]["before"]["access"][0] == {
+            "kind": "group",
+            "id": "ops",
+            "allow": ["read", "read-value"],
+        }
+        again, _ = ensure(client, params(value="old-value", access=access))
+        assert again["changed"] is False
+        assert len(server.access_changes) == 1
+
+    def test_an_empty_list_revokes_everything(self, client, server):
+        server.secrets[("/db", "DB_PASSWORD")].grants = {("group", "ops"): ["read"]}
+        result, _ = ensure(client, params(value="old-value", access=[]))
+        assert result["changed"] is True
+        assert server.secrets[("/db", "DB_PASSWORD")].grants == {}
+
+    def test_check_mode_reports_without_changing(self, client, server):
+        result, _ = ensure(client, params(value="old-value", restricted=True, access=[POD]), check_mode=True)
+        assert result["changed"] is True
+        assert result["access_changed"] is True
+        assert result["restricted"] is True
+        assert server.access_changes == []
+        assert not server.secrets[("/db", "DB_PASSWORD")].restricted
+        assert result["diff"]["after"]["access"] == [
+            {"kind": "identity", "id": "pod-1", "allow": ["read", "read-value"]}
+        ]
+
+    def test_absent_ignores_access(self, client, server):
+        result, _ = ensure(client, params(state="absent", restricted=True, access=[POD]))
+        assert result["operation"] == "deleted"
+        assert all(not c.path.endswith("/access") for c in server.calls)
+
+    def test_setting_off_is_reported(self, client, server):
+        server.secret_access = False
+        with pytest.raises(SekretError, match="per-secret access is off"):
+            ensure(client, params(value="old-value", restricted=True))
+        with pytest.raises(SekretError, match="per-secret access is off"):
+            ensure(client, params(key="NEW", value="v", restricted=True))
+        assert ("/db", "NEW") not in server.secrets, "a restricted secret is never created open"
+
+    def test_non_admins_are_told_why(self, client, server):
+        server.admin = False
+        with pytest.raises(SekretError, match="only a project admin"):
+            ensure(client, params(value="old-value", access=[POD]))
+
+    def test_duplicate_entries_are_refused(self, client):
+        with pytest.raises(ConfigError, match="more than once"):
+            ensure(client, params(value="old-value", access=[POD, POD]))
+
+    def test_values_never_reach_the_output(self, client, server):
+        result, _ = ensure(client, params(value="new-secret-value", restricted=True, access=[POD]))
+        assert_no_value(result, "new-secret-value", "old-value")
+
+
 class TestErrors:
     def test_requires_project(self, client, monkeypatch):
         monkeypatch.delenv("SEKRET_PROJECT", raising=False)
@@ -250,3 +421,21 @@ class TestMain:
         out = run_main(monkeypatch, capsys, server, {**CONNECTION, **params()})
         assert out["failed"] is True
         assert "value" in out["msg"]
+
+    def test_access_options_through_the_argument_spec(self, monkeypatch, capsys, server):
+        args = {
+            **CONNECTION,
+            **params(value="old-value", restricted=True, access=[{"kind": "group", "id": "ops"}]),
+        }
+        out = run_main(monkeypatch, capsys, server, args)
+        assert out["changed"] is True
+        assert out["restricted"] is True
+        assert out["access_changed"] is True
+        assert server.secrets[("/db", "DB_PASSWORD")].grants == {("group", "ops"): ["read", "read-value"]}
+        bad = {
+            **CONNECTION,
+            **params(value="old-value", access=[{"kind": "group", "id": "ops", "allow": ["create"]}]),
+        }
+        out = run_main(monkeypatch, capsys, server, bad)
+        assert out["failed"] is True
+        assert "create" in out["msg"]

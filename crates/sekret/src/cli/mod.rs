@@ -1,3 +1,4 @@
+pub mod access;
 pub mod config;
 pub mod format;
 pub mod login;
@@ -143,6 +144,10 @@ pub enum SecretsCommand {
         from_dotenv: Option<PathBuf>,
         #[arg(long, default_value = "")]
         comment: String,
+        /// Create the secrets restricted, so only admins reach them until someone is granted
+        /// access. Needs a project admin and per-secret access on for the project.
+        #[arg(long)]
+        restricted: bool,
     },
     /// Delete secrets.
     Delete {
@@ -170,6 +175,9 @@ pub enum SecretsCommand {
         charset: Option<CharsetArg>,
         #[arg(long, default_value = "")]
         comment: String,
+        /// Create the secret restricted, as for `secrets set --restricted`.
+        #[arg(long)]
+        restricted: bool,
     },
     /// Show a secret's generation and rotation policy, or change it with the flags.
     Policy {
@@ -180,6 +188,9 @@ pub enum SecretsCommand {
         #[command(flatten)]
         policy: PolicyFlags,
     },
+    /// Show or change who may reach a secret, when per-secret access is on for the project.
+    #[command(subcommand)]
+    Access(access::AccessCommand),
 }
 
 impl SecretsCommand {
@@ -192,6 +203,7 @@ impl SecretsCommand {
             | SecretsCommand::Rollback { .. }
             | SecretsCommand::Generate { .. } => true,
             SecretsCommand::Policy { inherit, policy, .. } => *inherit || !policy.is_empty(),
+            SecretsCommand::Access(command) => command.changes(),
         }
     }
 }
@@ -654,6 +666,44 @@ pub async fn run_logout(client_args: &ClientArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuses a restricted write before anything is written when the project does not have
+/// per-secret access on, which is also how a server from before the feature answers.
+pub async fn require_secret_access(api: &dyn SekretApi, at: &Location) -> anyhow::Result<()> {
+    let on = api
+        .list_projects()
+        .await?
+        .iter()
+        .any(|p| (p.slug == at.project || p.id == at.project) && p.secret_access);
+    if on {
+        return Ok(());
+    }
+    bail!(
+        "per-secret access is not on for {}, or the server predates it, so nothing was written; a project \
+         admin can turn it on with `sekret projects secret-access on`",
+        format::one_line(&at.project)
+    )
+}
+
+/// Fails loudly when the server did not confirm that each of `keys` is restricted, as a server
+/// from before per-secret access would silently write them open.
+pub fn confirm_restricted(result: &BatchResult, keys: &[String]) -> anyhow::Result<()> {
+    let open: Vec<&str> = keys
+        .iter()
+        .filter(|k| !result.restricted.contains(k))
+        .map(String::as_str)
+        .collect();
+    if open.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the server did not confirm that {} {} restricted, so treat {} as open; it may predate per-secret \
+         access. Check with `sekret secrets access list`",
+        format::one_line(&open.join(", ")),
+        if open.len() == 1 { "is" } else { "are" },
+        if open.len() == 1 { "it" } else { "them" },
+    )
+}
+
 fn summarise(result: &BatchResult) -> String {
     let mut parts = Vec::new();
     for (label, keys) in [
@@ -661,6 +711,7 @@ fn summarise(result: &BatchResult) -> String {
         ("updated", &result.updated),
         ("deleted", &result.deleted),
         ("unchanged", &result.unchanged),
+        ("restricted", &result.restricted),
     ] {
         if !keys.is_empty() {
             parts.push(format!("{label}: {}", format::one_line(&keys.join(", "))));
@@ -734,6 +785,7 @@ pub fn collect_upserts(
             value,
             comment: comment.to_string(),
             tags: None,
+            restricted: None,
         })
         .collect())
 }
@@ -816,6 +868,7 @@ pub async fn secrets(
             pairs,
             from_dotenv,
             comment,
+            restricted,
         } => {
             if let Some(warning) = shell_history_warning(&pairs, std::io::IsTerminal::is_terminal(&std::io::stdin())) {
                 eprintln!("{warning}");
@@ -825,7 +878,14 @@ pub async fn secrets(
                 .map(config::read_text)
                 .transpose()
                 .context("reading .env file")?;
-            let upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
+            let mut upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
+            if restricted {
+                require_secret_access(api, &at).await?;
+                for upsert in &mut upserts {
+                    upsert.restricted = Some(true);
+                }
+            }
+            let written: Vec<String> = upserts.iter().map(|u| u.key.clone()).collect();
             let result = api
                 .write(
                     at,
@@ -837,6 +897,9 @@ pub async fn secrets(
                 )
                 .await?;
             writeln!(out, "{}", summarise(&result))?;
+            if restricted {
+                confirm_restricted(&result, &written)?;
+            }
         }
         SecretsCommand::Delete { keys } => {
             let result = api
@@ -917,6 +980,7 @@ pub async fn secrets(
             length,
             charset,
             comment,
+            restricted,
         } => {
             let generator = (length.is_some() || charset.is_some()).then(|| {
                 let base = Generator::default();
@@ -925,8 +989,19 @@ pub async fn secrets(
                     charset: charset.map(Charset::from).unwrap_or(base.charset),
                 }
             });
-            let result = api.generate(at, key, GenerateSecret { generator, comment }).await?;
+            if restricted {
+                require_secret_access(api, &at).await?;
+            }
+            let request = GenerateSecret {
+                generator,
+                comment,
+                restricted: restricted.then_some(true),
+            };
+            let result = api.generate(at, key.clone(), request).await?;
             writeln!(out, "{}", summarise(&result))?;
+            if restricted {
+                confirm_restricted(&result, &[key])?;
+            }
         }
         SecretsCommand::Policy { key, inherit, policy } => {
             let view = if inherit {
@@ -952,6 +1027,7 @@ pub async fn secrets(
                 None => {}
             }
         }
+        SecretsCommand::Access(command) => access::run(api, at, command, out).await?,
     }
     Ok(())
 }
@@ -1334,6 +1410,7 @@ mod tests {
             deleted: vec![],
             unchanged: vec!["B".into()],
             snapshot_id: None,
+            restricted: vec![],
         }
     }
 
@@ -1352,6 +1429,8 @@ mod tests {
             updated_by: "user:sam".into(),
             generated: false,
             next_rotation_at: None,
+            restricted: false,
+            granted: None,
         }
     }
 
@@ -1494,15 +1573,106 @@ mod tests {
         Ok(())
     }
 
+    /// A server that predates per-secret access drops the field and writes the secret open, so
+    /// anything it does not confirm is reported as open and the command fails.
+    fn projects(secret_access: bool) -> Vec<sekret_api::Project> {
+        vec![sekret_api::Project {
+            id: "p1".into(),
+            slug: "app".into(),
+            name: "App".into(),
+            description: String::new(),
+            created_at: 0,
+            logo_url: None,
+            secret_access,
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_restricted_write_is_refused_before_writing_when_the_setting_is_off() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(false)));
+        api.expect_write().never();
+        api.expect_generate().never();
+        let set = SecretsCommand::Set {
+            pairs: vec!["B=1".into()],
+            from_dotenv: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        let refused = secrets(&api, at(), set, &mut Vec::new(), &mut "".as_bytes()).await;
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("nothing was written"), "{message}");
+        let generate = SecretsCommand::Generate {
+            key: "D".into(),
+            length: None,
+            charset: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        assert!(
+            secrets(&api, at(), generate, &mut Vec::new(), &mut "".as_bytes())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_restriction_fails_the_command() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(true)));
+        api.expect_write().times(1).returning(|_, _| {
+            Ok(BatchResult {
+                restricted: vec!["B".into()],
+                ..result()
+            })
+        });
+        api.expect_generate().times(1).returning(|_, _, _| Ok(result()));
+        let set = SecretsCommand::Set {
+            pairs: vec!["B=1".into(), "C=2".into()],
+            from_dotenv: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        let mut out = Vec::new();
+        let refused = secrets(&api, at(), set, &mut out, &mut "".as_bytes()).await;
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("did not confirm that C is restricted"), "{message}");
+        let generate = SecretsCommand::Generate {
+            key: "D".into(),
+            length: None,
+            charset: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        let refused = secrets(&api, at(), generate, &mut out, &mut "".as_bytes()).await;
+        assert!(refused.is_err(), "generate checks too");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn set_and_delete_send_batches() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(true)));
         api.expect_write()
             .withf(|at, b| {
-                at.project == "app" && b.upserts.len() == 1 && b.upserts[0].key == "A" && b.deletes.is_empty()
+                at.project == "app"
+                    && b.upserts.len() == 1
+                    && b.upserts[0].key == "A"
+                    && b.upserts[0].restricted.is_none()
+                    && b.deletes.is_empty()
             })
             .times(1)
             .returning(|_, _| Ok(result()));
+        api.expect_write()
+            .withf(|_, b| b.upserts.len() == 2 && b.upserts.iter().all(|u| u.restricted == Some(true)))
+            .times(1)
+            .returning(|_, _| {
+                Ok(BatchResult {
+                    restricted: vec!["B".into(), "C".into()],
+                    ..result()
+                })
+            });
         api.expect_write()
             .withf(|_, b| b.deletes == vec!["OLD".to_string()])
             .times(1)
@@ -1512,10 +1682,20 @@ mod tests {
             pairs: vec!["A=1".into()],
             from_dotenv: None,
             comment: String::new(),
+            restricted: false,
         };
         secrets(&api, at(), set, &mut out, &mut "".as_bytes())
             .await
             .context("set")?;
+        let restricted = SecretsCommand::Set {
+            pairs: vec!["B=1".into(), "C=2".into()],
+            from_dotenv: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        secrets(&api, at(), restricted, &mut out, &mut "".as_bytes())
+            .await
+            .context("set restricted")?;
         secrets(
             &api,
             at(),

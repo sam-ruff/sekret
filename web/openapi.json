@@ -2134,6 +2134,135 @@
         ]
       }
     },
+    "/api/v1/projects/{project}/environments/{env}/secrets/{key}/access": {
+      "get": {
+        "tags": [
+          "secrets"
+        ],
+        "summary": "A secret's restricted flag and access list. Admins only.",
+        "operationId": "get_secret_access",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretAccess"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "secrets"
+        ],
+        "summary": "Restricts or unrestricts a secret and changes its access list, all at once. Admins only.\nRestricting and granting need the project setting on; unrestricting and revoking always\nwork, so a project can be cleaned up before the setting is turned off. A restricted secret\nis reachable only by the principals on its list, for the actions listed, and only as far as\ntheir roles also allow; admins keep access so a secret is never orphaned.",
+        "operationId": "patch_secret_access",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretAccessChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretAccess"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "per-secret access is off"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/projects/{project}/environments/{env}/secrets/{key}/generate": {
       "post": {
         "tags": [
@@ -3097,6 +3226,87 @@
         ],
         "responses": {
           "204": {}
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{project}/secret-access": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "summary": "Admins only, along with the restricted secrets they may see.",
+        "operationId": "get_setting",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretAccessSetting"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "projects"
+        ],
+        "summary": "Turns per-secret access on or off for the project. It is off by default, and turning it off\nis refused while any secret in the project is restricted, so no restriction lapses unnoticed.",
+        "operationId": "put_setting",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSecretAccessSetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretAccessSetting"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "secrets are still restricted"
+          }
         },
         "security": [
           {
@@ -4212,6 +4422,13 @@
               "type": "string"
             }
           },
+          "restricted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys that asked for `restricted: true` and are restricted after this write. A client\nshould treat a key missing here as open, since a server that predates per-secret access\nignores the request."
+          },
           "snapshot_id": {
             "type": [
               "string",
@@ -4699,6 +4916,13 @@
                 "type": "null"
               }
             ]
+          },
+          "restricted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "See [`SecretUpsert::restricted`]."
           }
         }
       },
@@ -4715,6 +4939,29 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "GrantRequest": {
+        "type": "object",
+        "required": [
+          "principal_kind",
+          "principal_id",
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Any of `read`, `read-value`, `edit` and `delete`; `read` is always added."
+          },
+          "principal_id": {
+            "type": "string"
+          },
+          "principal_kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
           }
         }
       },
@@ -5279,6 +5526,21 @@
           "identity"
         ]
       },
+      "PrincipalRef": {
+        "type": "object",
+        "required": [
+          "principal_kind",
+          "principal_id"
+        ],
+        "properties": {
+          "principal_id": {
+            "type": "string"
+          },
+          "principal_kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
+          }
+        }
+      },
       "Project": {
         "type": "object",
         "required": [
@@ -5309,6 +5571,10 @@
           "name": {
             "type": "string"
           },
+          "secret_access": {
+            "type": "boolean",
+            "description": "Secrets here may be restricted to their own access lists."
+          },
           "slug": {
             "type": "string"
           }
@@ -5320,6 +5586,10 @@
           "rules"
         ],
         "properties": {
+          "manages_secret_access": {
+            "type": "boolean",
+            "description": "The caller is a project or organisation admin, so manages per-secret access and is\nexempt from access lists, though not from their own rules."
+          },
           "rules": {
             "type": "array",
             "items": {
@@ -5396,6 +5666,35 @@
           "path": {
             "type": "string",
             "description": "Restrict the restore to this folder and everything beneath it."
+          }
+        }
+      },
+      "RestrictedSecret": {
+        "type": "object",
+        "required": [
+          "environment",
+          "path",
+          "key",
+          "deleted",
+          "grants"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "grants": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entries on its access list."
+          },
+          "key": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
           }
         }
       },
@@ -5508,6 +5807,16 @@
             "type": "boolean",
             "description": "The current value was generated by sekret, so rotation may replace it."
           },
+          "granted": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "For a restricted secret, what its list grants the caller; absent when the list does not\nbind them, because the secret is open or they are an admin."
+          },
           "id": {
             "type": "string"
           },
@@ -5524,6 +5833,10 @@
           },
           "path": {
             "type": "string"
+          },
+          "restricted": {
+            "type": "boolean",
+            "description": "Only principals on its access list, and admins, may reach it."
           },
           "tags": {
             "type": "array",
@@ -5551,6 +5864,112 @@
           "version": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "SecretAccess": {
+        "type": "object",
+        "description": "Who may reach a secret beyond its role rules.",
+        "required": [
+          "restricted",
+          "grants"
+        ],
+        "properties": {
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecretGrant"
+            }
+          },
+          "restricted": {
+            "type": "boolean",
+            "description": "Only principals on `grants`, project admins and organisation admins may reach it, and\nonly as far as their roles also allow. Off, the list has no effect."
+          }
+        }
+      },
+      "SecretAccessChange": {
+        "type": "object",
+        "description": "Changes to one secret's access, applied together.",
+        "properties": {
+          "grant": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrantRequest"
+            },
+            "description": "Entries to add, or to replace the actions of for a principal already listed."
+          },
+          "restricted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Restricting needs the project setting on."
+          },
+          "revoke": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalRef"
+            }
+          }
+        }
+      },
+      "SecretAccessSetting": {
+        "type": "object",
+        "description": "The project's per-secret access setting.",
+        "required": [
+          "enabled",
+          "restricted",
+          "restricted_count"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "restricted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RestrictedSecret"
+            },
+            "description": "Every restricted secret in the project the caller's roles let them see, deleted ones\nincluded. The setting cannot be turned off while any secret is restricted."
+          },
+          "restricted_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Restricted secrets in the project, including any the caller's roles hide."
+          }
+        }
+      },
+      "SecretGrant": {
+        "type": "object",
+        "description": "One entry on a secret's access list.",
+        "required": [
+          "principal_kind",
+          "principal_id",
+          "principal_name",
+          "actions",
+          "created_at"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Always includes `read`; at most `read`, `read-value`, `edit` and `delete`."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "principal_id": {
+            "type": "string"
+          },
+          "principal_kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
+          },
+          "principal_name": {
+            "type": "string",
+            "description": "A user's verified email, or their display name when they have none; an identity's name;\nthe group name for groups."
           }
         }
       },
@@ -5641,6 +6060,13 @@
           "key": {
             "type": "string"
           },
+          "restricted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`true` creates the secret restricted, with an empty access list, so it is never open\neven for a moment; that needs a project admin and the project setting on. A deleted\nsecret can be brought back restricted the same way. Otherwise, for a secret that already\nexists it must match whether it is restricted, which only the access route changes."
+          },
           "tags": {
             "type": [
               "array",
@@ -5710,6 +6136,13 @@
           "comment": {
             "type": "string"
           },
+          "restricted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "See [`SecretUpsert::restricted`]."
+          },
           "tags": {
             "type": [
               "array",
@@ -5721,6 +6154,17 @@
           },
           "value": {
             "type": "string"
+          }
+        }
+      },
+      "SetSecretAccessSetting": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
           }
         }
       },

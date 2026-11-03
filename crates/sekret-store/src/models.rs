@@ -1,4 +1,4 @@
-use sekret_core::permissions::Rule;
+use sekret_core::permissions::{Action, Rule};
 use sekret_core::seal::{SealFlags, SealMode, UnlockPolicy, WrappedRootKey};
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +187,8 @@ pub struct Project {
     pub logo_updated_at: Option<i64>,
     /// Default generation and rotation policy as JSON; `None` is off.
     pub secret_policy: Option<String>,
+    /// Secrets in this project may be restricted to their own access lists.
+    pub secret_access: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +239,53 @@ pub struct Secret {
     pub updated_at: i64,
     /// This secret's own policy override as JSON; `None` follows the project.
     pub policy: Option<String>,
+    /// Only the principals on its access list, and admins, may reach it.
+    pub restricted: bool,
+    /// Goes up with every change to its restriction or list.
+    pub access_epoch: i64,
+}
+
+/// A restricted secret, without its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedSecret {
+    pub secret_id: String,
+    pub environment: String,
+    pub path: String,
+    pub key: String,
+    pub deleted: bool,
+    /// The current version's tags.
+    pub tags: Vec<String>,
+}
+
+/// One entry on a secret's access list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretGrant {
+    pub secret_id: String,
+    pub principal_kind: PrincipalKind,
+    pub principal_id: String,
+    pub actions: Vec<Action>,
+    pub created_at: i64,
+}
+
+/// The access lists of an environment's restricted secrets at one moment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentAccess {
+    /// Secret id to its access epoch, for every restricted secret.
+    pub epochs: std::collections::HashMap<String, i64>,
+    pub grants: Vec<SecretGrant>,
+}
+
+/// Changes to one secret's access, applied together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessChange {
+    pub secret_id: String,
+    /// Restricting needs the project setting on, checked in the same transaction.
+    pub restricted: Option<bool>,
+    /// Added, or replacing the actions of an existing entry for the same principal.
+    pub grant: Vec<SecretGrant>,
+    pub revoke: Vec<(PrincipalKind, String)>,
+    /// The most entries the list may hold afterwards; more is a `Conflict`.
+    pub max_grants: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +318,12 @@ pub struct SecretChange {
     pub key: String,
     pub previous_version: i64,
     pub version: SecretVersion,
+    /// Restricts the secret in the same write, which needs the project setting on. False leaves
+    /// an existing secret's flag as it is.
+    pub restricted: bool,
+    /// The access epoch the write was planned against, for an existing secret; a change to its
+    /// access since then is a `Conflict`.
+    pub access_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,10 +367,16 @@ pub struct AuditEntry {
     pub secret_key: Option<String>,
     pub detail: serde_json::Value,
     pub ip: String,
+    /// About a restricted secret, so kept from readers off its list.
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditQuery {
+    /// `None` returns entries about restricted secrets too. Otherwise only those about one of
+    /// these `(environment, path, key)` secrets are returned, and never access-list changes or
+    /// refused writes.
+    pub restricted_visible: Option<Vec<(String, String, String)>>,
     pub project_id: Option<String>,
     /// Case-insensitive substring over action, actor, environment, path, key and address.
     pub search: Option<String>,

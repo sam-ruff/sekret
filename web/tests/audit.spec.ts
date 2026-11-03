@@ -113,15 +113,15 @@ test("filters by category, actor kind and search, keeping them in the URL", asyn
   expect(actions.every((a) => a.startsWith("secret."))).toBe(true);
 
   await choose(page, "audit-actor-kind", "audit-actor-kind-identity", /actor_kind=identity/);
-  await expect(page.getByTestId("audit-row").first()).toBeVisible();
-  const kinds = await page.getByTestId("audit-actor").evaluateAll((els) => els.map((el) => el.getAttribute("data-kind")));
-  expect(new Set(kinds)).toEqual(new Set(["identity"]));
+  // The previous page stays on screen until the filtered one arrives, so wait for it rather than read at once.
+  await expect
+    .poll(async () => new Set(await page.getByTestId("audit-actor").evaluateAll((els) => els.map((el) => el.getAttribute("data-kind")))))
+    .toEqual(new Set(["identity"]));
 
   await page.getByTestId("audit-search").fill("billing-worker");
   await expect(page).toHaveURL(/q=billing-worker/);
+  await expect.poll(async () => new Set(await page.getByTestId("audit-actor").allTextContents())).toEqual(new Set(["billing-worker"]));
   const filtered = await total(page);
-  const actors = await page.getByTestId("audit-actor").allTextContents();
-  expect(actors.every((a) => a === "billing-worker")).toBe(true);
 
   await page.reload();
   await expect(page.getByTestId("audit-search")).toHaveValue("billing-worker");

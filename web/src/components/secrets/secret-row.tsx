@@ -49,6 +49,17 @@ function GenerationBadges({ secret }: { secret: Secret }) {
   );
 }
 
+/** Marks a secret only those on its access list, and admins, can reach. */
+export function RestrictedBadge() {
+  return (
+    <Badge variant="outline" className="h-5 gap-1 text-[0.7rem] text-muted-foreground" data-testid="secret-restricted-badge">
+      <Lock className="size-3" aria-hidden />
+      Restricted
+      <span className="sr-only">: only those on its access list, and admins, can reach it</span>
+    </Badge>
+  );
+}
+
 interface SecretRowProps {
   secret: Secret;
   revealed: boolean;
@@ -106,6 +117,7 @@ export function SecretRow({
           {secret.key}
         </button>
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {secret.restricted && <RestrictedBadge />}
           <GenerationBadges secret={secret} />
           {secret.comment && (
             <Tooltip>

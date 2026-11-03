@@ -26,6 +26,7 @@ The script installs the latest release for x86-64 Linux after checking its SHA-2
 - Sign-in through any OIDC provider, with its groups mapped to sekret roles
 - Machine identities for GitHub Actions and other OIDC issuers, Kubernetes service accounts, or a client id and secret
 - Roles with conditions on environment, folder, key and tag, where a deny always wins
+- Optional per-secret access lists, so a pod can be given only the secrets it needs
 - Generated values with optional scheduled rotation
 - A searchable audit log of every value read and every change
 - `sekret run`, `sekret export` and `sekret-env` for getting secrets into processes and shells

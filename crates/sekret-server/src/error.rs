@@ -195,6 +195,12 @@ impl From<StoreError> for ApiError {
                 ApiError::conflict("the record already exists or was changed by someone else; reload and try again")
             }
             StoreError::NotFound => ApiError::not_found("record"),
+            // Destroying a restricted secret's history is for admins, whom no list keeps off it.
+            StoreError::HoldsRestricted => ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "only a project admin can delete this, because it holds restricted secrets",
+            ),
             StoreError::Unsupported(message) => ApiError::new(StatusCode::NOT_IMPLEMENTED, "not_implemented", message),
             other => ApiError::internal("store failure", other),
         }

@@ -18,6 +18,7 @@ async fn seed(store: &SqlStore) -> anyhow::Result<(String, String)> {
         created_at: 1,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     let environment = Environment {
         id: "e1".into(),
@@ -49,6 +50,8 @@ async fn seed(store: &SqlStore) -> anyhow::Result<(String, String)> {
                 actor: "test".into(),
                 created_at: version,
             },
+            restricted: false,
+            access_epoch: 0,
         });
     }
     for change in changes {
@@ -492,4 +495,104 @@ async fn postgres_machine_tokens_without_a_source_are_revoked_on_upgrade() -> an
     let port = container.get_host_port_ipv4(5432).await.context("port")?;
     let database = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     machine_tokens_without_a_source_are_revoked_on_upgrade(&database, "postgres").await
+}
+
+/// A database with every migration before `first_missing` applied.
+async fn database_before(
+    database: &str,
+    backend: &str,
+    first_missing: &str,
+) -> anyhow::Result<(tempfile::TempDir, sqlx::AnyPool)> {
+    let dir = tempfile::tempdir().context("dir")?;
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join(backend);
+    for entry in std::fs::read_dir(&source).context("read migrations")? {
+        let entry = entry.context("entry")?;
+        if entry.file_name().to_string_lossy().as_ref() < first_missing {
+            std::fs::copy(entry.path(), dir.path().join(entry.file_name())).context("copy")?;
+        }
+    }
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(database).await.context("pool")?;
+    sqlx::migrate::Migrator::new(dir.path())
+        .await
+        .context("migrator")?
+        .run(&pool)
+        .await
+        .context("older migrations")?;
+    Ok((dir, pool))
+}
+
+/// Projects and secrets from before per-secret access come through the upgrade with the
+/// setting off, nothing restricted and no access lists, and behave exactly as before.
+async fn secrets_from_before_secret_access_stay_open(database: &str, backend: &str) -> anyhow::Result<()> {
+    let (_migrations, pool) = database_before(database, backend, "0010").await?;
+    for statement in [
+        "INSERT INTO projects (id, slug, name, description, wrapped_key, created_at) VALUES ('p1', 'app', 'App', '', $1, 1)",
+        "INSERT INTO environments (id, project_id, slug, name, position, created_at) VALUES ('e1', 'p1', 'dev', 'dev', 0, 1)",
+        "INSERT INTO secrets (id, project_id, environment_id, path, key, current_version, deleted, created_at, updated_at) \
+         VALUES ('s1', 'p1', 'e1', '/', 'A', 1, 0, 1, 1)",
+        "INSERT INTO secret_versions (secret_id, version, value, comment, tags, deleted, actor, created_at) \
+         VALUES ('s1', 1, $1, '', '[]', 0, 'old', 1)",
+    ] {
+        sqlx::query(statement)
+            .bind(vec![7u8; 8])
+            .execute(&pool)
+            .await
+            .with_context(|| statement.to_string())?;
+    }
+    pool.close().await;
+    let store = SqlStore::connect(database).await.context("upgrade")?;
+    let project = store.get_project("p1").await.context("project")?.context("p1")?;
+    assert!(!project.secret_access, "the setting starts off");
+    let secret = store.get_secret("e1", "/", "A").await.context("get")?.context("s1")?;
+    assert!(!secret.secret.restricted, "nothing starts restricted");
+    assert_eq!(secret.version.value, Some(vec![7u8; 8]));
+    assert!(store.list_environment_grants("e1").await.context("grants")?.is_empty());
+    assert_eq!(store.count_restricted_secrets("p1").await.context("count")?, 0);
+    store.set_project_secret_access("p1", true).await.context("enable")?;
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "s1".into(),
+            restricted: Some(true),
+            grant: vec![],
+            revoke: vec![],
+            max_grants: 100,
+        })
+        .await
+        .context("restrict an old secret")?;
+    assert!(
+        store
+            .get_secret_by_id("s1")
+            .await
+            .context("get")?
+            .context("s1")?
+            .secret
+            .restricted
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_secrets_from_before_secret_access_stay_open() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("dir")?;
+    secrets_from_before_secret_access_stay_open(&url(dir.path()), "sqlite").await
+}
+
+/// Needs Docker. Skipped with a message when it is unavailable unless SEKRET_REQUIRE_POSTGRES is set.
+#[tokio::test]
+async fn postgres_secrets_from_before_secret_access_stay_open() -> anyhow::Result<()> {
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    let container = match testcontainers_modules::postgres::Postgres::default().start().await {
+        Ok(container) => container,
+        Err(error) if std::env::var_os("SEKRET_REQUIRE_POSTGRES").is_none() => {
+            eprintln!("skipping postgres test: {error}");
+            return Ok(());
+        }
+        Err(error) => anyhow::bail!("postgres container failed: {error}"),
+    };
+    let port = container.get_host_port_ipv4(5432).await.context("port")?;
+    let database = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    secrets_from_before_secret_access_stay_open(&database, "postgres").await
 }

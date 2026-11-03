@@ -29,6 +29,8 @@ fn change(secret_id: &str, path: &str, key: &str, previous: i64, deleted: bool) 
             format!("{key}-{}", previous + 1).as_bytes(),
             deleted,
         ),
+        restricted: false,
+        access_epoch: 0,
     }
 }
 
@@ -54,6 +56,7 @@ async fn seed_project(store: &SqlStore) -> anyhow::Result<()> {
         created_at: 1,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     let env = |id: &str, slug: &str, position| Environment {
         id: id.into(),
@@ -214,9 +217,13 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
         "the generated flag survives a round trip"
     );
     store
-        .set_secret_policy("s1", Some(r#"{"mode":"inherit"}"#.into()))
+        .set_secret_policy("s1", Some(r#"{"mode":"inherit"}"#.into()), 0)
         .await
         .context("policy")?;
+    assert!(
+        matches!(store.set_secret_policy("s1", None, 1).await, Err(StoreError::Conflict)),
+        "a policy planned against another access epoch is refused"
+    );
     store
         .set_project_policy("p1", Some(r#"{"rotation_days":7}"#.into()))
         .await
@@ -229,7 +236,10 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
             .and_then(|p| p.secret_policy),
         Some(r#"{"rotation_days":7}"#.into())
     );
-    assert!(store.set_secret_policy("missing", None).await.is_err());
+    assert!(matches!(
+        store.set_secret_policy("missing", None, 0).await,
+        Err(StoreError::NotFound)
+    ));
     let with_policy = store.list_secrets("e1", "/", true, true).await.context("list")?;
     assert!(
         with_policy
@@ -274,7 +284,7 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
         Err(StoreError::Conflict)
     ));
 
-    store.delete_project("p1").await.context("delete project")?;
+    store.delete_project("p1", true).await.context("delete project")?;
     assert!(store.get_project("p1").await.context("get")?.is_none());
     Ok(())
 }
@@ -597,6 +607,7 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
                 secret_key: key.map(String::from),
                 detail: serde_json::json!({}),
                 ip: "10.0.0.1".into(),
+                restricted: key == Some("DB_PASS"),
             })
             .await
             .context("audit")?;
@@ -688,6 +699,64 @@ async fn exercise_logins_and_audit(store: &SqlStore) -> anyhow::Result<()> {
         }
         assert_eq!(seen, expected, "oldest_first = {oldest_first}");
     }
+
+    // a1 is about a restricted secret; a5 changes its access list.
+    store
+        .insert_audit(AuditEntry {
+            id: "a5".into(),
+            created_at: 11,
+            actor_kind: "user".into(),
+            actor_id: "admin".into(),
+            actor_name: "Admin".into(),
+            action: "secret.access".into(),
+            project_id: Some("p".into()),
+            environment: Some("prod".into()),
+            path: Some("/app/db".into()),
+            secret_key: Some("DB_PASS".into()),
+            detail: serde_json::json!({}),
+            ip: "10.0.0.1".into(),
+            restricted: true,
+        })
+        .await
+        .context("access entry")?;
+    let visible = |list: Option<Vec<(&str, &str, &str)>>| AuditQuery {
+        restricted_visible: list.map(|l| {
+            l.into_iter()
+                .map(|(e, p, k)| (e.to_string(), p.to_string(), k.to_string()))
+                .collect()
+        }),
+        limit: 50,
+        oldest_first: true,
+        ..Default::default()
+    };
+    let restricted_ids = |query: AuditQuery| async move {
+        let entries = store.list_audit(query.clone()).await.context("audit")?;
+        let total = store.count_audit(query).await.context("count")?;
+        anyhow::Ok((entries.into_iter().map(|a| a.id).collect::<Vec<_>>(), total))
+    };
+    let named = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        restricted_ids(visible(None)).await?,
+        (named(&["a0", "a1", "a2", "a3", "a4", "a5"]), 6),
+        "an admin sees every entry"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![]))).await?,
+        (named(&["a0", "a2", "a3", "a4"]), 4),
+        "entries about restricted secrets are left out, and the total agrees"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![("prod", "/app/db", "DB_PASS")]))).await?,
+        (named(&["a0", "a1", "a2", "a3", "a4"]), 5),
+        "a listed reader sees the secret's entries but never its access-list changes"
+    );
+    assert_eq!(
+        restricted_ids(visible(Some(vec![("dev", "/app/db", "DB_PASS")])))
+            .await?
+            .1,
+        4,
+        "the environment must match too"
+    );
     Ok(())
 }
 
@@ -887,8 +956,333 @@ async fn exercise_revoking_credentials(store: &SqlStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn grant(secret_id: &str, kind: PrincipalKind, id: &str, actions: &[sekret_core::permissions::Action]) -> SecretGrant {
+    SecretGrant {
+        secret_id: secret_id.into(),
+        principal_kind: kind,
+        principal_id: id.into(),
+        actions: actions.to_vec(),
+        created_at: 7,
+    }
+}
+
+async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
+    use sekret_core::permissions::Action;
+    seed_project(store).await?;
+    let project = store.get_project("p1").await.context("get")?.context("project")?;
+    assert!(!project.secret_access, "off by default");
+    let restricted_new = SecretChange {
+        restricted: true,
+        ..change("r1", "/", "R", 0, false)
+    };
+    assert!(
+        matches!(
+            store.write_secrets(batch("a1", vec![restricted_new.clone()])).await,
+            Err(StoreError::Conflict)
+        ),
+        "a secret cannot start restricted while the project setting is off"
+    );
+    assert!(store.get_secret_by_id("r1").await.context("get")?.is_none());
+    store
+        .write_secrets(batch("a2", vec![change("o1", "/", "OPEN", 0, false)]))
+        .await
+        .context("open")?;
+    let restrict_open = AccessChange {
+        secret_id: "o1".into(),
+        restricted: Some(true),
+        grant: vec![],
+        revoke: vec![],
+        max_grants: 100,
+    };
+    assert!(matches!(
+        store.update_secret_access(restrict_open.clone()).await,
+        Err(StoreError::Conflict)
+    ));
+
+    store.set_project_secret_access("p1", true).await.context("enable")?;
+    assert!(
+        store
+            .get_project("p1")
+            .await
+            .context("get")?
+            .context("project")?
+            .secret_access
+    );
+    store
+        .write_secrets(batch("a3", vec![restricted_new]))
+        .await
+        .context("restricted write")?;
+    let r1 = store.get_secret_by_id("r1").await.context("get")?.context("r1")?;
+    assert!(r1.secret.restricted);
+    let o1 = store
+        .get_secret("e1", "/", "OPEN")
+        .await
+        .context("get")?
+        .context("o1")?;
+    assert!(!o1.secret.restricted, "unrestricted by default");
+
+    store
+        .update_secret_access(AccessChange {
+            grant: vec![
+                grant("o1", PrincipalKind::Identity, "pod", &[Action::Read, Action::ReadValue]),
+                grant("o1", PrincipalKind::Group, "ops", &[Action::Read]),
+            ],
+            ..restrict_open
+        })
+        .await
+        .context("restrict and grant")?;
+    assert!(
+        store
+            .get_secret_by_id("o1")
+            .await
+            .context("get")?
+            .context("o1")?
+            .secret
+            .restricted
+    );
+    assert_eq!(store.count_restricted_secrets("p1").await.context("count")?, 2);
+    let grants = store.list_secret_grants("o1").await.context("grants")?;
+    assert_eq!(
+        grants,
+        vec![
+            grant("o1", PrincipalKind::Group, "ops", &[Action::Read]),
+            grant("o1", PrincipalKind::Identity, "pod", &[Action::Read, Action::ReadValue]),
+        ]
+    );
+    // Granting again replaces the entry's actions; revoking removes it.
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            restricted: None,
+            grant: vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
+            revoke: vec![(PrincipalKind::Group, "ops".into())],
+            max_grants: 100,
+        })
+        .await
+        .context("regrant")?;
+    assert_eq!(
+        store.list_environment_grants("e1").await.context("env grants")?,
+        vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])]
+    );
+    assert!(
+        store
+            .list_environment_grants("e2")
+            .await
+            .context("other env")?
+            .is_empty()
+    );
+    let foreign = AccessChange {
+        secret_id: "o1".into(),
+        restricted: None,
+        grant: vec![grant("r1", PrincipalKind::User, "u", &[Action::Read])],
+        revoke: vec![],
+        max_grants: 100,
+    };
+    assert!(store.update_secret_access(foreign).await.is_err());
+    assert!(matches!(
+        store
+            .update_secret_access(AccessChange {
+                secret_id: "missing".into(),
+                restricted: Some(false),
+                grant: vec![],
+                revoke: vec![],
+                max_grants: 100,
+            })
+            .await,
+        Err(StoreError::NotFound)
+    ));
+
+    assert!(
+        matches!(
+            store.set_project_secret_access("p1", false).await,
+            Err(StoreError::Conflict)
+        ),
+        "turning the setting off while secrets are restricted is refused"
+    );
+    assert!(
+        store
+            .get_project("p1")
+            .await
+            .context("get")?
+            .context("project")?
+            .secret_access
+    );
+    let current = store.environment_access("e1").await.context("environment access")?;
+    assert_eq!(
+        current.epochs,
+        std::collections::HashMap::from([("o1".to_string(), 2), ("r1".to_string(), 0)]),
+        "every restricted secret, listed or not"
+    );
+    assert_eq!(
+        current.grants,
+        vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])]
+    );
+    assert_eq!(
+        store.environment_access("e2").await.context("other")?,
+        EnvironmentAccess::default()
+    );
+    let snapshots = store.list_snapshots("e1", 10).await.context("snapshots")?;
+    let newest = snapshots.first().context("newest")?;
+    let previous = store.previous_snapshot(newest).await.context("previous")?;
+    assert_eq!(previous.as_ref().map(|s| &s.id), snapshots.get(1).map(|s| &s.id));
+    let oldest = snapshots.last().context("oldest")?;
+    assert_eq!(store.previous_snapshot(oldest).await.context("none")?, None);
+
+    // Every access change moves the epoch on, so a write planned before it is refused.
+    let o1 = store.get_secret_by_id("o1").await.context("get")?.context("o1")?;
+    assert_eq!(o1.secret.access_epoch, 2, "restricted and granted, then regranted");
+    let stale = SecretChange {
+        access_epoch: 1,
+        ..change("o1", "/", "OPEN", 1, false)
+    };
+    assert!(matches!(
+        store.write_secrets(batch("a4", vec![stale])).await,
+        Err(StoreError::Conflict)
+    ));
+    let current = SecretChange {
+        access_epoch: 2,
+        ..change("o1", "/", "OPEN", 1, false)
+    };
+    store
+        .write_secrets(batch("a5", vec![current]))
+        .await
+        .context("current epoch")?;
+    assert_eq!(
+        store
+            .list_restricted_secrets("p1")
+            .await
+            .context("restricted")?
+            .iter()
+            .map(|s| (s.environment.as_str(), s.key.as_str()))
+            .collect::<Vec<_>>(),
+        [("dev", "OPEN"), ("dev", "R")]
+    );
+    assert_eq!(store.list_project_grants("p1").await.context("grants")?.len(), 1);
+
+    // The cap is checked inside the transaction, and a refusal changes nothing.
+    assert!(matches!(
+        store
+            .update_secret_access(AccessChange {
+                secret_id: "o1".into(),
+                restricted: None,
+                grant: vec![grant("o1", PrincipalKind::Group, "extra", &[Action::Read])],
+                revoke: vec![],
+                max_grants: 1,
+            })
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(store.list_secret_grants("o1").await.context("grants")?.len(), 1);
+    let mut cleared = Vec::new();
+    for id in ["o1", "r1"] {
+        cleared.extend(
+            store
+                .update_secret_access(AccessChange {
+                    secret_id: id.into(),
+                    restricted: Some(false),
+                    grant: vec![],
+                    revoke: vec![],
+                    max_grants: 100,
+                })
+                .await
+                .context("unrestrict")?,
+        );
+    }
+    assert_eq!(
+        cleared,
+        vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
+        "unrestricting reports what it cleared"
+    );
+    assert!(
+        store.list_secret_grants("o1").await.context("grants")?.is_empty(),
+        "unrestricting clears the list, so it cannot come back later"
+    );
+    assert!(
+        store
+            .list_restricted_secrets("p1")
+            .await
+            .context("restricted")?
+            .is_empty()
+    );
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            restricted: None,
+            grant: vec![grant("o1", PrincipalKind::Group, "ops", &[Action::Read])],
+            revoke: vec![],
+            max_grants: 100,
+        })
+        .await
+        .context("prepare a list on an open secret")?;
+    store.set_project_secret_access("p1", false).await.context("disable")?;
+    assert!(
+        store.list_project_grants("p1").await.context("grants")?.is_empty(),
+        "turning the setting off clears every list"
+    );
+    assert!(matches!(
+        store.set_project_secret_access("missing", true).await,
+        Err(StoreError::NotFound)
+    ));
+    store
+        .set_project_secret_access("p1", true)
+        .await
+        .context("enable again")?;
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            restricted: None,
+            grant: vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
+            revoke: vec![],
+            max_grants: 100,
+        })
+        .await
+        .context("grant the identity")?;
+
+    store
+        .create_identity(Identity {
+            id: "pod".into(),
+            name: "pod".into(),
+            description: String::new(),
+            token_ttl: 60,
+            token_max_ttl: 60,
+            trusted_cidrs: vec![],
+            disabled: false,
+            created_at: 1,
+        })
+        .await
+        .context("identity")?;
+    store.delete_identity("pod").await.context("delete identity")?;
+    assert!(
+        store.list_secret_grants("o1").await.context("grants")?.is_empty(),
+        "a deleted identity leaves no entries behind"
+    );
+    store
+        .update_secret_access(AccessChange {
+            secret_id: "o1".into(),
+            grant: vec![grant("o1", PrincipalKind::User, "u1", &[Action::Read])],
+            restricted: Some(true),
+            revoke: vec![],
+            max_grants: 100,
+        })
+        .await
+        .context("grant")?;
+    // Sparing restricted secrets refuses in the same transaction, for environments and projects.
+    assert!(matches!(
+        store.delete_environment("e1", true).await,
+        Err(StoreError::HoldsRestricted | StoreError::Conflict)
+    ));
+    assert!(matches!(
+        store.delete_project("p1", true).await,
+        Err(StoreError::HoldsRestricted)
+    ));
+    store.delete_project("p1", false).await.context("delete project")?;
+    assert!(store.list_environment_grants("e1").await.context("grants")?.is_empty());
+    Ok(())
+}
+
 async fn exercise(store: SqlStore) -> anyhow::Result<()> {
     exercise_projects_and_secrets(&store).await?;
+    exercise_secret_access(&store).await?;
     exercise_identities_and_tokens(&store).await?;
     exercise_logins_and_audit(&store).await?;
     exercise_seal_config(&store).await?;

@@ -17,6 +17,7 @@ import type {
   PolicyOverride,
   PrincipalKind,
   PutRole,
+  SecretAccessChange,
   SecretPolicy,
   SetSecret,
   UpdateEnvironment,
@@ -170,6 +171,21 @@ export const api = {
         body,
       }),
     ),
+  secretAccess: (at: SecretLocation, key: string) =>
+    unwrap(
+      client.GET("/api/v1/projects/{project}/environments/{env}/secrets/{key}/access", { params: secretParams(at, key) }),
+    ),
+  changeSecretAccess: (at: SecretLocation, key: string, body: SecretAccessChange) =>
+    unwrap(
+      client.PATCH("/api/v1/projects/{project}/environments/{env}/secrets/{key}/access", {
+        params: secretParams(at, key),
+        body,
+      }),
+    ),
+  secretAccessSetting: (project: string) =>
+    unwrap(client.GET("/api/v1/projects/{project}/secret-access", { params: { path: { project } } })),
+  putSecretAccessSetting: (project: string, enabled: boolean) =>
+    unwrap(client.PUT("/api/v1/projects/{project}/secret-access", { params: { path: { project } }, body: { enabled } })),
   projectPolicy: (project: string) =>
     unwrap(client.GET("/api/v1/projects/{project}/secret-policy", { params: { path: { project } } })),
   putProjectPolicy: (project: string, body: SecretPolicy) =>

@@ -7,7 +7,7 @@ use sekret_api::{
     UpdateIdentity, UpdateUser, User, UserPage,
 };
 use sekret_core::crypto::generate_token;
-use sekret_core::permissions::{Action, Subject, covers, dropped_rules, may_remove};
+use sekret_core::permissions::{Action, BuiltinRole, Subject, covers, dropped_rules, may_remove};
 use sekret_core::validate;
 use sekret_store::{Binding, PrincipalKind};
 use serde_json::json;
@@ -19,8 +19,9 @@ use super::projects::{api_role, builtin_roles, ensure_principal_exists, removal_
 use super::{AuditTarget, audit, from_api_kind, to_api_kind};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{
-    added_denies, admin_bindings, deny_needs_admin, has_denies, is_org_admin, org_management_rules, org_rules,
-    project_rules, reaches_admin, require_any, role_rules,
+    added_denies, admin_bindings, admin_role_needs_admin, deny_needs_admin, has_denies, is_org_admin,
+    manages_secret_access, org_management_rules, org_rules, principal_matches, project_rules, reaches_admin,
+    require_any, role_rules,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::machine::{
@@ -203,6 +204,24 @@ async fn ensure_covers_principal(state: &AppState, caller: &Principal, target: &
         return Err(escalation());
     }
     for project in state.store.list_projects().await? {
+        // Lists reach past role rules, so a principal on one, or exempt from them, is for admins.
+        // Checked whatever roles the target holds now, since a role can be taken away and given back.
+        if project.secret_access
+            && !manages_secret_access(state, caller, &project.id).await?
+            && (manages_secret_access(state, target, &project.id).await?
+                || state
+                    .store
+                    .list_project_grants(&project.id)
+                    .await?
+                    .iter()
+                    .any(|g| principal_matches(g.principal_kind, &g.principal_id, target)))
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "escalation",
+                "they are on per-secret access lists you do not manage",
+            ));
+        }
         let target_rules = project_rules(state, target, &project.id).await?;
         if target_rules.is_empty() {
             continue;
@@ -719,6 +738,11 @@ async fn add_binding(
             "you cannot grant a role with more access than you have",
         ));
     }
+    // Backups hold every secret, so handing out the backup role is as strong as org admin.
+    let admin_only = [BuiltinRole::OrgAdmin.slug(), BuiltinRole::BackupReader.slug()];
+    if admin_only.contains(&request.role.as_str()) && !is_org_admin(&state, &principal).await? {
+        return Err(admin_role_needs_admin(&request.role));
+    }
     let kind = from_api_kind(request.principal_kind);
     ensure_principal_exists(&state, kind, &request.principal_id).await?;
     if has_denies(&granted)
@@ -929,5 +953,11 @@ async fn org_audit(
         Subject::OrgAuditLog,
         Action::Read,
     )?;
-    Ok(Json(audit_page(&state, None, params, false).await?))
+    // Only organisation admins, whom no access list binds, see entries about restricted secrets.
+    let visible = if is_org_admin(&state, &principal).await? {
+        None
+    } else {
+        Some(Vec::new())
+    };
+    Ok(Json(audit_page(&state, None, params, false, visible).await?))
 }

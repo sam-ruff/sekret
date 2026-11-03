@@ -4032,7 +4032,19 @@ async fn a_database_from_before_sealing_keeps_working_in_key_file_mode() -> anyh
         .execute(&pool)
         .await
         .context("drop index")?;
+    sqlx::query("DROP TABLE secret_grants")
+        .execute(&pool)
+        .await
+        .context("drop grants")?;
+    sqlx::query("DROP INDEX secrets_restricted")
+        .execute(&pool)
+        .await
+        .context("drop index")?;
     for (table, column) in [
+        ("projects", "secret_access"),
+        ("secrets", "restricted"),
+        ("secrets", "access_epoch"),
+        ("audit_log", "restricted"),
         ("access_tokens", "mac"),
         ("access_tokens", "sealed_hash"),
         ("client_secrets", "mac"),

@@ -535,6 +535,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project}/environments/{env}/secrets/{key}/access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A secret's restricted flag and access list. Admins only. */
+        get: operations["get_secret_access"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Restricts or unrestricts a secret and changes its access list, all at once. Admins only.
+         *     Restricting and granting need the project setting on; unrestricting and revoking always
+         *     work, so a project can be cleaned up before the setting is turned off. A restricted secret
+         *     is reachable only by the principals on its list, for the actions listed, and only as far as
+         *     their roles also allow; admins keep access so a secret is never orphaned.
+         */
+        patch: operations["patch_secret_access"];
+        trace?: never;
+    };
     "/api/v1/projects/{project}/environments/{env}/secrets/{key}/generate": {
         parameters: {
             query?: never;
@@ -755,6 +779,27 @@ export interface paths {
         put: operations["put_role"];
         post?: never;
         delete: operations["delete_role"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{project}/secret-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Admins only, along with the restricted secrets they may see. */
+        get: operations["get_setting"];
+        /**
+         * Turns per-secret access on or off for the project. It is off by default, and turning it off
+         *     is refused while any secret in the project is restricted, so no restriction lapses unnoticed.
+         */
+        put: operations["put_setting"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1071,6 +1116,12 @@ export interface components {
         BatchResult: {
             created: string[];
             deleted: string[];
+            /**
+             * @description The keys that asked for `restricted: true` and are restricted after this write. A client
+             *     should treat a key missing here as open, since a server that predates per-secret access
+             *     ignores the request.
+             */
+            restricted?: string[];
             snapshot_id?: string | null;
             unchanged: string[];
             updated: string[];
@@ -1230,11 +1281,19 @@ export interface components {
         GenerateSecret: {
             comment?: string;
             generator?: components["schemas"]["Generator"] | null;
+            /** @description See [`SecretUpsert::restricted`]. */
+            restricted?: boolean | null;
         };
         Generator: {
             charset?: components["schemas"]["Charset"];
             /** Format: int32 */
             length: number;
+        };
+        GrantRequest: {
+            /** @description Any of `read`, `read-value`, `edit` and `delete`; `read` is always added. */
+            actions: components["schemas"]["Action"][];
+            principal_id: string;
+            principal_kind: components["schemas"]["PrincipalKind"];
         };
         Identity: {
             auth_methods: components["schemas"]["AuthMethodKind"][];
@@ -1416,6 +1475,10 @@ export interface components {
         });
         /** @enum {string} */
         PrincipalKind: "user" | "group" | "identity";
+        PrincipalRef: {
+            principal_id: string;
+            principal_kind: components["schemas"]["PrincipalKind"];
+        };
         Project: {
             /** Format: int64 */
             created_at: number;
@@ -1424,9 +1487,16 @@ export interface components {
             /** @description Versioned URL of the project's logo, absent when it has none. */
             logo_url?: string | null;
             name: string;
+            /** @description Secrets here may be restricted to their own access lists. */
+            secret_access?: boolean;
             slug: string;
         };
         ProjectPermissions: {
+            /**
+             * @description The caller is a project or organisation admin, so manages per-secret access and is
+             *     exempt from access lists, though not from their own rules.
+             */
+            manages_secret_access?: boolean;
             rules: components["schemas"]["Rule"][];
         };
         PutRole: {
@@ -1447,6 +1517,17 @@ export interface components {
         RestoreRequest: {
             /** @description Restrict the restore to this folder and everything beneath it. */
             path?: string;
+        };
+        RestrictedSecret: {
+            deleted: boolean;
+            environment: string;
+            /**
+             * Format: int64
+             * @description Entries on its access list.
+             */
+            grants: number;
+            key: string;
+            path: string;
         };
         Role: {
             builtin: boolean;
@@ -1480,6 +1561,11 @@ export interface components {
             environment: string;
             /** @description The current value was generated by sekret, so rotation may replace it. */
             generated?: boolean;
+            /**
+             * @description For a restricted secret, what its list grants the caller; absent when the list does not
+             *     bind them, because the secret is open or they are an admin.
+             */
+            granted?: components["schemas"]["Action"][] | null;
             id: string;
             key: string;
             /**
@@ -1488,6 +1574,8 @@ export interface components {
              */
             next_rotation_at?: number | null;
             path: string;
+            /** @description Only principals on its access list, and admins, may reach it. */
+            restricted?: boolean;
             tags: string[];
             /** Format: int64 */
             updated_at: number;
@@ -1497,6 +1585,51 @@ export interface components {
             value_hidden: boolean;
             /** Format: int64 */
             version: number;
+        };
+        /** @description Who may reach a secret beyond its role rules. */
+        SecretAccess: {
+            grants: components["schemas"]["SecretGrant"][];
+            /**
+             * @description Only principals on `grants`, project admins and organisation admins may reach it, and
+             *     only as far as their roles also allow. Off, the list has no effect.
+             */
+            restricted: boolean;
+        };
+        /** @description Changes to one secret's access, applied together. */
+        SecretAccessChange: {
+            /** @description Entries to add, or to replace the actions of for a principal already listed. */
+            grant?: components["schemas"]["GrantRequest"][];
+            /** @description Restricting needs the project setting on. */
+            restricted?: boolean | null;
+            revoke?: components["schemas"]["PrincipalRef"][];
+        };
+        /** @description The project's per-secret access setting. */
+        SecretAccessSetting: {
+            enabled: boolean;
+            /**
+             * @description Every restricted secret in the project the caller's roles let them see, deleted ones
+             *     included. The setting cannot be turned off while any secret is restricted.
+             */
+            restricted: components["schemas"]["RestrictedSecret"][];
+            /**
+             * Format: int64
+             * @description Restricted secrets in the project, including any the caller's roles hide.
+             */
+            restricted_count: number;
+        };
+        /** @description One entry on a secret's access list. */
+        SecretGrant: {
+            /** @description Always includes `read`; at most `read`, `read-value`, `edit` and `delete`. */
+            actions: components["schemas"]["Action"][];
+            /** Format: int64 */
+            created_at: number;
+            principal_id: string;
+            principal_kind: components["schemas"]["PrincipalKind"];
+            /**
+             * @description A user's verified email, or their display name when they have none; an identity's name;
+             *     the group name for groups.
+             */
+            principal_name: string;
         };
         SecretList: {
             folders: string[];
@@ -1522,6 +1655,13 @@ export interface components {
         SecretUpsert: {
             comment?: string;
             key: string;
+            /**
+             * @description `true` creates the secret restricted, with an empty access list, so it is never open
+             *     even for a moment; that needs a project admin and the project setting on. A deleted
+             *     secret can be brought back restricted the same way. Otherwise, for a secret that already
+             *     exists it must match whether it is restricted, which only the access route changes.
+             */
+            restricted?: boolean | null;
             tags?: string[] | null;
             value: string;
         };
@@ -1539,8 +1679,13 @@ export interface components {
         };
         SetSecret: {
             comment?: string;
+            /** @description See [`SecretUpsert::restricted`]. */
+            restricted?: boolean | null;
             tags?: string[] | null;
             value: string;
+        };
+        SetSecretAccessSetting: {
+            enabled: boolean;
         };
         SetUnlockPolicy: {
             /**
@@ -2931,6 +3076,67 @@ export interface operations {
             };
         };
     };
+    get_secret_access: {
+        parameters: {
+            query?: {
+                path?: string;
+            };
+            header?: never;
+            path: {
+                project: string;
+                env: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretAccess"];
+                };
+            };
+        };
+    };
+    patch_secret_access: {
+        parameters: {
+            query?: {
+                path?: string;
+            };
+            header?: never;
+            path: {
+                project: string;
+                env: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecretAccessChange"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretAccess"];
+                };
+            };
+            /** @description per-secret access is off */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     generate_secret: {
         parameters: {
             query?: {
@@ -3416,6 +3622,59 @@ export interface operations {
         requestBody?: never;
         responses: {
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_setting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretAccessSetting"];
+                };
+            };
+        };
+    };
+    put_setting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSecretAccessSetting"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretAccessSetting"];
+                };
+            };
+            /** @description secrets are still restricted */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

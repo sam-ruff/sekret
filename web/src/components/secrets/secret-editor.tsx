@@ -6,6 +6,7 @@ import { FormBlocker } from "@/components/form-blocker";
 import { useDiscardGuard } from "@/hooks/use-discard-guard";
 import { ListInput } from "@/components/list-input";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -22,6 +23,8 @@ export interface SecretDraft {
   tags: string[];
   /** Set when sekret should generate the value instead of saving the typed one. */
   generator?: { length: string; charset: Charset };
+  /** Create it restricted to its access list, so it is never open even for a moment. */
+  restricted?: boolean;
 }
 
 interface SecretEditorProps {
@@ -32,12 +35,24 @@ interface SecretEditorProps {
   /** The current value was generated, so typing a new one stops automatic rotation. */
   generated?: boolean;
   canGenerate?: boolean;
+  /** Offer creating it restricted: an admin, with per-secret access on for the project. */
+  canRestrict?: boolean;
   busy: boolean;
   onSave: (draft: SecretDraft) => void;
   onCancel: () => void;
 }
 
-export function SecretEditor({ initial, isNew, valueHidden, generated, canGenerate = true, busy, onSave, onCancel }: SecretEditorProps) {
+export function SecretEditor({
+  initial,
+  isNew,
+  valueHidden,
+  generated,
+  canGenerate = true,
+  canRestrict = false,
+  busy,
+  onSave,
+  onCancel,
+}: SecretEditorProps) {
   const [draft, setDraft] = useState<SecretDraft>(initial);
   const discard = useDiscardGuard(JSON.stringify(draft) !== JSON.stringify(initial));
   const keyProblem = draft.key && !isValidSecretKey(draft.key)
@@ -62,7 +77,11 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
   };
 
   const startGenerating = () =>
-    setDraft({ ...draft, tags: initial.tags, generator: { length: DEFAULT_DRAFT.length, charset: DEFAULT_DRAFT.charset } });
+    setDraft({
+      ...draft,
+      tags: initial.tags,
+      generator: { length: DEFAULT_DRAFT.length, charset: DEFAULT_DRAFT.charset },
+    });
 
   return (
     <form
@@ -182,6 +201,24 @@ export function SecretEditor({ initial, isNew, valueHidden, generated, canGenera
             )}
           </Field>
         </div>
+        {isNew && canRestrict && (
+          <Field orientation="horizontal">
+            <Checkbox
+              id={`restricted-${id}`}
+              checked={draft.restricted === true}
+              onCheckedChange={(on) => setDraft({ ...draft, restricted: on === true })}
+              data-testid="secret-restricted-input"
+            />
+            <div className="space-y-0.5">
+              <FieldLabel htmlFor={`restricted-${id}`} className="font-normal">
+                Restricted
+              </FieldLabel>
+              <FieldDescription className="text-xs">
+                Only admins can reach it until you add people, groups or machines to its access list.
+              </FieldDescription>
+            </div>
+          </Field>
+        )}
       </FieldGroup>
       <div className="flex flex-wrap items-center justify-end gap-2">
         {blocker && (

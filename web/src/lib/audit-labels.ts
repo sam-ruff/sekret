@@ -35,10 +35,12 @@ const ACTION_LABELS: Record<string, string> = {
   "project.delete": "Deleted the project",
   "project.logo-remove": "Removed the logo",
   "project.logo-set": "Changed the logo",
+  "project.secret-access": "Changed per-secret access",
   "project.secret-policy": "Changed the default secret policy",
   "project.update": "Changed project details",
   "role.delete": "Deleted a role",
   "role.put": "Saved a role",
+  "secret.access": "Changed who can reach a secret",
   "secret.generate": "Generated a value",
   "secret.history-read": "Viewed history values",
   "secret.policy": "Changed a secret's policy",
@@ -46,6 +48,7 @@ const ACTION_LABELS: Record<string, string> = {
   "secret.rollback": "Rolled back a secret",
   "secret.rotate": "Rotated a secret",
   "secret.write": "Changed secrets",
+  "secret.write-refused": "Write to a hidden secret refused",
   "snapshot.restore": "Restored a snapshot",
   "sys.backup": "Downloaded a backup",
   "sys.backup.refused": "Backup refused",
@@ -132,7 +135,55 @@ const SUMMARISED = new Set([
   "snapshot",
   "content_type",
   "bytes",
+  "enabled",
+  "restricted",
+  "granted",
+  "revoked",
+  "cleared",
 ]);
+
+/** The names the access section gives the actions an entry can allow. */
+export const ACCESS_ACTION_LABELS: Record<string, string> = {
+  read: "Read name",
+  "read-value": "Read value",
+  edit: "Edit",
+  delete: "Delete",
+};
+
+interface ListEntry {
+  principal_kind?: unknown;
+  principal_id?: unknown;
+  actions?: unknown;
+}
+
+function entryName(entry: ListEntry, names: AuditNames): string {
+  const kindCode = String(entry.principal_kind);
+  return `${KIND_NAMES[kindCode] ?? "principal"} ${principalName(kindCode, String(entry.principal_id), names)}`;
+}
+
+/** Per-secret access changes in plain words. */
+function accessSummary(action: string, detail: Detail, names: AuditNames): string[] {
+  const parts: string[] = [];
+  if (action === "project.secret-access" && typeof detail.enabled === "boolean") {
+    parts.push(detail.enabled ? "Turned on" : "Turned off");
+  }
+  if (action === "secret.access") {
+    // The entry records the flag as sent, not whether it changed.
+    if (detail.restricted === true) parts.push("Set restricted");
+    if (detail.restricted === false) parts.push("Set open");
+    const entries = (field: unknown) => (Array.isArray(field) ? (field as ListEntry[]) : []);
+    for (const c of entries(detail.cleared)) parts.push(`Removed ${entryName(c, names)}`);
+    for (const g of entries(detail.granted)) {
+      const actions = Array.isArray(g.actions) ? g.actions.map((a) => ACCESS_ACTION_LABELS[String(a)] ?? String(a)) : [];
+      parts.push(`Granted ${entryName(g, names)}${actions.length > 0 ? `: ${actions.join(", ")}` : ""}`);
+    }
+    for (const r of entries(detail.revoked)) parts.push(`Removed ${entryName(r, names)}`);
+  }
+  if (action === "secret.write" && Array.isArray(detail.restricted) && detail.restricted.length > 0) {
+    parts.push(`Created restricted: ${detail.restricted.join(", ")}`);
+  }
+  return parts;
+}
 
 /** Name lookups the reader's own data can answer; anything they miss shows its ID. */
 export interface AuditNames {
@@ -197,6 +248,7 @@ function summary(action: string, detail: Detail, names: AuditNames): string[] {
   if (detail.automatic === true) parts.push("Automatic");
   if ("policy" in detail) parts.push(policySummary(detail.policy));
   if (typeof detail.snapshot === "string") parts.push(`From snapshot ${detail.snapshot}`);
+  parts.push(...accessSummary(action, detail, names));
   if (typeof detail.content_type === "string" && typeof detail.bytes === "number") {
     const format = detail.content_type.replace(/^image\//, "").replace(/\+xml$/, "").toUpperCase();
     parts.push(`${format} image, ${formatBytes(detail.bytes)}`);

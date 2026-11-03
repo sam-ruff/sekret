@@ -319,23 +319,20 @@ async fn snapshots_and_history_leave_out_what_the_reader_cannot_read(db: String)
     let id = hidden_batch["id"].as_str().context("id")?;
 
     let (_, partial) = h.get(&format!("{SECRETS}/dev/snapshots"), &token).await?;
-    let seen = partial
-        .as_array()
-        .context("snapshots")?
-        .iter()
-        .find(|s| s["id"] == id)
-        .context("the same snapshot")?;
-    assert_eq!(seen["reason"], "secrets changed", "{partial}");
-    assert_eq!(seen["secret_count"], 1, "only PUBLIC is readable");
+    let partial = partial.as_array().context("snapshots")?;
     assert!(
-        partial
-            .as_array()
-            .context("snapshots")?
-            .iter()
-            .any(|s| s["reason"] == "secrets changed in /"),
-        "a visible folder stays, without counts: {partial}"
+        !partial.iter().any(|s| s["id"] == id),
+        "a snapshot that only changed hidden secrets is left out: {partial:?}"
     );
-    let (_, detail) = h.get(&format!("{SECRETS}/dev/snapshots/{id}"), &token).await?;
+    let visible = partial
+        .iter()
+        .find(|s| s["reason"] == "secrets changed in /")
+        .context("a visible folder stays, without counts")?;
+    assert_eq!(visible["secret_count"], 1, "only PUBLIC is readable");
+    let (status, _) = h.get(&format!("{SECRETS}/dev/snapshots/{id}"), &token).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nor can it be opened directly");
+    let visible_id = visible["id"].as_str().context("id")?;
+    let (_, detail) = h.get(&format!("{SECRETS}/dev/snapshots/{visible_id}"), &token).await?;
     assert_eq!(detail["snapshot"]["secret_count"], 1, "{detail}");
 
     // A version whose own tags hide it keeps its number but not its comment, tags or author.

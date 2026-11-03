@@ -98,6 +98,7 @@ export function emptyState(start: number): MockState {
     audit: [],
     logos: {},
     projectPolicies: {},
+    grants: [],
     sys: mockSys(),
   };
 }
@@ -227,6 +228,16 @@ export function seededState(realNow: number): MockState {
     },
   });
   backend.addMember("storefront", { principal_kind: "identity", principal_id: ci.id, role: "viewer" });
+  // Per-secret access is on for the storefront only: the live Stripe key is restricted to the
+  // deploy identity and the finance group.
+  backend.putSecretAccessSetting("storefront", true);
+  backend.changeSecretAccess("storefront", "prod", "STRIPE_SECRET_KEY", "/", {
+    restricted: true,
+    grant: [
+      { principal_kind: "identity", principal_id: ci.id, actions: ["read-value"] },
+      { principal_kind: "group", principal_id: "finance", actions: ["read"] },
+    ],
+  });
   const worker = backend.createIdentity({
     name: "billing-worker",
     description: "Kubernetes batch jobs",

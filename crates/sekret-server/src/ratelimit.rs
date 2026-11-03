@@ -737,6 +737,7 @@ mod tests {
             secret_key: None,
             detail: serde_json::json!({}),
             ip: "203.0.113.9".into(),
+            restricted: false,
         }
     }
 

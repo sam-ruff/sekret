@@ -117,10 +117,28 @@ pub fn slug(value: &str) -> Result<(), ValidationError> {
 
 pub fn name(value: &str) -> Result<(), ValidationError> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 128 || trimmed.chars().any(char::is_control) {
+    let hidden = |c: char| c.is_control() || is_invisible_format(c);
+    if trimmed.is_empty() || trimmed.chars().count() > 128 || trimmed.chars().any(hidden) {
         return Err(ValidationError::Name);
     }
     Ok(())
+}
+
+/// Invisible characters that change how the text around them reads, such as bidirectional
+/// overrides and zero-width joiners, so a name cannot pose as another.
+pub fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
 }
 
 /// True when `path` is `folder` or sits beneath it.

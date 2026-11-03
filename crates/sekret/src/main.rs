@@ -98,6 +98,12 @@ enum ProjectsAction {
         #[arg(long = "environment", value_name = "SLUG")]
         environments: Vec<String>,
     },
+    /// Show per-secret access for the project and its restricted secrets, or turn it on or off.
+    /// Off by default; turning it off is refused while any secret is restricted. Admins only.
+    SecretAccess {
+        #[arg(value_enum)]
+        state: Option<cli::access::OnOff>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +200,16 @@ async fn dispatch(cli: Cli, env_secrets: settings::EnvSecrets, sources: &setting
                 cli::format::one_line(&project.slug),
                 cli::format::one_line(&project.id)
             );
+        }
+        Command::Projects {
+            action: Some(ProjectsAction::SecretAccess { state }),
+        } => {
+            let (resolved, api) = authenticated(&cli.client).await?;
+            cli::confirm_target(&resolved, state.is_some())?;
+            let project = resolved
+                .checked_project()?
+                .ok_or_else(|| anyhow::anyhow!("no project; pass -p or set SEKRET_PROJECT"))?;
+            print!("{}", cli::access::project_setting(&api, project, state).await?);
         }
         Command::Projects { .. } => {
             let (_, api) = authenticated(&cli.client).await?;

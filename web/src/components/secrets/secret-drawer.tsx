@@ -19,6 +19,7 @@ import { formatDateTime, formatRelative } from "@/lib/format";
 import { folderLabel } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { HISTORY_PAGE, mergeHistory, nextHistoryCursor, sameContent } from "@/lib/versions";
+import { AccessSection } from "./access-section";
 import { PolicySection } from "./policy-section";
 
 interface SecretDrawerProps {
@@ -30,6 +31,12 @@ interface SecretDrawerProps {
   canRollback: boolean;
   /** May change this secret's generation policy and rotate it. */
   canEditPolicy: boolean;
+  /** Only those on its access list, and admins, can reach it. */
+  restricted?: boolean;
+  /** Show the access section first, when the reader needs to check it. */
+  accessFirst?: boolean;
+  /** May read old values, by role and by the secret's own access list. */
+  canRevealHistory?: boolean;
   onRotate: (key: string) => void;
   onClose: () => void;
   onCloseAutoFocus?: (event: Event) => void;
@@ -238,6 +245,9 @@ export function SecretDrawer({
   secretKey,
   canRollback,
   canEditPolicy,
+  restricted = false,
+  accessFirst = false,
+  canRevealHistory = true,
   onRotate,
   onClose,
   onCloseAutoFocus,
@@ -254,7 +264,7 @@ export function SecretDrawer({
     setValuesFor(null);
     setTarget(null);
   }
-  const showValues = location !== null && valuesFor === location;
+  const showValues = canRevealHistory && location !== null && valuesFor === location;
 
   const historyKey = keys.versions(project, env, path, secretKey ?? "");
   const loadPage = async (values: boolean, before: number | undefined) => {
@@ -332,6 +342,7 @@ export function SecretDrawer({
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
+            {secretKey && accessFirst && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
             {versions.isPending && <ListSkeleton rows={3} />}
             {versions.error && !versions.isFetchNextPageError && (
               <ErrorState error={versions.error} onRetry={() => void versions.refetch()} />
@@ -341,18 +352,26 @@ export function SecretDrawer({
                 <section className="space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-sm font-semibold">History</h3>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setValuesFor(showValues ? null : location)}
-                      aria-pressed={showValues}
-                      data-testid="history-values-toggle"
-                    >
-                      {showValues ? <EyeOff /> : <Eye />}
-                      {showValues ? "Hide values" : "Show values"}
-                    </Button>
+                    {canRevealHistory && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setValuesFor(showValues ? null : location)}
+                        aria-pressed={showValues}
+                        data-testid="history-values-toggle"
+                      >
+                        {showValues ? <EyeOff /> : <Eye />}
+                        {showValues ? "Hide values" : "Show values"}
+                      </Button>
+                    )}
                   </div>
-                  {!showValues && (
+                  {!canRevealHistory && (
+                    <p className="flex items-start gap-2 text-sm text-muted-foreground" data-testid="history-values-denied">
+                      <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
+                      You can see this secret's versions but not read their values.
+                    </p>
+                  )}
+                  {canRevealHistory && !showValues && (
                     <p className="text-sm text-muted-foreground" data-testid="history-values-hidden">
                       Values are hidden. Show them to see each version and compare versions. Showing them is recorded in
                       the audit log.
@@ -407,6 +426,7 @@ export function SecretDrawer({
                 )}
               </>
             )}
+            {secretKey && !accessFirst && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
             {secretKey && (
               <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />
             )}

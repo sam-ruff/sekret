@@ -511,6 +511,7 @@ async fn a_rotation_that_fails_leaves_no_staged_key_behind() -> anyhow::Result<(
         created_at: 0,
         logo_updated_at: None,
         secret_policy: None,
+        secret_access: false,
     };
     store.create_project(project, vec![]).await?;
     drop(store);

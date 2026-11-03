@@ -24,7 +24,7 @@ A folder with many secrets shows the first 100, with a button to show more. *Rev
 
 On the project overview, which lists every key across every environment, a *Missing* cell opens that environment with the new secret form already holding the key. A copied value is cleared from the clipboard after 45 seconds, as long as you stayed in the sekret tab and copied nothing else. sekret is not allowed to read the clipboard, so once you have switched to another window it cannot tell whether you copied something of your own there; it leaves the clipboard alone and tells you to clear it yourself. Signing out or being sent to sign in again overwrites the clipboard straight away, and if the browser refuses, the sign-in page says so. Closing or reloading the tab first asks you to confirm and tries to clear it, but the browser may refuse, for example when the tab is closed from another window, so clear the clipboard yourself if you are not sure. Pasting a `.env` file into the import dialog creates or updates every key in it in one write; closing the dialog throws the pasted text away.
 
-Reading a key name and reading its value are separate permissions, so a role can let someone see which keys exist without seeing any values.
+Reading a key name and reading its value are separate permissions, so a role can let someone see which keys exist without seeing any values. When a project has [per-secret access](secret-access.md) on, an admin can also restrict one secret to a list of users, groups and machine identities; everyone else sees it as if it did not exist.
 
 ## History and rollback
 

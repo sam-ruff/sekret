@@ -21,6 +21,8 @@ pub enum StoreError {
     Database(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error("it holds restricted secrets")]
+    HoldsRestricted,
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -104,9 +106,34 @@ pub trait Store: Send + Sync {
     async fn set_project_logo(&self, project_id: &str, logo: Option<ProjectLogo>, now: i64) -> StoreResult<()>;
     async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>>;
     async fn set_project_policy(&self, project_id: &str, policy: Option<String>) -> StoreResult<()>;
-    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
+    /// A change to the secret's access since `access_epoch` was read is a `Conflict`.
+    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>, access_epoch: i64) -> StoreResult<()>;
+    /// Turns per-secret access on or off. Turning it off is a `Conflict` while any secret in the
+    /// project is restricted, so no restriction is ever dropped silently, and otherwise clears
+    /// every access list in the project.
+    async fn set_project_secret_access(&self, project_id: &str, enabled: bool) -> StoreResult<()>;
+    /// Restricted secrets in the project, deleted ones included.
+    async fn count_restricted_secrets(&self, project_id: &str) -> StoreResult<i64>;
+    /// Restricted secrets in the project, deleted ones included, without their values.
+    async fn list_restricted_secrets(&self, project_id: &str) -> StoreResult<Vec<RestrictedSecret>>;
+    /// Every access list entry on secrets in the environment.
+    async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    /// The restricted secrets in the environment with their access epochs, and their entries,
+    /// read together so a write can be held to the lists it was judged by.
+    async fn environment_access(&self, environment_id: &str) -> StoreResult<EnvironmentAccess>;
+    /// The snapshot taken just before this one in its environment.
+    async fn previous_snapshot(&self, snapshot: &Snapshot) -> StoreResult<Option<Snapshot>>;
+    /// Every access list entry on secrets in the project.
+    async fn list_project_grants(&self, project_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    /// Applies one secret's access changes atomically and moves its access epoch on.
+    /// Restricting is a `Conflict` when the project setting is off, and unrestricting clears the
+    /// list before any grants in the same change. Returns the entries unrestricting cleared.
+    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<Vec<SecretGrant>>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
-    async fn delete_project(&self, id: &str) -> StoreResult<()>;
+    /// With `spare_restricted`, refuses with `HoldsRestricted` when any secret in the project is
+    /// restricted, checked in the same transaction.
+    async fn delete_project(&self, id: &str, spare_restricted: bool) -> StoreResult<()>;
     /// Every stored secret value in the project, history included.
     async fn list_encrypted_values(&self, project_id: &str) -> StoreResult<Vec<EncryptedValue>>;
     /// Swaps every root-key-dependent value in one transaction: project keys, secret values,
@@ -131,7 +158,8 @@ pub trait Store: Send + Sync {
     async fn list_environments(&self, project_id: &str) -> StoreResult<Vec<Environment>>;
     async fn create_environment(&self, environment: Environment) -> StoreResult<()>;
     async fn update_environment(&self, id: &str, name: &str, position: i64) -> StoreResult<()>;
-    async fn delete_environment(&self, id: &str) -> StoreResult<()>;
+    /// `spare_restricted` as for [`Store::delete_project`].
+    async fn delete_environment(&self, id: &str, spare_restricted: bool) -> StoreResult<()>;
 
     async fn list_folders(&self, environment_id: &str) -> StoreResult<Vec<Folder>>;
     async fn create_folder(&self, folder: Folder) -> StoreResult<()>;

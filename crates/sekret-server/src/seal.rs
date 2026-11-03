@@ -912,6 +912,7 @@ pub async fn audit_as(store: &dyn Store, now: i64, ip: &str, actor: &str, action
         secret_key: None,
         detail: crate::peer::annotate(detail, ip),
         ip: ip.to_string(),
+        restricted: false,
     };
     if let Err(error) = store.insert_audit(entry).await {
         tracing::error!(%error, action, "failed to write audit entry");

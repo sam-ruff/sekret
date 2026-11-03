@@ -90,17 +90,25 @@ Add `--print-token` to any machine login to print the token rather than save it.
 |---|---|
 | `sekret projects` | Lists the projects you can see. |
 | `sekret projects create SLUG [--name N] [--environment E]...` | Creates a project, with `dev`, `staging` and `prod` unless you list others. |
+| `sekret projects secret-access [on\|off]` | Shows whether [per-secret access](user-guide/secret-access.md) is on for the project and lists its restricted secrets, or turns it on or off. Admins only. Turning it off is refused while any secret is restricted. |
 | `sekret secrets list [--values] [--recursive]` | Lists keys, and values if asked. |
 | `sekret secrets get KEY [--json] [--raw]` | Prints one value, or the whole record as JSON. A value with control characters or escape sequences, or a JSON record with characters JSON does not escape such as bidirectional overrides, is refused when printing to a terminal, since it could rewrite the screen or set the clipboard; pipe it, or pass `--raw` to print it anyway. |
-| `sekret secrets set KEY=value ... [--from-dotenv F] [--comment C]` | Creates or updates secrets in one write. `KEY=-` reads the value from standard input. Typed at a terminal, `KEY=value` warns that the value is now in your shell history. |
+| `sekret secrets set KEY=value ... [--from-dotenv F] [--comment C] [--restricted]` | Creates or updates secrets in one write. `KEY=-` reads the value from standard input. Typed at a terminal, `KEY=value` warns that the value is now in your shell history. `--restricted` creates new secrets restricted, in the same write, which needs a project admin and per-secret access on; it can bring a deleted secret back restricted, and for a live one it must match what it is now. The command fails if the server does not confirm each restriction. |
 | `sekret secrets delete KEY ...` | Deletes secrets; their history stays. |
 | `sekret secrets history KEY [--values] [--diff A B]` | Lists versions, or diffs two of them. |
 | `sekret secrets rollback KEY VERSION` | Writes a new version with the old value. |
-| `sekret secrets generate KEY [--length N] [--charset C]` | Stores a random value without printing it. |
+| `sekret secrets generate KEY [--length N] [--charset C] [--restricted]` | Stores a random value without printing it. `--restricted` works as for `secrets set`. |
 | `sekret secrets policy KEY [--rotate-days N] [--length N] [--charset C] [--off] [--inherit]` | Shows or sets a secret's generation and rotation policy. |
+| `sekret secrets access list KEY` | Shows whether a secret is restricted and who is on its access list. |
+| `sekret secrets access grant KEY [--identity I] [--user U] [--group G] [--allow A,...]` | Adds principals to a secret's access list, or replaces what they may do. `--identity` takes an id or a name, `--user` an id or an email, `--group` a group name; each can be repeated. `--allow` takes `read`, `read-value`, `edit` and `delete`, defaults to `read,read-value`, and always includes `read`. |
+| `sekret secrets access revoke KEY [--identity I] [--user U] [--group G]` | Takes principals off a secret's access list. |
+| `sekret secrets access restrict KEY` | Restricts a secret to its list and to admins. Needs per-secret access on for the project. |
+| `sekret secrets access unrestrict KEY` | Opens a restricted secret to its role rules again, and clears its list. |
 | `sekret policy [--rotate-days N] [--length N] [--charset C] [--off]` | Shows or sets the project default. |
 | `sekret snapshots list` | Lists the environment's snapshots. |
 | `sekret snapshots restore ID [--path P]` | Restores a snapshot, limited to a folder if given. |
+
+Every `sekret secrets access` command is for project and organisation admins, and works on deleted secrets too, so a project can be cleaned up before per-secret access is turned off.
 
 ## Using secrets
 
