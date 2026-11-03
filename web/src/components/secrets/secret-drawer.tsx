@@ -264,7 +264,7 @@ export function SecretDrawer({
     setValuesFor(null);
     setTarget(null);
   }
-  const showValues = location !== null && valuesFor === location;
+  const showValues = canRevealHistory && location !== null && valuesFor === location;
 
   const historyKey = keys.versions(project, env, path, secretKey ?? "");
   const loadPage = async (values: boolean, before: number | undefined) => {

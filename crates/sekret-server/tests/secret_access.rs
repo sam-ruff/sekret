@@ -1023,6 +1023,19 @@ async fn identity_managers_cannot_take_over_listed_identities(db: String) -> any
         assert_eq!(status, StatusCode::FORBIDDEN, "{url}: {answer}");
         assert_eq!(answer["error"], "escalation", "{url}: {answer}");
     }
+    // Taking its role away first does not help: the lists are checked whatever roles it holds.
+    let (status, body) = h
+        .delete(&format!("/api/v1/projects/app/members/identity/{pod}/viewer"), &h.admin)
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, answer) = h
+        .post(
+            &format!("/api/v1/identities/{pod}/client-secrets"),
+            &mallory_token,
+            json!({}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
     let (status, body) = h
         .post(
             &format!("/api/v1/identities/{other}/client-secrets"),

@@ -39,6 +39,7 @@ test("restricts a secret, manages its list and refuses turning the setting off w
   await page.goto(`/projects/${slug}/secrets/dev`);
   access = await openAccess(page, "PAYOUT_TOKEN");
   await access.getByTestId("access-restricted").click();
+  await confirm(page, "access-restrict-confirm");
   await expect(access.getByTestId("access-restricted")).toBeChecked();
   await expect(access.getByTestId("access-empty")).toContainText("only admins can reach it");
 
@@ -58,8 +59,10 @@ test("restricts a secret, manages its list and refuses turning the setting off w
   card = await setting(page, slug);
   await expect(card.getByTestId("secret-access-restricted")).toContainText("PAYOUT_TOKEN");
   await card.getByTestId("secret-access-enabled").click();
-  await confirm(page, "secret-access-off-confirm");
-  await expect(card.getByTestId("secret-access-refused")).toContainText("1 secret in this project is restricted");
+  const blocked = page.getByTestId("secret-access-off-confirm");
+  await expect(blocked).toContainText("1 secret is still restricted");
+  await blocked.getByTestId("confirm-cancel").click();
+  await expect(blocked).toBeHidden();
   await expect(card.getByTestId("secret-access-enabled")).toBeChecked();
 
   await page.goto(`/projects/${slug}/secrets/dev`);

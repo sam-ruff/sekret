@@ -273,13 +273,12 @@ function SecretsView() {
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
-  // Router state, or `?open=KEY` with `&access=1`, opens a secret's drawer, at the access section if asked.
+  // Router state opens a secret's drawer, at the access section if asked; keys never go in the address.
   const location = useLocation();
   const arrival = (() => {
     const state = openSecretState(location.state);
-    const key = state?.open ?? search.get("open");
-    if (key === null || !isValidSecretKey(key)) return null;
-    return { key, access: state ? state.access === true : search.get("access") === "1" };
+    if (!state || !isValidSecretKey(state.open)) return null;
+    return { key: state.open, access: state.access === true };
   })();
   const [drawerKey, setDrawerKey] = useState<string | null>(() => arrival?.key ?? null);
   /** The drawer opens on its access section, as asked or after a restriction the server did not confirm. */
@@ -299,15 +298,13 @@ function SecretsView() {
 
   // The prefilled key, search or import request has been read; a reload should not apply it again.
   useEffect(() => {
-    if (!["add", "import", "q", "open", "access"].some((name) => search.has(name))) return;
+    if (!["add", "import", "q"].some((name) => search.has(name))) return;
     setSearch(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("add");
         next.delete("import");
         next.delete("q");
-        next.delete("open");
-        next.delete("access");
         return next;
       },
       { replace: true },
@@ -875,10 +872,12 @@ function SecretsView() {
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
             restricted={drawerSecret?.restricted === true}
             accessFirst={accessFirst}
+            // A secret not in the list, such as a deleted one, shows values only to admins, who no list binds.
             canRevealHistory={
-              drawerSecret === undefined ||
-              (perms.can("secrets", "read-value", resourceFor(drawerSecret)) &&
-                perms.can("secret-versions", "read-value", resourceFor(drawerSecret)))
+              drawerSecret === undefined
+                ? managesAccess
+                : perms.can("secrets", "read-value", resourceFor(drawerSecret)) &&
+                  perms.can("secret-versions", "read-value", resourceFor(drawerSecret))
             }
             onRotate={(key) => {
               rotateReturnFocus.current = null;

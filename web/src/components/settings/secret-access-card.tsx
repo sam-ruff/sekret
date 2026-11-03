@@ -72,6 +72,7 @@ function SettingForm({ project, setting, canEdit }: { project: string; setting: 
     },
   });
   const hidden = setting.restricted_count - setting.restricted.length;
+  const blockedOff = setting.restricted_count > 0;
   const change = (enabled: boolean) => {
     // Stays focusable while saving, so keyboard users keep their place.
     if (save.isPending) return;
@@ -100,8 +101,14 @@ function SettingForm({ project, setting, canEdit }: { project: string; setting: 
       <ConfirmDialog
         open={confirmOff}
         onOpenChange={setConfirmOff}
-        title="Turn per-secret access off?"
-        description="Secrets can no longer be restricted, and every access list in the project is cleared, including lists prepared on secrets that are still open."
+        title={blockedOff ? "Per-secret access cannot be turned off yet" : "Turn per-secret access off?"}
+        description={
+          blockedOff
+            ? `${setting.restricted_count} secret${setting.restricted_count === 1 ? " is" : "s are"} still restricted. Open ${setting.restricted_count === 1 ? "it" : "each of them"} to everyone its roles allow first, so no restriction lapses unnoticed.`
+            : "Secrets can no longer be restricted, and every access list in the project is cleared, including lists prepared on secrets that are still open."
+        }
+        // Nothing can be cleared while a secret is restricted, so the dialog only explains why.
+        blocked={blockedOff}
         confirmLabel="Turn off"
         destructive
         onConfirm={() => save.mutateAsync(false).catch(() => undefined)}

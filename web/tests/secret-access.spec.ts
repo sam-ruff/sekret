@@ -181,8 +181,9 @@ test("entries whose names differ only in punctuation keep their own controls", a
   await expect(access.getByRole("checkbox", { name: "Edit for eng ops" })).not.toBeChecked();
 });
 
-test("a stray access flag without a secret does not reorder later drawers", async ({ page }) => {
-  await openSecrets(page, "prod", "storefront", "?access=1");
+test("a secret named in the address opens nothing and does not reorder later drawers", async ({ page }) => {
+  await openSecrets(page, "prod", "storefront", "?open=STRIPE_SECRET_KEY&access=1");
+  await expect(page.getByTestId("secret-drawer")).toHaveCount(0);
   await secretRow(page, "SENTRY_DSN").getByTestId("secret-key").click();
   const drawer = page.getByTestId("secret-drawer");
   const history = drawer.getByTestId("version-list");
@@ -214,6 +215,7 @@ test("unrestricting always asks first, naming the first few on the list", async 
   // Even with nobody on the list, opening a secret up is confirmed.
   const sentry = await openAccess(page, "SENTRY_DSN");
   await sentry.getByTestId("access-restricted").click();
+  await page.getByTestId("access-restrict-confirm").getByTestId("confirm-action").click();
   await expect(sentry.getByTestId("access-restricted")).toBeChecked();
   await sentry.getByTestId("access-restricted").click();
   await expect(page.getByTestId("access-unrestrict-confirm")).not.toContainText("cleared");
@@ -226,8 +228,11 @@ test("turning the setting off is refused while a secret is restricted, and confi
   await expect(card.getByTestId("secret-access-enabled")).toBeChecked();
   await expect(card.getByTestId("secret-access-restricted")).toContainText("STRIPE_SECRET_KEY");
   await card.getByTestId("secret-access-enabled").click();
-  await page.getByTestId("secret-access-off-confirm").getByTestId("confirm-action").click();
-  await expect(card.getByTestId("secret-access-refused")).toContainText("1 secret in this project is restricted");
+  // With a secret restricted, the dialog only explains why it cannot go ahead.
+  const blocked = page.getByTestId("secret-access-off-confirm");
+  await expect(blocked).toContainText("1 secret is still restricted");
+  await expect(blocked.getByTestId("confirm-action")).toHaveCount(0);
+  await blocked.getByTestId("confirm-cancel").click();
   await expect(card.getByTestId("secret-access-enabled")).toBeChecked();
 
   // The restricted secret's row opens its drawer at the access section, without the key in the address.
@@ -237,7 +242,8 @@ test("turning the setting off is refused while a secret is restricted, and confi
   expect(page.url()).not.toContain("STRIPE");
   await access.getByTestId("access-restricted").click();
   const confirm = page.getByTestId("access-unrestrict-confirm");
-  await expect(confirm).toContainText("finance, github-deploy");
+  // A group is named by its id; a machine identity also shows its kind and id.
+  await expect(confirm).toContainText("finance, github-deploy (machine identity ");
   await confirm.getByTestId("confirm-action").click();
   await expect(access.getByTestId("access-restricted")).not.toBeChecked();
   await expect(access.getByTestId("access-empty")).toHaveText("No one is on the list.");
@@ -268,6 +274,9 @@ test("restricts a secret from its drawer while the setting is on", async ({ page
   await expect(access.getByTestId("access-empty")).toHaveText("No one is on the list.");
   await expect(access.getByTestId("access-restrict-note")).toContainText("rotate the value if it must be contained");
   await access.getByTestId("access-restricted").click();
+  const confirm = page.getByTestId("access-restrict-confirm");
+  await expect(confirm).toContainText("Only project and organisation admins will reach SENTRY_DSN");
+  await confirm.getByTestId("confirm-action").click();
   await expect(access.getByTestId("access-restricted")).toBeChecked();
   await expectToast(page, "Restricted SENTRY_DSN");
   await expect(access.getByTestId("access-empty")).toContainText("only admins can reach it");

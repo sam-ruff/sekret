@@ -49,6 +49,14 @@ function namesWithMore(names: string[]): string {
 
 const entryId = (g: Pick<SecretGrant, "principal_kind" | "principal_id">) => `${g.principal_kind}:${g.principal_id}`;
 
+/** An entry by name, with its kind and id when the name alone could be mistaken for someone else. */
+function entryLabel(g: SecretGrant): string {
+  if (g.principal_name === g.principal_id) return g.principal_name;
+  return `${g.principal_name} (${KIND_LABEL[g.principal_kind].toLowerCase()} ${g.principal_id})`;
+}
+
+const settingsLink = (project: string) => `/projects/${encodeURIComponent(project)}/settings/general`;
+
 interface AccessSectionProps {
   at: Location;
   secretKey: string;
@@ -101,19 +109,17 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
   const save = (next: Change) => change.mutateAsync(next).then(() => undefined);
   const section = useRef<HTMLElement>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmRestrict, setConfirmRestrict] = useState(false);
   const listed = access.data?.grants ?? [];
   const busy = change.isPending;
 
   const setRestricted = (restricted: boolean) => {
     if (busy) return;
-    // Opening a secret exposes it, and clears its list, so it is always confirmed.
-    if (!restricted) {
-      // The dialog names who is cleared, so it asks for the list as it is now.
-      void access.refetch();
-      setConfirmOpen(true);
-      return;
-    }
-    change.mutate({ body: { restricted: true }, message: `Restricted ${secretKey}` });
+    // Both ways are confirmed against the list as it is now: opening exposes the secret and
+    // clears its list, and restricting shuts out everyone not on it.
+    void access.refetch();
+    if (restricted) setConfirmRestrict(true);
+    else setConfirmOpen(true);
   };
 
   const off = !enabled && access.data?.restricted === false;
@@ -133,7 +139,7 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
       {access.data && project.data && off && listed.length === 0 && (
         <p className="text-sm text-muted-foreground" data-testid="access-off">
           Per-secret access is off for this project, so roles alone decide who can reach this secret. Turn it on in the{" "}
-          <Link className="underline underline-offset-2" to={`/projects/${at.project}/settings/general`}>
+          <Link className="underline underline-offset-2" to={settingsLink(at.project)}>
             project settings
           </Link>{" "}
           to restrict secrets.
@@ -176,22 +182,45 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
               ) : (
                 <>
                   Everyone whose role allows it can read {secretKey} again, and its access list is cleared:{" "}
-                  {namesWithMore(listed.map((g) => g.principal_name))} {listed.length === 1 ? "is" : "are"} removed.
+                  {namesWithMore(listed.map(entryLabel))} {listed.length === 1 ? "is" : "are"} removed.
                   Restricting it again starts with an empty list.
                 </>
               )
             }
             confirmLabel="Unrestrict"
             // Waits for the list as it is now, so the names above are who is really cleared.
-            confirmDisabled={access.isFetching}
+            confirmDisabled={access.isFetching || access.isError}
             destructive
             onConfirm={() => save({ body: { restricted: false }, message: `Opened ${secretKey} to everyone its roles allow` })}
             testId="access-unrestrict-confirm"
           />
+          <ConfirmDialog
+            open={confirmRestrict}
+            onOpenChange={setConfirmRestrict}
+            title={`Restrict ${secretKey}?`}
+            description={
+              listed.length === 0 ? (
+                <>
+                  Only project and organisation admins will reach {secretKey}, until you add people, groups or machine
+                  identities to its access list. Everyone else, including running workloads, loses it.
+                </>
+              ) : (
+                <>
+                  Only project and organisation admins and the {listed.length === 1 ? "one entry" : `${listed.length} entries`}{" "}
+                  on its access list ({namesWithMore(listed.map(entryLabel))}) will reach {secretKey}, and only as far as
+                  their roles allow. Everyone else loses it.
+                </>
+              )
+            }
+            confirmLabel="Restrict"
+            confirmDisabled={access.isFetching || access.isError}
+            onConfirm={() => save({ body: { restricted: true }, message: `Restricted ${secretKey}` })}
+            testId="access-restrict-confirm"
+          />
           {off && (
             <p className="text-sm text-muted-foreground" data-testid="access-off">
               Per-secret access is off for this project. Turn it on in the{" "}
-              <Link className="underline underline-offset-2" to={`/projects/${at.project}/settings/general`}>
+              <Link className="underline underline-offset-2" to={settingsLink(at.project)}>
                 project settings
               </Link>{" "}
               to restrict secrets.
@@ -248,7 +277,7 @@ function GrantList({
     try {
       await onChange({
         body: { revoke: [{ principal_kind: grant.principal_kind, principal_id: grant.principal_id }] },
-        message: `Removed ${grant.principal_name}`,
+        message: `Removed ${entryLabel(grant)}`,
       });
     } catch (error) {
       focusNext.current = null;
@@ -292,7 +321,7 @@ function GrantRow({
   const toggle = (action: Action, on: boolean) => {
     if (busy) return;
     const actions = on ? [...grant.actions, action] : grant.actions.filter((a) => a !== action);
-    void onChange({ body: { grant: [{ ...principal, actions }] }, message: `Updated what ${name} may do` }).catch(
+    void onChange({ body: { grant: [{ ...principal, actions }] }, message: `Updated what ${entryLabel(grant)} may do` }).catch(
       () => undefined,
     );
   };
@@ -387,7 +416,10 @@ function AddGrant({
     try {
       await onAdd({
         body: { grant: [{ principal_kind: kind, principal_id: principal, actions }] },
-        message: already ? `Updated what ${name} may do` : `Added ${name}`,
+        message: (() => {
+          const who = entryLabel({ principal_kind: kind, principal_id: principal, principal_name: name, actions, created_at: 0 });
+          return already ? `Updated what ${who} may do` : `Added ${who}`;
+        })(),
       });
       setGroup("");
       setChosen(undefined);

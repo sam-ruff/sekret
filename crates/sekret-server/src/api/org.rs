@@ -204,14 +204,8 @@ async fn ensure_covers_principal(state: &AppState, caller: &Principal, target: &
         return Err(escalation());
     }
     for project in state.store.list_projects().await? {
-        let target_rules = project_rules(state, target, &project.id).await?;
-        if target_rules.is_empty() {
-            continue;
-        }
-        if !covers(&project_rules(state, caller, &project.id).await?, &target_rules) {
-            return Err(escalation());
-        }
         // Lists reach past role rules, so a principal on one, or exempt from them, is for admins.
+        // Checked whatever roles the target holds now, since a role can be taken away and given back.
         if project.secret_access
             && !manages_secret_access(state, caller, &project.id).await?
             && (manages_secret_access(state, target, &project.id).await?
@@ -227,6 +221,13 @@ async fn ensure_covers_principal(state: &AppState, caller: &Principal, target: &
                 "escalation",
                 "they are on per-secret access lists you do not manage",
             ));
+        }
+        let target_rules = project_rules(state, target, &project.id).await?;
+        if target_rules.is_empty() {
+            continue;
+        }
+        if !covers(&project_rules(state, caller, &project.id).await?, &target_rules) {
+            return Err(escalation());
         }
     }
     Ok(())
