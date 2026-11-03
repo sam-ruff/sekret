@@ -104,11 +104,7 @@ pub fn terminal_safe_json(json: &str) -> String {
 }
 
 fn is_unprintable(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
-        )
+    c.is_control() || sekret_api::is_invisible_format(c)
 }
 
 /// Drops the rest of an escape sequence: CSI up to its final byte, OSC, DCS and similar strings

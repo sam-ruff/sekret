@@ -287,6 +287,7 @@ pub async fn plan_batch(
     };
     let mut changes = Vec::new();
     let mut touches_restricted = false;
+    let mut collision: Option<(String, String)> = None;
     let rules = caller.rules;
 
     for upsert in upserts {
@@ -306,9 +307,12 @@ pub async fn plan_batch(
         if let Some(hidden) = hidden {
             // Answered exactly as a missing key would be, up to the point where the caller could
             // really create one; only then is the clash refused, and recorded.
+            // The clash is held back until the rest of the batch has passed, so a batch cannot
+            // test for the name and fail harmlessly on a later item.
             let tags = normalise_tags(upsert.tags.clone().unwrap_or_default())?;
             check_creatable(caller, project, env, &path, &upsert, &tags)?;
-            return Err(hidden_collision(ctx, &upsert.key, &hidden.secret.path));
+            collision.get_or_insert((upsert.key.clone(), hidden.secret.path.clone()));
+            continue;
         }
         let existing = stored;
         // A new secret has no list until it exists.
@@ -454,6 +458,9 @@ pub async fn plan_batch(
         result.deleted.push(key_name);
     }
 
+    if let Some((key_name, at)) = collision {
+        return Err(hidden_collision(ctx, &key_name, &at));
+    }
     if changes.is_empty() {
         return Ok(PlannedWrite {
             batch: None,

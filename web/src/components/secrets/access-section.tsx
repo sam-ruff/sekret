@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Bot, Lock, Plus, Trash2, User, Users } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent, type RefObject } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Link } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Action, PrincipalKind, SecretAccess, SecretAccessChange, SecretGrant } from "@/api/types";
@@ -106,6 +106,8 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
     if (busy) return;
     // Opening a secret exposes it, and clears its list, so it is always confirmed.
     if (!restricted) {
+      // The dialog names who is cleared, so it asks for the list as it is now.
+      void access.refetch();
       setConfirmOpen(true);
       return;
     }
@@ -123,9 +125,10 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
       <p className="sr-only" role="status" data-testid="access-announce">
         {announced}
       </p>
-      {access.isPending && <ListSkeleton rows={2} />}
+      {(access.isPending || project.isPending) && <ListSkeleton rows={2} />}
       {access.error && <ErrorState error={access.error} onRetry={() => void access.refetch()} />}
-      {access.data && off && listed.length === 0 && (
+      {project.error && <ErrorState error={project.error} onRetry={() => void project.refetch()} />}
+      {access.data && project.data && off && listed.length === 0 && (
         <p className="text-sm text-muted-foreground" data-testid="access-off">
           Per-secret access is off for this project, so roles alone decide who can reach this secret. Turn it on in the{" "}
           <Link className="underline underline-offset-2" to={`/projects/${at.project}/settings/general`}>
@@ -134,7 +137,7 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
           to restrict secrets.
         </p>
       )}
-      {access.data && !(off && listed.length === 0) && (
+      {access.data && project.data && !(off && listed.length === 0) && (
         <div className="space-y-4 rounded-lg border bg-card p-3">
           <Field orientation="horizontal">
             <Switch
@@ -273,7 +276,8 @@ function GrantRow({
 }) {
   const Icon = KIND_ICON[grant.principal_kind];
   const principal = { principal_kind: grant.principal_kind, principal_id: grant.principal_id };
-  const id = entryId(grant).replace(/[^A-Za-z0-9_-]/g, "_");
+  // Per row, so entries whose ids differ only in punctuation never share a label.
+  const id = useId();
   const name = grant.principal_name;
   const toggle = (action: Action, on: boolean) => {
     if (busy) return;
@@ -286,9 +290,15 @@ function GrantRow({
     <li className="space-y-2 p-3" data-testid={`access-grant-${name}`}>
       <div className="flex items-start gap-2">
         <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="min-w-0 flex-1 text-sm font-medium break-all" title={grant.principal_id}>
-          {name}
-        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium break-all">{name}</div>
+          {/* The id is shown, so a display name made to look like someone else's cannot pass for them. */}
+          {grant.principal_kind !== "group" && grant.principal_id !== name && (
+            <div className="font-mono text-xs break-all text-muted-foreground" data-testid="access-grant-id">
+              {grant.principal_id}
+            </div>
+          )}
+        </div>
         <Badge variant="secondary" className="shrink-0 text-[0.7rem]">
           {KIND_LABEL[grant.principal_kind]}
         </Badge>

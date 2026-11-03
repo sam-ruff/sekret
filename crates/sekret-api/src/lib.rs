@@ -7,6 +7,7 @@ pub use sekret_core::claims::ClaimBindings;
 pub use sekret_core::permissions::{Action, Conditions, Effect, Rule, Subject};
 pub use sekret_core::rotation::{Charset, Generator, PolicyOverride, SecretPolicy};
 pub use sekret_core::seal::{PassphraseStrength, SealMode, SealState, UnlockPolicy, UnsealedBy};
+pub use sekret_core::validate::is_invisible_format;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use zeroize::Zeroizing;

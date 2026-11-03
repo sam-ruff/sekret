@@ -249,25 +249,8 @@ fn grant_actions(requested: &[Action]) -> ApiResult<Vec<Action>> {
         .collect())
 }
 
-/// Invisible characters that change how text around them reads, such as bidirectional
-/// overrides and zero-width joiners, so a name cannot pose as another.
-fn is_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-    )
-}
-
 fn check_principal_id(id: &str) -> ApiResult<()> {
-    let hidden = |c: char| c.is_control() || is_format(c);
+    let hidden = |c: char| c.is_control() || validate::is_invisible_format(c);
     if id.trim().is_empty() || id.len() > MAX_PRINCIPAL_ID || id.chars().any(hidden) {
         return Err(ApiError::bad_request(format!(
             "principal ids must be 1 to {MAX_PRINCIPAL_ID} characters without control or invisible characters"

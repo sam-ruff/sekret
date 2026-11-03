@@ -278,7 +278,10 @@ function SecretsView() {
     return key !== null && isValidSecretKey(key) ? key : null;
   });
   /** The drawer opens on its access section, as asked or after a restriction the server did not confirm. */
-  const [accessFirst, setAccessFirst] = useState(() => search.get("access") === "1");
+  const [accessFirst, setAccessFirst] = useState(() => {
+    const key = search.get("open");
+    return search.get("access") === "1" && key !== null && isValidSecretKey(key);
+  });
   const [importing, setImporting] = useState(() => search.get("import") === "1");
   const [newFolder, setNewFolder] = useState(false);
   const [deletingFolder, setDeletingFolder] = useState<string | null>(null);
@@ -845,7 +848,7 @@ function SecretsView() {
             envName={env.name}
             path={path}
             secretKey={drawerKey}
-            canRollback={canRollback && (drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : true)}
+            canRollback={canRollback && drawerSecret !== undefined && perms.can("secrets", "edit", resourceFor(drawerSecret))}
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
             restricted={drawerSecret?.restricted === true}
             accessFirst={accessFirst}

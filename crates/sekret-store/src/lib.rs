@@ -21,6 +21,8 @@ pub enum StoreError {
     Database(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error("it holds restricted secrets")]
+    HoldsRestricted,
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -128,7 +130,9 @@ pub trait Store: Send + Sync {
     /// list before any grants in the same change. Returns the entries unrestricting cleared.
     async fn update_secret_access(&self, change: AccessChange) -> StoreResult<Vec<SecretGrant>>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
-    async fn delete_project(&self, id: &str) -> StoreResult<()>;
+    /// With `spare_restricted`, refuses with `HoldsRestricted` when any secret in the project is
+    /// restricted, checked in the same transaction.
+    async fn delete_project(&self, id: &str, spare_restricted: bool) -> StoreResult<()>;
     /// Every stored secret value in the project, history included.
     async fn list_encrypted_values(&self, project_id: &str) -> StoreResult<Vec<EncryptedValue>>;
     /// Swaps every root-key-dependent value in one transaction: project keys, secret values,
@@ -153,7 +157,8 @@ pub trait Store: Send + Sync {
     async fn list_environments(&self, project_id: &str) -> StoreResult<Vec<Environment>>;
     async fn create_environment(&self, environment: Environment) -> StoreResult<()>;
     async fn update_environment(&self, id: &str, name: &str, position: i64) -> StoreResult<()>;
-    async fn delete_environment(&self, id: &str) -> StoreResult<()>;
+    /// `spare_restricted` as for [`Store::delete_project`].
+    async fn delete_environment(&self, id: &str, spare_restricted: bool) -> StoreResult<()>;
 
     async fn list_folders(&self, environment_id: &str) -> StoreResult<Vec<Folder>>;
     async fn create_folder(&self, folder: Folder) -> StoreResult<()>;

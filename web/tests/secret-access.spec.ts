@@ -109,10 +109,55 @@ test("the members dialog picker waits for the search too", async ({ page }) => {
   await expect(page.getByRole("option").first()).toBeVisible();
   await search.fill("priya");
   await page.keyboard.press("Enter");
-  await expect(page.getByTestId("member-principal")).not.toContainText("Aisha");
+  await expect(page.getByTestId("member-principal")).not.toContainText(/aisha/i);
   await expect(page.getByTestId("principal-searching")).toHaveCount(0);
   if (await search.isVisible()) await page.keyboard.press("Enter");
-  await expect(page.getByTestId("member-principal")).toHaveText("Priya Shah");
+  // Users lead with their email, as access lists name them.
+  await expect(page.getByTestId("member-principal")).toHaveText("priya@example.com · Priya Shah");
+});
+
+test("a user search finds people by their group, once the server has answered", async ({ page }) => {
+  await openSecrets(page);
+  const access = await openAccess(page, "STRIPE_SECRET_KEY");
+  await access.getByTestId("access-kind-user").click();
+  await access.getByTestId("access-principal").click();
+  await page.getByTestId("access-principal-search").fill("finance");
+  await expect(page.getByTestId("principal-searching")).toHaveCount(0);
+  // Tom's name and email do not say finance; his group does.
+  await page.getByTestId("principal-option-Tom Okafor").click();
+  await access.getByTestId("access-add-submit").click();
+  const tom = access.getByTestId("access-grant-tom@example.com");
+  await expect(tom).toBeVisible();
+  await expect(tom.getByTestId("access-grant-id")).toHaveText("user-tom");
+});
+
+test("entries whose names differ only in punctuation keep their own controls", async ({ page }) => {
+  await openSecrets(page);
+  const access = await openAccess(page, "SENTRY_DSN");
+  for (const group of ["eng ops", "eng.ops"]) {
+    await access.getByTestId("access-kind-group").click();
+    await access.getByTestId("access-group").fill(group);
+    await access.getByTestId("access-add-submit").click();
+    await expect(access.getByTestId(`access-grant-${group}`)).toBeVisible();
+  }
+  // Clicking a label changes only the entry it sits in.
+  await access.getByTestId("access-grant-eng.ops").getByText("Edit", { exact: true }).click();
+  await expectToast(page, "Updated what eng.ops may do");
+  await expect(access.getByRole("checkbox", { name: "Edit for eng.ops" })).toBeChecked();
+  await expect(access.getByRole("checkbox", { name: "Edit for eng ops" })).not.toBeChecked();
+});
+
+test("a stray access flag without a secret does not reorder later drawers", async ({ page }) => {
+  await openSecrets(page, "prod", "storefront", "?access=1");
+  await secretRow(page, "SENTRY_DSN").getByTestId("secret-key").click();
+  const drawer = page.getByTestId("secret-drawer");
+  const history = drawer.getByTestId("version-list");
+  const access = drawer.getByTestId("access-section");
+  await expect(history).toBeVisible();
+  await expect(access).toBeVisible();
+  await expect
+    .poll(async () => ((await history.boundingBox())?.y ?? 0) < ((await access.boundingBox())?.y ?? 0))
+    .toBe(true);
 });
 
 test("unrestricting always asks first, naming the first few on the list", async ({ page }) => {

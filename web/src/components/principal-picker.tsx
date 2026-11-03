@@ -10,8 +10,11 @@ import { cn } from "@/lib/utils";
 
 export interface PrincipalOption {
   id: string;
+  /** Shown first: a user's email, or an identity's name. */
   label: string;
   hint?: string;
+  /** A user's display name, or an identity's name. */
+  name?: string;
 }
 
 const RESULTS = 20;
@@ -36,18 +39,30 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
   const identities = useIdentityPage({ ...query, sort: "name" }, open && canList && kind === "identity");
 
   const page = kind === "user" ? users : identities;
-  const fetched: PrincipalOption[] =
+  // Users lead with their email, as the access list names them, so a look-alike name cannot pass for someone.
+  const fetched: (PrincipalOption & { searchable: string[] })[] =
     kind === "user"
-      ? (users.data?.items ?? []).map((u) => ({ id: u.id, label: u.name || u.email, hint: u.name ? u.email : undefined }))
-      : (identities.data?.items ?? []).map((i) => ({ id: i.id, label: i.name, hint: i.description || undefined }));
-  // What is on screen narrows as you type, before the server answers the new search.
-  const typed = search.trim().toLowerCase();
-  const options = typed
-    ? fetched.filter((o) => [o.label, o.hint ?? "", o.id].some((text) => text.toLowerCase().includes(typed)))
-    : fetched;
+      ? (users.data?.items ?? []).map((u) => ({
+          id: u.id,
+          label: u.email || u.name,
+          hint: u.email && u.name ? u.name : undefined,
+          name: u.name || u.email,
+          searchable: [u.name, u.email, u.id, ...u.groups],
+        }))
+      : (identities.data?.items ?? []).map((i) => ({
+          id: i.id,
+          label: i.name,
+          hint: i.description || undefined,
+          name: i.name,
+          searchable: [i.name, i.description, i.id],
+        }));
   const total = page.data?.total ?? 0;
   const noun = kind === "user" ? "user" : "machine identity";
   const settling = q !== search.trim() || page.isFetching;
+  // What is on screen narrows as you type, until the server has answered for the text typed.
+  const typed = search.trim().toLowerCase();
+  const options =
+    typed && settling ? fetched.filter((o) => o.searchable.some((text) => text.toLowerCase().includes(typed))) : fetched;
   // The highlighted option follows the results, so Enter picks the first match on screen.
   const [active, setActive] = useState("");
   const firstId = options[0]?.id ?? "";
@@ -82,6 +97,9 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
         >
           <span className={cn("truncate", !selected && "text-muted-foreground")}>
             {selected ? selected.label : `Choose a ${noun}`}
+            {selected && kind === "user" && selected.hint && (
+              <span className="text-muted-foreground"> · {selected.hint}</span>
+            )}
           </span>
           <ChevronsUpDown className="opacity-50" />
         </Button>
@@ -123,7 +141,7 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
                     key={o.id}
                     value={o.id}
                     onSelect={() => pick(o)}
-                    data-testid={`principal-option-${o.label}`}
+                    data-testid={`principal-option-${o.name ?? o.label}`}
                   >
                     <Check className={cn(selected?.id === o.id ? "opacity-100" : "opacity-0")} />
                     <div className="min-w-0">

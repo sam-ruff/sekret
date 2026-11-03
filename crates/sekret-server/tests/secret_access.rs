@@ -812,6 +812,18 @@ async fn writes_cannot_probe_for_hidden_secrets(db: String) -> anyhow::Result<()
     ]});
     let (status, _) = h.post(batch, &developer, probe).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A batch whose later item fails answers the same whether or not an earlier key is hidden.
+    for first in ["STRIPE", "MISSING"] {
+        let probe = json!({"path": "/payments", "upserts": [{"key": first, "value": "x"}], "deletes": ["NOPE"]});
+        let (status, body) = h.post(batch, &developer, probe).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["message"].as_str().is_some_and(|m| m.contains("NOPE")),
+            "{first}: {body}"
+        );
+    }
+    let (status, _) = h.get(&url("MISSING"), &h.admin).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was written");
     // Someone who could create there meets the clash, which is recorded but not for them.
     let (status, _) = h.put(&url("STRIPE"), &developer, json!({"value": "x"})).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);

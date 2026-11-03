@@ -83,7 +83,7 @@ Downgrading to a release from before per-secret access is refused: an older serv
 
 Backups hold the whole database, restricted secrets and their lists included. Anyone who can download and decrypt a backup can read everything in it, so treat `backup-reader` as access to every secret.
 
-Automatic [rotation](rotation.md) is not bound by lists. It replaces the value of a restricted secret on schedule and keeps its list as it was. Because of that, while per-secret access is on only a project admin can change the project's default rotation policy, which every inheriting secret follows.
+Automatic [rotation](rotation.md) is not bound by lists. It replaces the value of a restricted secret on schedule and keeps its list as it was. Because of that, while per-secret access is on only a project admin can change the project's default rotation policy, which every inheriting secret follows. A policy set before the setting was turned on, or on a secret before it was restricted, keeps running, so check the project default and each secret's policy when you restrict it.
 
 ## Example: one pod, three secrets
 

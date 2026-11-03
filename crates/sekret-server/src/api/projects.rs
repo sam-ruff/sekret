@@ -278,8 +278,8 @@ async fn delete_project(
             "deleting a project needs unrestricted delete on its secrets, folders and environments",
         ));
     }
-    refuse_destroying_restricted(&state, &principal, &project.id, None).await?;
-    state.store.delete_project(&project.id).await?;
+    let spare_restricted = !manages_secret_access(&state, &principal, &project.id).await?;
+    state.store.delete_project(&project.id, spare_restricted).await?;
     audit(
         &state,
         &principal,
@@ -437,12 +437,16 @@ async fn delete_environment(
     if !state.store.list_secrets(&env.id, "/", true, false).await?.is_empty() {
         return Err(not_empty());
     }
-    refuse_destroying_restricted(&state, &principal, &project.id, Some(&env.id)).await?;
+    let spare_restricted = !manages_secret_access(&state, &principal, &project.id).await?;
     // Deleting an environment destroys its history, so it must be emptied through the secret routes first.
-    state.store.delete_environment(&env.id).await.map_err(|e| match e {
-        sekret_store::StoreError::Conflict => not_empty(),
-        other => other.into(),
-    })?;
+    state
+        .store
+        .delete_environment(&env.id, spare_restricted)
+        .await
+        .map_err(|e| match e {
+            sekret_store::StoreError::Conflict => not_empty(),
+            other => other.into(),
+        })?;
     audit(
         &state,
         &principal,
@@ -457,33 +461,6 @@ async fn delete_environment(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Destroying a restricted secret's history, with its project or environment, is for admins only,
-/// since anyone else may be kept off it by its list.
-async fn refuse_destroying_restricted(
-    state: &AppState,
-    principal: &Principal,
-    project_id: &str,
-    environment_id: Option<&str>,
-) -> ApiResult<()> {
-    let restricted = match environment_id {
-        None => state.store.count_restricted_secrets(project_id).await? > 0,
-        Some(env) => state
-            .store
-            .list_secrets(env, "/", true, true)
-            .await?
-            .iter()
-            .any(|s| s.secret.restricted),
-    };
-    if !restricted || manages_secret_access(state, principal, project_id).await? {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        StatusCode::FORBIDDEN,
-        "forbidden",
-        "only a project admin can delete this, because it holds restricted secrets",
-    ))
 }
 
 #[derive(Deserialize, IntoParams)]

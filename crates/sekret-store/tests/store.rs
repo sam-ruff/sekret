@@ -277,7 +277,7 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
         Err(StoreError::Conflict)
     ));
 
-    store.delete_project("p1").await.context("delete project")?;
+    store.delete_project("p1", true).await.context("delete project")?;
     assert!(store.get_project("p1").await.context("get")?.is_none());
     Ok(())
 }
@@ -1252,14 +1252,23 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
     store
         .update_secret_access(AccessChange {
             secret_id: "o1".into(),
-            restricted: None,
             grant: vec![grant("o1", PrincipalKind::User, "u1", &[Action::Read])],
+            restricted: Some(true),
             revoke: vec![],
             max_grants: 100,
         })
         .await
         .context("grant")?;
-    store.delete_project("p1").await.context("delete project")?;
+    // Sparing restricted secrets refuses in the same transaction, for environments and projects.
+    assert!(matches!(
+        store.delete_environment("e1", true).await,
+        Err(StoreError::HoldsRestricted | StoreError::Conflict)
+    ));
+    assert!(matches!(
+        store.delete_project("p1", true).await,
+        Err(StoreError::HoldsRestricted)
+    ));
+    store.delete_project("p1", false).await.context("delete project")?;
     assert!(store.list_environment_grants("e1").await.context("grants")?.is_empty());
     Ok(())
 }

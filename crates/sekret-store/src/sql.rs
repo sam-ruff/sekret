@@ -22,9 +22,7 @@ impl From<sqlx::Error> for StoreError {
                 StoreError::Conflict
             }
             // SQLite refuses a write from a transaction whose snapshot another write has overtaken.
-            sqlx::Error::Database(db) if matches!(db.code().as_deref(), Some("5" | "6" | "517")) => {
-                StoreError::Conflict
-            }
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("517") => StoreError::Conflict,
             sqlx::Error::RowNotFound => StoreError::NotFound,
             _ => StoreError::Database(error.to_string()),
         }
@@ -1718,8 +1716,24 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn delete_project(&self, id: &str) -> StoreResult<()> {
+    async fn delete_project(&self, id: &str, spare_restricted: bool) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        if spare_restricted {
+            // Under the project lock, so nothing is restricted between this check and the delete.
+            sqlx::query(self.locking("SELECT secret_access FROM projects WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let restricted: i64 =
+                sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE project_id = $1 AND restricted = 1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("n")?;
+            if restricted > 0 {
+                return Err(StoreError::HoldsRestricted);
+            }
+        }
         sqlx::query("DELETE FROM project_logos WHERE project_id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -2018,8 +2032,16 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn delete_environment(&self, id: &str) -> StoreResult<()> {
+    async fn delete_environment(&self, id: &str, spare_restricted: bool) -> StoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        if spare_restricted {
+            sqlx::query(self.locking(
+                "SELECT p.secret_access FROM projects p JOIN environments e ON e.project_id = p.id WHERE e.id = $1",
+            ))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
         // Checked inside the transaction so a secret written meanwhile is not lost with its history.
         let live: i64 = sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE environment_id = $1 AND deleted = 0")
             .bind(id)
@@ -2028,6 +2050,17 @@ impl Store for SqlStore {
             .try_get("n")?;
         if live > 0 {
             return Err(StoreError::Conflict);
+        }
+        if spare_restricted {
+            let restricted: i64 =
+                sqlx::query("SELECT COUNT(*) AS n FROM secrets WHERE environment_id = $1 AND restricted = 1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("n")?;
+            if restricted > 0 {
+                return Err(StoreError::HoldsRestricted);
+            }
         }
         sqlx::query(
             "DELETE FROM secret_versions WHERE secret_id IN (SELECT id FROM secrets WHERE environment_id = $1)",
