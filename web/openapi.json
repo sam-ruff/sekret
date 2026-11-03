@@ -5969,7 +5969,7 @@
           },
           "principal_name": {
             "type": "string",
-            "description": "Display name for users and identities; the group name for groups."
+            "description": "A user's verified email, or their display name when they have none; an identity's name;\nthe group name for groups."
           }
         }
       },

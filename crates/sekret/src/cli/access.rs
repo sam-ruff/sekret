@@ -337,7 +337,9 @@ pub async fn run(api: &dyn SekretApi, at: Location, command: AccessCommand, out:
 
 pub fn describe_setting(setting: &SecretAccessSetting) -> String {
     let mut text = format!("per-secret access: {}\n", if setting.enabled { "on" } else { "off" });
-    let hidden = setting.restricted_count - i64::try_from(setting.restricted.len()).unwrap_or(i64::MAX);
+    let hidden = setting
+        .restricted_count
+        .saturating_sub(i64::try_from(setting.restricted.len()).unwrap_or(i64::MAX));
     if setting.restricted_count == 0 {
         text.push_str("no secrets are restricted\n");
         return text;

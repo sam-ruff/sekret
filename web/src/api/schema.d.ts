@@ -1625,7 +1625,10 @@ export interface components {
             created_at: number;
             principal_id: string;
             principal_kind: components["schemas"]["PrincipalKind"];
-            /** @description Display name for users and identities; the group name for groups. */
+            /**
+             * @description A user's verified email, or their display name when they have none; an identity's name;
+             *     the group name for groups.
+             */
             principal_name: string;
         };
         SecretList: {

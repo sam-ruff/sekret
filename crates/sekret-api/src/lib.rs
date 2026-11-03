@@ -169,7 +169,8 @@ pub struct SetSecretAccessSetting {
 pub struct SecretGrant {
     pub principal_kind: PrincipalKind,
     pub principal_id: String,
-    /// Display name for users and identities; the group name for groups.
+    /// A user's verified email, or their display name when they have none; an identity's name;
+    /// the group name for groups.
     pub principal_name: String,
     /// Always includes `read`; at most `read`, `read-value`, `edit` and `delete`.
     pub actions: Vec<Action>,

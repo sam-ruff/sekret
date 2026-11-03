@@ -104,7 +104,11 @@ pub fn terminal_safe_json(json: &str) -> String {
 }
 
 fn is_unprintable(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+        )
 }
 
 /// Drops the rest of an escape sequence: CSI up to its final byte, OSC, DCS and similar strings
@@ -1200,6 +1204,11 @@ mod tests {
         assert_eq!(terminal_safe("a\rb\u{8}c\u{7}d\u{0}e\u{7f}f"), "abcdef");
         assert_eq!(terminal_safe("x\u{9b}31my"), "x31my", "C1 controls are removed");
         assert_eq!(terminal_safe("ab\u{202e}cd\u{2066}e"), "abcde");
+        assert_eq!(
+            terminal_safe("pod\u{200b}\u{2060}\u{feff}"),
+            "pod",
+            "invisible characters cannot make one name pass for another"
+        );
         assert_eq!(terminal_safe("trailing\u{1b}"), "trailing");
     }
 

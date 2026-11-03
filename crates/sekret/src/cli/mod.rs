@@ -711,6 +711,7 @@ fn summarise(result: &BatchResult) -> String {
         ("updated", &result.updated),
         ("deleted", &result.deleted),
         ("unchanged", &result.unchanged),
+        ("restricted", &result.restricted),
     ] {
         if !keys.is_empty() {
             parts.push(format!("{label}: {}", format::one_line(&keys.join(", "))));
