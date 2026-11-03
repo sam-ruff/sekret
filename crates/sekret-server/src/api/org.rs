@@ -20,7 +20,8 @@ use super::{AuditTarget, audit, from_api_kind, to_api_kind};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{
     added_denies, admin_bindings, admin_role_needs_admin, deny_needs_admin, has_denies, is_org_admin,
-    org_management_rules, org_rules, project_rules, reaches_admin, require_any, role_rules,
+    manages_secret_access, org_management_rules, org_rules, principal_matches, project_rules, reaches_admin,
+    require_any, role_rules,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::machine::{
@@ -209,6 +210,23 @@ async fn ensure_covers_principal(state: &AppState, caller: &Principal, target: &
         }
         if !covers(&project_rules(state, caller, &project.id).await?, &target_rules) {
             return Err(escalation());
+        }
+        // Lists reach past role rules, so a principal on one, or exempt from them, is for admins.
+        if project.secret_access
+            && !manages_secret_access(state, caller, &project.id).await?
+            && (manages_secret_access(state, target, &project.id).await?
+                || state
+                    .store
+                    .list_project_grants(&project.id)
+                    .await?
+                    .iter()
+                    .any(|g| principal_matches(g.principal_kind, &g.principal_id, target)))
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "escalation",
+                "they are on per-secret access lists you do not manage",
+            ));
         }
     }
     Ok(())

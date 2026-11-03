@@ -1,6 +1,7 @@
 import { Check, ChevronsUpDown } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
@@ -77,6 +78,32 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
     setSearch("");
   };
 
+  // Someone who cannot list users or identities can still name one by id, as the CLI allows.
+  if (!canList) {
+    return (
+      <div className="space-y-1.5">
+        <Input
+          id={id}
+          value={selected?.id ?? ""}
+          onChange={(event) => {
+            const value = event.target.value.trim();
+            onSelect({ id: value, label: value });
+          }}
+          placeholder={kind === "user" ? "Paste the user's id" : "Paste the machine identity's id"}
+          className="font-mono"
+          autoComplete="off"
+          spellCheck={false}
+          aria-describedby={id ? `${id}-paste-note` : undefined}
+          data-testid={testId ? `${testId}-id` : undefined}
+        />
+        <p id={id ? `${id}-paste-note` : undefined} className="text-xs text-muted-foreground">
+          You cannot list {kind === "user" ? "users" : "machine identities"}, so enter the id. The server refuses an id
+          that does not exist.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <Popover
       open={open}
@@ -122,14 +149,13 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
             data-testid={testId ? `${testId}-search` : undefined}
           />
           <CommandList>
-            {!canList && <div className="px-3 py-4 text-sm text-muted-foreground">You cannot list these.</div>}
-            {canList && page.isPending && (
+            {page.isPending && (
               <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
                 <Spinner /> Loading
               </div>
             )}
-            {canList && page.isSuccess && !settling && <CommandEmpty>No {noun} matches.</CommandEmpty>}
-            {canList && page.isSuccess && settling && (
+            {page.isSuccess && !settling && <CommandEmpty>No {noun} matches.</CommandEmpty>}
+            {page.isSuccess && settling && (
               <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground" data-testid="principal-searching">
                 <Spinner /> Searching
               </div>

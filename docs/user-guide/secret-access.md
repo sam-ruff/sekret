@@ -27,7 +27,7 @@ sekret secrets access grant STRIPE_KEY --identity checkout-pod -p payments -e pr
 sekret secrets access list STRIPE_KEY -p payments -e prod --path /stripe
 ```
 
-Restricting needs the setting on. So does granting, which also works on an open secret, so a list can be ready before the secret is restricted and nobody loses access in between. Unrestricting and revoking always work, so a project can be cleaned up before the setting is switched off. Unrestricting clears the list, and the audit entry records who was on it; a list never comes back to life when a secret is restricted again later.
+Restricting needs the setting on. So does granting, which also works on an open secret, so a list can be ready before the secret is restricted and nobody loses access in between. Unrestricting and revoking always work, so a project can be cleaned up before the setting is switched off. Unrestricting opens the secret's whole history to everyone its role rules allow, values written while it was restricted included, and clears the list, and the audit entry records who was on it; a list never comes back to life when a secret is restricted again later.
 
 Restricting an existing secret leaves a moment when it was open, and does nothing about what was read before. To avoid that, create it restricted in the same write: `sekret secrets set --restricted KEY=-`, `sekret secrets generate --restricted KEY`, the restricted option in the web interface's new secret form, or `"restricted": true` in a `PUT`, batch or generate request. The answer to such a write lists the keys that are now restricted; the CLI, the web interface and the Ansible module fail if a key is missing from it, since a server from before per-secret access ignores the request and writes the secret open. A secret created that way starts with an empty list, so only admins can reach it until someone is granted access. Only a project admin can create a secret restricted, and the same goes for bringing a deleted secret back restricted. On a live secret the field must match what it is now, and anything else is refused with a pointer to the access settings, so a routine write never changes who can see a secret.
 
@@ -52,6 +52,8 @@ A list holds at most 100 entries. Seeing a list and changing it are for project 
 
 Admin here means the built-in `org-admin` role, or the project's built-in `admin` role held directly or through a group. A custom role that allows everything is not enough, and since the built-in admin roles carry this exemption, only an admin can grant them; someone whose custom role merely matches them is refused. Admins are still held to their own deny rules, so a deny on `/payments/**` keeps an admin out of a restricted secret there as it would any other.
 
+Whoever can give an identity credentials can act as it, so in a project with the setting on, only an admin there can change, delete or give credentials to a user or identity that is on one of its lists or is an admin. Before turning the setting on, check who holds the built-in admin roles, since they are exempt from every list.
+
 A write is planned against a secret as it stands. If its restriction or list changes before the write lands, the write is refused as a conflict and has to be tried again, so a change of access always takes effect at once.
 
 ## What someone off the list sees
@@ -63,7 +65,7 @@ Nothing. Every route answers for a restricted secret exactly as for a key that d
 - The project overview leaves out its row.
 - Its history, rollback, generation, and its rotation policy answer not found.
 - Writing to it or deleting it answers exactly as for a missing key, and never changes it. A malformed batch fails before any key in it is looked up.
-- Snapshot secret counts leave it out, a snapshot's list of changes never names it, and restoring a snapshot leaves it as it is. A snapshot that only changed secrets hidden from you is not listed at all, and a rollback's reason does not give the version number.
+- Snapshot secret counts leave it out, a snapshot's list of changes never names it, and restoring a snapshot leaves it as it is. A snapshot that only changed secrets hidden from you is not listed at all, and a rollback's reason does not give the version number. Such snapshots still count towards how many are kept, so someone watching the list closely can see an old one drop off without a new one appearing.
 
 Someone listed with only `read` sees the key with its value hidden, and needs `read-value` before it appears in `export`, `run` or the `raw` endpoint.
 

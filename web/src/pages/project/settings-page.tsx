@@ -47,7 +47,18 @@ function GeneralSection({ project, perms }: { project: string; perms: Permission
     <div className="space-y-6">
       <GeneralForm key={query.data.id} project={query.data} perms={perms} />
       <LogoCard project={query.data} canEdit={canEdit} />
-      {perms.can("settings", "read") && <SecretDefaultsCard project={query.data.slug} canEdit={canEdit} />}
+      {perms.can("settings", "read") && (
+        <SecretDefaultsCard
+          project={query.data.slug}
+          // Rotation rewrites restricted secrets too, so with per-secret access on only admins set it.
+          canEdit={canEdit && (!query.data.secret_access || managesAccess)}
+          lockedReason={
+            canEdit && query.data.secret_access && !managesAccess
+              ? "With per-secret access on, only a project or organisation admin can change these defaults, because rotation also rewrites restricted secrets."
+              : undefined
+          }
+        />
+      )}
       {managesAccess && perms.can("settings", "read") && <SecretAccessCard project={query.data.slug} canEdit={canEdit} />}
     </div>
   );

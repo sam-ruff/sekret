@@ -217,9 +217,13 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
         "the generated flag survives a round trip"
     );
     store
-        .set_secret_policy("s1", Some(r#"{"mode":"inherit"}"#.into()))
+        .set_secret_policy("s1", Some(r#"{"mode":"inherit"}"#.into()), 0)
         .await
         .context("policy")?;
+    assert!(
+        matches!(store.set_secret_policy("s1", None, 1).await, Err(StoreError::Conflict)),
+        "a policy planned against another access epoch is refused"
+    );
     store
         .set_project_policy("p1", Some(r#"{"rotation_days":7}"#.into()))
         .await
@@ -232,7 +236,10 @@ async fn exercise_projects_and_secrets(store: &SqlStore) -> anyhow::Result<()> {
             .and_then(|p| p.secret_policy),
         Some(r#"{"rotation_days":7}"#.into())
     );
-    assert!(store.set_secret_policy("missing", None).await.is_err());
+    assert!(matches!(
+        store.set_secret_policy("missing", None, 0).await,
+        Err(StoreError::NotFound)
+    ));
     let with_policy = store.list_secrets("e1", "/", true, true).await.context("list")?;
     assert!(
         with_policy

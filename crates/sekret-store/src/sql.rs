@@ -1442,14 +1442,24 @@ impl Store for SqlStore {
         Ok(())
     }
 
-    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()> {
-        let result = sqlx::query("UPDATE secrets SET policy = $1 WHERE id = $2")
+    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>, access_epoch: i64) -> StoreResult<()> {
+        let result = sqlx::query("UPDATE secrets SET policy = $1 WHERE id = $2 AND access_epoch = $3")
             .bind(policy)
             .bind(secret_id)
+            .bind(access_epoch)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
+            let exists = sqlx::query("SELECT 1 FROM secrets WHERE id = $1")
+                .bind(secret_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
+            return Err(if exists {
+                StoreError::Conflict
+            } else {
+                StoreError::NotFound
+            });
         }
         Ok(())
     }

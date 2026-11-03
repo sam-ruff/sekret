@@ -57,7 +57,20 @@ pub async fn audit_refusal(
     action: &str,
     detail: Value,
 ) {
-    let entry = audit_entry(state, principal, ip, action, AuditTarget::default(), detail);
+    audit_refusal_at(state, principal, subject, ip, action, AuditTarget::default(), detail).await;
+}
+
+/// As [`audit_refusal`], for a refusal about one place, which the entry names.
+pub async fn audit_refusal_at(
+    state: &AppState,
+    principal: &Principal,
+    subject: &str,
+    ip: IpAddr,
+    action: &str,
+    target: AuditTarget<'_>,
+    detail: Value,
+) {
+    let entry = audit_entry(state, principal, ip, action, target, detail);
     let key = format!("{action}|{subject}|{}", crate::ratelimit::limiter_key(ip));
     for entry in state.refusals.admit(key, entry) {
         insert_audit(state, entry).await;

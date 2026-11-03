@@ -960,6 +960,84 @@ async fn only_admins_grant_the_admin_roles(db: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Someone who manages identities but not the lists cannot take over an identity on a list, by
+/// giving it credentials, changing it or deleting it.
+async fn identity_managers_cannot_take_over_listed_identities(db: String) -> anyhow::Result<()> {
+    let h = start(options(db)).await?;
+    restricted_project(&h).await?;
+    let (pod, _) = h.machine("checkout-pod", "app", "viewer").await?;
+    let (other, _) = h.machine("unlisted-pod", "app", "viewer").await?;
+    change(
+        &h,
+        &h.admin,
+        "/payments",
+        "STRIPE",
+        json!({"grant": [{"principal_kind": "identity", "principal_id": pod, "actions": ["read-value"]}]}),
+    )
+    .await?;
+    let (status, body) = h
+        .put(
+            "/api/v1/org/roles/identity-keeper",
+            &h.admin,
+            json!({"name": "Identity keeper", "rules": [
+                {"effect": "allow", "subject": "identities", "actions": ["read", "create", "edit", "delete"]},
+            ]}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (mallory, mallory_token) = user_token(&h, "mallory", &[]).await?;
+    add_member(&h, "user", &mallory, "developer").await?;
+    let (status, body) = h
+        .post(
+            "/api/v1/org/bindings",
+            &h.admin,
+            json!({"principal_kind": "user", "principal_id": mallory, "role": "identity-keeper"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let routes = |id: &str| {
+        vec![
+            (
+                reqwest::Method::POST,
+                format!("/api/v1/identities/{id}/client-secrets"),
+                Some(json!({})),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("/api/v1/identities/{id}/auth/universal"),
+                Some(json!({"kind": "universal"})),
+            ),
+            (
+                reqwest::Method::PATCH,
+                format!("/api/v1/identities/{id}"),
+                Some(
+                    json!({"name": "renamed", "description": "", "token_ttl": 3600, "token_max_ttl": 3600, "trusted_cidrs": [], "disabled": false}),
+                ),
+            ),
+            (reqwest::Method::DELETE, format!("/api/v1/identities/{id}"), None),
+        ]
+    };
+    for (method, url, body) in routes(&pod) {
+        let (status, answer) = h.call(method, &url, Some(&mallory_token), body).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{url}: {answer}");
+        assert_eq!(answer["error"], "escalation", "{url}: {answer}");
+    }
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/identities/{other}/client-secrets"),
+            &mallory_token,
+            json!({}),
+        )
+        .await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "an identity on no list is theirs to manage: {body}"
+    );
+    Ok(())
+}
+
 /// Each secret says what its list grants the caller, and a write that asked for restriction
 /// confirms it.
 async fn secrets_report_the_callers_entry(db: String) -> anyhow::Result<()> {
@@ -1024,4 +1102,5 @@ on_both_backends!(
     lists_never_outlive_their_restriction,
     only_admins_grant_the_admin_roles,
     secrets_report_the_callers_entry,
+    identity_managers_cannot_take_over_listed_identities,
 );

@@ -127,6 +127,11 @@ async fn put_setting(
         .await;
     if let Err(StoreError::Conflict) = result {
         let count = state.store.count_restricted_secrets(&project.id).await?;
+        if count == 0 {
+            return Err(ApiError::conflict(
+                "the project changed meanwhile; reload and try again",
+            ));
+        }
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "secrets_restricted",

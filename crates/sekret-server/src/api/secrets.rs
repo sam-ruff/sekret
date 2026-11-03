@@ -20,7 +20,7 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::{AuditTarget, api_env, audit, find_env, load_project, secret_ctx};
+use super::{AuditTarget, api_env, audit, audit_refusal_at, find_env, load_project, secret_ctx};
 use crate::auth::{ClientIp, Principal};
 use crate::authz::{Caller, SecretAccess, allowed, require, secret_access};
 use crate::error::{ApiError, ApiResult};
@@ -381,7 +381,7 @@ async fn write(
 }
 
 /// Records a write refused because it landed on a secret hidden from the caller, so probing for
-/// hidden names leaves a trace that only admins and those listed see.
+/// hidden names leaves a trace that only admins see. Repeats within a minute fold into one entry.
 async fn refused_collision(
     state: &AppState,
     principal: &Principal,
@@ -394,9 +394,11 @@ async fn refused_collision(
         return;
     };
     let (path, key) = (path.as_str(), key.as_str());
-    audit(
+    let subject = format!("{}/{}{path}/{key}", scope.project.id, scope.env.slug);
+    audit_refusal_at(
         state,
         principal,
+        &subject,
         ip,
         "secret.write-refused",
         AuditTarget {
@@ -734,7 +736,11 @@ async fn put_secret_policy(
         PolicyOverride::Inherit => None,
         custom => Some(serde_json::to_string(&custom).map_err(|e| ApiError::internal("secret policy", e))?),
     };
-    state.store.set_secret_policy(&s.secret.id, stored.clone()).await?;
+    let epoch = scope.access.planned_epoch(&s.secret);
+    state
+        .store
+        .set_secret_policy(&s.secret.id, stored.clone(), epoch)
+        .await?;
     s.secret.policy = stored;
     audit(
         &state,

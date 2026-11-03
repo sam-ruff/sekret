@@ -1,7 +1,7 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, EyeOff, FileUp, Folder, FolderPlus, KeyRound, Lock, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { Link, Navigate, useSearchParams } from "react-router";
+import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api } from "@/api/endpoints";
 import type { BatchResult, Secret } from "@/api/types";
@@ -43,6 +43,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { useManagesSecretAccess, useProjectPermissions } from "@/hooks/use-permissions";
 import { isValidSecretKey } from "@/lib/dotenv";
 import { generatorFromDraft } from "@/lib/generation";
+import { openSecretState } from "@/lib/links";
 import { folderLabel, isValidFolderName, joinPath } from "@/lib/paths";
 import { countByChildFolder, matchesBelow, matchesSecret, relativeFolder } from "@/lib/secret-search";
 import { focusInstead } from "@/lib/return-focus";
@@ -272,16 +273,23 @@ function SecretsView() {
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
-  // `?open=KEY` opens a secret's drawer, and `&access=1` starts it at the access section.
-  const [drawerKey, setDrawerKey] = useState<string | null>(() => {
-    const key = search.get("open");
-    return key !== null && isValidSecretKey(key) ? key : null;
-  });
+  // Router state, or `?open=KEY` with `&access=1`, opens a secret's drawer, at the access section if asked.
+  const location = useLocation();
+  const arrival = (() => {
+    const state = openSecretState(location.state);
+    const key = state?.open ?? search.get("open");
+    if (key === null || !isValidSecretKey(key)) return null;
+    return { key, access: state ? state.access === true : search.get("access") === "1" };
+  })();
+  const [drawerKey, setDrawerKey] = useState<string | null>(() => arrival?.key ?? null);
   /** The drawer opens on its access section, as asked or after a restriction the server did not confirm. */
-  const [accessFirst, setAccessFirst] = useState(() => {
-    const key = search.get("open");
-    return search.get("access") === "1" && key !== null && isValidSecretKey(key);
-  });
+  const [accessFirst, setAccessFirst] = useState(() => arrival?.access === true);
+  const navigate = useNavigate();
+  // Read once; a reload or a return through history should not open it again.
+  useEffect(() => {
+    if (!openSecretState(location.state)) return;
+    void navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location, navigate]);
   const [importing, setImporting] = useState(() => search.get("import") === "1");
   const [newFolder, setNewFolder] = useState(false);
   const [deletingFolder, setDeletingFolder] = useState<string | null>(null);
@@ -500,6 +508,9 @@ function SecretsView() {
   const canCreateFolder = perms.canSomewhere("folders", "create");
   const canRollback = perms.canSomewhere("secrets", "edit");
   const hiddenCount = secrets.filter((s) => s.value_hidden).length;
+  // Hidden by the secret's own access list rather than by roles.
+  const listHiddenCount = secrets.filter((s) => s.value_hidden && s.granted && !s.granted.includes("read-value")).length;
+  const roleHiddenCount = hiddenCount - listHiddenCount;
   const nothingToReveal = secrets.length > 0 && hiddenCount === secrets.length;
   const isRevealed = (key: string) => (revealAll ? !hiddenFromAll.has(key) : revealed.has(key));
 
@@ -759,8 +770,20 @@ function SecretsView() {
               {hiddenCount > 0 && (
                 <p className="flex items-start gap-1.5 px-4 py-2.5 text-xs text-muted-foreground" data-testid="hidden-values-note">
                   <Lock className="mt-0.5 size-3.5 shrink-0" />
-                  {nothingToReveal ? "Your roles do not let you read the values here." : `Your roles do not let you read ${hiddenCount === 1 ? "one of these values" : `${hiddenCount} of these values`}.`}{" "}
-                  Roles add up, but a deny rule in any of them wins over every role that allows the same thing.
+                  <span>
+                    {roleHiddenCount > 0 && (
+                      <>
+                        {nothingToReveal && listHiddenCount === 0
+                          ? "Your roles do not let you read the values here."
+                          : `Your roles do not let you read ${roleHiddenCount === 1 ? "one of these values" : `${roleHiddenCount} of these values`}.`}{" "}
+                        Roles add up, but a deny rule in any of them wins over every role that allows the same thing.{" "}
+                      </>
+                    )}
+                    {listHiddenCount > 0 &&
+                      (listHiddenCount === 1
+                        ? "One secret's access list lets you see it but not read its value."
+                        : `${listHiddenCount} secrets' access lists let you see them but not read their values.`)}
+                  </span>
                 </p>
               )}
               {hiddenRows > 0 && (
@@ -852,6 +875,11 @@ function SecretsView() {
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
             restricted={drawerSecret?.restricted === true}
             accessFirst={accessFirst}
+            canRevealHistory={
+              drawerSecret === undefined ||
+              (perms.can("secrets", "read-value", resourceFor(drawerSecret)) &&
+                perms.can("secret-versions", "read-value", resourceFor(drawerSecret)))
+            }
             onRotate={(key) => {
               rotateReturnFocus.current = null;
               setRotating(key);

@@ -106,7 +106,8 @@ pub trait Store: Send + Sync {
     async fn set_project_logo(&self, project_id: &str, logo: Option<ProjectLogo>, now: i64) -> StoreResult<()>;
     async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>>;
     async fn set_project_policy(&self, project_id: &str, policy: Option<String>) -> StoreResult<()>;
-    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>) -> StoreResult<()>;
+    /// A change to the secret's access since `access_epoch` was read is a `Conflict`.
+    async fn set_secret_policy(&self, secret_id: &str, policy: Option<String>, access_epoch: i64) -> StoreResult<()>;
     /// Turns per-secret access on or off. Turning it off is a `Conflict` while any secret in the
     /// project is restricted, so no restriction is ever dropped silently, and otherwise clears
     /// every access list in the project.

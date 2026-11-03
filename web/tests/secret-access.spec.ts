@@ -131,6 +131,40 @@ test("a user search finds people by their group, once the server has answered", 
   await expect(tom.getByTestId("access-grant-id")).toHaveText("user-tom");
 });
 
+test("choosing someone already listed loads what they may do and updates rather than replaces", async ({ page }) => {
+  await openSecrets(page);
+  const access = await openAccess(page, "STRIPE_SECRET_KEY");
+  await access.getByTestId("access-kind-group").click();
+  await expect(access.getByTestId("access-add")).toContainText("a typo grants nothing");
+  await access.getByTestId("access-group").fill("finance");
+  // Finance may only read the name, so the form shows that rather than its defaults.
+  await expect(access.getByTestId("access-add-submit")).toHaveText("Update");
+  await expect(access.getByTestId("access-add-listed")).toContainText("finance is already on the list");
+  await expect(access.getByTestId("access-new-read-value")).not.toBeChecked();
+  await access.getByTestId("access-new-edit").click();
+  await access.getByTestId("access-add-submit").click();
+  await expectToast(page, "Updated what finance may do");
+  await expect(access.getByRole("checkbox", { name: "Edit for finance" })).toBeChecked();
+  await expect(access.getByRole("checkbox", { name: "Read value for finance" })).not.toBeChecked();
+  // Someone new starts from the defaults again.
+  await access.getByTestId("access-group").fill("newcomers");
+  await expect(access.getByTestId("access-add-submit")).toHaveText("Add");
+  await expect(access.getByTestId("access-new-read-value")).toBeChecked();
+});
+
+test("an admin who cannot list identities can still grant one by pasting its id", async ({ page }) => {
+  await openSecrets(page, "prod", "storefront", "?mock-org-role=backup-reader");
+  const access = await openAccess(page, "STRIPE_SECRET_KEY");
+  const id = (await access.getByTestId("access-grant-github-deploy").getByTestId("access-grant-id").textContent()) ?? "";
+  expect(id).not.toBe("");
+  await access.getByTestId("access-revoke-github-deploy").click();
+  await expect(access.getByTestId("access-grant-github-deploy")).toHaveCount(0);
+  await access.getByTestId("access-kind-identity").click();
+  await access.getByTestId("access-principal-id").fill(id);
+  await access.getByTestId("access-add-submit").click();
+  await expect(access.getByTestId("access-grant-github-deploy")).toBeVisible();
+});
+
 test("entries whose names differ only in punctuation keep their own controls", async ({ page }) => {
   await openSecrets(page);
   const access = await openAccess(page, "SENTRY_DSN");
@@ -196,9 +230,11 @@ test("turning the setting off is refused while a secret is restricted, and confi
   await expect(card.getByTestId("secret-access-refused")).toContainText("1 secret in this project is restricted");
   await expect(card.getByTestId("secret-access-enabled")).toBeChecked();
 
-  // The restricted secret's row opens its drawer at the access section.
+  // The restricted secret's row opens its drawer at the access section, without the key in the address.
   await card.getByTestId("secret-access-open-prod-STRIPE_SECRET_KEY").click();
   const access = page.getByTestId("secret-drawer").getByTestId("access-section");
+  await expect(access.getByTestId("access-restricted")).toBeVisible();
+  expect(page.url()).not.toContain("STRIPE");
   await access.getByTestId("access-restricted").click();
   const confirm = page.getByTestId("access-unrestrict-confirm");
   await expect(confirm).toContainText("finance, github-deploy");
@@ -230,6 +266,7 @@ test("restricts a secret from its drawer while the setting is on", async ({ page
   const access = await openAccess(page, "SENTRY_DSN");
   await expect(access.getByTestId("access-restricted")).not.toBeChecked();
   await expect(access.getByTestId("access-empty")).toHaveText("No one is on the list.");
+  await expect(access.getByTestId("access-restrict-note")).toContainText("rotate the value if it must be contained");
   await access.getByTestId("access-restricted").click();
   await expect(access.getByTestId("access-restricted")).toBeChecked();
   await expectToast(page, "Restricted SENTRY_DSN");

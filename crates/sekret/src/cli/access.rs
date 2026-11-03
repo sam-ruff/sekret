@@ -91,6 +91,11 @@ pub fn pick_identity(wanted: &str, candidates: &[Identity]) -> anyhow::Result<St
     if let Some(found) = candidates.iter().find(|i| i.id == wanted) {
         return Ok(found.id.clone());
     }
+    // Something shaped like an id is only ever an id, so a name made to look like one cannot
+    // catch a grant meant for a mistyped or deleted identity.
+    if looks_like_id(wanted) {
+        bail!("no machine identity has the id {}", one_line(wanted));
+    }
     let named: Vec<&Identity> = candidates.iter().filter(|i| i.name == wanted).collect();
     match named.as_slice() {
         [one] => Ok(one.id.clone()),
@@ -423,6 +428,11 @@ mod tests {
                 .is_some_and(|e| e.to_string().contains("more than one"))
         );
         assert!(pick_identity("missing", &all).is_err());
+        let posing = [identity("i9", "0192d4a8-0000-7000-8000-00000000000a")];
+        assert!(
+            pick_identity("0192d4a8-0000-7000-8000-00000000000a", &posing).is_err(),
+            "a name shaped like an id never stands in for one"
+        );
         Ok(())
     }
 

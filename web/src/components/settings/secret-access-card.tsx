@@ -15,16 +15,22 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { keys, useApiMutation } from "@/hooks/queries";
 import { errorMessage } from "@/lib/errors";
+import type { OpenSecretState } from "@/lib/links";
 
 function place(path: string, key: string): string {
   return path === "/" ? key : `${path}/${key}`;
 }
 
-/** The secret's drawer, opened at its access section. */
-function drawerLink(project: string, s: RestrictedSecret): string {
-  const params = new URLSearchParams({ open: s.key, access: "1" });
-  if (s.path !== "/") params.set("path", s.path);
-  return `/projects/${project}/secrets/${s.environment}?${params.toString()}`;
+/**
+ * The secret's folder, with the drawer to open passed in router state, so a restricted key's name
+ * never lands in the address bar, history or proxy logs.
+ */
+function drawerLink(project: string, s: RestrictedSecret): { to: string; state: OpenSecretState } {
+  const folder = s.path === "/" ? "" : `?${new URLSearchParams({ path: s.path }).toString()}`;
+  return {
+    to: `/projects/${encodeURIComponent(project)}/secrets/${encodeURIComponent(s.environment)}${folder}`,
+    state: { open: s.key, access: true },
+  };
 }
 
 /** The project's per-secret access setting and its restricted secrets. Admins only. */
@@ -119,7 +125,7 @@ function SettingForm({ project, setting, canEdit }: { project: string; setting: 
             {setting.restricted.map((s) => (
               <li key={`${s.environment}:${s.path}:${s.key}`}>
                 <Link
-                  to={drawerLink(project, s)}
+                  {...drawerLink(project, s)}
                   className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 hover:bg-muted/50 focus-visible:bg-muted/50"
                   data-testid={`secret-access-open-${s.environment}-${s.key}`}
                 >

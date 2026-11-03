@@ -35,6 +35,8 @@ interface SecretDrawerProps {
   restricted?: boolean;
   /** Show the access section first, when the reader needs to check it. */
   accessFirst?: boolean;
+  /** May read old values, by role and by the secret's own access list. */
+  canRevealHistory?: boolean;
   onRotate: (key: string) => void;
   onClose: () => void;
   onCloseAutoFocus?: (event: Event) => void;
@@ -245,6 +247,7 @@ export function SecretDrawer({
   canEditPolicy,
   restricted = false,
   accessFirst = false,
+  canRevealHistory = true,
   onRotate,
   onClose,
   onCloseAutoFocus,
@@ -349,18 +352,26 @@ export function SecretDrawer({
                 <section className="space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-sm font-semibold">History</h3>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setValuesFor(showValues ? null : location)}
-                      aria-pressed={showValues}
-                      data-testid="history-values-toggle"
-                    >
-                      {showValues ? <EyeOff /> : <Eye />}
-                      {showValues ? "Hide values" : "Show values"}
-                    </Button>
+                    {canRevealHistory && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setValuesFor(showValues ? null : location)}
+                        aria-pressed={showValues}
+                        data-testid="history-values-toggle"
+                      >
+                        {showValues ? <EyeOff /> : <Eye />}
+                        {showValues ? "Hide values" : "Show values"}
+                      </Button>
+                    )}
                   </div>
-                  {!showValues && (
+                  {!canRevealHistory && (
+                    <p className="flex items-start gap-2 text-sm text-muted-foreground" data-testid="history-values-denied">
+                      <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
+                      You can see this secret's versions but not read their values.
+                    </p>
+                  )}
+                  {canRevealHistory && !showValues && (
                     <p className="text-sm text-muted-foreground" data-testid="history-values-hidden">
                       Values are hidden. Show them to see each version and compare versions. Showing them is recorded in
                       the audit log.
