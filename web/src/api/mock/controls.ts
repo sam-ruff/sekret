@@ -23,6 +23,8 @@ export interface MockControls {
   rememberFile?: boolean;
   /** False plays a server with no sign-in provider configured. */
   oidc?: boolean;
+  /** Plays a server from before per-secret access, which writes a secret asked to be restricted open. */
+  legacyWrites?: boolean;
 }
 
 function optionalFlag(params: URLSearchParams, name: string): boolean | undefined {
@@ -42,6 +44,7 @@ export function parseControls(search: string): MockControls {
     idpLogout: params.has("mock-idp-logout") ? true : undefined,
     rememberFile: optionalFlag(params, "mock-remember-file"),
     oidc: optionalFlag(params, "mock-oidc"),
+    legacyWrites: params.has("mock-legacy-writes") ? true : undefined,
   };
 }
 

@@ -431,6 +431,7 @@ export class MockBackend {
     if (controls.orgRole) this.setMyOrgRole(controls.orgRole);
     if (controls.idpLogout) this.state.idpLogoutUrl = MOCK_IDP_LOGOUT_URL;
     if (controls.oidc !== undefined) this.state.oidcDisabled = !controls.oidc;
+    if (controls.legacyWrites) this.state.legacyWrites = true;
   }
 
   // Projects
@@ -958,6 +959,16 @@ export class MockBackend {
 
   /** Writes a batch with the caller's permissions; `generated` marks the new values as sekret's own. */
   private applyBatch(projectId: string, envSlug: string, request: BatchWrite, generated: boolean): BatchResult {
+    if (this.state.legacyWrites) {
+      const upserts = (request.upserts ?? []).map((u) => ({ ...u, restricted: undefined }));
+      this.state.legacyWrites = false;
+      try {
+        const { restricted: _ignored, ...result } = this.applyBatch(projectId, envSlug, { ...request, upserts }, generated);
+        return result;
+      } finally {
+        this.state.legacyWrites = true;
+      }
+    }
     const { project, rules } = this.loadProject(projectId);
     const env = this.findEnv(project, envSlug);
     const path = normaliseFolder(request.path ?? "/");
@@ -1221,16 +1232,21 @@ export class MockBackend {
     if (kept.filter((g) => g.secretId === secret.id).length + planned.length > MAX_GRANTS) {
       throw badRequest(`a secret's access list holds at most ${MAX_GRANTS} entries`);
     }
-    const cleared = clears && (this.state.grants ?? []).some((g) => g.secretId === secret.id);
+    const cleared = clears
+      ? (this.state.grants ?? [])
+          .filter((g) => g.secretId === secret.id)
+          .map((g) => ({ principal_kind: g.principal_kind, principal_id: g.principal_id }))
+      : [];
     const changes =
       (request.restricted != null && request.restricted !== (secret.restricted === true)) ||
       grant.length + revoke.length > 0 ||
-      cleared;
+      cleared.length > 0;
     this.state.grants = [...kept, ...planned];
     if (request.restricted != null) secret.restricted = request.restricted;
     if (changes) {
       this.audit("secret.access", { project_id: project.id, environment: env.slug, path: secret.path, secret_key: key }, {
         restricted: request.restricted ?? null,
+        cleared,
         granted: planned.map((g) => ({ principal_kind: g.principal_kind, principal_id: g.principal_id, actions: g.actions })),
         revoked: revoke,
       });

@@ -36,13 +36,31 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
   const identities = useIdentityPage({ ...query, sort: "name" }, open && canList && kind === "identity");
 
   const page = kind === "user" ? users : identities;
-  const options: PrincipalOption[] =
+  const fetched: PrincipalOption[] =
     kind === "user"
       ? (users.data?.items ?? []).map((u) => ({ id: u.id, label: u.name || u.email, hint: u.name ? u.email : undefined }))
       : (identities.data?.items ?? []).map((i) => ({ id: i.id, label: i.name, hint: i.description || undefined }));
+  // What is on screen narrows as you type, before the server answers the new search.
+  const typed = search.trim().toLowerCase();
+  const options = typed
+    ? fetched.filter((o) => [o.label, o.hint ?? "", o.id].some((text) => text.toLowerCase().includes(typed)))
+    : fetched;
   const total = page.data?.total ?? 0;
   const noun = kind === "user" ? "user" : "machine identity";
   const settling = q !== search.trim() || page.isFetching;
+  // The highlighted option follows the results, so Enter picks the first match on screen.
+  const [active, setActive] = useState("");
+  const firstId = options[0]?.id ?? "";
+  const [shownFirst, setShownFirst] = useState(firstId);
+  if (shownFirst !== firstId) {
+    setShownFirst(firstId);
+    setActive(firstId);
+  }
+  const pick = (option: PrincipalOption) => {
+    onSelect(option);
+    setOpen(false);
+    setSearch("");
+  };
 
   return (
     <Popover
@@ -69,11 +87,20 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-(--radix-popover-trigger-width) min-w-64 p-0" align="start">
-        <Command shouldFilter={false}>
+        <Command
+          shouldFilter={false}
+          value={active}
+          onValueChange={setActive}
+          onKeyDown={(event) => {
+            // Enter waits for the search to catch up, so it never picks a stale match.
+            if (event.key === "Enter" && settling) event.preventDefault();
+          }}
+        >
           <CommandInput
             value={search}
             onValueChange={setSearch}
             placeholder={kind === "user" ? "Search name, email or group" : "Search identities"}
+            aria-busy={settling}
             data-testid={testId ? `${testId}-search` : undefined}
           />
           <CommandList>
@@ -84,17 +111,18 @@ export function PrincipalPicker({ kind, selected, onSelect, canList = true, id, 
               </div>
             )}
             {canList && page.isSuccess && !settling && <CommandEmpty>No {noun} matches.</CommandEmpty>}
+            {canList && page.isSuccess && settling && (
+              <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground" data-testid="principal-searching">
+                <Spinner /> Searching
+              </div>
+            )}
             {options.length > 0 && (
               <CommandGroup>
                 {options.map((o) => (
                   <CommandItem
                     key={o.id}
                     value={o.id}
-                    onSelect={() => {
-                      onSelect(o);
-                      setOpen(false);
-                      setSearch("");
-                    }}
+                    onSelect={() => pick(o)}
                     data-testid={`principal-option-${o.label}`}
                   >
                     <Check className={cn(selected?.id === o.id ? "opacity-100" : "opacity-0")} />

@@ -136,6 +136,8 @@ export interface MockState {
   projectPolicies: Record<string, SecretPolicy>;
   /** Access list entries of every secret. */
   grants: StoredGrant[];
+  /** Writes ignore `restricted` and leave it out of results, as a server from before per-secret access. */
+  legacyWrites?: boolean;
   sys: MockSys;
 }
 

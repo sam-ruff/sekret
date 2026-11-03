@@ -139,7 +139,16 @@ const SUMMARISED = new Set([
   "restricted",
   "granted",
   "revoked",
+  "cleared",
 ]);
+
+/** The names the access section gives the actions an entry can allow. */
+export const ACCESS_ACTION_LABELS: Record<string, string> = {
+  read: "Read name",
+  "read-value": "Read value",
+  edit: "Edit",
+  delete: "Delete",
+};
 
 interface ListEntry {
   principal_kind?: unknown;
@@ -159,15 +168,16 @@ function accessSummary(action: string, detail: Detail, names: AuditNames): strin
     parts.push(detail.enabled ? "Turned on" : "Turned off");
   }
   if (action === "secret.access") {
-    if (detail.restricted === true) parts.push("Restricted");
-    if (detail.restricted === false) parts.push("Unrestricted, clearing its access list");
-    const granted = Array.isArray(detail.granted) ? (detail.granted as ListEntry[]) : [];
-    for (const g of granted) {
-      const actions = Array.isArray(g.actions) ? g.actions.join(", ") : "";
-      parts.push(`Granted ${entryName(g, names)}${actions ? ` ${actions}` : ""}`);
+    // The entry records the flag as sent, not whether it changed.
+    if (detail.restricted === true) parts.push("Set restricted");
+    if (detail.restricted === false) parts.push("Set open");
+    const entries = (field: unknown) => (Array.isArray(field) ? (field as ListEntry[]) : []);
+    for (const c of entries(detail.cleared)) parts.push(`Removed ${entryName(c, names)}`);
+    for (const g of entries(detail.granted)) {
+      const actions = Array.isArray(g.actions) ? g.actions.map((a) => ACCESS_ACTION_LABELS[String(a)] ?? String(a)) : [];
+      parts.push(`Granted ${entryName(g, names)}${actions.length > 0 ? `: ${actions.join(", ")}` : ""}`);
     }
-    const revoked = Array.isArray(detail.revoked) ? (detail.revoked as ListEntry[]) : [];
-    for (const r of revoked) parts.push(`Removed ${entryName(r, names)}`);
+    for (const r of entries(detail.revoked)) parts.push(`Removed ${entryName(r, names)}`);
   }
   if (action === "secret.write" && Array.isArray(detail.restricted) && detail.restricted.length > 0) {
     parts.push(`Created restricted: ${detail.restricted.join(", ")}`);

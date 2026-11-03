@@ -13,18 +13,23 @@ async function setting(page: Page, slug: string) {
 async function openAccess(page: Page, key: string) {
   await page.getByTestId(`secret-row-${key}`).getByTestId("secret-key").click();
   const access = page.getByTestId("secret-drawer").getByTestId("access-section");
-  await expect(access.getByTestId("access-restricted")).toBeVisible();
+  await expect(access.getByTestId("access-restricted").or(access.getByTestId("access-off"))).toBeVisible();
   return access;
+}
+
+async function confirm(page: Page, testId: string) {
+  await page.getByTestId(testId).getByTestId("confirm-action").click();
+  await expect(page.getByTestId(testId)).toBeHidden();
 }
 
 test("restricts a secret, manages its list and refuses turning the setting off while it is restricted", async ({ page }) => {
   const slug = await createProject(page, unique("E2E Access"));
   await addSecret(page, "PAYOUT_TOKEN", "tok_live");
 
-  // Off by default, so the drawer cannot restrict yet.
+  // Off by default, so the drawer only says how to turn it on.
   let access = await openAccess(page, "PAYOUT_TOKEN");
-  await expect(access.getByTestId("access-restricted")).toBeDisabled();
   await expect(access.getByTestId("access-off")).toBeVisible();
+  await expect(access.getByTestId("access-restricted")).toHaveCount(0);
 
   let card = await setting(page, slug);
   await expect(card.getByTestId("secret-access-enabled")).not.toBeChecked();
@@ -53,6 +58,7 @@ test("restricts a secret, manages its list and refuses turning the setting off w
   card = await setting(page, slug);
   await expect(card.getByTestId("secret-access-restricted")).toContainText("PAYOUT_TOKEN");
   await card.getByTestId("secret-access-enabled").click();
+  await confirm(page, "secret-access-off-confirm");
   await expect(card.getByTestId("secret-access-refused")).toContainText("1 secret in this project is restricted");
   await expect(card.getByTestId("secret-access-enabled")).toBeChecked();
 
@@ -61,11 +67,13 @@ test("restricts a secret, manages its list and refuses turning the setting off w
   await access.getByTestId("access-revoke-payments-team").click();
   await expect(access.getByTestId("access-grant-payments-team")).toHaveCount(0);
   await access.getByTestId("access-restricted").click();
+  await confirm(page, "access-unrestrict-confirm");
   await expect(access.getByTestId("access-restricted")).not.toBeChecked();
   await page.keyboard.press("Escape");
 
   card = await setting(page, slug);
   await card.getByTestId("secret-access-enabled").click();
+  await confirm(page, "secret-access-off-confirm");
   await expect(card.getByTestId("secret-access-enabled")).not.toBeChecked();
   await expect(card.getByTestId("secret-access-none")).toBeVisible();
 
@@ -94,6 +102,7 @@ test("creates a secret restricted from the start", async ({ page }) => {
   const access = await openAccess(page, "SIGNING_KEY");
   await expect(access.getByTestId("access-restricted")).toBeChecked();
   await access.getByTestId("access-restricted").click();
+  await confirm(page, "access-unrestrict-confirm");
   await expect(access.getByTestId("access-restricted")).not.toBeChecked();
   await page.keyboard.press("Escape");
 

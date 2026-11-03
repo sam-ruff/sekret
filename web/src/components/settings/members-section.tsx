@@ -27,7 +27,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { keys, useApiMutation, useRoles } from "@/hooks/queries";
-import { useManagesSecretAccess, useOrgPermissions, type Permissions } from "@/hooks/use-permissions";
+import { useAdministers, useOrgPermissions, type Permissions } from "@/hooks/use-permissions";
 import { errorMessage, isEscalation } from "@/lib/errors";
 import { formatRelative } from "@/lib/format";
 import { changeMemberRole, RoleChangeIncomplete } from "@/lib/member-role";
@@ -45,7 +45,7 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
   const [role, setRole] = useState("developer");
   const [problem, setProblem] = useState<{ escalation: boolean; message: string }>();
   const roles = useRoles(project);
-  const administers = useManagesSecretAccess(project);
+  const administers = useAdministers(project);
   const principal = kind === "group" ? group : (chosen?.id ?? "");
   const blocker = !principal.trim()
     ? kind === "group"
@@ -146,11 +146,12 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(roles.data ?? []).map((r) => (
+                  {/* Until it is known whether the caller may give the admin role, it is not offered. */}
+                  {(roles.data ?? []).filter((r) => r.slug !== ADMIN_ROLE || administers !== undefined).map((r) => (
                     <SelectItem
                       key={r.slug}
                       value={r.slug}
-                      disabled={r.slug === ADMIN_ROLE && !administers}
+                      disabled={r.slug === ADMIN_ROLE && administers === false}
                       data-testid={`member-role-option-${r.slug}`}
                     >
                       <span className="first-letter:uppercase">{r.name}</span>
@@ -158,7 +159,7 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
                   ))}
                 </SelectContent>
               </Select>
-              {!administers && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
+              {administers === false && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
             </Field>
           </FieldGroup>
           {problem && (
@@ -211,9 +212,11 @@ function ChangeRoleDialog({
   onClose: () => void;
 }) {
   const roles = useRoles(project);
-  const administers = useManagesSecretAccess(project);
+  const administers = useAdministers(project);
   const [role, setRole] = useState(member.role);
-  const choices = (roles.data ?? []).filter((r) => r.slug === member.role || !heldRoles.includes(r.slug));
+  const choices = (roles.data ?? [])
+    .filter((r) => r.slug === member.role || !heldRoles.includes(r.slug))
+    .filter((r) => r.slug !== ADMIN_ROLE || administers !== undefined || member.role === ADMIN_ROLE);
   const unchanged = role === member.role;
 
   const queryClient = useQueryClient();
@@ -255,7 +258,7 @@ function ChangeRoleDialog({
               <SelectItem
                 key={r.slug}
                 value={r.slug}
-                disabled={r.slug === ADMIN_ROLE && !administers && member.role !== ADMIN_ROLE}
+                disabled={r.slug === ADMIN_ROLE && administers === false && member.role !== ADMIN_ROLE}
                 data-testid={`change-role-option-${r.slug}`}
               >
                 <span className="first-letter:uppercase">{r.name}</span>
@@ -263,7 +266,7 @@ function ChangeRoleDialog({
             ))}
           </SelectContent>
         </Select>
-        {!administers && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
+        {administers === false && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
       </Field>
     </ConfirmDialog>
   );

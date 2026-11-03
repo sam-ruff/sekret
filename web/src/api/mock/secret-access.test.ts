@@ -140,6 +140,33 @@ describe("per-secret access in the mock", () => {
     expect(b.getSecretAccess("app", "prod", "STRIPE", "/").grants).toEqual([]);
   });
 
+  it("records who unrestricting removed, as the server does", () => {
+    const { b, pod } = setup();
+    b.putSecretAccessSetting("app", true);
+    b.changeSecretAccess("app", "prod", "STRIPE", "/", {
+      restricted: true,
+      grant: [{ principal_kind: "identity", principal_id: pod, actions: [] }],
+    });
+    b.changeSecretAccess("app", "prod", "STRIPE", "/", { restricted: false });
+    const entry = b.projectAudit("app", { action: "secret.access", limit: 1 }).entries[0];
+    expect(entry.detail).toEqual({
+      restricted: false,
+      cleared: [{ principal_kind: "identity", principal_id: pod }],
+      granted: [],
+      revoked: [],
+    });
+  });
+
+  it("plays an old server that writes a restricted request open and says nothing", () => {
+    const { b, state } = setup();
+    b.putSecretAccessSetting("app", true);
+    state.legacyWrites = true;
+    const result = b.setSecret("app", "prod", "NEW", "/", { value: "x", restricted: true });
+    expect(result.restricted).toBeUndefined();
+    expect(b.getSecret("app", "prod", "NEW", "/").restricted).toBe(false);
+    expect(state.legacyWrites).toBe(true);
+  });
+
   it("tells a listed caller what its entry grants and leaves admins without it", () => {
     const { b, state } = setup();
     b.putSecretAccessSetting("app", true);

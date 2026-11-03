@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, Navigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api } from "@/api/endpoints";
-import type { Secret } from "@/api/types";
+import type { BatchResult, Secret } from "@/api/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { EnvTabs } from "@/components/project/env-tabs";
@@ -137,6 +137,11 @@ const BELOW_LIMIT = 50;
 
 const secretCount = (count: number) => (count === 1 ? "1 secret" : `${count} secrets`);
 
+/** A create asked to be restricted but the server did not say it is. */
+function restrictionUnconfirmed(result: BatchResult, draft: SecretDraft): boolean {
+  return draft.restricted === true && !(result.restricted ?? []).includes(draft.key);
+}
+
 /** A subfolder, with how many secrets it holds; only an empty one offers to be deleted. */
 function FolderRow({
   name,
@@ -267,7 +272,13 @@ function SecretsView() {
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Secret | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
-  const [drawerKey, setDrawerKey] = useState<string | null>(null);
+  // `?open=KEY` opens a secret's drawer, and `&access=1` starts it at the access section.
+  const [drawerKey, setDrawerKey] = useState<string | null>(() => {
+    const key = search.get("open");
+    return key !== null && isValidSecretKey(key) ? key : null;
+  });
+  /** The drawer opens on its access section, as asked or after a restriction the server did not confirm. */
+  const [accessFirst, setAccessFirst] = useState(() => search.get("access") === "1");
   const [importing, setImporting] = useState(() => search.get("import") === "1");
   const [newFolder, setNewFolder] = useState(false);
   const [deletingFolder, setDeletingFolder] = useState<string | null>(null);
@@ -277,13 +288,15 @@ function SecretsView() {
 
   // The prefilled key, search or import request has been read; a reload should not apply it again.
   useEffect(() => {
-    if (!search.has("add") && !search.has("import") && !search.has("q")) return;
+    if (!["add", "import", "q", "open", "access"].some((name) => search.has(name))) return;
     setSearch(
       (current) => {
         const next = new URLSearchParams(current);
         next.delete("add");
         next.delete("import");
         next.delete("q");
+        next.delete("open");
+        next.delete("access");
         return next;
       },
       { replace: true },
@@ -364,15 +377,20 @@ function SecretsView() {
           }),
     invalidate: [...invalidate, ["project", project, "policy"]],
     success: (r, { draft, isNew }) => {
+      if (restrictionUnconfirmed(r, draft)) return undefined;
       if (draft.generator) return isNew ? `Generated ${draft.key}` : `Generated a new value for ${draft.key}`;
       return r.unchanged.length > 0 ? `${draft.key} is unchanged` : isNew ? `Added ${draft.key}` : `Saved ${draft.key}`;
     },
     onSuccess: (result, { draft }) => {
       // A server from before per-secret access ignores the flag and writes the secret open.
-      if (draft.restricted && !(result.restricted ?? []).includes(draft.key)) {
+      if (restrictionUnconfirmed(result, draft)) {
         toast.error(
-          `The server did not confirm that ${draft.key} is restricted. Check its access settings before you rely on it.`,
+          `${draft.key} was saved, but the server did not confirm it is restricted, so it may be open to everyone ` +
+            "its roles allow. Check its access below.",
+          { duration: Infinity, closeButton: true },
         );
+        setAccessFirst(true);
+        setDrawerKey(draft.key);
       }
       setAdding(null);
       setEditing(null);
@@ -830,11 +848,15 @@ function SecretsView() {
             canRollback={canRollback && (drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : true)}
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
             restricted={drawerSecret?.restricted === true}
+            accessFirst={accessFirst}
             onRotate={(key) => {
               rotateReturnFocus.current = null;
               setRotating(key);
             }}
-            onClose={() => setDrawerKey(null)}
+            onClose={() => {
+              setDrawerKey(null);
+              setAccessFirst(false);
+            }}
             onCloseAutoFocus={(event) => focusInstead(event, returnFocus.current)}
           />
         </>

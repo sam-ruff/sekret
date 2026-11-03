@@ -33,6 +33,8 @@ interface SecretDrawerProps {
   canEditPolicy: boolean;
   /** Only those on its access list, and admins, can reach it. */
   restricted?: boolean;
+  /** Show the access section first, when the reader needs to check it. */
+  accessFirst?: boolean;
   onRotate: (key: string) => void;
   onClose: () => void;
   onCloseAutoFocus?: (event: Event) => void;
@@ -242,6 +244,7 @@ export function SecretDrawer({
   canRollback,
   canEditPolicy,
   restricted = false,
+  accessFirst = false,
   onRotate,
   onClose,
   onCloseAutoFocus,
@@ -336,6 +339,7 @@ export function SecretDrawer({
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block [&>div]:min-w-0">
           <div className="space-y-6 p-4">
+            {secretKey && accessFirst && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
             {versions.isPending && <ListSkeleton rows={3} />}
             {versions.error && !versions.isFetchNextPageError && (
               <ErrorState error={versions.error} onRetry={() => void versions.refetch()} />
@@ -411,7 +415,7 @@ export function SecretDrawer({
                 )}
               </>
             )}
-            {secretKey && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
+            {secretKey && !accessFirst && <AccessSection at={at} secretKey={secretKey} restricted={restricted} />}
             {secretKey && (
               <PolicySection at={at} secretKey={secretKey} canEdit={canEditPolicy} onRotate={() => onRotate(secretKey)} />
             )}

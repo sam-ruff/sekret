@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Bot, Lock, Plus, Trash2, User, Users } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Link } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Action, PrincipalKind, SecretAccess, SecretAccessChange, SecretGrant } from "@/api/types";
@@ -28,12 +28,24 @@ interface Location {
 const KIND_ICON: Record<PrincipalKind, typeof User> = { user: User, group: Users, identity: Bot };
 const KIND_LABEL: Record<PrincipalKind, string> = { user: "User", group: "Group", identity: "Machine identity" };
 
-/** What an entry can grant beyond reading the secret's name, which every entry allows. */
+/** What an entry can allow beyond seeing the secret exists, which every entry allows. */
 const EXTRA_ACTIONS: { action: Action; label: string }[] = [
   { action: "read-value", label: "Read value" },
   { action: "edit", label: "Edit" },
   { action: "delete", label: "Delete" },
 ];
+
+/** Names shown in a confirmation before the rest are counted. */
+const NAMED_IN_CONFIRM = 3;
+
+/** The first few names, then how many more. */
+function namesWithMore(names: string[]): string {
+  if (names.length <= NAMED_IN_CONFIRM) return names.join(", ");
+  const rest = names.length - NAMED_IN_CONFIRM;
+  return `${names.slice(0, NAMED_IN_CONFIRM).join(", ")} and ${rest} more`;
+}
+
+const entryId = (g: Pick<SecretGrant, "principal_kind" | "principal_id">) => `${g.principal_kind}:${g.principal_id}`;
 
 interface AccessSectionProps {
   at: Location;
@@ -60,6 +72,12 @@ export function AccessSection({ at, secretKey, restricted }: AccessSectionProps)
   return <ManagedAccess at={at} secretKey={secretKey} />;
 }
 
+/** A change to the list, with what to say once it is saved. */
+interface Change {
+  body: SecretAccessChange;
+  message: string;
+}
+
 function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
   const project = useProject(at.project);
   const enabled = project.data?.secret_access === true;
@@ -67,38 +85,64 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
     queryKey: keys.secretAccess(at.project, at.env, at.path, secretKey),
     queryFn: () => api.secretAccess(at, secretKey),
   });
+  const [announced, setAnnounced] = useState("");
   const change = useApiMutation({
-    mutationFn: (body: SecretAccessChange) => api.changeSecretAccess(at, secretKey, body),
+    mutationFn: ({ body }: Change) => api.changeSecretAccess(at, secretKey, body),
     invalidate: [
       keys.secretAccess(at.project, at.env, at.path, secretKey),
       ["project", at.project, "secrets"],
       keys.secretAccessSetting(at.project),
     ],
+    success: (_, { message }) => message,
+    onSuccess: (_, { message }) => setAnnounced(message),
   });
+  const save = (next: Change) => change.mutateAsync(next).then(() => undefined);
+  const section = useRef<HTMLElement>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const listed = access.data?.grants ?? [];
+  const busy = change.isPending;
+
   const setRestricted = (restricted: boolean) => {
-    // Unrestricting clears the list, so ask first when it names anyone.
-    if (!restricted && listed.length > 0) {
+    if (busy) return;
+    // Opening a secret exposes it, and clears its list, so it is always confirmed.
+    if (!restricted) {
       setConfirmOpen(true);
       return;
     }
-    change.mutate({ restricted });
+    change.mutate({ body: { restricted: true }, message: `Restricted ${secretKey}` });
   };
 
+  const off = !enabled && access.data?.restricted === false;
+
   return (
-    <section className="space-y-3" data-testid="access-section">
-      <h3 className="text-sm font-semibold">Access</h3>
+    <section ref={section} className="space-y-3" data-testid="access-section">
+      <h3 className="text-sm font-semibold" tabIndex={-1} data-focus="access-heading">
+        Access
+      </h3>
+      {/* Says each saved change again for screen readers, as the toast may be missed. */}
+      <p className="sr-only" role="status" data-testid="access-announce">
+        {announced}
+      </p>
       {access.isPending && <ListSkeleton rows={2} />}
       {access.error && <ErrorState error={access.error} onRetry={() => void access.refetch()} />}
-      {access.data && (
+      {access.data && off && listed.length === 0 && (
+        <p className="text-sm text-muted-foreground" data-testid="access-off">
+          Per-secret access is off for this project, so roles alone decide who can reach this secret. Turn it on in the{" "}
+          <Link className="underline underline-offset-2" to={`/projects/${at.project}/settings/general`}>
+            project settings
+          </Link>{" "}
+          to restrict secrets.
+        </p>
+      )}
+      {access.data && !(off && listed.length === 0) && (
         <div className="space-y-4 rounded-lg border bg-card p-3">
           <Field orientation="horizontal">
             <Switch
               id="access-restricted"
               checked={access.data.restricted}
               // Unrestricting always works, so a project can be cleaned up before the setting goes off.
-              disabled={change.isPending || (!access.data.restricted && !enabled)}
+              disabled={!access.data.restricted && !enabled}
+              aria-disabled={busy || undefined}
               onCheckedChange={setRestricted}
               data-testid="access-restricted"
             />
@@ -108,29 +152,30 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
           </Field>
           <p className="text-sm text-muted-foreground" data-testid="access-summary">
             {access.data.restricted
-              ? "Only the principals below, project admins and organisation admins can reach it, and only as far as their roles allow. Unrestricting it removes everyone from the list."
-              : enabled
-                ? "Open: roles alone decide who can reach it. Anyone you add below only counts once it is restricted."
-                : "Open: roles alone decide who can reach it."}
+              ? "Only the people, groups and machine identities below, project admins and organisation admins can reach it, and only as far as their roles allow."
+              : "Open: roles alone decide who can reach it. Anyone added below only counts once it is restricted."}
           </p>
           <ConfirmDialog
             open={confirmOpen}
             onOpenChange={setConfirmOpen}
-            title={`Unrestrict ${secretKey}?`}
+            title={`Open ${secretKey} to everyone its roles allow?`}
             description={
-              <>
-                Everyone its roles allow can reach it again, and{" "}
-                {listed.length === 1 ? "the one entry" : `all ${listed.length} entries`} on its access list (
-                {listed.map((g) => g.principal_name).join(", ")}) {listed.length === 1 ? "is" : "are"} removed. Restricting it
-                again starts with an empty list.
-              </>
+              listed.length === 0 ? (
+                <>Everyone whose role allows it can read {secretKey} again.</>
+              ) : (
+                <>
+                  Everyone whose role allows it can read {secretKey} again, and its access list is cleared:{" "}
+                  {namesWithMore(listed.map((g) => g.principal_name))} {listed.length === 1 ? "is" : "are"} removed.
+                  Restricting it again starts with an empty list.
+                </>
+              )
             }
             confirmLabel="Unrestrict"
             destructive
-            onConfirm={() => change.mutateAsync({ restricted: false })}
+            onConfirm={() => save({ body: { restricted: false }, message: `Opened ${secretKey} to everyone its roles allow` })}
             testId="access-unrestrict-confirm"
           />
-          {!enabled && !access.data.restricted && (
+          {off && (
             <p className="text-sm text-muted-foreground" data-testid="access-off">
               Per-secret access is off for this project. Turn it on in the{" "}
               <Link className="underline underline-offset-2" to={`/projects/${at.project}/settings/general`}>
@@ -139,8 +184,8 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
               to restrict secrets.
             </p>
           )}
-          <GrantList access={access.data} enabled={enabled} busy={change.isPending} onChange={(body) => change.mutateAsync(body)} />
-          {enabled && <AddGrant busy={change.isPending} onAdd={(body) => change.mutateAsync(body)} />}
+          <GrantList access={access.data} enabled={enabled} busy={busy} section={section} onChange={save} />
+          {enabled && <AddGrant busy={busy} existing={listed} onAdd={save} />}
         </div>
       )}
     </section>
@@ -151,13 +196,31 @@ function GrantList({
   access,
   enabled,
   busy,
+  section,
   onChange,
 }: {
   access: SecretAccess;
   enabled: boolean;
   busy: boolean;
-  onChange: (body: SecretAccessChange) => Promise<unknown>;
+  section: RefObject<HTMLElement | null>;
+  onChange: (change: Change) => Promise<void>;
 }) {
+  // After a removal, focus moves to the next entry's remove button, or on to adding.
+  const focusNext = useRef<string | null>(null);
+  // Runs once the list without the removed entry is on screen.
+  useEffect(() => {
+    const wanted = focusNext.current;
+    if (wanted === null) return;
+    const root = section.current;
+    const target =
+      root?.querySelector<HTMLElement>(`[data-focus="${CSS.escape(wanted)}"]`) ??
+      root?.querySelector<HTMLElement>('[data-focus="access-add-heading"]') ??
+      root?.querySelector<HTMLElement>('[data-focus="access-heading"]');
+    if (!target) return;
+    target.focus();
+    focusNext.current = null;
+  }, [access.grants, section]);
+
   if (access.grants.length === 0) {
     return (
       <p className="text-sm text-muted-foreground" data-testid="access-empty">
@@ -165,10 +228,31 @@ function GrantList({
       </p>
     );
   }
+  const revoke = async (index: number) => {
+    const grant = access.grants[index];
+    const next = access.grants[index + 1] ?? access.grants[index - 1];
+    focusNext.current = next ? `revoke:${entryId(next)}` : "access-add-heading";
+    try {
+      await onChange({
+        body: { revoke: [{ principal_kind: grant.principal_kind, principal_id: grant.principal_id }] },
+        message: `Removed ${grant.principal_name}`,
+      });
+    } catch (error) {
+      focusNext.current = null;
+      throw error;
+    }
+  };
   return (
     <ul className="divide-y rounded-md border" data-testid="access-grants">
-      {access.grants.map((g) => (
-        <GrantRow key={`${g.principal_kind}:${g.principal_id}`} grant={g} enabled={enabled} busy={busy} onChange={onChange} />
+      {access.grants.map((g, index) => (
+        <GrantRow
+          key={entryId(g)}
+          grant={g}
+          enabled={enabled}
+          busy={busy}
+          onChange={onChange}
+          onRevoke={() => void revoke(index).catch(() => undefined)}
+        />
       ))}
     </ul>
   );
@@ -179,25 +263,31 @@ function GrantRow({
   enabled,
   busy,
   onChange,
+  onRevoke,
 }: {
   grant: SecretGrant;
   enabled: boolean;
   busy: boolean;
-  onChange: (body: SecretAccessChange) => Promise<unknown>;
+  onChange: (change: Change) => Promise<void>;
+  onRevoke: () => void;
 }) {
   const Icon = KIND_ICON[grant.principal_kind];
   const principal = { principal_kind: grant.principal_kind, principal_id: grant.principal_id };
-  const id = `${grant.principal_kind}-${grant.principal_id}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  const id = entryId(grant).replace(/[^A-Za-z0-9_-]/g, "_");
+  const name = grant.principal_name;
   const toggle = (action: Action, on: boolean) => {
+    if (busy) return;
     const actions = on ? [...grant.actions, action] : grant.actions.filter((a) => a !== action);
-    void onChange({ grant: [{ ...principal, actions }] }).catch(() => undefined);
+    void onChange({ body: { grant: [{ ...principal, actions }] }, message: `Updated what ${name} may do` }).catch(
+      () => undefined,
+    );
   };
   return (
-    <li className="space-y-2 p-3" data-testid={`access-grant-${grant.principal_name}`}>
-      <div className="flex items-center gap-2">
-        <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="min-w-0 flex-1 truncate text-sm font-medium" title={grant.principal_id}>
-          {grant.principal_name}
+    <li className="space-y-2 p-3" data-testid={`access-grant-${name}`}>
+      <div className="flex items-start gap-2">
+        <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <span className="min-w-0 flex-1 text-sm font-medium break-all" title={grant.principal_id}>
+          {name}
         </span>
         <Badge variant="secondary" className="shrink-0 text-[0.7rem]">
           {KIND_LABEL[grant.principal_kind]}
@@ -205,48 +295,72 @@ function GrantRow({
         <Button
           variant="ghost"
           size="icon-sm"
-          disabled={busy}
-          aria-label={`Remove ${grant.principal_name} from the access list`}
-          onClick={() => void onChange({ revoke: [principal] }).catch(() => undefined)}
-          data-testid={`access-revoke-${grant.principal_name}`}
+          aria-disabled={busy || undefined}
+          aria-label={`Remove ${name} from the access list`}
+          onClick={() => {
+            if (!busy) onRevoke();
+          }}
+          data-focus={`revoke:${entryId(grant)}`}
+          data-testid={`access-revoke-${name}`}
         >
           <Trash2 />
         </Button>
       </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-2 pl-6 text-sm">
-        <span className="text-muted-foreground">Read name</span>
+      <fieldset className="flex flex-wrap gap-x-4 gap-y-2 pl-6 text-sm">
+        <legend className="sr-only">What {name} may do</legend>
+        <div className="flex items-center gap-1.5">
+          <Checkbox id={`${id}-read`} checked disabled aria-label={`Read name for ${name}`} />
+          <Label htmlFor={`${id}-read`} className="font-normal text-muted-foreground">
+            Read name
+          </Label>
+        </div>
         {EXTRA_ACTIONS.map(({ action, label }) => (
           <div key={action} className="flex items-center gap-1.5">
             <Checkbox
               id={`${id}-${action}`}
               checked={grant.actions.includes(action)}
-              disabled={busy || !enabled}
+              disabled={!enabled}
+              aria-disabled={busy || undefined}
+              aria-label={`${label} for ${name}`}
               onCheckedChange={(on) => toggle(action, on === true)}
-              data-testid={`access-action-${grant.principal_name}-${action}`}
+              data-testid={`access-action-${name}-${action}`}
             />
             <Label htmlFor={`${id}-${action}`} className="font-normal">
               {label}
             </Label>
           </div>
         ))}
-      </div>
+      </fieldset>
     </li>
   );
 }
 
-function AddGrant({ busy, onAdd }: { busy: boolean; onAdd: (body: SecretAccessChange) => Promise<unknown> }) {
+function AddGrant({
+  busy,
+  existing,
+  onAdd,
+}: {
+  busy: boolean;
+  existing: SecretGrant[];
+  onAdd: (change: Change) => Promise<void>;
+}) {
   const org = useOrgPermissions();
   const [kind, setKind] = useState<PrincipalKind>("identity");
   const [group, setGroup] = useState("");
   const [chosen, setChosen] = useState<PrincipalOption>();
   const [actions, setActions] = useState<Action[]>(["read", "read-value"]);
   const principal = kind === "group" ? group.trim() : (chosen?.id ?? "");
+  const name = kind === "group" ? group.trim() : (chosen?.label ?? "");
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!principal) return;
+    if (!principal || busy) return;
+    const already = existing.some((g) => g.principal_kind === kind && g.principal_id === principal);
     try {
-      await onAdd({ grant: [{ principal_kind: kind, principal_id: principal, actions }] });
+      await onAdd({
+        body: { grant: [{ principal_kind: kind, principal_id: principal, actions }] },
+        message: already ? `Updated what ${name} may do` : `Added ${name}`,
+      });
       setGroup("");
       setChosen(undefined);
     } catch {
@@ -256,7 +370,9 @@ function AddGrant({ busy, onAdd }: { busy: boolean; onAdd: (body: SecretAccessCh
 
   return (
     <form onSubmit={(e) => void submit(e)} className="space-y-3 border-t pt-3" data-testid="access-add">
-      <p className="text-sm font-medium">Add to the list</p>
+      <p className="text-sm font-medium" tabIndex={-1} data-focus="access-add-heading">
+        Add to the list
+      </p>
       <ToggleGroup
         type="single"
         variant="outline"
@@ -268,7 +384,7 @@ function AddGrant({ busy, onAdd }: { busy: boolean; onAdd: (body: SecretAccessCh
           setChosen(undefined);
         }}
         className="w-full"
-        aria-label="Kind of principal"
+        aria-label="Kind of entry"
         data-testid="access-kind"
       >
         {(["identity", "user", "group"] as const).map((k) => {
@@ -306,8 +422,13 @@ function AddGrant({ busy, onAdd }: { busy: boolean; onAdd: (body: SecretAccessCh
         </Field>
       )}
       <fieldset className="flex flex-wrap gap-x-4 gap-y-2 text-sm">
-        <legend className="sr-only">Allowed actions</legend>
-        <span className="text-muted-foreground">Read name</span>
+        <legend className="sr-only">What they may do</legend>
+        <div className="flex items-center gap-1.5">
+          <Checkbox id="access-new-read" checked disabled />
+          <Label htmlFor="access-new-read" className="font-normal text-muted-foreground">
+            Read name
+          </Label>
+        </div>
         {EXTRA_ACTIONS.map(({ action, label }) => (
           <div key={action} className="flex items-center gap-1.5">
             <Checkbox
@@ -325,10 +446,17 @@ function AddGrant({ busy, onAdd }: { busy: boolean; onAdd: (body: SecretAccessCh
         ))}
       </fieldset>
       <p className="text-xs text-muted-foreground">
-        A list only narrows what roles allow. Someone whose role cannot edit still cannot edit, whatever the list says.
+        Everyone on the list can see that the secret exists. The list only narrows what roles allow: someone whose role
+        cannot edit still cannot edit, whatever the list says.
       </p>
       <div className="flex justify-end">
-        <Button type="submit" size="sm" disabled={!principal || busy} data-testid="access-add-submit">
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!principal}
+          aria-disabled={busy || undefined}
+          data-testid="access-add-submit"
+        >
           {busy ? <Spinner /> : <Plus />}
           Add
         </Button>
