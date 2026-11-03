@@ -1430,7 +1430,10 @@ async fn secret_access_commands(mode: Mode) -> anyhow::Result<()> {
         h,
         None,
     )?);
-    assert!(refused.contains("per-secret access is off"), "{refused}");
+    assert!(
+        refused.contains("per-secret access is not on") && refused.contains("nothing was written"),
+        "{refused}"
+    );
     let refused = failed(run(&["projects", "secret-access", "on"], &pod, h, None)?);
     assert!(refused.contains("only a project admin"), "{refused}");
     let on = ok(run(&["projects", "secret-access", "on"], &admin, h, None)?)?;

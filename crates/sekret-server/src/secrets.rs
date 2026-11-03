@@ -402,7 +402,7 @@ pub async fn plan_batch(
                 ..new_version(&secret_id, version, Some(blob), upsert.comment, tags, ctx)
             },
             restricted,
-            access_epoch: existing.as_ref().map_or(0, |s| s.secret.access_epoch),
+            access_epoch: existing.as_ref().map_or(0, |s| caller.access.planned_epoch(&s.secret)),
         });
     }
 
@@ -449,7 +449,7 @@ pub async fn plan_batch(
                 ctx,
             ),
             restricted: false,
-            access_epoch: current.secret.access_epoch,
+            access_epoch: caller.access.planned_epoch(&current.secret),
         });
         result.deleted.push(key_name);
     }
@@ -585,15 +585,18 @@ pub async fn plan_rollback(
         &secret_resource(&env.slug, &s.path, &s.key, &target.tags, access),
     )?;
     let key = data_key(&ctx.root_key, project)?;
-    let change = restore_change(
-        &key,
-        project,
-        current,
-        &target,
-        restored_tags(caller, env, current, &target),
-        rollback_comment(version, &target.comment),
-        ctx,
-    )?;
+    let change = SecretChange {
+        access_epoch: caller.access.planned_epoch(s),
+        ..restore_change(
+            &key,
+            project,
+            current,
+            &target,
+            restored_tags(caller, env, current, &target),
+            rollback_comment(version, &target.comment),
+            ctx,
+        )?
+    };
     let mut result = BatchResult {
         created: vec![],
         updated: vec![s.key.clone()],
@@ -708,7 +711,7 @@ pub async fn plan_restore(
                         ctx,
                     ),
                     restricted: false,
-                    access_epoch: s.secret.access_epoch,
+                    access_epoch: caller.access.planned_epoch(&s.secret),
                 });
                 result.deleted.push(label);
             }
@@ -730,15 +733,18 @@ pub async fn plan_restore(
                     action,
                     &secret_resource(&env.slug, &s.secret.path, &s.secret.key, &target.tags, access),
                 )?;
-                changes.push(restore_change(
-                    &key,
-                    project,
-                    s,
-                    &target,
-                    restored_tags(caller, env, s, &target),
-                    format!("snapshot {} restore", snapshot.id),
-                    ctx,
-                )?);
+                changes.push(SecretChange {
+                    access_epoch: caller.access.planned_epoch(&s.secret),
+                    ..restore_change(
+                        &key,
+                        project,
+                        s,
+                        &target,
+                        restored_tags(caller, env, s, &target),
+                        format!("snapshot {} restore", snapshot.id),
+                        ctx,
+                    )?
+                });
                 if kind == SnapshotChangeKind::Added {
                     result.created.push(label);
                 } else {
@@ -1335,6 +1341,42 @@ mod tests {
             "listed editor",
         )?;
         assert_eq!(planned.result.updated, vec!["STRIPE_KEY".to_string()]);
+        Ok(())
+    }
+
+    /// A list revoked between reading the caller's entries and reading the secret moves the
+    /// secret's epoch on, so the write is held to the epoch read with the entries and refused.
+    #[tokio::test]
+    async fn writes_are_held_to_the_epoch_read_with_the_lists() -> anyhow::Result<()> {
+        let (root, project, env) = fixture()?;
+        let mut current = stored(&project, &root, "A", "v", 1, false)?;
+        current.secret.restricted = true;
+        current.secret.access_epoch = 5;
+        let mut store = MockStore::new();
+        let seen = current.clone();
+        store
+            .expect_get_secret()
+            .returning(move |_, _, _| Ok(Some(seen.clone())));
+        let rules = BuiltinRole::Developer.rules();
+        let access = listed_for("id-A", &[Action::Read, Action::Edit, Action::Delete])
+            .with_epochs(HashMap::from([("id-A".to_string(), 4)]));
+        let caller = Caller {
+            rules: &rules,
+            access: &access,
+        };
+        for (upserts, deletes) in [(vec![upsert("A", "new")], vec![]), (vec![], vec!["A".to_string()])] {
+            let planned = api(
+                plan_batch(&ctx(&store, &root), caller, &project, &env, "/", upserts, deletes).await,
+                "plan",
+            )?;
+            assert_eq!(planned.batch.context("batch")?.changes[0].access_epoch, 4);
+        }
+        let exempt = crate::authz::SecretAccess::exempt();
+        assert_eq!(
+            exempt.planned_epoch(&current.secret),
+            5,
+            "admins are held to the secret as read"
+        );
         Ok(())
     }
 

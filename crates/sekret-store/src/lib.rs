@@ -115,6 +115,11 @@ pub trait Store: Send + Sync {
     async fn list_restricted_secrets(&self, project_id: &str) -> StoreResult<Vec<RestrictedSecret>>;
     /// Every access list entry on secrets in the environment.
     async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>>;
+    /// The restricted secrets in the environment with their access epochs, and their entries,
+    /// read together so a write can be held to the lists it was judged by.
+    async fn environment_access(&self, environment_id: &str) -> StoreResult<EnvironmentAccess>;
+    /// The snapshot taken just before this one in its environment.
+    async fn previous_snapshot(&self, snapshot: &Snapshot) -> StoreResult<Option<Snapshot>>;
     /// Every access list entry on secrets in the project.
     async fn list_project_grants(&self, project_id: &str) -> StoreResult<Vec<SecretGrant>>;
     async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>>;

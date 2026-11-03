@@ -335,6 +335,17 @@ async fn patch_secret_access(
     }
     let (grant, revoke) = plan_change(&state, &s.secret.id, state.clock.now(), request.grant, request.revoke).await?;
     let existing = state.store.list_secret_grants(&s.secret.id).await?;
+    // A revocation that matches nobody would read as done while access stays.
+    if let Some((kind, id)) = revoke.iter().find(|(kind, id)| {
+        !existing
+            .iter()
+            .any(|e| e.principal_kind == *kind && e.principal_id == *id)
+    }) {
+        return Err(ApiError::bad_request(format!(
+            "{} {id} is not on this secret's access list",
+            kind.as_str()
+        )));
+    }
     // Unrestricting clears the list, so a later restriction never brings back stale entries.
     let clears = request.restricted == Some(false);
     let survivors: Vec<&sekret_store::SecretGrant> = existing
@@ -432,14 +443,20 @@ pub async fn restricted_visible(
         return Ok(Some(Vec::new()));
     }
     let access = SecretAccess::listed(principal, state.store.list_project_grants(&project.id).await?);
+    // Bounded so the query stays within the database's limit on parameters; past it a reader
+    // simply sees fewer entries.
     Ok(Some(
         restricted
             .into_iter()
             .filter(|s| access.lists_for_read(&s.secret_id))
+            .take(MAX_VISIBLE_RESTRICTED)
             .map(|s| (s.environment, s.path, s.key))
             .collect(),
     ))
 }
+
+/// The most restricted secrets whose audit entries one reader's query names.
+const MAX_VISIBLE_RESTRICTED: usize = 2000;
 
 #[cfg(test)]
 mod tests {

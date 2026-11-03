@@ -847,6 +847,27 @@ async fn lists_never_outlive_their_restriction(db: String) -> anyhow::Result<()>
         audit["entries"][0]["detail"]["cleared"][0]["principal_id"], "ops",
         "the cleared entries are recorded: {audit}"
     );
+    // Revoking someone who is not listed is refused rather than reported as done.
+    let (status, body) = change(
+        &h,
+        &h.admin,
+        "/payments",
+        "STRIPE",
+        json!({"revoke": [{"principal_kind": "group", "principal_id": "nobody"}]}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().is_some_and(|m| m.contains("not on")), "{body}");
+    // A deleted secret brought back restricted starts with an empty list, whatever it had.
+    let old = "/api/v1/projects/app/environments/prod/secrets/OLD?path=/";
+    h.put(old, &h.admin, json!({"value": "1"})).await?;
+    change(&h, &h.admin, "/", "OLD", ops.clone()).await?;
+    h.delete(old, &h.admin).await?;
+    let (status, body) = h.put(old, &h.admin, json!({"value": "2", "restricted": true})).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, revived) = h.get(&access_url("/", "OLD"), &h.admin).await?;
+    assert_eq!(revived, json!({"restricted": true, "grants": []}));
+    change(&h, &h.admin, "/", "OLD", json!({"restricted": false})).await?;
     // A list made ready on an open secret goes when the setting is turned off.
     change(&h, &h.admin, "/payments", "OPEN", ops).await?;
     let (status, body) = set_setting(&h, &h.admin, false).await?;

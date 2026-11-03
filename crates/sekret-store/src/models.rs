@@ -267,6 +267,14 @@ pub struct SecretGrant {
     pub created_at: i64,
 }
 
+/// The access lists of an environment's restricted secrets at one moment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentAccess {
+    /// Secret id to its access epoch, for every restricted secret.
+    pub epochs: std::collections::HashMap<String, i64>,
+    pub grants: Vec<SecretGrant>,
+}
+
 /// Changes to one secret's access, applied together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessChange {
@@ -364,7 +372,8 @@ pub struct AuditEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditQuery {
     /// `None` returns entries about restricted secrets too. Otherwise only those about one of
-    /// these `(environment, path, key)` secrets are returned, and never access-list changes.
+    /// these `(environment, path, key)` secrets are returned, and never access-list changes or
+    /// refused writes.
     pub restricted_visible: Option<Vec<(String, String, String)>>,
     pub project_id: Option<String>,
     /// Case-insensitive substring over action, actor, environment, path, key and address.

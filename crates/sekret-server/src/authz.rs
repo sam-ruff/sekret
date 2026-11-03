@@ -129,6 +129,8 @@ pub struct SecretAccess {
     exempt: bool,
     /// Secret id to the actions its list grants the caller, through any entry that reaches them.
     granted: HashMap<String, Vec<Action>>,
+    /// Restricted secret id to the access epoch read with the lists, which a write is held to.
+    epochs: HashMap<String, i64>,
 }
 
 impl SecretAccess {
@@ -136,7 +138,7 @@ impl SecretAccess {
     pub fn exempt() -> Self {
         Self {
             exempt: true,
-            granted: HashMap::new(),
+            ..Self::default()
         }
     }
 
@@ -154,7 +156,25 @@ impl SecretAccess {
                 }
             }
         }
-        Self { exempt: false, granted }
+        Self {
+            exempt: false,
+            granted,
+            epochs: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_epochs(self, epochs: HashMap<String, i64>) -> Self {
+        Self { epochs, ..self }
+    }
+
+    /// The access epoch a write to `secret` is held to: the one read with the caller's lists for
+    /// a restricted secret that binds them, so a list changed after it was read stops the write.
+    pub fn planned_epoch(&self, secret: &Secret) -> i64 {
+        if self.exempt || !secret.restricted {
+            return secret.access_epoch;
+        }
+        self.epochs.get(&secret.id).copied().unwrap_or(secret.access_epoch)
     }
 
     pub fn is_exempt(&self) -> bool {
@@ -204,8 +224,11 @@ pub async fn secret_access(
     if manages_secret_access(state, principal, &project.id).await? {
         return Ok(SecretAccess::exempt());
     }
-    let grants = state.store.list_environment_grants(environment_id).await?;
-    Ok(SecretAccess::listed(principal, grants))
+    let current = state.store.environment_access(environment_id).await?;
+    Ok(SecretAccess {
+        epochs: current.epochs,
+        ..SecretAccess::listed(principal, current.grants)
+    })
 }
 
 /// A caller's role rules and their access lists, which together decide what they may do with

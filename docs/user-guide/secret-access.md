@@ -44,7 +44,7 @@ Each entry names a user, a group from your identity provider, or a machine ident
 | `edit` | Writing a new value, rolling back, and bringing the secret back after it was deleted. |
 | `delete` | Deleting it. |
 
-`sekret secrets access grant` takes `--identity` (an id or a name), `--user` (an id or an email), `--group` (a group name) and `--allow`, which defaults to `read,read-value`. Each flag can be repeated, and granting someone already on the list replaces their actions. `revoke` takes the same principal flags. A name that matches more principals than one search returns is refused, so give the id. Users must have signed in once before they can be listed, and an identity that is deleted leaves the lists it was on. Group names are not checked, so a typo grants nothing.
+`sekret secrets access grant` takes `--identity` (an id or a name), `--user` (an id or an email), `--group` (a group name) and `--allow`, which defaults to `read,read-value`. Each flag can be repeated, and granting someone already on the list replaces their actions. `revoke` takes the same principal flags, matched against the secret's own list by id or by the name it shows, and revoking someone who is not on the list is refused rather than reported as done. Without the right to look up identities or users, give their ids to `grant`. A name that matches more principals than one search returns is refused, so give the id. Users must have signed in once before they can be listed, and an identity that is deleted leaves the lists it was on. Group names are not checked, so a typo grants nothing.
 
 A restricted secret tells each caller on its list what their entry allows, in the `granted` field, so the web interface only offers what will work.
 
@@ -71,7 +71,7 @@ There is one thing a hidden secret cannot hide from someone allowed to create se
 
 ## The audit log
 
-Entries about a restricted secret are marked when they are written. Readers off its list never get them: the log, its totals, filters and search all behave as if they were never written. Someone on the list gets the entries that name the secret, but not access-list changes, and not batch writes or folder reads that touched it, since those can name other restricted secrets. Admins get everything. Entries written before a secret was restricted stay as they were, and entries written while it was restricted stay hidden after it is opened again. See [Audit log](audit-log.md#searching-and-filtering).
+Entries about a restricted secret are marked when they are written. Readers off its list never get them: the log, its totals, filters and search all behave as if they were never written. Someone on the list gets the entries that name the secret, but not access-list changes, and not batch writes or folder reads that touched it, since those can name other restricted secrets. Admins get everything. Entries written before a secret was restricted stay as they were, and entries written while it was restricted stay hidden after it is opened again. Entries are matched to a secret by environment, folder and key, so a secret created later in the same place, after an environment was deleted and made again, shares them. See [Audit log](audit-log.md#searching-and-filtering).
 
 The organisation audit log leaves the same entries out for everyone but organisation admins. No audit entry ever holds a value.
 
@@ -94,13 +94,15 @@ First, give the service account a [machine identity](machine-identities.md#kuber
 Then turn the setting on, restrict everything in `/checkout`, and list the pod on just the three secrets it needs:
 
 ```sh
+set -e
 export SEKRET_PROJECT=payments SEKRET_ENVIRONMENT=prod SEKRET_PATH=/checkout
 sekret projects secret-access on
-for key in STRIPE_KEY STRIPE_WEBHOOK_SECRET DATABASE_URL REFUNDS_KEY LEDGER_TOKEN; do
-  sekret secrets access restrict "$key"
-done
+# Grant first, so the pod never loses a secret it reads while the restrictions go on.
 for key in STRIPE_KEY STRIPE_WEBHOOK_SECRET DATABASE_URL; do
   sekret secrets access grant "$key" --identity checkout-pod
+done
+for key in STRIPE_KEY STRIPE_WEBHOOK_SECRET DATABASE_URL REFUNDS_KEY LEDGER_TOKEN; do
+  sekret secrets access restrict "$key"
 done
 ```
 

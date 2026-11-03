@@ -1096,6 +1096,27 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             .context("project")?
             .secret_access
     );
+    let current = store.environment_access("e1").await.context("environment access")?;
+    assert_eq!(
+        current.epochs,
+        std::collections::HashMap::from([("o1".to_string(), 2), ("r1".to_string(), 0)]),
+        "every restricted secret, listed or not"
+    );
+    assert_eq!(
+        current.grants,
+        vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])]
+    );
+    assert_eq!(
+        store.environment_access("e2").await.context("other")?,
+        EnvironmentAccess::default()
+    );
+    let snapshots = store.list_snapshots("e1", 10).await.context("snapshots")?;
+    let newest = snapshots.first().context("newest")?;
+    let previous = store.previous_snapshot(newest).await.context("previous")?;
+    assert_eq!(previous.as_ref().map(|s| &s.id), snapshots.get(1).map(|s| &s.id));
+    let oldest = snapshots.last().context("oldest")?;
+    assert_eq!(store.previous_snapshot(oldest).await.context("none")?, None);
+
     // Every access change moves the epoch on, so a write planned before it is refused.
     let o1 = store.get_secret_by_id("o1").await.context("get")?.context("o1")?;
     assert_eq!(o1.secret.access_epoch, 2, "restricted and granted, then regranted");

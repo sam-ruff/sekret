@@ -370,7 +370,7 @@ fn audit_filter(query: &AuditQuery) -> Filter {
             "restricted = 0".to_string()
         } else {
             format!(
-                "(restricted = 0 OR (action <> 'secret.access' AND ({})))",
+                "(restricted = 0 OR (action NOT IN ('secret.access', 'secret.write-refused') AND ({})))",
                 allowed.join(" OR ")
             )
         };
@@ -1536,6 +1536,50 @@ impl Store for SqlStore {
         )
     }
 
+    async fn environment_access(&self, environment_id: &str) -> StoreResult<EnvironmentAccess> {
+        // One statement, so the epochs and the entries come from the same moment.
+        let rows = sqlx::query(
+            "SELECT s.id AS sid, s.access_epoch, g.principal_kind, g.principal_id, g.actions, g.created_at \
+             FROM secrets s LEFT JOIN secret_grants g ON g.secret_id = s.id \
+             WHERE s.environment_id = $1 AND s.restricted = 1",
+        )
+        .bind(environment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut access = EnvironmentAccess::default();
+        for row in &rows {
+            let secret_id: String = row.try_get("sid")?;
+            access.epochs.insert(secret_id.clone(), row.try_get("access_epoch")?);
+            let Some(actions) = row.try_get::<Option<String>, _>("actions")? else {
+                continue;
+            };
+            let kind: String = row.try_get("principal_kind")?;
+            access.grants.push(SecretGrant {
+                secret_id,
+                principal_kind: PrincipalKind::parse(&kind)
+                    .ok_or_else(|| StoreError::Corrupt(format!("unknown principal kind {kind}")))?,
+                principal_id: row.try_get("principal_id")?,
+                actions: from_json(&actions)?,
+                created_at: row.try_get("created_at")?,
+            });
+        }
+        Ok(access)
+    }
+
+    async fn previous_snapshot(&self, snapshot: &Snapshot) -> StoreResult<Option<Snapshot>> {
+        let row = sqlx::query(
+            "SELECT * FROM snapshots WHERE environment_id = $1 AND (created_at < $2 OR (created_at = $3 AND id < $4)) \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&snapshot.environment_id)
+        .bind(snapshot.created_at)
+        .bind(snapshot.created_at)
+        .bind(&snapshot.id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(snapshot_from).transpose()
+    }
+
     async fn list_environment_grants(&self, environment_id: &str) -> StoreResult<Vec<SecretGrant>> {
         collect(
             sqlx::query(
@@ -1571,7 +1615,8 @@ impl Store for SqlStore {
             .bind(&project_id)
             .fetch_one(&mut *tx)
             .await?;
-        if change.restricted == Some(true) && !get_flag(&enabled, "secret_access")? {
+        let widens = change.restricted == Some(true) || !change.grant.is_empty();
+        if widens && !get_flag(&enabled, "secret_access")? {
             return Err(StoreError::Conflict);
         }
         if let Some(restricted) = change.restricted {
@@ -2190,7 +2235,12 @@ impl Store for SqlStore {
                     return Err(StoreError::Conflict);
                 }
                 if change.restricted {
-                    sqlx::query("UPDATE secrets SET restricted = 1 WHERE id = $1")
+                    // Brought back restricted with an empty list, as a new restricted secret starts.
+                    sqlx::query("UPDATE secrets SET restricted = 1, access_epoch = access_epoch + 1 WHERE id = $1")
+                        .bind(&change.secret_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1")
                         .bind(&change.secret_id)
                         .execute(&mut *tx)
                         .await?;

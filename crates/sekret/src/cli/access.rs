@@ -6,7 +6,7 @@ use anyhow::bail;
 use clap::{Args, Subcommand, ValueEnum};
 use sekret_api::{
     Action, GrantRequest, Identity, PrincipalKind, PrincipalRef, SecretAccess, SecretAccessChange, SecretAccessSetting,
-    User,
+    SecretGrant, User,
 };
 use sekret_client::{Location, SekretApi};
 
@@ -137,10 +137,30 @@ fn complete<T>(wanted: &str, total: i64, items: &[T], id_of: impl Fn(&T) -> &str
     Ok(())
 }
 
-/// Whether the caller may not search principals, in which case what they typed is sent as an
-/// id for the server to check.
+/// Whether the caller may not search principals, in which case only an id can be sent, for the
+/// server to check.
 fn may_not_search(error: &sekret_client::ClientError) -> bool {
     matches!(error, sekret_client::ClientError::Api { status: 403, .. })
+}
+
+/// Whether `text` has the shape of the ids sekret gives users and identities.
+fn looks_like_id(text: &str) -> bool {
+    text.len() == 36
+        && text.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// What was typed, when searching is not allowed: an id is passed on, a name cannot be looked up.
+fn unsearched(kind: &str, wanted: &str) -> anyhow::Result<String> {
+    if looks_like_id(wanted) {
+        return Ok(wanted.to_string());
+    }
+    bail!(
+        "you may not look up {kind}s by name here, so give the {kind}'s id instead of {}",
+        one_line(wanted)
+    )
 }
 
 async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<PrincipalRef>> {
@@ -151,7 +171,7 @@ async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<Pr
                 complete(wanted, page.total, &page.items, |i| &i.id)?;
                 pick_identity(wanted, &page.items)?
             }
-            Err(error) if may_not_search(&error) => wanted.clone(),
+            Err(error) if may_not_search(&error) => unsearched("identity", wanted)?,
             Err(error) => return Err(error.into()),
         };
         resolved.push(PrincipalRef {
@@ -165,7 +185,7 @@ async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<Pr
                 complete(wanted, page.total, &page.items, |u| &u.id)?;
                 pick_user(wanted, &page.items)?
             }
-            Err(error) if may_not_search(&error) => wanted.clone(),
+            Err(error) if may_not_search(&error) => unsearched("user", wanted)?,
             Err(error) => return Err(error.into()),
         };
         resolved.push(PrincipalRef {
@@ -180,6 +200,46 @@ async fn resolve(api: &dyn SekretApi, who: &Principals) -> anyhow::Result<Vec<Pr
         });
     }
     Ok(resolved)
+}
+
+/// The entries on `access` that `who` names, by id or by the name the list shows. Revoking is
+/// judged against the list itself, so a name that is not on it fails rather than removing nobody.
+pub fn listed_principals(access: &SecretAccess, who: &Principals) -> anyhow::Result<Vec<PrincipalRef>> {
+    let wanted = who
+        .identities
+        .iter()
+        .map(|w| (PrincipalKind::Identity, w))
+        .chain(who.users.iter().map(|w| (PrincipalKind::User, w)))
+        .chain(who.groups.iter().map(|w| (PrincipalKind::Group, w)));
+    let mut found = Vec::new();
+    for (kind, name) in wanted {
+        let of_kind = || access.grants.iter().filter(|g| g.principal_kind == kind);
+        let exact: Vec<&SecretGrant> = of_kind().filter(|g| g.principal_id == *name).collect();
+        let named: Vec<&SecretGrant> = if exact.is_empty() {
+            of_kind()
+                .filter(|g| g.principal_name.eq_ignore_ascii_case(name))
+                .collect()
+        } else {
+            exact
+        };
+        match named.as_slice() {
+            [one] => found.push(PrincipalRef {
+                principal_kind: kind,
+                principal_id: one.principal_id.clone(),
+            }),
+            [] => bail!(
+                "no {} {} is on this secret's access list",
+                kind_label(kind),
+                one_line(name)
+            ),
+            _ => bail!(
+                "more than one {} on the list is called {}; give the id instead",
+                kind_label(kind),
+                one_line(name)
+            ),
+        }
+    }
+    Ok(found)
 }
 
 fn kind_label(kind: PrincipalKind) -> &'static str {
@@ -249,8 +309,9 @@ pub async fn run(api: &dyn SekretApi, at: Location, command: AccessCommand, out:
             api.change_secret_access(at, key, change).await?
         }
         AccessCommand::Revoke { key, who } => {
+            let current = api.secret_access(at.clone(), key.clone()).await?;
             let change = SecretAccessChange {
-                revoke: resolve(api, &who).await?,
+                revoke: listed_principals(&current, &who)?,
                 ..Default::default()
             };
             api.change_secret_access(at, key, change).await?
@@ -317,7 +378,7 @@ pub async fn project_setting(api: &dyn SekretApi, project: String, state: Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sekret_api::{RestrictedSecret, SecretGrant};
+    use sekret_api::RestrictedSecret;
 
     fn identity(id: &str, name: &str) -> Identity {
         Identity {
@@ -383,8 +444,9 @@ mod tests {
         };
         let mut api = sekret_client::MockSekretApi::new();
         api.expect_find_identities().returning(move |_| Err(forbidden()));
+        const ID: &str = "0192d4a8-0000-7000-8000-00000000000a";
         api.expect_change_secret_access()
-            .withf(|_, _, change| change.grant.len() == 1 && change.grant[0].principal_id == "raw-id")
+            .withf(|_, _, change| change.grant.len() == 1 && change.grant[0].principal_id == ID)
             .times(1)
             .returning(|_, _, _| {
                 Ok(SecretAccess {
@@ -392,16 +454,70 @@ mod tests {
                     grants: vec![],
                 })
             });
-        let command = AccessCommand::Grant {
+        let grant = |name: &str| AccessCommand::Grant {
             key: "DB".into(),
             who: Principals {
-                identities: vec!["raw-id".into()],
+                identities: vec![name.into()],
                 ..Default::default()
             },
             allow: vec![AccessAction::Read],
         };
-        run(&api, at(), command, &mut Vec::new()).await.context("grant")?;
+        run(&api, at(), grant(ID), &mut Vec::new()).await.context("grant")?;
+        let refused = run(&api, at(), grant("checkout-pod"), &mut Vec::new()).await;
+        assert!(
+            refused
+                .err()
+                .is_some_and(|e| e.to_string().contains("give the identity's id")),
+            "a name is never passed off as an id"
+        );
         Ok(())
+    }
+
+    fn entry(kind: PrincipalKind, id: &str, name: &str) -> SecretGrant {
+        SecretGrant {
+            principal_kind: kind,
+            principal_id: id.into(),
+            principal_name: name.into(),
+            actions: vec![Action::Read],
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn revocations_must_name_someone_on_the_list() -> anyhow::Result<()> {
+        let access = SecretAccess {
+            restricted: true,
+            grants: vec![
+                entry(PrincipalKind::Identity, "i1", "checkout-pod"),
+                entry(PrincipalKind::User, "u1", "ann@example.com"),
+                entry(PrincipalKind::Group, "ops", "ops"),
+            ],
+        };
+        let who = Principals {
+            identities: vec!["checkout-pod".into()],
+            users: vec!["u1".into()],
+            groups: vec!["ops".into()],
+        };
+        let found = listed_principals(&access, &who)?;
+        let ids: Vec<&str> = found.iter().map(|p| p.principal_id.as_str()).collect();
+        assert_eq!(ids, ["i1", "u1", "ops"]);
+        let typo = Principals {
+            groups: vec!["Ops-team".into()],
+            ..Default::default()
+        };
+        assert!(
+            listed_principals(&access, &typo)
+                .err()
+                .is_some_and(|e| e.to_string().contains("no group Ops-team is on"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ids_have_one_shape() {
+        assert!(looks_like_id("0192d4a8-0000-7000-8000-00000000000a"));
+        assert!(!looks_like_id("checkout-pod"));
+        assert!(!looks_like_id("0192d4a8-0000-7000-8000-00000000000g"));
     }
 
     #[test]

@@ -971,12 +971,8 @@ async fn get_snapshot(
     let readable = permitted(scope.caller(), &scope.env.slug, current, &[Action::Read]).await?;
     let readable_ids = readable_secret_ids(&state, &scope).await?;
     if readable_ids.is_some() {
-        let recent = state.store.list_snapshots(&scope.env.id, SNAPSHOTS_SHOWN + 1).await?;
-        let previous = recent
-            .iter()
-            .position(|s| s.id == snapshot.id)
-            .and_then(|i| recent.get(i + 1));
-        if only_hidden_changes(&snapshot, previous, readable_ids.as_ref()) {
+        let previous = state.store.previous_snapshot(&snapshot).await?;
+        if only_hidden_changes(&snapshot, previous.as_ref(), readable_ids.as_ref()) {
             return Err(ApiError::not_found("snapshot"));
         }
     }

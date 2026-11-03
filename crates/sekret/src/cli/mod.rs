@@ -666,6 +666,24 @@ pub async fn run_logout(client_args: &ClientArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuses a restricted write before anything is written when the project does not have
+/// per-secret access on, which is also how a server from before the feature answers.
+pub async fn require_secret_access(api: &dyn SekretApi, at: &Location) -> anyhow::Result<()> {
+    let on = api
+        .list_projects()
+        .await?
+        .iter()
+        .any(|p| (p.slug == at.project || p.id == at.project) && p.secret_access);
+    if on {
+        return Ok(());
+    }
+    bail!(
+        "per-secret access is not on for {}, or the server predates it, so nothing was written; a project \
+         admin can turn it on with `sekret projects secret-access on`",
+        format::one_line(&at.project)
+    )
+}
+
 /// Fails loudly when the server did not confirm that each of `keys` is restricted, as a server
 /// from before per-secret access would silently write them open.
 pub fn confirm_restricted(result: &BatchResult, keys: &[String]) -> anyhow::Result<()> {
@@ -861,6 +879,7 @@ pub async fn secrets(
                 .context("reading .env file")?;
             let mut upserts = collect_upserts(&pairs, dotenv.as_deref(), &comment, stdin)?;
             if restricted {
+                require_secret_access(api, &at).await?;
                 for upsert in &mut upserts {
                     upsert.restricted = Some(true);
                 }
@@ -969,6 +988,9 @@ pub async fn secrets(
                     charset: charset.map(Charset::from).unwrap_or(base.charset),
                 }
             });
+            if restricted {
+                require_secret_access(api, &at).await?;
+            }
             let request = GenerateSecret {
                 generator,
                 comment,
@@ -1552,9 +1574,52 @@ mod tests {
 
     /// A server that predates per-secret access drops the field and writes the secret open, so
     /// anything it does not confirm is reported as open and the command fails.
+    fn projects(secret_access: bool) -> Vec<sekret_api::Project> {
+        vec![sekret_api::Project {
+            id: "p1".into(),
+            slug: "app".into(),
+            name: "App".into(),
+            description: String::new(),
+            created_at: 0,
+            logo_url: None,
+            secret_access,
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_restricted_write_is_refused_before_writing_when_the_setting_is_off() -> anyhow::Result<()> {
+        let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(false)));
+        api.expect_write().never();
+        api.expect_generate().never();
+        let set = SecretsCommand::Set {
+            pairs: vec!["B=1".into()],
+            from_dotenv: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        let refused = secrets(&api, at(), set, &mut Vec::new(), &mut "".as_bytes()).await;
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("nothing was written"), "{message}");
+        let generate = SecretsCommand::Generate {
+            key: "D".into(),
+            length: None,
+            charset: None,
+            comment: String::new(),
+            restricted: true,
+        };
+        assert!(
+            secrets(&api, at(), generate, &mut Vec::new(), &mut "".as_bytes())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn an_unconfirmed_restriction_fails_the_command() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(true)));
         api.expect_write().times(1).returning(|_, _| {
             Ok(BatchResult {
                 restricted: vec!["B".into()],
@@ -1587,6 +1652,7 @@ mod tests {
     #[tokio::test]
     async fn set_and_delete_send_batches() -> anyhow::Result<()> {
         let mut api = MockSekretApi::new();
+        api.expect_list_projects().returning(|| Ok(projects(true)));
         api.expect_write()
             .withf(|at, b| {
                 at.project == "app"
