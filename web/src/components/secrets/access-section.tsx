@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { Link } from "react-router";
 import { api } from "@/api/endpoints";
 import type { Action, PrincipalKind, SecretAccess, SecretAccessChange, SecretGrant } from "@/api/types";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PrincipalPicker, type PrincipalOption } from "@/components/principal-picker";
 import { ErrorState, ListSkeleton } from "@/components/states";
 import { Badge } from "@/components/ui/badge";
@@ -74,6 +75,16 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
       keys.secretAccessSetting(at.project),
     ],
   });
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const listed = access.data?.grants ?? [];
+  const setRestricted = (restricted: boolean) => {
+    // Unrestricting clears the list, so ask first when it names anyone.
+    if (!restricted && listed.length > 0) {
+      setConfirmOpen(true);
+      return;
+    }
+    change.mutate({ restricted });
+  };
 
   return (
     <section className="space-y-3" data-testid="access-section">
@@ -88,7 +99,7 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
               checked={access.data.restricted}
               // Unrestricting always works, so a project can be cleaned up before the setting goes off.
               disabled={change.isPending || (!access.data.restricted && !enabled)}
-              onCheckedChange={(restricted) => change.mutate({ restricted })}
+              onCheckedChange={setRestricted}
               data-testid="access-restricted"
             />
             <FieldLabel htmlFor="access-restricted" className="font-normal">
@@ -97,11 +108,28 @@ function ManagedAccess({ at, secretKey }: { at: Location; secretKey: string }) {
           </Field>
           <p className="text-sm text-muted-foreground" data-testid="access-summary">
             {access.data.restricted
-              ? "Only the principals below, project admins and organisation admins can reach it, and only as far as their roles allow."
+              ? "Only the principals below, project admins and organisation admins can reach it, and only as far as their roles allow. Unrestricting it removes everyone from the list."
               : enabled
-                ? "Open: roles alone decide who can reach it. The list below has no effect until it is restricted."
+                ? "Open: roles alone decide who can reach it. Anyone you add below only counts once it is restricted."
                 : "Open: roles alone decide who can reach it."}
           </p>
+          <ConfirmDialog
+            open={confirmOpen}
+            onOpenChange={setConfirmOpen}
+            title={`Unrestrict ${secretKey}?`}
+            description={
+              <>
+                Everyone its roles allow can reach it again, and{" "}
+                {listed.length === 1 ? "the one entry" : `all ${listed.length} entries`} on its access list (
+                {listed.map((g) => g.principal_name).join(", ")}) {listed.length === 1 ? "is" : "are"} removed. Restricting it
+                again starts with an empty list.
+              </>
+            }
+            confirmLabel="Unrestrict"
+            destructive
+            onConfirm={() => change.mutateAsync({ restricted: false })}
+            testId="access-unrestrict-confirm"
+          />
           {!enabled && !access.data.restricted && (
             <p className="text-sm text-muted-foreground" data-testid="access-off">
               Per-secret access is off for this project. Turn it on in the{" "}

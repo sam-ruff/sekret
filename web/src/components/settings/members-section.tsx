@@ -27,13 +27,15 @@ import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { keys, useApiMutation, useRoles } from "@/hooks/queries";
-import { useOrgPermissions, type Permissions } from "@/hooks/use-permissions";
+import { useManagesSecretAccess, useOrgPermissions, type Permissions } from "@/hooks/use-permissions";
 import { errorMessage, isEscalation } from "@/lib/errors";
 import { formatRelative } from "@/lib/format";
 import { changeMemberRole, RoleChangeIncomplete } from "@/lib/member-role";
 
 const KIND_ICON: Record<PrincipalKind, typeof User> = { user: User, group: Users, identity: Bot };
 const KIND_LABEL: Record<PrincipalKind, string> = { user: "User", group: "Group", identity: "Machine identity" };
+const ADMIN_ROLE = "admin";
+const ADMIN_ONLY = "Only a project or organisation admin can give someone the admin role.";
 
 function AddMemberDialog({ project, onClose }: { project: string; onClose: () => void }) {
   const org = useOrgPermissions();
@@ -43,6 +45,7 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
   const [role, setRole] = useState("developer");
   const [problem, setProblem] = useState<{ escalation: boolean; message: string }>();
   const roles = useRoles(project);
+  const administers = useManagesSecretAccess(project);
   const principal = kind === "group" ? group : (chosen?.id ?? "");
   const blocker = !principal.trim()
     ? kind === "group"
@@ -144,12 +147,18 @@ function AddMemberDialog({ project, onClose }: { project: string; onClose: () =>
                 </SelectTrigger>
                 <SelectContent>
                   {(roles.data ?? []).map((r) => (
-                    <SelectItem key={r.slug} value={r.slug}>
+                    <SelectItem
+                      key={r.slug}
+                      value={r.slug}
+                      disabled={r.slug === ADMIN_ROLE && !administers}
+                      data-testid={`member-role-option-${r.slug}`}
+                    >
                       <span className="first-letter:uppercase">{r.name}</span>
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              {!administers && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
             </Field>
           </FieldGroup>
           {problem && (
@@ -202,6 +211,7 @@ function ChangeRoleDialog({
   onClose: () => void;
 }) {
   const roles = useRoles(project);
+  const administers = useManagesSecretAccess(project);
   const [role, setRole] = useState(member.role);
   const choices = (roles.data ?? []).filter((r) => r.slug === member.role || !heldRoles.includes(r.slug));
   const unchanged = role === member.role;
@@ -242,12 +252,18 @@ function ChangeRoleDialog({
           </SelectTrigger>
           <SelectContent>
             {choices.map((r) => (
-              <SelectItem key={r.slug} value={r.slug} data-testid={`change-role-option-${r.slug}`}>
+              <SelectItem
+                key={r.slug}
+                value={r.slug}
+                disabled={r.slug === ADMIN_ROLE && !administers && member.role !== ADMIN_ROLE}
+                data-testid={`change-role-option-${r.slug}`}
+              >
                 <span className="first-letter:uppercase">{r.name}</span>
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
+        {!administers && <FieldDescription>{ADMIN_ONLY}</FieldDescription>}
       </Field>
     </ConfirmDialog>
   );

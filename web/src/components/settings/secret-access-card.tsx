@@ -78,7 +78,7 @@ function SettingForm({ project, setting, canEdit }: { project: string; setting: 
       )}
       {setting.restricted_count === 0 ? (
         <p className="text-sm text-muted-foreground" data-testid="secret-access-none">
-          No secrets are restricted.
+          No secrets are restricted.{setting.enabled && " Turning this off clears every access list in the project."}
         </p>
       ) : (
         <div className="space-y-2">
@@ -105,6 +105,7 @@ function SettingForm({ project, setting, canEdit }: { project: string; setting: 
           )}
           <p className="text-xs text-muted-foreground">
             Per-secret access can only be turned off once nothing is restricted, so no restriction lapses unnoticed.
+            Turning it off then clears every access list in the project.
           </p>
         </div>
       )}

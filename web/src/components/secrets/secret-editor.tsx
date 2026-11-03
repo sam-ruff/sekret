@@ -80,7 +80,6 @@ export function SecretEditor({
     setDraft({
       ...draft,
       tags: initial.tags,
-      restricted: undefined,
       generator: { length: DEFAULT_DRAFT.length, charset: DEFAULT_DRAFT.charset },
     });
 
@@ -202,7 +201,7 @@ export function SecretEditor({
             )}
           </Field>
         </div>
-        {isNew && canRestrict && !draft.generator && (
+        {isNew && canRestrict && (
           <Field orientation="horizontal">
             <Checkbox
               id={`restricted-${id}`}

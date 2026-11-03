@@ -91,6 +91,29 @@ describe("describeDetail", () => {
     expect(describeDetail("auth.machine-login", { method: "carrier-pigeon" })).toBe("Signed in with carrier-pigeon auth");
   });
 
+  it("describes per-secret access changes", () => {
+    expect(actionLabel("secret.write-refused")).toBe("Write to a hidden secret refused");
+    expect(actionLabel("secret.access")).toBe("Changed who can reach a secret");
+    expect(describeDetail("project.secret-access", { enabled: false })).toBe("Turned off");
+    expect(
+      describeDetail(
+        "secret.access",
+        {
+          restricted: true,
+          granted: [{ principal_kind: "identity", principal_id: "i1", actions: ["read", "read-value"] }],
+          revoked: [{ principal_kind: "group", principal_id: "ops" }],
+        },
+        { identity: (id) => (id === "i1" ? "payments-pod" : undefined) },
+      ),
+    ).toBe("Restricted · Granted machine identity payments-pod read, read-value · Removed group ops");
+    expect(describeDetail("secret.access", { restricted: false, granted: [], revoked: [] })).toBe(
+      "Unrestricted, clearing its access list",
+    );
+    expect(describeDetail("secret.write", { created: ["A"], updated: [], deleted: [], restricted: ["A"] })).toContain(
+      "Created restricted: A",
+    );
+  });
+
   it("falls back to plain fields for anything unknown", () => {
     expect(describeDetail("identity.auth-put", { identity: "id-1", method: "oidc", empty: "", none: null })).toBe(
       "OIDC auth on id-1",

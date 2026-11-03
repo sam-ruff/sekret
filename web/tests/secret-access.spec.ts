@@ -80,7 +80,12 @@ test("turning the setting off is refused while a secret is restricted", async ({
   await openSecrets(page);
   const access = await openAccess(page, "STRIPE_SECRET_KEY");
   await access.getByTestId("access-restricted").click();
+  // Unrestricting clears the list, so it asks first and names who goes.
+  const confirm = page.getByTestId("access-unrestrict-confirm");
+  await expect(confirm).toContainText("finance, github-deploy");
+  await confirm.getByTestId("confirm-action").click();
   await expect(access.getByTestId("access-restricted")).not.toBeChecked();
+  await expect(access.getByTestId("access-empty")).toHaveText("No one is on the list.");
   await closeDrawer(page);
   await expect(secretRow(page, "STRIPE_SECRET_KEY").getByTestId("secret-restricted-badge")).toHaveCount(0);
 
@@ -120,6 +125,18 @@ test("creates a secret restricted from the start", async ({ page }) => {
   await form.getByTestId("secret-save").click();
   await expectToast(page, "Added PAYOUT_TOKEN");
   await expect(secretRow(page, "PAYOUT_TOKEN").getByTestId("secret-restricted-badge")).toBeVisible();
+});
+
+test("generates a secret restricted from the start", async ({ page }) => {
+  await openSecrets(page);
+  await page.getByTestId("add-secret").click();
+  const form = page.getByTestId("new-secret-form");
+  await form.getByTestId("secret-key-input").fill("WEBHOOK_KEY");
+  await form.getByTestId("secret-generate").click();
+  await form.getByTestId("secret-restricted-input").click();
+  await form.getByTestId("secret-save").click();
+  await expectToast(page, "Generated WEBHOOK_KEY");
+  await expect(secretRow(page, "WEBHOOK_KEY").getByTestId("secret-restricted-badge")).toBeVisible();
 });
 
 test("a project with the setting off offers no restriction", async ({ page }) => {

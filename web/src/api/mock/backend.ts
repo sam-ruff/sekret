@@ -639,7 +639,12 @@ export class MockBackend {
       request.generator ?? this.effectivePolicy(project.id, existing && !isDeleted(existing) ? existing : undefined).generator ?? DEFAULT_GENERATOR;
     validatePolicy({ generator, rotation_days: null });
     const value = generateValue(generator);
-    const result = this.applyBatch(projectId, envSlug, { path, upserts: [{ key, value, comment: request.comment ?? "" }] }, true);
+    const result = this.applyBatch(
+      projectId,
+      envSlug,
+      { path, upserts: [{ key, value, comment: request.comment ?? "", restricted: request.restricted }] },
+      true,
+    );
     this.audit("secret.generate", { project_id: project.id, environment: env.slug, path, secret_key: key }, {
       created: result.created.length > 0,
     });
@@ -849,8 +854,10 @@ export class MockBackend {
   private toApi(env: StoredEnvironment, s: StoredSecret, rules: Rule[], values: boolean): Secret {
     const current = currentVersion(s);
     const mayRead = authorise(rules, "secrets", "read-value", this.resource(env, s, current.tags));
+    const granted = this.granted(env.projectId, s);
     return {
       restricted: s.restricted === true,
+      ...(granted && { granted }),
       id: s.id,
       environment: env.slug,
       path: s.path,
@@ -966,7 +973,14 @@ export class MockBackend {
       seen.add(key);
     }
 
-    const result: BatchResult = { created: [], updated: [], deleted: [], unchanged: [], snapshot_id: null };
+    const result: BatchResult = {
+      created: [],
+      updated: [],
+      deleted: [],
+      unchanged: [],
+      restricted: [],
+      snapshot_id: null,
+    };
     const planned: { existing?: StoredSecret; key: string; version: StoredVersion; restricted?: boolean }[] = [];
 
     for (const upsert of upserts) {
@@ -976,6 +990,8 @@ export class MockBackend {
         throw notFound(`secret ${upsert.key}`);
       }
       const restricted = this.checkRestricted(project, existing, upsert.key, upsert.restricted);
+      // As the server: the keys that asked to be restricted and are restricted after the write.
+      if (upsert.restricted === true && (restricted || existing?.restricted === true)) result.restricted?.push(upsert.key);
       const live = existing && !isDeleted(existing) ? existing : undefined;
       const tags = upsert.tags ? normaliseTags(upsert.tags) : live ? currentVersion(live).tags : [];
       if (live) {
@@ -1016,6 +1032,7 @@ export class MockBackend {
     for (const change of planned) {
       if (change.existing) {
         change.existing.versions.push(change.version);
+        if (change.restricted) change.existing.restricted = true;
       } else {
         this.state.secrets.push({
           id: this.nextId("sec"),
@@ -1061,16 +1078,17 @@ export class MockBackend {
   ): boolean {
     if (wanted == null) return false;
     if (existing) {
-      if ((existing.restricted === true) !== wanted) {
+      const revivesRestricted = isDeleted(existing) && wanted && existing.restricted !== true;
+      if ((existing.restricted === true) !== wanted && !revivesRestricted) {
         throw badRequest(`${key} already exists; change whether it is restricted through its access settings`);
       }
-      return false;
+      if (!revivesRestricted) return false;
     }
     if (!wanted) return false;
+    if (!project.secret_access) throw secretAccessOff();
     if (!this.managesSecretAccess(project.id)) {
       throw new MockError(403, "forbidden", "only a project admin can create a restricted secret");
     }
-    if (!project.secret_access) throw secretAccessOff();
     return true;
   }
 
@@ -1123,6 +1141,13 @@ export class MockBackend {
           `${count} secret${one ? "" : "s"} in this project ${one ? "is" : "are"} restricted; unrestrict ${one ? "it" : "them"} before turning per-secret access off`,
         );
       }
+    }
+    if (!enabled) {
+      // As the server: turning the setting off clears every list in the project.
+      const ids = new Set(
+        this.state.secrets.filter((s) => this.projectEnvs(project.id).some((e) => e.id === s.envId)).map((s) => s.id),
+      );
+      this.state.grants = (this.state.grants ?? []).filter((g) => !ids.has(g.secretId));
     }
     if ((project.secret_access === true) !== enabled) {
       project.secret_access = enabled;
@@ -1190,12 +1215,17 @@ export class MockBackend {
     });
     const touched = (g: { principal_kind: PrincipalKind; principal_id: string }) =>
       seen.has(`${g.principal_kind}:${g.principal_id}`);
-    const kept = (this.state.grants ?? []).filter((g) => !(g.secretId === secret.id && touched(g)));
+    // As the server: unrestricting clears the list first, then any grants in the same request apply.
+    const clears = request.restricted === false;
+    const kept = (this.state.grants ?? []).filter((g) => !(g.secretId === secret.id && (clears || touched(g))));
     if (kept.filter((g) => g.secretId === secret.id).length + planned.length > MAX_GRANTS) {
       throw badRequest(`a secret's access list holds at most ${MAX_GRANTS} entries`);
     }
+    const cleared = clears && (this.state.grants ?? []).some((g) => g.secretId === secret.id);
     const changes =
-      (request.restricted != null && request.restricted !== (secret.restricted === true)) || grant.length + revoke.length > 0;
+      (request.restricted != null && request.restricted !== (secret.restricted === true)) ||
+      grant.length + revoke.length > 0 ||
+      cleared;
     this.state.grants = [...kept, ...planned];
     if (request.restricted != null) secret.restricted = request.restricted;
     if (changes) {
@@ -1439,6 +1469,8 @@ export class MockBackend {
     const administers =
       this.isOrgAdmin() ||
       this.state.memberships.some((m) => m.projectId === project.id && m.role === "admin" && this.principalIsMe(m.principal_kind, m.principal_id));
+    // As the server: the admin role also exempts from access lists, so only admins hand it out.
+    if (request.role === "admin" && !administers) throw escalation("only an admin can grant the built-in admin role");
     this.checkDenyForAdmin(granted, request.principal_kind, request.principal_id, administers, project.id);
     this.ensurePrincipal(request.principal_kind, request.principal_id);
     const duplicate = this.state.memberships.some(
@@ -1586,7 +1618,7 @@ export class MockBackend {
     const { project, rules } = this.loadProject(projectId);
     this.require(rules, "audit-log", "read");
     const actorsOnly = this.auditFilterScope(rules, query);
-    const entries = this.state.audit.filter((e) => e.project_id === project.id);
+    const entries = this.state.audit.filter((e) => e.project_id === project.id && this.auditVisible(project.id, e));
     if (!actorsOnly) return this.auditPage(entries, query);
     // `q` may only search what redaction leaves alone.
     const search = emptyToUndefined(query.q)?.toLowerCase();
@@ -1594,6 +1626,20 @@ export class MockBackend {
       ? entries.filter((e) => [e.action, e.actor_name, e.actor_id, e.ip].some((f) => f.toLowerCase().includes(search)))
       : entries;
     return this.auditPage(searched, { ...query, q: undefined });
+  }
+
+  /**
+   * As the server: entries about a restricted secret are left out for readers its list keeps off,
+   * and access list changes are for admins only.
+   */
+  private auditVisible(projectId: string, entry: AuditEntry): boolean {
+    if (this.managesSecretAccess(projectId)) return true;
+    if (entry.action === "secret.access") return false;
+    if (!entry.environment || !entry.secret_key) return true;
+    const env = this.projectEnvs(projectId).find((e) => e.slug === entry.environment);
+    const secret = env && this.state.secrets.find((s) => s.envId === env.id && s.path === entry.path && s.key === entry.secret_key);
+    if (!secret?.restricted) return true;
+    return this.granted(projectId, secret)?.includes("read") ?? true;
   }
 
   /** As the server: refuses filters that would reveal what redaction hides, and says whether `q` is limited. */

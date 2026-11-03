@@ -351,7 +351,11 @@ function SecretsView() {
   const save = useApiMutation({
     mutationFn: ({ draft }: { draft: SecretDraft; isNew: boolean }) =>
       draft.generator
-        ? api.generateSecret(at, draft.key, { generator: generatorFromDraft(draft.generator), comment: draft.comment })
+        ? api.generateSecret(at, draft.key, {
+            generator: generatorFromDraft(draft.generator),
+            comment: draft.comment,
+            ...(draft.restricted && { restricted: true }),
+          })
         : api.setSecret(at, draft.key, {
             value: draft.value,
             comment: draft.comment,
@@ -363,7 +367,13 @@ function SecretsView() {
       if (draft.generator) return isNew ? `Generated ${draft.key}` : `Generated a new value for ${draft.key}`;
       return r.unchanged.length > 0 ? `${draft.key} is unchanged` : isNew ? `Added ${draft.key}` : `Saved ${draft.key}`;
     },
-    onSuccess: () => {
+    onSuccess: (result, { draft }) => {
+      // A server from before per-secret access ignores the flag and writes the secret open.
+      if (draft.restricted && !(result.restricted ?? []).includes(draft.key)) {
+        toast.error(
+          `The server did not confirm that ${draft.key} is restricted. Check its access settings before you rely on it.`,
+        );
+      }
       setAdding(null);
       setEditing(null);
       // The finished mutation still holds the saved value as its variables.
@@ -454,7 +464,14 @@ function SecretsView() {
   const shownSecrets = visibleSecrets.slice(0, Math.max(0, shownRows - shownFolders.length));
   const hiddenRows = visibleFolders.length + visibleSecrets.length - shownFolders.length - shownSecrets.length;
 
-  const resourceFor = (s: Secret) => ({ environment: envSlug, path, key: s.key, tags: s.tags });
+  // `granted` narrows a restricted secret to what the caller's own list entry allows.
+  const resourceFor = (s: Secret) => ({
+    environment: envSlug,
+    path,
+    key: s.key,
+    tags: s.tags,
+    ...(s.granted && { granted: s.granted }),
+  });
   const drawerSecret = secrets.find((s) => s.key === drawerKey);
   const rotatingSecret = secrets.find((s) => s.key === rotating);
   const rotatingTyped = rotatingSecret !== undefined && !rotatingSecret.generated;
@@ -810,7 +827,7 @@ function SecretsView() {
             envName={env.name}
             path={path}
             secretKey={drawerKey}
-            canRollback={canRollback}
+            canRollback={canRollback && (drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : true)}
             canEditPolicy={drawerSecret ? perms.can("secrets", "edit", resourceFor(drawerSecret)) : false}
             restricted={drawerSecret?.restricted === true}
             onRotate={(key) => {
