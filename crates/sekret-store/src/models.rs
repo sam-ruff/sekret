@@ -284,6 +284,8 @@ pub struct AccessChange {
     /// Added, or replacing the actions of an existing entry for the same principal.
     pub grant: Vec<SecretGrant>,
     pub revoke: Vec<(PrincipalKind, String)>,
+    /// The most entries the list may hold afterwards; more is a `Conflict`.
+    pub max_grants: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

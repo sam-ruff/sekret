@@ -437,7 +437,11 @@ async fn users_groups_and_admins(db: String) -> anyhow::Result<()> {
         ),
         (
             json!({"principal_kind": "group", "principal_id": "a\nb", "actions": ["read"]}),
-            "control characters",
+            "control or invisible characters",
+        ),
+        (
+            json!({"principal_kind": "group", "principal_id": "ops\u{202e}", "actions": ["read"]}),
+            "control or invisible characters",
         ),
     ] {
         let (status, body) = change(&h, &h.admin, "/payments", "STRIPE", json!({"grant": [grant]})).await?;
@@ -922,6 +926,15 @@ async fn only_admins_grant_the_admin_roles(db: String) -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "still off the list");
+    // Rotation is bound by no list, so steering it through the project default is for admins.
+    let policy = json!({"generator": {"length": 32, "charset": "hex"}, "rotation_days": 1});
+    let (status, body) = h
+        .put("/api/v1/projects/app/secret-policy", &maintainer, policy.clone())
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "escalation");
+    let (status, body) = h.put("/api/v1/projects/app/secret-policy", &h.admin, policy).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     // A real admin still can.
     let (status, body) = h

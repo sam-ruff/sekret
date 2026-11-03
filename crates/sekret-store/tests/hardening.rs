@@ -558,6 +558,7 @@ async fn secrets_from_before_secret_access_stay_open(database: &str, backend: &s
             restricted: Some(true),
             grant: vec![],
             revoke: vec![],
+            max_grants: 100,
         })
         .await
         .context("restrict an old secret")?;

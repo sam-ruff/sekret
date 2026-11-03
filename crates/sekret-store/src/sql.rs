@@ -21,6 +21,10 @@ impl From<sqlx::Error> for StoreError {
             sqlx::Error::Database(db) if db.is_unique_violation() || db.is_foreign_key_violation() => {
                 StoreError::Conflict
             }
+            // SQLite refuses a write from a transaction whose snapshot another write has overtaken.
+            sqlx::Error::Database(db) if matches!(db.code().as_deref(), Some("5" | "6" | "517")) => {
+                StoreError::Conflict
+            }
             sqlx::Error::RowNotFound => StoreError::NotFound,
             _ => StoreError::Database(error.to_string()),
         }
@@ -1603,7 +1607,7 @@ impl Store for SqlStore {
         )
     }
 
-    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<()> {
+    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<Vec<SecretGrant>> {
         let mut tx = self.pool.begin().await?;
         let project_id: String = sqlx::query("SELECT project_id FROM secrets WHERE id = $1")
             .bind(&change.secret_id)
@@ -1626,7 +1630,16 @@ impl Store for SqlStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        // Read under the project lock, so what is recorded as cleared is what was removed.
+        let mut cleared = Vec::new();
         if change.restricted == Some(false) {
+            cleared = collect(
+                sqlx::query("SELECT * FROM secret_grants WHERE secret_id = $1 ORDER BY principal_kind, principal_id")
+                    .bind(&change.secret_id)
+                    .fetch_all(&mut *tx)
+                    .await?,
+                grant_from,
+            )?;
             sqlx::query("DELETE FROM secret_grants WHERE secret_id = $1")
                 .bind(&change.secret_id)
                 .execute(&mut *tx)
@@ -1666,8 +1679,16 @@ impl Store for SqlStore {
             .execute(&mut *tx)
             .await?;
         }
+        let entries: i64 = sqlx::query("SELECT COUNT(*) AS n FROM secret_grants WHERE secret_id = $1")
+            .bind(&change.secret_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("n")?;
+        if usize::try_from(entries).map_or(true, |n| n > change.max_grants) {
+            return Err(StoreError::Conflict);
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(cleared)
     }
 
     async fn get_project_logo(&self, project_id: &str) -> StoreResult<Option<ProjectLogo>> {

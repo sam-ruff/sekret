@@ -125,8 +125,8 @@ pub trait Store: Send + Sync {
     async fn list_secret_grants(&self, secret_id: &str) -> StoreResult<Vec<SecretGrant>>;
     /// Applies one secret's access changes atomically and moves its access epoch on.
     /// Restricting is a `Conflict` when the project setting is off, and unrestricting clears the
-    /// list before any grants in the same change.
-    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<()>;
+    /// list before any grants in the same change. Returns the entries unrestricting cleared.
+    async fn update_secret_access(&self, change: AccessChange) -> StoreResult<Vec<SecretGrant>>;
     async fn update_project(&self, id: &str, name: &str, description: &str) -> StoreResult<()>;
     async fn delete_project(&self, id: &str) -> StoreResult<()>;
     /// Every stored secret value in the project, history included.

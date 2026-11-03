@@ -985,6 +985,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
         restricted: Some(true),
         grant: vec![],
         revoke: vec![],
+        max_grants: 100,
     };
     assert!(matches!(
         store.update_secret_access(restrict_open.clone()).await,
@@ -1048,6 +1049,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             restricted: None,
             grant: vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
             revoke: vec![(PrincipalKind::Group, "ops".into())],
+            max_grants: 100,
         })
         .await
         .context("regrant")?;
@@ -1067,6 +1069,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
         restricted: None,
         grant: vec![grant("r1", PrincipalKind::User, "u", &[Action::Read])],
         revoke: vec![],
+        max_grants: 100,
     };
     assert!(store.update_secret_access(foreign).await.is_err());
     assert!(matches!(
@@ -1076,6 +1079,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
                 restricted: Some(false),
                 grant: vec![],
                 revoke: vec![],
+                max_grants: 100,
             })
             .await,
         Err(StoreError::NotFound)
@@ -1148,17 +1152,40 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
     );
     assert_eq!(store.list_project_grants("p1").await.context("grants")?.len(), 1);
 
-    for id in ["o1", "r1"] {
+    // The cap is checked inside the transaction, and a refusal changes nothing.
+    assert!(matches!(
         store
             .update_secret_access(AccessChange {
-                secret_id: id.into(),
-                restricted: Some(false),
-                grant: vec![],
+                secret_id: "o1".into(),
+                restricted: None,
+                grant: vec![grant("o1", PrincipalKind::Group, "extra", &[Action::Read])],
                 revoke: vec![],
+                max_grants: 1,
             })
-            .await
-            .context("unrestrict")?;
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(store.list_secret_grants("o1").await.context("grants")?.len(), 1);
+    let mut cleared = Vec::new();
+    for id in ["o1", "r1"] {
+        cleared.extend(
+            store
+                .update_secret_access(AccessChange {
+                    secret_id: id.into(),
+                    restricted: Some(false),
+                    grant: vec![],
+                    revoke: vec![],
+                    max_grants: 100,
+                })
+                .await
+                .context("unrestrict")?,
+        );
     }
+    assert_eq!(
+        cleared,
+        vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
+        "unrestricting reports what it cleared"
+    );
     assert!(
         store.list_secret_grants("o1").await.context("grants")?.is_empty(),
         "unrestricting clears the list, so it cannot come back later"
@@ -1176,6 +1203,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             restricted: None,
             grant: vec![grant("o1", PrincipalKind::Group, "ops", &[Action::Read])],
             revoke: vec![],
+            max_grants: 100,
         })
         .await
         .context("prepare a list on an open secret")?;
@@ -1198,6 +1226,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             restricted: None,
             grant: vec![grant("o1", PrincipalKind::Identity, "pod", &[Action::Read])],
             revoke: vec![],
+            max_grants: 100,
         })
         .await
         .context("grant the identity")?;
@@ -1226,6 +1255,7 @@ async fn exercise_secret_access(store: &SqlStore) -> anyhow::Result<()> {
             restricted: None,
             grant: vec![grant("o1", PrincipalKind::User, "u1", &[Action::Read])],
             revoke: vec![],
+            max_grants: 100,
         })
         .await
         .context("grant")?;

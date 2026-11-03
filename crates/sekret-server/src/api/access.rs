@@ -249,10 +249,28 @@ fn grant_actions(requested: &[Action]) -> ApiResult<Vec<Action>> {
         .collect())
 }
 
+/// Invisible characters that change how text around them reads, such as bidirectional
+/// overrides and zero-width joiners, so a name cannot pose as another.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
 fn check_principal_id(id: &str) -> ApiResult<()> {
-    if id.trim().is_empty() || id.len() > MAX_PRINCIPAL_ID || id.chars().any(char::is_control) {
+    let hidden = |c: char| c.is_control() || is_format(c);
+    if id.trim().is_empty() || id.len() > MAX_PRINCIPAL_ID || id.chars().any(hidden) {
         return Err(ApiError::bad_request(format!(
-            "principal ids must be 1 to {MAX_PRINCIPAL_ID} characters without control characters"
+            "principal ids must be 1 to {MAX_PRINCIPAL_ID} characters without control or invisible characters"
         )));
     }
     Ok(())
@@ -364,17 +382,8 @@ async fn patch_secret_access(
             "a secret's access list holds at most {MAX_GRANTS} entries"
         )));
     }
-    let cleared: Vec<serde_json::Value> = if clears {
-        survivors
-            .iter()
-            .map(|e| json!({"principal_kind": e.principal_kind.as_str(), "principal_id": e.principal_id}))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let detail = json!({
+    let mut detail = json!({
         "restricted": request.restricted,
-        "cleared": cleared,
         "granted": grant.iter().map(|g| json!({
             "principal_kind": g.principal_kind.as_str(),
             "principal_id": g.principal_id,
@@ -390,16 +399,33 @@ async fn patch_secret_access(
         restricted: request.restricted,
         grant,
         revoke,
+        max_grants: MAX_GRANTS,
     };
-    let changes_anything = change.restricted.is_some_and(|r| r != s.secret.restricted)
+    let mut changes_anything = change.restricted.is_some_and(|r| r != s.secret.restricted)
         || !change.grant.is_empty()
-        || !change.revoke.is_empty()
-        || !cleared.is_empty();
-    state.store.update_secret_access(change).await.map_err(|e| match e {
-        StoreError::Conflict => secret_access_off(),
-        StoreError::NotFound => ApiError::not_found("secret"),
-        other => other.into(),
-    })?;
+        || !change.revoke.is_empty();
+    let cleared = match state.store.update_secret_access(change).await {
+        Ok(cleared) => cleared,
+        Err(StoreError::NotFound) => return Err(ApiError::not_found("secret")),
+        // Either the setting went off, or a change made at the same moment filled the list.
+        Err(StoreError::Conflict) => {
+            let current = state.store.get_project(&project.id).await?;
+            if current.is_some_and(|p| !p.secret_access) && widens {
+                return Err(secret_access_off());
+            }
+            return Err(ApiError::conflict(format!(
+                "the access list changed meanwhile, or would hold more than {MAX_GRANTS} entries; reload and try again"
+            )));
+        }
+        Err(other) => return Err(other.into()),
+    };
+    changes_anything |= !cleared.is_empty();
+    detail["cleared"] = json!(
+        cleared
+            .iter()
+            .map(|e| json!({"principal_kind": e.principal_kind.as_str(), "principal_id": e.principal_id}))
+            .collect::<Vec<_>>()
+    );
     if changes_anything {
         audit(
             &state,
@@ -479,6 +505,9 @@ mod tests {
         assert!(check_principal_id("").is_err());
         assert!(check_principal_id("  ").is_err());
         assert!(check_principal_id("a\nb").is_err());
+        assert!(check_principal_id("ops\u{202E}nimda").is_err(), "a bidi override");
+        assert!(check_principal_id("op\u{200B}s").is_err(), "a zero-width space");
+        assert!(check_principal_id("équipe-ops").is_ok(), "accents are fine");
         assert!(check_principal_id(&"x".repeat(MAX_PRINCIPAL_ID + 1)).is_err());
     }
 }

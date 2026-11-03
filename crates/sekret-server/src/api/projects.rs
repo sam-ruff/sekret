@@ -190,6 +190,14 @@ async fn put_project_policy(
             "changing the project default needs unrestricted create and edit on secrets",
         ));
     }
+    // Rotation is bound by no list, so with lists in play only those exempt from them may steer it.
+    if project.secret_access && !manages_secret_access(&state, &principal, &project.id).await? {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "escalation",
+            "with per-secret access on, only a project admin can change the project default",
+        ));
+    }
     policy.validate().map_err(|e| ApiError::bad_request(e.to_string()))?;
     let stored = if policy == SecretPolicy::default() {
         None
